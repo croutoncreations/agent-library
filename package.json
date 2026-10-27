@@ -1,0 +1,66 @@
+{
+  "name": "agent-library",
+  "version": "0.1.0",
+  "description": "One place for everything your agents make, with per-agent permissions, first-class Markdown and linkable artifacts. Self-hosted on Cloudflare Workers.",
+  "license": "MIT",
+  "author": "Crouton Creations",
+  "homepage": "https://github.com/croutoncreations/agent-library#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/croutoncreations/agent-library.git"
+  },
+  "bugs": {
+    "url": "https://github.com/croutoncreations/agent-library/issues"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "ai-agents",
+    "cloudflare-workers",
+    "self-hosted",
+    "markdown",
+    "oauth",
+    "d1",
+    "r2"
+  ],
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.22.1 <25 || >=26.12.1 <27"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "fixtures": "node test/make-fixtures.mjs",
+    "test": "node --test --test-concurrency=1 test/*.test.mjs",
+    "test:deploy": "node --test test/deploy-guards.test.mjs test/migrations-order.test.mjs",
+    "check:bundle": "node scripts/deploy/check-bundle.mjs",
+    "check:deploy-config": "node scripts/deploy/stage.mjs && node scripts/deploy/check-deploy-config.mjs",
+    "build:design": "node build-current-bundle.mjs && node build-design-bundle.mjs --consent-style && node build-service-fixes.mjs && node build-ui-fixes.mjs && node build-icon-fixes.mjs && node build-history-fixes.mjs && node build-consent-fixes.mjs && node build-session-fixes.mjs && node build-upload-fixes.mjs && node build-portability-fixes.mjs && node build-auth-fixes.mjs && node build-app-connect-fixes.mjs && node build-read-fixes.mjs && node build-file-tools-fixes.mjs",
+    "capture:design": "node scripts/design/capture.mjs",
+    "stage:hosted": "node scripts/deploy/stage.mjs",
+    "setup:self-host": "node scripts/self-host/setup.mjs",
+    "test:self-host": "node --test test/self-host.test.mjs",
+    "check:editor": "npm run check --prefix editor",
+    "check:self-host-upload": "node scripts/self-host/check-upload.mjs",
+    "dev": "wrangler dev --config wrangler.local.toml --local"
+  },
+  "dependencies": {
+    "@cloudflare/workers-oauth-provider": "1.2.1"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20261024.1",
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "esbuild": "0.28.2",
+    "smol-toml": "1.9.1",
+    "typescript": "7.0.2",
+    "wrangler": "4.152.0"
+  },
+  "overrides": {
+    "wrangler": {
+      "@cloudflare/workers-types": "$@cloudflare/workers-types"
+    },
+    "miniflare": {
+      "undici": "7.30.1"
+    }
+  }
+}

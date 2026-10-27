@@ -1,0 +1,57 @@
+{
+  "base_history_fixes_sha256": "d1a5a560bb674bcbd74f476e36445dcf84bf3876028b9ac7b4d932570edaa59e",
+  "integrated_sha256": "4919da74595f4191cad684e2def1a84b1a69cf190d8aec0a0dc79fc57517f808",
+  "preserved_prefix_sha256": "eed00b8e2211d132c82cb55702d056b9e924a36ca5572b40d437f60167d967d2",
+  "preserved_suffix_sha256": "63e9ca360062e23d9b82d1560856260557fc704366a62d458594ab8d7e25f2e1",
+  "oauth_server_module_sha256": {
+    "history_fixes": "91a78326ca0baa4270689cfd3c07c84ec1a12be1affa76573fe574e95f76498c",
+    "candidate": "884c2b441d62ab29357d8e763fd63c15c31abf7a044407f6503747cbb11a6450"
+  },
+  "patched_module": "src/oauth/server.ts",
+  "style": {
+    "replaced_sha256": "26c8730c50b7938a07662f9545a2e7ff0a2b7157b5a9195fb7ca004c6027050b",
+    "candidate_sha256": "e8beed1ae4937d2c15c9c6f4309e86fb5936c9c88fa19fe09d9fdc0c9dbd8708"
+  },
+  "regions": [
+    {
+      "name": "toClient",
+      "replaced_sha256": "c63929c90a643bb2819ae630ac1ed87865642896cb20a085687af11cd39711c9",
+      "replacement_sha256": "38a3cfd0ac618c78fea6103d7af160045db61add0059393668149caaa08cd69b"
+    },
+    {
+      "name": "helpers",
+      "replaced_sha256": "af6bbcda33c7097f671136758593eae1784ce73099a91c9f0bdd8fb6e49e2a0b",
+      "replacement_sha256": "a387af4ebccefa68572c1372c47ea3046e94c45ded11dbd0f16a119451d4cfc5"
+    },
+    {
+      "name": "authorizeGet",
+      "replaced_sha256": "c4a5ad9faf315cf4ca4cf01f337eb45ee7f952c4fc6a4af740c12863bf30d5e8",
+      "replacement_sha256": "376ce4d0cf3ed865fbe3911284414503e92a16529dcc69c4309432c8d3758aa9"
+    },
+    {
+      "name": "grantSave",
+      "replaced_sha256": "2504ab51a7034014f2fcd9740c5138b750bcaea60494727461a57b55b6f4ec23",
+      "replacement_sha256": "670a01051bbaeedb628b9c006a217eab046b59021d1834359818a05dc1dd453f"
+    },
+    {
+      "name": "grantPage",
+      "replaced_sha256": "6ee1c22d0b47108ec6d0e5388815a52a7db610a6c7a7b4c03cc396fa6920a00e",
+      "replacement_sha256": "4f052e303abb6c86fd2287a778df35ec33fa3706866643182440edbd873c90b4"
+    },
+    {
+      "name": "publishConsentPage",
+      "replaced_sha256": "b3cf6558973e9a1bd462352577730db8f6a8a5e25609bd486b40dd8ff07a9070",
+      "replacement_sha256": "37749dd54dc811410a1f6f6742ff97b4ba314f0a50de2b117ac6d3c26bf391f6"
+    },
+    {
+      "name": "publishValidate",
+      "replaced_sha256": "39f6263d9513da07abf922e177ceddf25aea17bfe52c529c1da34009857d7e4f",
+      "replacement_sha256": "6517807757a9ab838125a91ffe7b6abafcc102b7d07958ce674e707ffe1f2f93"
+    },
+    {
+      "name": "errorPage",
+      "replaced_sha256": "3588fbc778e834cc1b2ebbb438472ea52e84b5dc948f6a042b37bda8a3dfe9a4",
+      "replacement_sha256": "7106c713e0cc084844eaf73e46d1881604e6df128d3b5120f6e24a17659ef220"
+    }
+  ]
+}

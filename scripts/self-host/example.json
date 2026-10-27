@@ -1,0 +1,15 @@
+{
+  "workerName": "my-agent-library",
+  "accountId": "11111111111111111111111111111111",
+  "databaseName": "my-agent-library-db",
+  "databaseId": "11111111-1111-4111-8111-111111111111",
+  "bucketName": "my-agent-library-blobs",
+  "kvNamespaceId": "22222222222222222222222222222222",
+  "appHost": "library.example.com",
+  "mcpHost": "library-mcp.example.com",
+  "accessTeamDomain": "my-team.cloudflareaccess.com",
+  "accessAudience": "replace-with-your-access-application-audience",
+  "ownerEmail": "owner@example.com",
+  "oidcClientId": "replaceWithYourOidcClientId",
+  "oidcIssuer": "https://my-team.cloudflareaccess.com/cdn-cgi/access/sso/oidc/replaceWithYourOidcClientId"
+}

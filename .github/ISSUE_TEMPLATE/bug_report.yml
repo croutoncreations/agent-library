@@ -1,0 +1,58 @@
+name: Bug report
+description: Something doesn't work as documented.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! Please don't include tokens, API keys, client secrets, account IDs or real library content.
+        **Security issues:** don't open an issue. Use [private vulnerability reporting](../security/advisories/new) instead.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you did, what you expected and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. …
+        2. …
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Self-hosting / setup
+        - Browser UI
+        - MCP / agent connection
+        - HTTP API (/v1)
+        - App Connect
+        - Deploy pipeline
+        - Docs
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: client
+    attributes:
+      label: Agent or MCP client (if relevant)
+      placeholder: e.g. Claude, ChatGPT, Cursor, a custom script
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      placeholder: e.g. v0.1.0 or a commit SHA
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Error messages or logs
+      description: Redact hostnames, emails and anything secret.
+      render: text

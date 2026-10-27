@@ -1,0 +1,90 @@
+{
+  "base_app_connect_fixes_sha256": "ce2343fb169c3aea508b2364531581188a8b3c2b507080e74c13a5cd0cd9332b",
+  "integrated_sha256": "b3ba648c65dc2bac456211f1f436bcf67db9bedb7104b2c60cab40a8ac4ce106",
+  "sources_sha256": {
+    "service.js": "aa8ce47b2a58a675b23714df6747a47bed232233da3f890c2e70db4a02391217",
+    "v1-route.js": "e6a8c0ee65a03b32ca8dc11fb7ea415fec4999ff05e286cbed0530638da0ab22"
+  },
+  "patches": [
+    {
+      "module": "service",
+      "name": "readTextChunk and helpers (inserted before getArtifact)",
+      "find_sha256": "b1ca91c55ea8be241724b9e4ab54c01e92608ceee87e34402c5bd5b84f9c0e9b"
+    },
+    {
+      "module": "oauthMcp",
+      "name": "OAuth MCP: read_artifact accepts cursor and max_bytes",
+      "find_sha256": "8a198fdb8c923ec0a1a661465758d75d68d3a04ed0dcc31eac44be1eed5ed592"
+    },
+    {
+      "module": "oauthMcp",
+      "name": "OAuth MCP: read_artifact chunk mode",
+      "find_sha256": "f8d0825c39d7eac9da049142652e88841c3cd180504707badc92b729f320b680"
+    },
+    {
+      "module": "oauthMcp",
+      "name": "OAuth MCP: chunk sizes count the request id (it is echoed in the reply)",
+      "find_sha256": "e9025ae4063c7f850ea473ddcda8cc3027229b4a0bc5bcb68ecc8d6bdc48b243"
+    },
+    {
+      "module": "oauthMcp",
+      "name": "OAuth MCP: chunked reads bound every reply, errors included",
+      "find_sha256": "434c50db7ac2a82ca8c6df616dc89a6c74d8bf8328a7279cc9f1e3bedde7a589"
+    },
+    {
+      "module": "oauthMcp",
+      "name": "OAuth MCP: refuse an over-long id on a chunked read before any reply echoes it",
+      "find_sha256": "3ada89c7247a652e49ce044add8b9caf8ad2207933d92153d607eaa16e983ac5"
+    },
+    {
+      "module": "oauthMcp",
+      "name": "OAuth MCP: rate-limit reply is bounded too",
+      "find_sha256": "3cf9c803adcf8be1b465163777333b57a943fc6f92fcdff5be7596403f1c6f75"
+    },
+    {
+      "module": "oauthMcp",
+      "name": "OAuth MCP: chunk argument schemas",
+      "find_sha256": "1fcd80401b80b25d18b5fda6b53df9ccdf7cc6857a143dbffca18898750fa0aa"
+    },
+    {
+      "module": "oauthMcp",
+      "name": "OAuth MCP: declare chunk schemas",
+      "find_sha256": "47175b27100722b88732adc405622487b7d9e84414af357d3c7d95459bf99f65"
+    },
+    {
+      "module": "mcp",
+      "name": "legacy MCP: read_artifact chunk mode",
+      "find_sha256": "27a51f09a128c95aa6f6edb3581610f4b0d9fd066869ec0efc1d0e14b914c040"
+    },
+    {
+      "module": "mcp",
+      "name": "legacy MCP: chunk sizes count the request id (it is echoed in the reply)",
+      "find_sha256": "825f7a59eb490acab78a84da25cfc7bee62a281dbf53cc8faba957c814f68dae"
+    },
+    {
+      "module": "mcp",
+      "name": "legacy MCP: refuse an over-long id on a chunked read before any reply echoes it",
+      "find_sha256": "3ada89c7247a652e49ce044add8b9caf8ad2207933d92153d607eaa16e983ac5"
+    },
+    {
+      "module": "mcp",
+      "name": "legacy MCP: chunked reads bound every reply, errors included",
+      "find_sha256": "b2ab87d0cf6e7bf7fec1f9104fd03704bed4bddc334ccf4a262ca3bfc222c2a3"
+    },
+    {
+      "module": "v1",
+      "name": "route: text chunks",
+      "find_sha256": "a613e58c03af8da79f05d01f8567380e92504766c29fb8339a44c65944c95e29"
+    },
+    {
+      "module": "v1",
+      "name": "handler: text chunks",
+      "find_sha256": "f438daac0fbfcb9d68eb7d2fa63f9244ad7dc42c510ed17e9958df795d293a3d"
+    },
+    {
+      "module": "index",
+      "name": "browser API: text chunks",
+      "find_sha256": "c4439ba0e6db612f0421d6f887f4f47025ca7d968ed1c649e8f449f5ab10e4db"
+    }
+  ]
+}

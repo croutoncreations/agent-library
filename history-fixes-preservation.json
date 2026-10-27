@@ -1,0 +1,306 @@
+{
+  "base_icon_fixes_sha256": "e705170f69a84c66763ca49f3215cef8fe2417292c625400322beb7fdedb615b",
+  "integrated_sha256": "d1a5a560bb674bcbd74f476e36445dcf84bf3876028b9ac7b4d932570edaa59e",
+  "sources_sha256": {
+    "service.js": "8b1c74c4d7a99af0b5aaad18fb02584d28249e743ebd28b5d5e961734892c49f",
+    "oauth-tools.js": "abc5f4eb6d87826363a6c865388eeee5073435d65f531db0f0e429b594daf473",
+    "legacy-tools.js": "39719d06ba296048881fef5bb03fa3120839a7100949fbacc5fc405be3433e9a",
+    "v1-routes.js": "e0bc3cb3ffd3f6854a1ce757e8513f0b5988472331832d1d6b8d30a3ce820052",
+    "ui-history.js": "b136d9b4c8e85237d32fa83706e6bf5bf818689be5859ebffd22abc9f723266c",
+    "ui-history.css": "1f5983801180c48e4fbc1252ed9871bcf0811aa34c2db857ee927c47305a655e",
+    "util.js": "1a28d48083a48a167ae0322ef7d0c8ed3bb268b0d4bd486904036b5722cae7b7"
+  },
+  "migration": "0010_version_history.sql",
+  "patches": [
+    {
+      "module": "service",
+      "name": "provenance helpers, history paging, diff, metadata versions (appended to the service module)",
+      "find_sha256": "c25f315ab9020f569fe73490fd90beb27bb124837bd8825d42c1eede865b327a"
+    },
+    {
+      "module": "service",
+      "name": "createMarkdown: first version records who/why",
+      "find_sha256": "63d45750f077316571f7bb8d20a2d08c4d8f2d9a2f0db8ad03b38b6b8fe9a993"
+    },
+    {
+      "module": "service",
+      "name": "publishRevision: every later version records who/why",
+      "find_sha256": "4ca4cba6211ea099654bfbf6782b8245a628acba4e875fb444eb454173a3ff7f"
+    },
+    {
+      "module": "service",
+      "name": "publishRevision: bind who/why after created_at",
+      "find_sha256": "b91a815279aac90de843c35be58743aa21b0912ed5bd5789b3c1ebab5d25c04a"
+    },
+    {
+      "module": "service",
+      "name": "saveMarkdown: carry the change note into the new version",
+      "find_sha256": "fdf62bcaf75b0cfa8a023e07b4f25bcd02e659bf20cdc79664ecbd62cb36b881"
+    },
+    {
+      "module": "service",
+      "name": "saveFile: pass the change note through to Markdown/HTML saves",
+      "find_sha256": "d155f413bb94714445ea3b2b69d3513d7945f37c2fa44fa1c85145b333da2f4f"
+    },
+    {
+      "module": "service",
+      "name": "saveFile: carry the change note into JSON/CSV versions",
+      "find_sha256": "4b4747dd07d7cff6d67e13cd37d9533bc2ce470160b4925d624d7877a8062954"
+    },
+    {
+      "module": "service",
+      "name": "restoreRevision: note defaults to \"Restored version N\"; read before the idempotency digest stays as is",
+      "find_sha256": "3025ad820db295cb56a70aab664f7af9c79cab5926a0f1eff16658baedc1c55d"
+    },
+    {
+      "module": "service",
+      "name": "history: paged, labelled versions (old 200-row list replaced)",
+      "find_sha256": "11b72d044a352214769e1d8444db04367a52626001294bd46db562b9bb71eb65"
+    },
+    {
+      "module": "service",
+      "name": "history: accept paging options; the owner can read the history of a trashed document (agents: 404)",
+      "find_sha256": "d045ea9d045306bf24efe5d7265918dd9bc156bfb8785494fdfdf69bb97f1365"
+    },
+    {
+      "module": "service",
+      "name": "updateMetadata: change notes are not part of the request digest",
+      "find_sha256": "e815609222b955a04a8054b5c480bbc4ddc875c4344cd227296efc08113aec6c"
+    },
+    {
+      "module": "service",
+      "name": "updateMetadata: record the baseline (once) and the new metadata version in the same gated batch",
+      "find_sha256": "42652dd84b0b1e0f3f8d749a31bef1c71c041c30816fa5d05aa5e743dbb318c1"
+    },
+    {
+      "module": "service",
+      "name": "updateMetadata: internal-only restore marker parameter",
+      "find_sha256": "96b0d7da3558ae250c3c27240bef94d3879cdf82607e72fa03d213548c13e4aa"
+    },
+    {
+      "module": "service",
+      "name": "register new service functions",
+      "find_sha256": "471f8a7f4dfca65ab0305da1a9275cefaa3ca8bd73f53c9c951bf270d06499bd"
+    },
+    {
+      "module": "oauthMcp",
+      "name": "OAuth MCP: write context names the connection and carries clientInfo",
+      "find_sha256": "99da81171949012ce82ce4beaac68551a341856d2d8b7b05266bffd911472584"
+    },
+    {
+      "module": "oauthMcp",
+      "name": "OAuth MCP: remember the initialize clientInfo on the connection",
+      "find_sha256": "f064405f0fd1e923cd41e06e8a625dbe6963563e32b06627aceb908e1312876a"
+    },
+    {
+      "module": "oauthMcp",
+      "name": "OAuth MCP: history paging, diff, restore tools (inserted after artifact_history)",
+      "find_sha256": "03aff9c3217df37a461f3d30b3db7f2c8a89ba9a6af4cb19cfd750e6a9e0481f"
+    },
+    {
+      "module": "oauthMcp",
+      "name": "OAuth MCP: artifact_history takes a cursor and documents labels",
+      "find_sha256": "d77ad978b2f8712c86efe0c16ab7c44440a871f2ebfa1b88f61feb4f421fe48c"
+    },
+    {
+      "module": "oauthMcp",
+      "name": "OAuth MCP: create_markdown accepts change_note",
+      "find_sha256": "97a294177390f64eba7e26270e57329de6b2a3cbe394a5480f0896019dc588f4"
+    },
+    {
+      "module": "oauthMcp",
+      "name": "OAuth MCP: save_markdown accepts change_note",
+      "find_sha256": "3d99271235c59b107a4316f7701d707f4f4e0501a5c12eca62b152ab5f834050"
+    },
+    {
+      "module": "oauthMcp",
+      "name": "OAuth MCP: save_markdown passes change_note",
+      "find_sha256": "d6152e0cccc248842e9836d49398e45f348176cdfac8262a743b7a72b6e45f6d"
+    },
+    {
+      "module": "oauthMcp",
+      "name": "OAuth MCP: shared change_note schema",
+      "find_sha256": "1513a3a4dea1d5e3769deca379bb31e282a1a46296af2cf3d94cda55cfd0fd57"
+    },
+    {
+      "module": "oauthMcp",
+      "name": "OAuth MCP: declare NOTE",
+      "find_sha256": "a7c9635c041ab83d90b9b49a2a0c263510751883b9008de16f6da6a23b626aee"
+    },
+    {
+      "module": "mcp",
+      "name": "legacy MCP: artifact_history paging + description",
+      "find_sha256": "ed607538165d0b7a42cd6e91009a1a55149b8a9b924b5a9da244c8fbe22c313f"
+    },
+    {
+      "module": "mcp",
+      "name": "legacy MCP: create_markdown accepts change_note",
+      "find_sha256": "b1b9eab9afbb9cba610c123620366b5443c4d102c215c3e7bd7efa88bd026bd2"
+    },
+    {
+      "module": "mcp",
+      "name": "legacy MCP: save_markdown accepts change_note",
+      "find_sha256": "fcccc3694493221ea00adc373f3619800e64b415f60ea923d6600b59e649cf55"
+    },
+    {
+      "module": "mcp",
+      "name": "legacy MCP: write context names the grant and carries clientInfo",
+      "find_sha256": "ae6f1bdbe64588924bd7e166e71668c5df5a655928747b66d75cfea4401c785b"
+    },
+    {
+      "module": "mcp",
+      "name": "legacy MCP: remember the initialize clientInfo on the grant",
+      "find_sha256": "5ff23b736708415dc332f0374d3e21f06abf2c5b5560997cd6d3b50189124c61"
+    },
+    {
+      "module": "auth",
+      "name": "grant auth: read the remembered clientInfo with the grant",
+      "find_sha256": "8dbf7f6381e2f3ffcb9c43cfa42967c0cdb26d26cf7fa11155f2d3637e1f1d6c"
+    },
+    {
+      "module": "auth",
+      "name": "grant auth: context carries the clientInfo hint",
+      "find_sha256": "7f44e1c8c1538ca38332595a8efefb0f1e6f20989033f40399912f6d6f5e9ab8"
+    },
+    {
+      "module": "mcp",
+      "name": "legacy MCP: restore tools rate-limited as mutations",
+      "find_sha256": "cd134443e03192ab9a81b3090aab3c43bfc8000eaef6fda5212a324feaee4640"
+    },
+    {
+      "module": "links",
+      "name": "web links for restore results and per-version links",
+      "find_sha256": "700e3af293d7a954913ed91cf5e2f85da208960796a50b60375ab067167c4163"
+    },
+    {
+      "module": "links",
+      "name": "artifact_history: per-version browser link",
+      "find_sha256": "d300390d102982257fa0a7d98099139b426c72c7dc40b569234253356b6070b4"
+    },
+    {
+      "module": "links",
+      "name": "artifact_history output schema mentions version_url",
+      "find_sha256": "f00fe63d492f61d33c1b0cbf9c44d7275be15e7f6b987499064cc70cb1facf97"
+    },
+    {
+      "module": "backup",
+      "name": "export: revision who/why columns and metadata versions",
+      "find_sha256": "5edde00978f73ffb47f9ad0a8d079721829e5bc7d851bba5d25813ae7c4ee1db"
+    },
+    {
+      "module": "backup",
+      "name": "export: declare the metadata versions holder",
+      "find_sha256": "aa5279495f00379860f3720f2c5677e136aad96624b718f1c469116a9d8306e0"
+    },
+    {
+      "module": "backup",
+      "name": "export: include metadata versions",
+      "find_sha256": "c735d2584bc3a5754d53bb27ccc8faf2e8616c2174f09d71d0b1234acefdc0ec"
+    },
+    {
+      "module": "backup",
+      "name": "restore: revision who/why columns",
+      "find_sha256": "a5ae735fe8295e54e8b7cb2ce0fdef6464c0cb9b8bbe27219015196c3710f8aa"
+    },
+    {
+      "module": "backup",
+      "name": "restore: authors of metadata versions exist as principals (backups from before 0010 have none)",
+      "find_sha256": "38d8122a01c4f8ef20f5b6c33b0d2c717ad964a219dfc9855bc7e3f4e88b7b25"
+    },
+    {
+      "module": "v1",
+      "name": "routes: version diff, restore, metadata history/restore",
+      "find_sha256": "8f57ac06466f42965e3764871d1e1c798a7d94bc01c751adfea054595d08228f"
+    },
+    {
+      "module": "v1",
+      "name": "API key context names the key",
+      "find_sha256": "df7287eb949b54d9b333f0a29c4508e8195be66e748d6def6612616cdb0d5d1c"
+    },
+    {
+      "module": "v1",
+      "name": "create: change_note",
+      "find_sha256": "633a0c25c052096d75c34a27787ff222728b871d73dbd28294124be5251d01ba"
+    },
+    {
+      "module": "v1",
+      "name": "create (flag off): change_note",
+      "find_sha256": "6c311edc9ed8ed9013af4952e2cdcc0418848204102d1cab0190a2c0e9b0eb85"
+    },
+    {
+      "module": "v1",
+      "name": "save: change_note",
+      "find_sha256": "edbed885da1c29e7ce03b22bc4415be5a4f7f8aee025ffdbea48c53a6a9cd3af"
+    },
+    {
+      "module": "v1",
+      "name": "history paging + new endpoints",
+      "find_sha256": "f4bfc83089233a36637c5870e8fd50e7a88db6476d5f756a0059968e4f369bef"
+    },
+    {
+      "module": "index",
+      "name": "browser API: history paging, diff, metadata history and restore",
+      "find_sha256": "f848fdcda56983f3cd0d6b96c6e3a554cf5bc001dfb34d0916a11a1b64d0b159"
+    },
+    {
+      "module": "ui",
+      "name": "history tab: labelled, grouped timeline with compare and restore (old list replaced)",
+      "find_sha256": "1ed4a674a55b22eb2170a746e3ffec5f46bc8b098a69547d99afc19a9b765ef3"
+    },
+    {
+      "module": "ui",
+      "name": "history tab uses the new timeline",
+      "find_sha256": "5914f97359f8c39c7e783961505c92f42bd234607428aaef7bdd14dc3c613f69"
+    },
+    {
+      "module": "ui",
+      "name": "?v=N deep link opens the History tab on that version",
+      "find_sha256": "87064b6cdf3d97c1bb860f208b69bb9eda129d46856416849d5a7d3cbf23f111"
+    },
+    {
+      "module": "ui",
+      "name": "a /p/…/a/…?v=N link keeps the version when it becomes the in-app route",
+      "find_sha256": "1e5ed0112796d1318e3c3cbb65f5361902d8e3a1d9cc31fadbdfd96044401de4"
+    },
+    {
+      "module": "ui",
+      "name": "router ignores a ?v=N version query on a document route",
+      "find_sha256": "fd28ebe8a33598bf63fbe34c31eb1b58d3a96b3388e3e949a8878e3f6e469c89"
+    },
+    {
+      "module": "ui",
+      "name": "history CSS (appended to the app stylesheet)",
+      "find_sha256": "8377c43a78e3170242b8af586682b6e03be1240dc524871acbad0fc83a2a1365"
+    },
+    {
+      "module": "publisher",
+      "name": "generation commit: part versions record the publishing app",
+      "find_sha256": "103fe6fd37d940d30547e1bff2e0d10e0039714f967e3a67c98490c7a467b7b4"
+    },
+    {
+      "module": "publisher",
+      "name": "generation commit: manifest version records the publishing app",
+      "find_sha256": "5262ce4bb742bc8fd05ce2bfb355a7c7056e73cfee3df01957eafed489b80ff3"
+    },
+    {
+      "module": "publisher",
+      "name": "legacy publish: each file version records the publishing app",
+      "find_sha256": "d2bb68fa73b103cdbd9c4b785b29385e5167fdadb71156eed1695ce4cd72c664"
+    },
+    {
+      "module": "oauthMcp",
+      "name": "OAuth MCP instructions: every change says why (change_note)",
+      "find_sha256": "82e319a24d179eade4bc4bbfc5d3538d8d528d631bbe0dd6f4aea3b9c527ff3e"
+    },
+    {
+      "module": "mcp",
+      "name": "legacy MCP instructions: every change says why (change_note)",
+      "find_sha256": "02f65b48ccc2880a7f1afb5667afbfcf7cc23c135c577db8924b9b4475b15f04"
+    },
+    {
+      "module": "util",
+      "name": "change note schema + MCP clientInfo reader",
+      "find_sha256": "2465027e0816aec3604bb62c8f66da0eb820cfb5c65f919671df770a9079d4e4"
+    }
+  ]
+}

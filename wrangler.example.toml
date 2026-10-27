@@ -1,0 +1,90 @@
+# Example installation config. Copy to wrangler.toml (gitignored) and replace every placeholder
+# with your own resources, or generate an equivalent standalone config with
+# `npm run setup:self-host` (docs/self-hosting.md). Names and IDs here are not secrets, but they
+# describe your installation, so wrangler.toml is never committed.
+#
+# Two configurations live in this file:
+#  - top level: local only (wrangler dev). Placeholder IDs; never deploy it.
+#  - [env.hosted]: your deployed installation. Always pass `--env hosted` to wrangler; without it,
+#    wrangler resolves the placeholder top-level config. If you use the optional deploy pipeline
+#    (docs/deploy-pipeline.md), this file lives in your private deploy repo, next to deploy/production.json
+#    (from deploy/production.example.json); keep the two identical, the pipeline checks both before every deploy.
+name = "agent-library"
+main = "src/index.js"
+compatibility_date = "2025-09-01"
+# Required by workers-oauth-provider for Client ID Metadata Document fetches (SSRF protection).
+compatibility_flags = ["global_fetch_strictly_public"]
+
+[[kv_namespaces]]
+binding = "OAUTH_KV"
+id = "00000000000000000000000000000000"
+
+[[rules]]
+type = "Text"
+globs = ["**/*.txt"]
+fallthrough = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "agent-library-db"
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "migrations"
+
+[[r2_buckets]]
+binding = "BLOBS"
+bucket_name = "agent-library-blobs"
+
+# ---- Your installation (wrangler deploy --env hosted) ----
+# src/index.js is a byte-pinned bundle; it is uploaded unmodified from an isolated copy
+# (`npm run stage:hosted` copies it to dist/hosted/index.js and verifies its sha256), so wrangler
+# cannot attach neighbouring sources as extra modules.
+[env.hosted]
+name = "agent-library"
+main = "dist/hosted/index.js"
+no_bundle = true
+find_additional_modules = false
+workers_dev = false
+preview_urls = false
+# Two hostnames in a zone you control: the owner UI (behind Cloudflare Access) and the
+# agent-facing host (OAuth, MCP at /mcp, HTTP API at /v1). They must differ.
+routes = [
+  { pattern = "library.example.com", custom_domain = true },
+  { pattern = "library-mcp.example.com", custom_domain = true },
+]
+
+[env.hosted.triggers]
+# Upload cleanup (bounded, idempotent).
+crons = ["*/15 * * * *"]
+
+[env.hosted.vars]
+APP_HOST = "library.example.com"
+MCP_HOST = "library-mcp.example.com"
+# Cloudflare Access self-hosted application protecting APP_HOST (owner sign-in).
+ACCESS_TEAM_DOMAIN = "your-team.cloudflareaccess.com"
+ACCESS_AUD = "replace-with-your-access-application-audience-tag"
+OWNER_EMAIL = "you@example.com"
+# Access for SaaS OIDC application used for agent consent on MCP_HOST.
+ACCESS_OIDC_ISSUER = "https://your-team.cloudflareaccess.com/cdn-cgi/access/sso/oidc/replace-with-client-id"
+ACCESS_OIDC_CLIENT_ID = "replace-with-client-id"
+# App Connect: lets apps you register keep their own files in your library (docs/app-connect.md).
+APP_CONNECT_ENABLED = "1"
+# Optional: extra exact https OAuth callbacks to trust besides the built-in ChatGPT, Claude and
+# Cursor callbacks, e.g. your own MCP gateway. Space- or comma-separated; exact match only.
+# OAUTH_EXTRA_REDIRECT_URIS = "https://gateway.example.com/oauth/callback"
+#
+# Worker secret (never in this file):
+#   ACCESS_OIDC_CLIENT_SECRET  (wrangler secret put ACCESS_OIDC_CLIENT_SECRET --env hosted)
+
+[[env.hosted.kv_namespaces]]
+binding = "OAUTH_KV"
+id = "replace-with-your-kv-namespace-id"
+
+[[env.hosted.d1_databases]]
+binding = "DB"
+database_name = "agent-library-db"
+database_id = "replace-with-your-d1-database-id"
+migrations_dir = "migrations"
+
+[[env.hosted.r2_buckets]]
+binding = "BLOBS"
+bucket_name = "agent-library-blobs"

@@ -1,0 +1,60 @@
+{
+  "$comment": "Recorded deploy target for the optional deploy pipeline (docs/deploy-pipeline.md). Copy to deploy/production.json in your private deploy repo (it is gitignored here) and keep it identical to wrangler.toml [env.hosted]. Non-secret identifiers only. baseline: the Worker version live before the pipeline's first deploy. pendingVars: vars this deploy adds or changes on purpose, as { NAME: <exact current live value, or null if new> } (preflight otherwise refuses a target var that is missing live or differs); empty it after the deploy.",
+  "accountId": "replace-with-your-32-hex-cloudflare-account-id",
+  "workerName": "agent-library",
+  "wranglerEnv": "hosted",
+  "main": "src/index.js",
+  "uploadMain": "dist/hosted/index.js",
+  "noBundle": true,
+  "compatibilityDate": "2025-09-01",
+  "compatibilityFlags": [
+    "global_fetch_strictly_public"
+  ],
+  "customDomains": [
+    "library.example.com",
+    "library-mcp.example.com"
+  ],
+  "crons": [
+    "*/15 * * * *"
+  ],
+  "vars": {
+    "ACCESS_AUD": "replace-with-your-access-application-audience-tag",
+    "ACCESS_OIDC_CLIENT_ID": "replace-with-client-id",
+    "ACCESS_OIDC_ISSUER": "https://your-team.cloudflareaccess.com/cdn-cgi/access/sso/oidc/replace-with-client-id",
+    "ACCESS_TEAM_DOMAIN": "your-team.cloudflareaccess.com",
+    "APP_CONNECT_ENABLED": "1",
+    "APP_HOST": "library.example.com",
+    "MCP_HOST": "library-mcp.example.com",
+    "OWNER_EMAIL": "you@example.com"
+  },
+  "pendingVars": {},
+  "requiredSecrets": [
+    "ACCESS_OIDC_CLIENT_SECRET"
+  ],
+  "bindings": {
+    "d1": [
+      {
+        "binding": "DB",
+        "id": "replace-with-your-d1-database-id",
+        "name": "agent-library-db"
+      }
+    ],
+    "kv": [
+      {
+        "binding": "OAUTH_KV",
+        "id": "replace-with-your-kv-namespace-id"
+      }
+    ],
+    "r2": [
+      {
+        "binding": "BLOBS",
+        "bucket": "agent-library-blobs"
+      }
+    ]
+  },
+  "baseline": {
+    "versionId": "",
+    "tag": ""
+  },
+  "appliedMigrationsAtBaseline": []
+}

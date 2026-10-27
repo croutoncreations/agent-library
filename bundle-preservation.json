@@ -1,0 +1,9 @@
+{
+  "baseline_sha256": "da3ffeeaeacbbcf6c9dcac8e323e90ead9b0b8bd8270e38cd268f89e80ae5571",
+  "integrated_sha256": "7ca4365663bd3518a3613510b3d511a1357c5b2b53be9692d1ab82fcbbd50ef1",
+  "preserved_prefix_sha256": "4529139fe0d7a24a2b2529cdb5ae9ba5beae990ce85dbe637996325c4ad8f4fb",
+  "preserved_suffix_sha256": "80b096294ef53f14ed4788642a9fe4313fb78867f6615782a50aa3fef4f2b390",
+  "unchanged_outside_publisher": true,
+  "replaced_module": "src/api/publisher.ts",
+  "esbuild_version": "0.28.2"
+}

@@ -1,0 +1,24 @@
+{
+  "name": "agent-library-launch-video",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "studio": "remotion studio",
+    "assets": "node scripts/sync-assets.mjs",
+    "render": "remotion render Hero out/agent-library-hero.mp4",
+    "still": "remotion still"
+  },
+  "dependencies": {
+    "@remotion/cli": "4.0.539",
+    "@remotion/google-fonts": "4.0.539",
+    "@remotion/media": "4.0.539",
+    "@remotion/transitions": "4.0.539",
+    "react": "19.1.1",
+    "react-dom": "19.1.1",
+    "remotion": "4.0.539"
+  },
+  "devDependencies": {
+    "@types/react": "19.1.12",
+    "typescript": "5.9.3"
+  }
+}

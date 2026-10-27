@@ -1,0 +1,22 @@
+{
+  "input": "5ca04dfc47489ef897ec25a1b129a28c7a41ffa5e9cb2393f09ba34fd2222e9c",
+  "output": "de0f5d146f38181c8c0c2214242c881bb04027d1e6b7bb1e6493b76cb85b0ce3",
+  "replacements": [
+    {
+      "before": "return json({ principal: ctx.principal, csrf: ctx.csrf ?? null });",
+      "count": 1
+    },
+    {
+      "before": "S.me = me.principal;",
+      "count": 2
+    },
+    {
+      "before": "function allowedRedirect(u) {\n  return HOSTED_CALLBACKS.has(u) || ",
+      "count": 1
+    },
+    {
+      "before": "async function handleOAuthHost(req, env, ctx, host) {\n  const origin = originFor(host);\n",
+      "count": 1
+    }
+  ]
+}

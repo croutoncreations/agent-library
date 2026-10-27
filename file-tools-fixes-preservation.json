@@ -1,0 +1,87 @@
+{
+  "base_read_fixes_sha256": "b3ba648c65dc2bac456211f1f436bcf67db9bedb7104b2c60cab40a8ac4ce106",
+  "integrated_sha256": "cfd255449f84e5a071aea50104e77f58671c5df2db89d809142905428c3f7c78",
+  "preserved_outside_patches_sha256": "a067e6dc3a65dde2042822730d65bf5d2aaca0006c438a5ecd01584555e45386",
+  "module_sha256": "b7f6dfbb13fb82860fdffaef02a7aa5a9161c668bb09dc1d5886a99964546ef7",
+  "patches": [
+    {
+      "name": "mcp: connections with files accept bodies up to 3 MiB (upload_file)",
+      "module": "// src/oauth/mcp.ts",
+      "find_sha256": "770ac01b9b31144945d4cb4975cf4481904992160c2e3e6ef6dbb8a306ef3764",
+      "replace_sha256": "8b4e87144a26888136dc9368574baa52167bd6a88964a92fdcdb766e6ea61df2"
+    },
+    {
+      "name": "mcp: file tools only for connections approved with files (call)",
+      "module": "// src/oauth/mcp.ts",
+      "find_sha256": "d03bba69ac0d65aa35f50369a0bc42612a4a9f96e1adaef7599ef0bedc95dab7",
+      "replace_sha256": "84a32850d96825c62bd6ca2d3c05c03a50c2cd753831a5f01f3ac1fb6b9513b7"
+    },
+    {
+      "name": "mcp: rate limits come back as a readable tool error with the limit and wait time",
+      "module": "// src/oauth/mcp.ts",
+      "find_sha256": "52ba61dc6b73dbad28d59aa9739a1331e647c58fd803a8135c5e259e54b05daa",
+      "replace_sha256": "b1ce6923bfe12cded4e8b5288d3ebf861e8cea206fd5ca57ab8d8132aac6f844"
+    },
+    {
+      "name": "mcp: instructions mention files for connections with files",
+      "module": "// src/oauth/mcp.ts",
+      "find_sha256": "025e8296294deb6338a8092d18db23e7af6fb1468c6bb996e588a863f694c5ab",
+      "replace_sha256": "417d3712a229b0bab9c22e47960874e5efdb8d1d4f1290990f1f20b08a0c5b36"
+    },
+    {
+      "name": "mcp: file tools only for connections approved with files (list)",
+      "module": "// src/oauth/mcp.ts",
+      "find_sha256": "41850a51b2122fa8c4d9b9804b088510b491dd67e2a231855755b8d8bda5c9dd",
+      "replace_sha256": "f933768710deef5f5668d298479b2623047a2baa9d07ec43c8749e765b0fbd14"
+    },
+    {
+      "name": "mcp: tool context carries the connection (links, per-connection uploader)",
+      "module": "// src/oauth/mcp.ts",
+      "find_sha256": "b1259e216d3eb1131d31e9088fb1de8f5bcdb147b3f38660ec8e92a6d4975795",
+      "replace_sha256": "c4af665527a1e315fd6a76968f98702dd082dc32bf553f1820b9ba1aa75c4f5f"
+    },
+    {
+      "name": "mcp: tool results may add image and resource_link content blocks",
+      "module": "// src/oauth/mcp.ts",
+      "find_sha256": "d37c121aa240e228796bc77b7a77b1c153a57cf5c24c926e7fb6494427f993f3",
+      "replace_sha256": "b29002dc2654259837aae176532c437d72f71704b3f6b574a8938a68261e92ab"
+    },
+    {
+      "name": "module: files for OAuth connections (inserted before the publisher module)",
+      "module": "// src/api/publisher.ts — isolated readable-generation integration",
+      "find_sha256": "404d6845e0c9fe140dce7900992d19346bdde62477d97eaa10d256298ecf7c28",
+      "replace_sha256": "738dc975ae62bd4228f22dadfd71cc25cb82204ef5093d6ac8a38fb353350bf6"
+    },
+    {
+      "name": "cleanup: drop expired transfer links",
+      "module": "// src/cleanup.ts",
+      "find_sha256": "469515e032915913ae9552d80e0aa144a9356915909a026ed10bae357ff13dce",
+      "replace_sha256": "bf9d74c986fcee5e856595413eaec43f963b1763979bf900fbaa4e8b37ebc428"
+    },
+    {
+      "name": "connections: Settings shows whether a connection includes files",
+      "module": "// src/oauth/connections.ts",
+      "find_sha256": "39eca01150e8759db0ff6dd9f426ed12332ee0de59fbf73283f691befd926f21",
+      "replace_sha256": "d4cee30c651917b0f1a690f21448e1a6703bbaf58a9c6a066d506881f6bc20b1"
+    },
+    {
+      "name": "connections: file_access in the Settings list",
+      "module": "// src/oauth/connections.ts",
+      "find_sha256": "601a2de85a24c32458ee149bf7754f1f0f320531988cd75687ef0530db1f33df",
+      "replace_sha256": "c1e574f23bea0b6538d2bd479174695543af24d5ff0f4f09e5c9d5ee48ff9ff8"
+    },
+    {
+      "name": "uploads: uploadPut accepts a context from a verified upload link",
+      "module": "// src/uploads.ts",
+      "find_sha256": "bcf30e7d15c290761e09dd9ee490193f9d27ba74a6025fa1de2ec9e530cb0782",
+      "replace_sha256": "7f1656fe9c65aac56b4ed371c3ebda7adfdcf18fa1d8bf4e71d6eb285a7ef6d3"
+    },
+    {
+      "name": "routing: transfer links on the MCP host",
+      "module": "// src/index.ts",
+      "find_sha256": "1e2932849fdf5c9caca8d6f6ba954f75aa4d781534a0ff74889947f4d8f237d1",
+      "replace_sha256": "fe8002b0e209ede16fd5cb437a34fb16955d6ce37f2f1408171b411e371e87aa"
+    }
+  ],
+  "requires_migration": "0013_oauth_file_access.sql"
+}

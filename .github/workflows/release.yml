@@ -1,0 +1,71 @@
+name: Verify release tag
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing owner-approved tag (vMAJOR.MINOR.PATCH); validation only
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-24.04' }}
+    outputs:
+      commit: ${{ steps.tag.outputs.commit }}
+    steps:
+      - name: Validate tag syntax
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: node -e 'if (!/^v\d+\.\d+\.\d+$/.test(process.env.RELEASE_TAG)) process.exit(1)'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+      - name: Require main ancestry, license and versioned changelog
+        id: tag
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          node --input-type=module <<'JS'
+          import {execFileSync} from 'node:child_process';
+          import {readFileSync, appendFileSync} from 'node:fs';
+          const tag = process.env.RELEASE_TAG;
+          const pkg = JSON.parse(readFileSync('package.json', 'utf8'));
+          if (pkg.version !== tag.slice(1) || pkg.license !== 'MIT') throw Error('Tag must match package version and approved MIT metadata');
+          const sha = execFileSync('git', ['rev-parse', '--verify', `refs/tags/${tag}^{commit}`], {encoding:'utf8'}).trim();
+          if (execFileSync('git', ['cat-file', '-t', `refs/tags/${tag}`], {encoding:'utf8'}).trim() !== 'tag') throw Error('Use an annotated release tag');
+          execFileSync('git', ['merge-base', '--is-ancestor', sha, 'origin/main']);
+          if (readFileSync('LICENSE','utf8').trim().length < 100) throw Error('Owner-selected LICENSE required');
+          if (!readFileSync('CHANGELOG.md','utf8').split('\n').some(line => line.startsWith(`## ${tag.slice(1)} `) || line === `## ${tag.slice(1)}`)) throw Error('Versioned changelog heading required');
+          appendFileSync(process.env.GITHUB_OUTPUT, `commit=${sha}\n`);
+          JS
+  ci:
+    needs: validate
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.validate.outputs.commit }}
+    permissions:
+      contents: read
+  receipt:
+    needs: [validate, ci]
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-24.04' }}
+    steps:
+      - name: Write verification receipt
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_COMMIT: ${{ needs.validate.outputs.commit }}
+        run: |
+          node -e 'require("fs").writeFileSync("release-verification.json", JSON.stringify({tag:process.env.RELEASE_TAG, commit:process.env.RELEASE_COMMIT, validation:"CI passed; publication, licensing/provenance review, advisory disposition and account acceptance require owner review", published:false},null,2))'
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-verification
+          path: release-verification.json
+          retention-days: 90

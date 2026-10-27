@@ -1,0 +1,25 @@
+version: 2
+updates:
+  # GitHub Actions are pinned to commit SHAs; this proposes reviewed bumps.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+  # npm: Dependabot security alerts still arrive for everything. Routine bumps skip packages that are
+  # pinned on purpose: Wrangler and esbuild (the bundle build checks the esbuild version), and the OAuth
+  # provider, which is compiled into the byte-pinned src/index.js and needs a deliberate rebuild.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+    ignore:
+      - dependency-name: wrangler
+      - dependency-name: esbuild
+      - dependency-name: "@cloudflare/workers-oauth-provider"
+    groups:
+      dev-dependencies:
+        dependency-type: development

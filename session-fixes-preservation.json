@@ -1,0 +1,30 @@
+{
+  "base_consent_fixes_sha256": "4919da74595f4191cad684e2def1a84b1a69cf190d8aec0a0dc79fc57517f808",
+  "integrated_sha256": "edf85aab0d471c20f640d0487c78e23f4acc371f71b2b96681b5f971ee4d858f",
+  "preserved_prefix_sha256": "90659c113346560436d18ac7a0055a5d1a9c1e2b3b72b3b169bb1a0318d9279f",
+  "preserved_between_sha256": "3a47c72d7fc812e08b1987961b16b247bab7727bceda55174e34a8f7bdf202fe",
+  "modules_sha256": {
+    "ui": {
+      "base": "fe6afc02baba56dcdaf695f9df43438638d8dec3f51facaad18de62e59900b8e",
+      "candidate": "75d7fa6c4498518982a7b5967a472c93afe87d75810a2d36e6b4cac42c616669"
+    },
+    "routing": {
+      "base": "0f96ea72743c4d72f7b93914f7cbb661f1d7e87454187dc565c610db625601a4",
+      "candidate": "51111fbe0a3a9134f21abd3b91128bbdc51e64216951daf0b989f4b07c8765b1"
+    }
+  },
+  "patched_modules": [
+    "src/ui.ts",
+    "src/index.ts (routing)"
+  ],
+  "patches": [
+    "ui: API requests ask Access for a 401 (not a login redirect) when its session has expired",
+    "ui: a 401 renews the hosted session and retries once before signing out",
+    "ui: hosted session renewal helpers",
+    "ui: sign-out waits for an in-flight session renewal and blocks new ones",
+    "ui: an ended hosted session reloads into Access sign-in instead of the dev login form",
+    "ui: the hosted sign-in view offers Access sign-in, never the loopback passphrase form",
+    "server: a new Access user ID for the owner relinks the existing owner account instead of creating another",
+    "server: Access sessions last 30 days (Access still checked on every request)"
+  ]
+}

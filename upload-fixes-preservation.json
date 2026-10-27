@@ -1,0 +1,38 @@
+{
+  "base_session_fixes_sha256": "edf85aab0d471c20f640d0487c78e23f4acc371f71b2b96681b5f971ee4d858f",
+  "integrated_sha256": "5ca04dfc47489ef897ec25a1b129a28c7a41ffa5e9cb2393f09ba34fd2222e9c",
+  "preserved_outside_regions_sha256": "9479f3e53fa2c6804f681ea0228445cd882f15f992a21c037eb791d2660823bb",
+  "regions": [
+    {
+      "name": "service: publishRevision accepts a fence predicate on the revision insert",
+      "module": "// src/service.ts",
+      "base_sha256": "6b639153289dfbc1c3d1a3ba1c0a341a7e13cc608f9ced89123beb95258debb0",
+      "candidate_sha256": "4454ea30a1c6634d7eebe6c73d6a713205f0ad6b0e578f5ec4f74037ae824fa5"
+    },
+    {
+      "name": "cleanup: a sealed upload with a live finalization lease is never failed",
+      "module": "// src/cleanup.ts",
+      "base_sha256": "c82d11f912ffdb7595d98dbc04da4536b3a384c34b51d152051a54e57dd7cc56",
+      "candidate_sha256": "c31152fb2bf3081f08ffe41081b4dae3cd0fdfe110379a8c4c47905613cf4842"
+    },
+    {
+      "name": "cleanup: warn about retained terminal or published uploads with pending write accounting",
+      "module": "// src/cleanup.ts",
+      "base_sha256": "1b60477f0989b6c164f9cc473f582a49a79da3c19723d17fc852e52eb5fabb4f",
+      "candidate_sha256": "1b1c2864b67630c66836d096df524451879ce7420d2f1bca35b27085f8ffb31e"
+    },
+    {
+      "name": "cleanup: a failed upload's final object is purged only when no final write is in flight",
+      "module": "// src/cleanup.ts",
+      "base_sha256": "f6c4f0552566210a7e5b3d144ffe8a77c8770f99b2e90caa0d367d7194227a9c",
+      "candidate_sha256": "4f38a1690897243da16398c89ee92942f6994fe5b209fd22cc9934766abd00cd"
+    },
+    {
+      "name": "uploads: uploadFinish holds an exclusive expiring lease and writes one final object per upload",
+      "module": "// src/uploads.ts",
+      "base_sha256": "4b400cad24e3c95615a53ea84c9d6950942f4e8694738c23bfa28c6902438ae5",
+      "candidate_sha256": "51d6dfbddf17033037de8dbfd9a09679a9b389582302d72788712e80c64d6f3d"
+    }
+  ],
+  "requires_migration": "0011_upload_finalize_lease.sql"
+}

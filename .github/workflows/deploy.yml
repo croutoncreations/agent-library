@@ -1,0 +1,40 @@
+name: Deploy
+
+# OPTIONAL: hand a tested commit on main to your PRIVATE deploy repository (docs/deploy-pipeline.md).
+# This public repository holds no installation config, Cloudflare credentials or deploy steps. Your deploy
+# repo (created from deploy/template/) holds wrangler.toml, deploy/production.json and the deploy workflow,
+# checks out this repository at the exact commit, and deploys it.
+#
+# Inactive unless BOTH are set, so forks and clones never trigger anything:
+#   repository variable DEPLOY_REPO            e.g. my-org/agent-library-deploy
+#   repository secret   DEPLOY_DISPATCH_TOKEN  fine-grained token: DEPLOY_REPO only, "Contents: read and write"
+#                                              (needed to send repository_dispatch). Nothing else.
+
+on:
+  push:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  ci:
+    # Same checks as pull requests, run on the exact pushed commit; nothing is handed off unless they pass.
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  dispatch:
+    needs: ci
+    if: vars.DEPLOY_REPO != '' && github.ref == 'refs/heads/main'
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 5
+    steps:
+      - name: Ask the deploy repository to deploy this commit
+        env:
+          GH_TOKEN: ${{ secrets.DEPLOY_DISPATCH_TOKEN }}
+          DEPLOY_REPO: ${{ vars.DEPLOY_REPO }}
+        run: |
+          test -n "$GH_TOKEN" || { echo "::notice::DEPLOY_DISPATCH_TOKEN is not set; skipping (deploy manually from $DEPLOY_REPO)"; exit 0; }
+          gh api "repos/$DEPLOY_REPO/dispatches" -f event_type=agent-library-main \
+            -F "client_payload[sha]=$GITHUB_SHA" -F "client_payload[repository]=$GITHUB_REPOSITORY"
+          echo "Requested deploy of $GITHUB_SHA from $DEPLOY_REPO"

@@ -1,0 +1,36 @@
+node_modules/
+.wrangler/
+dist/
+coverage/
+.env
+.env.*
+!.env.example
+.dev.vars
+.dev.vars.*
+.worktrees/
+.artifacts/
+.pi/
+tmp/
+.DS_Store
+*.log
+
+# Generated DevX worktree files and local DevX/agent setup
+.envrc
+.tmuxp.yaml
+.devx/
+
+# Operator-specific configuration (never commit; see wrangler.example.toml,
+# deploy/production.example.json and scripts/self-host/example.json)
+wrangler.toml
+deploy/production.json
+deploy/smoke.json
+.self-host*.json
+
+# Operator-only notes and agent instructions (AGENTS.md tells agents to read AGENTS.local.md if present)
+AGENTS.local.md
+private/
+
+# Local publish checks (scripts/release/export-public.mjs)
+.release-denylist
+.release-allowlist
+.gstack/

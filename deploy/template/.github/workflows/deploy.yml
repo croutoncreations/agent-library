@@ -1,0 +1,196 @@
+name: Deploy Agent Library
+
+# Lives in your PRIVATE deploy repository (copy of agent-library's deploy/template/). Deploys an exact,
+# CI-tested commit of the app repository to your Cloudflare installation, using the config in this repo.
+#
+# Triggers:
+#   - repository_dispatch from the app repo's deploy.yml after CI passes on its main branch;
+#   - manual run (Actions -> Deploy Agent Library -> Run workflow), optionally with a commit SHA.
+#
+# This repository holds:   wrangler.toml, deploy/production.json   (identifiers only, no secrets)
+# Environment `production`: secret CLOUDFLARE_API_TOKEN; optional AL_SMOKE_* (see docs/deploy-pipeline.md)
+# Repository variables:     APP_REPO (e.g. my-org/agent-library), DEPLOY_RUNNER (optional), PRODUCTION_URL (optional),
+#                           PRODUCTION_DEPLOY_ENABLED=true to activate.
+# If APP_REPO is private, add secret APP_REPO_TOKEN (fine-grained on APP_REPO: Contents read; Actions read for manual runs).
+#
+# CI gate: a dispatched run comes from the app repo's deploy.yml, which only dispatches after CI passed on that commit.
+# A manual run checks the app repo's Actions history itself and refuses unless that repo's Deploy workflow, on a push to
+# main, ran CI (`ci / checks`, `ci / test`) successfully for the exact commit.
+
+on:
+  repository_dispatch:
+    types: [agent-library-main]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "App commit to deploy (default: tip of main)"
+        required: false
+        default: ''
+
+permissions: {}
+
+jobs:
+  deploy:
+    if: vars.PRODUCTION_DEPLOY_ENABLED == 'true'
+    runs-on: ${{ vars.DEPLOY_RUNNER || 'ubuntu-24.04' }}
+    environment:
+      name: production
+      url: ${{ vars.PRODUCTION_URL }}
+    permissions:
+      contents: read
+    # One deploy at a time; a running deploy (possibly mid-migration) is never cancelled.
+    concurrency:
+      group: production-deploy
+      cancel-in-progress: false
+    timeout-minutes: 45
+    env:
+      WRANGLER_SEND_METRICS: 'false'
+      CI: 'true'
+      APP_REPOSITORY: ${{ vars.APP_REPO }}
+    steps:
+      - name: Resolve the app commit
+        id: app
+        env:
+          GH_TOKEN: ${{ secrets.APP_REPO_TOKEN || github.token }}
+          DISPATCH_SHA: ${{ github.event.client_payload.sha }}
+          DISPATCH_REPO: ${{ github.event.client_payload.repository }}
+          INPUT_SHA: ${{ inputs.sha }}
+        run: |
+          test -n "$APP_REPOSITORY" || { echo "::error::Repository variable APP_REPO is not set"; exit 1; }
+          if [ -n "$DISPATCH_REPO" ] && [ "$DISPATCH_REPO" != "$APP_REPOSITORY" ]; then echo "::error::dispatch from $DISPATCH_REPO, expected $APP_REPOSITORY"; exit 1; fi
+          sha="${DISPATCH_SHA:-$INPUT_SHA}"
+          [ -n "$sha" ] || sha=$(gh api "repos/$APP_REPOSITORY/commits/main" --jq .sha)
+          echo "$sha" | grep -Eq '^[0-9a-f]{40}$' || { echo "::error::invalid commit $sha"; exit 1; }
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "APP_SHA=$sha" >> "$GITHUB_ENV"
+
+      - name: Require passing app CI for this commit (manual runs)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.APP_REPO_TOKEN || github.token }}
+          SHA: ${{ steps.app.outputs.sha }}
+        run: |
+          # Only the app's own main-branch gate counts: push runs of .github/workflows/deploy.yml for this exact commit
+          # (other workflows that call ci.yml, e.g. release verification, can carry a different head_sha than they test).
+          runs=$(gh api "repos/$APP_REPOSITORY/actions/runs?head_sha=$SHA&event=push&per_page=100" \
+            --jq '.workflow_runs[] | select(.path == ".github/workflows/deploy.yml") | .id') \
+            || { echo "::error::cannot read $APP_REPOSITORY Actions runs; give APP_REPO_TOKEN 'Actions: read'"; exit 1; }
+          ok=""
+          for id in $runs; do
+            ok="$ok"$'\n'"$(gh api "repos/$APP_REPOSITORY/actions/runs/$id/jobs?per_page=100" \
+              --jq '.jobs[] | select(.conclusion == "success") | .name')"
+          done
+          for job in "ci / checks" "ci / test"; do
+            printf '%s\n' "$ok" | grep -qxF "$job" || { echo "::error::no successful '$job' job from $APP_REPOSITORY's Deploy workflow on main for $SHA; refusing to deploy untested code"; exit 1; }
+          done
+          echo "CI passed for $SHA (checks, test)"
+
+      - name: Check out the app at that commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ vars.APP_REPO }}
+          ref: ${{ steps.app.outputs.sha }}
+          token: ${{ secrets.APP_REPO_TOKEN || github.token }}
+          path: app
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out this deploy repo (config)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: config
+          persist-credentials: false
+
+      - name: Install config into the app checkout
+        working-directory: app
+        run: |
+          cp ../config/wrangler.toml wrangler.toml
+          cp ../config/deploy/production.json deploy/production.json
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: app/.node-version
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install (locked, no install scripts)
+        working-directory: app
+        run: npm ci --no-audit --no-fund --ignore-scripts
+
+      - name: Offline config check (upload == committed bundle, bindings match)
+        working-directory: app
+        run: npm run -s test:deploy && npm run -s check:deploy-config
+
+      - name: Check credentials are configured
+        working-directory: app
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          test -n "$CLOUDFLARE_API_TOKEN" || { echo "::error::Environment secret CLOUDFLARE_API_TOKEN is not set"; exit 1; }
+          echo "CLOUDFLARE_ACCOUNT_ID=$(node -p "require('./deploy/production.json').accountId")" >> "$GITHUB_ENV"
+
+      - name: Preflight (read-only target, bindings, resources, history, migrations)
+        id: preflight
+        working-directory: app
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          GH_TOKEN: ${{ secrets.APP_REPO_TOKEN || github.token }} # read-only: tip-of-main lookup on APP_REPO
+        run: |
+          node scripts/deploy/preflight.mjs "$RUNNER_TEMP/deploy-state.json"
+          echo "action=$(node -p "require('$RUNNER_TEMP/deploy-state.json').action")" >> "$GITHUB_OUTPUT"
+          echo "pending=$(node -p "(require('$RUNNER_TEMP/deploy-state.json').pending||[]).length")" >> "$GITHUB_OUTPUT"
+
+      - name: Apply additive D1 migrations
+        id: migrate
+        if: steps.preflight.outputs.action == 'deploy' && steps.preflight.outputs.pending != '0'
+        working-directory: app
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: npx --no-install wrangler d1 migrations apply DB --remote --env hosted
+
+      - name: Deploy exact commit
+        id: deploy
+        if: steps.preflight.outputs.action == 'deploy'
+        working-directory: app
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          npm run -s stage:hosted
+          tag="gh-${APP_SHA:0:12}"
+          npx --no-install wrangler deploy --env hosted --strict \
+            --tag "$tag" --message "deploy ${APP_SHA:0:12} run ${GITHUB_RUN_ID}"
+          live=$(npx --no-install wrangler deployments status --env hosted --json \
+            | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).versions.map(v=>v.version_id+":"+v.percentage).join(",")))')
+          echo "live=$live"
+          vid=${live%%:*}
+          got=$(npx --no-install wrangler versions view "$vid" --env hosted --json | node -p 'JSON.parse(require("fs").readFileSync(0,"utf8")).annotations["workers/tag"]')
+          [ "$got" = "$tag" ] || { echo "::error::live version $vid has tag $got, expected $tag"; exit 1; }
+
+      - name: Post-deploy checks
+        id: smoke
+        if: steps.deploy.outcome == 'success'
+        working-directory: app
+        env:
+          AL_SMOKE_API_TOKEN: ${{ secrets.AL_SMOKE_API_TOKEN }}
+          AL_SMOKE_PROJECT_ID: ${{ vars.AL_SMOKE_PROJECT_ID }}
+          AL_SMOKE_FILE_ID: ${{ vars.AL_SMOKE_FILE_ID }}
+        run: node scripts/deploy/smoke.mjs "$RUNNER_TEMP/smoke.json"
+
+      - name: Deployment receipt
+        if: always() && steps.preflight.outcome != 'skipped'
+        working-directory: app
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}
+          MIGRATE_OUTCOME: ${{ steps.migrate.outcome }}
+        run: |
+          node scripts/deploy/receipt.mjs "$RUNNER_TEMP/deploy-state.json" "$RUNNER_TEMP/smoke.json" "$RUNNER_TEMP/receipt"
+          cat "$RUNNER_TEMP/receipt/receipt.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload receipt
+        if: always() && steps.preflight.outcome != 'skipped'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: deploy-receipt-${{ steps.app.outputs.sha }}-attempt${{ github.run_attempt }}
+          path: ${{ runner.temp }}/receipt/
+          retention-days: 90

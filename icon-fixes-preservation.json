@@ -1,0 +1,35 @@
+{
+  "base_ui_fixes_sha256": "d4eb0b0af347a33f4fd34fd13da1b0336c1363de0cbbbff36c9bc53385bcc097",
+  "integrated_sha256": "e705170f69a84c66763ca49f3215cef8fe2417292c625400322beb7fdedb615b",
+  "preserved_prefix_sha256": "7b63b75199a100363c540f22a728fc56762dda7cf7bd40f944295a3d5eae4054",
+  "preserved_suffix_sha256": "971299a181f1ce2af75d678f1d8312862bf9488bb6e49425bd82c2f90df1ed63",
+  "pwa_icons_module_sha256": {
+    "ui_fixes": "f35448b64b1128f6db14eb7fd75f90472620093f3804e148b938a6b4e1f216d1",
+    "candidate": "3a071444cf42ec6cf66da0b799782d2cfe2135b9cc4924509fe9d88c1e1fb29d"
+  },
+  "pwa_module_sha256": {
+    "ui_fixes": "71f76822c8bbab868a85e3a85be258a07a22b1fb4d11be64158b72c24307135e",
+    "candidate": "7a13830951455742e8d28e7247e703d8c02f7402982528ae5cfe4354da6ec1e3"
+  },
+  "icons_sha256": {
+    "app-icon-192.png": "092cb20f82ade7e724fec09319103b906b27606ae484eaf43aacc0cd1e7a50ad",
+    "app-icon-512.png": "cbab07c59cf36e8b16af911096306d2015e59eebf89cbe4135e54787a9aeed28",
+    "app-maskable-512.png": "0c20dae7e29887ed5f34e14837a86b0837cb59f8b87dd3392162e80546d90bc0",
+    "app-apple-180.png": "d9ae40165903252dbc01e5576d90fd79bf05b2ec2eda5b6f7daad9b427eff23b"
+  },
+  "old_urls_serve": {
+    "icon-192.png": "app-icon-192.png",
+    "icon-512.png": "app-icon-512.png",
+    "maskable-512.png": "app-maskable-512.png",
+    "apple-180.png": "app-apple-180.png"
+  },
+  "patches": [
+    "manifest any-purpose 192",
+    "manifest any-purpose 512",
+    "manifest maskable 512",
+    "shell cache name",
+    "shell paths",
+    "favicon link",
+    "apple-touch-icon link"
+  ]
+}

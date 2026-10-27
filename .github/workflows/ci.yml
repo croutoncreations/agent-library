@@ -1,0 +1,134 @@
+name: CI
+
+# Required checks for main (see docs/deploy-pipeline.md#branch-protection): "CI / checks" and "CI / test".
+# Also called by deploy.yml so a deploy only ships commits that passed these exact checks.
+# No secrets are used. Tests run against local wrangler dev/D1/R2/KV on 127.0.0.1 with
+# synthetic fixtures only; nothing here can reach production data or storage.
+# Runner: vars.CI_RUNNER (e.g. a paid runner) only for workflow_call (deploy, release) and same-repo PRs. Pull requests from forks always
+# use GitHub-hosted runners, which are free for public repositories, so outside PRs never use the owner's paid runners.
+
+on:
+  pull_request:
+  workflow_call:
+    inputs:
+      ref:
+        description: Exact commit to verify (release validation); empty uses event ref
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  WRANGLER_SEND_METRICS: 'false'
+  CI: 'true'
+
+jobs:
+  checks:
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.CI_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+      - name: PR head includes current main
+        if: github.event_name == 'pull_request'
+        run: git merge-base --is-ancestor origin/main HEAD
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - name: Dependency security audit
+        if: github.event_name == 'pull_request' || inputs.ref != ''
+        run: npm audit --audit-level=low
+      - name: Install and verify embedded editor provenance
+        run: npm ci --prefix editor --no-audit --no-fund && npm run check:editor
+      - name: Embedded editor dependency audit
+        if: github.event_name == 'pull_request' || inputs.ref != ''
+        run: npm audit --prefix editor --audit-level=low
+      - name: Offline self-host setup tests
+        run: npm run test:self-host
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Deploy guards, config and migration ordering
+        run: npm run test:deploy
+      - name: Deploy bundle is reproducible from source
+        run: npm run check:bundle
+      - name: Generated self-host config uploads exactly the committed bundle (offline dry run)
+        run: npm run check:self-host-upload
+
+  test:
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.CI_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - name: Test tools (ffmpeg for fixtures; puppeteer where the browser tests load it)
+        env:
+          PUPPETEER_SKIP_DOWNLOAD: '1'
+        run: |
+          command -v ffmpeg >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg; }
+          # Ubuntu 24.04 blocks the unprivileged user namespaces Chrome's sandbox needs (ephemeral runner only).
+          # Runners without this AppArmor knob (e.g. Blacksmith) do not restrict them, so skip it there.
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          npm install -g --no-audit --no-fund --prefix "$HOME/.npm-packages" puppeteer@24.16.2
+          command -v google-chrome
+          echo "CHROME_PATH=$(command -v google-chrome)" >> "$GITHUB_ENV"
+          # Tests spawn the pinned local `wrangler` (npm scripts add this; plain `node --test` does not).
+          echo "$PWD/node_modules/.bin" >> "$GITHUB_PATH"
+      - name: Start Chrome once before the tests
+        # The first Chrome launch on a fresh runner sometimes takes 10-30 s (docs/testing.md#known-issues), which
+        # can exceed puppeteer's 30 s launch timeout in whichever test launches first. Pay it here, visibly.
+        timeout-minutes: 3
+        run: |
+          node -e '
+            const t = Date.now();
+            require(process.env.HOME + "/.npm-packages/lib/node_modules/puppeteer")
+              .launch({ executablePath: process.env.CHROME_PATH, headless: true, args: ["--no-first-run"], timeout: 150000 })
+              .then(async (b) => { await (await b.newPage()).goto("about:blank"); await b.close(); console.log("Chrome first launch: " + (Date.now() - t) + " ms"); })
+              .catch((e) => { console.error(e); process.exit(1); });'
+      - name: Full suite (isolated local servers, synthetic fixtures)
+        run: |
+          set -o pipefail
+          mkdir -p tmp # for tee; tests create tmp/test-evidence themselves
+          # Same files and flags as `npm test`, minus the one file with a known harness flake (below).
+          files=()
+          for f in test/*.test.mjs; do [ "$f" = test/app-connect-phase3.test.mjs ] || files+=("$f"); done
+          node --test --test-concurrency=1 "${files[@]}" 2>&1 | tee tmp/test-output.log
+          # Browser tests skip themselves if Chrome/puppeteer are missing; in CI that is a failure.
+          grep -Eq '^ℹ skipped 0$' tmp/test-output.log || { echo "::error::tests were skipped; CI must run the whole suite"; exit 1; }
+      - name: App Connect phase 3 (open race-test issue; one visible retry)
+        run: |
+          set -o pipefail
+          # Open issue (docs/testing.md#known-issues): an owner request in the trash race test intermittently fails
+          # "other side closed" (root cause not confirmed). A retry is always reported as a warning; two failures fail the job.
+          if ! node --test --test-concurrency=1 test/app-connect-phase3.test.mjs 2>&1 | tee tmp/test-acp3-1.log; then
+            echo "::warning::app-connect-phase3 failed once and was retried (open race-test issue); see tmp/test-acp3-1.log"
+            node --test --test-concurrency=1 test/app-connect-phase3.test.mjs 2>&1 | tee tmp/test-acp3-2.log
+          fi
+      - name: Upload test logs and evidence
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-logs-${{ github.sha }}
+          path: |
+            tmp/*.log
+            tmp/test-evidence/
+          retention-days: 14
