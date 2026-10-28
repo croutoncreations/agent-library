@@ -72,3 +72,7 @@ Nothing installation-specific is compiled in. Each installation sets these Worke
 - optionally, `OAUTH_EXTRA_REDIRECT_URIS`.
 
 Rate limits and upload TTLs have defaults and optional vars. See [wrangler.example.toml](../wrangler.example.toml).
+
+## Ranked search
+
+[Ranked search](ranked-search.md) adds a D1 FTS5 index over current published heads, live permission filtering, opaque query-bound pagination, a Home search view, `/api/search`, `/v1/search` and the `search_artifacts` MCP tool. Maintained sources in `src/search/` are integrated by the preservation-checked final `build-search.mjs` step. Rollout requires migration 0014 and a bounded existing-data backfill; see the guide for export/rollback considerations.

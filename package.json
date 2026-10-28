@@ -35,7 +35,7 @@
     "test:deploy": "node --test test/deploy-guards.test.mjs test/migrations-order.test.mjs",
     "check:bundle": "node scripts/deploy/check-bundle.mjs",
     "check:deploy-config": "node scripts/deploy/stage.mjs && node scripts/deploy/check-deploy-config.mjs",
-    "build:design": "node build-current-bundle.mjs && node build-design-bundle.mjs --consent-style && node build-service-fixes.mjs && node build-ui-fixes.mjs && node build-icon-fixes.mjs && node build-history-fixes.mjs && node build-consent-fixes.mjs && node build-session-fixes.mjs && node build-upload-fixes.mjs && node build-portability-fixes.mjs && node build-auth-fixes.mjs && node build-app-connect-fixes.mjs && node build-read-fixes.mjs && node build-file-tools-fixes.mjs",
+    "build:design": "node build-current-bundle.mjs && node build-design-bundle.mjs --consent-style && node build-service-fixes.mjs && node build-ui-fixes.mjs && node build-icon-fixes.mjs && node build-history-fixes.mjs && node build-consent-fixes.mjs && node build-session-fixes.mjs && node build-upload-fixes.mjs && node build-portability-fixes.mjs && node build-auth-fixes.mjs && node build-app-connect-fixes.mjs && node build-read-fixes.mjs && node build-file-tools-fixes.mjs && node build-search.mjs",
     "capture:design": "node scripts/design/capture.mjs",
     "stage:hosted": "node scripts/deploy/stage.mjs",
     "setup:self-host": "node scripts/self-host/setup.mjs",

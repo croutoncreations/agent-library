@@ -172,6 +172,8 @@ export const MIGRATION_NAME = /^\d{4}_[a-z0-9_]+\.sql$/;
 // a deploy fails after migrating: it needs explicit owner approval (marker) and is never
 // auto-applied by the pipeline.
 const ADDITIVE = [
+  // FTS5 is a supported D1 virtual table; require retry-safe creation and this module only.
+  /^CREATE\s+VIRTUAL\s+TABLE\s+IF\s+NOT\s+EXISTS\s+\w+\s+USING\s+fts5\s*\(/i,
   /^CREATE\s+(TEMP\s+|TEMPORARY\s+)?TABLE\s/i,
   /^CREATE\s+(UNIQUE\s+)?INDEX\s/i,
   /^CREATE\s+(TEMP\s+|TEMPORARY\s+)?VIEW\s/i,

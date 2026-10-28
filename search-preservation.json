@@ -1,0 +1,112 @@
+{
+  "base_file_tools_fixes_sha256": "cfd255449f84e5a071aea50104e77f58671c5df2db89d809142905428c3f7c78",
+  "integrated_sha256": "026f37911d77c6276f1a0611b453dc06e0a45b0063496e7216d83b6283103eab",
+  "sources_sha256": {
+    "service.js": "c67d4ef992ffbb47bb87929e5f40f08adf658505e7f7623e034e1d9b4b33b605",
+    "browser.js": "869e1802b3027e8a7576439a3fc0a1dac905f9e189133f8cb8c57c4febe51ec7",
+    "browser.css": "51a7f30065004427fee3900ef08ab57a473eed2db4938c803a148057a1efde06",
+    "generation-index.js": "c9d967d99906809f4aedc995ee5340aa47230979646be9082e9aaad9fc9d80b5"
+  },
+  "patches": [
+    {
+      "module": "service",
+      "name": "shared ranked search",
+      "find_sha256": "b1ca91c55ea8be241724b9e4ab54c01e92608ceee87e34402c5bd5b84f9c0e9b"
+    },
+    {
+      "module": "service",
+      "name": "bound search RPC envelopes including request IDs",
+      "find_sha256": "a934a26863056e031593460fdfecf8de389a445f9940e112919d4fca76169517"
+    },
+    {
+      "module": "oauthMcp",
+      "name": "read-only global search tool",
+      "find_sha256": "976ff313e7abe0d863b6ebe4b9253106881f902f1905812c5950b3e4728773ca"
+    },
+    {
+      "module": "oauthMcp",
+      "name": "search spans connection projects without project selection",
+      "find_sha256": "92d7251156c49a8e28caf43eef8344af4b05e9bb3bcf7f88bb2a8f0854661d75"
+    },
+    {
+      "module": "mcp",
+      "name": "legacy search tool",
+      "find_sha256": "79c6f0c0d38784e95eeb0b581185c7453d565c05cd88048b4f9c218ac4a353e5"
+    },
+    {
+      "module": "mcp",
+      "name": "advertise read-only hints",
+      "find_sha256": "acd6da5620e2b5e70d30ed7cb8050c006b1640d57fc1ceaef0b303481a922677"
+    },
+    {
+      "module": "v1",
+      "name": "machine search route recognition",
+      "find_sha256": "3e087cc9134c012aef7b9e8a2dc6ff2c64bfb26efb11427ee302f2604dfd62bd"
+    },
+    {
+      "module": "v1",
+      "name": "machine search endpoint",
+      "find_sha256": "2573dc8d6f0e11f7039de3a654d46272f44e28d6ff3b6f6154061ca5bbf7794b"
+    },
+    {
+      "module": "index",
+      "name": "owner search endpoint",
+      "find_sha256": "fb120758e44a20895b72097e27ddfbefe6a8626171e1675134bc8fc1d34c0a14"
+    },
+    {
+      "module": "ui",
+      "name": "global search browser screen",
+      "find_sha256": "81bcf3ea5954073fece07463dbbe3470c23d9bf7692c635606fabb17e44ff27a"
+    },
+    {
+      "module": "ui",
+      "name": "global search browser route",
+      "find_sha256": "3baed2548bb436eaeff3102c35d176b6b8fab2e43b172ef5bf5e40319e00f5ed"
+    },
+    {
+      "module": "ui",
+      "name": "Home search entry",
+      "find_sha256": "bf04968d03876744a3c6813ba2d6948759fb593ddbaaa3ec5f97bcca75750c07"
+    },
+    {
+      "module": "ui",
+      "name": "search layout",
+      "find_sha256": "dbf4cdd569563992bd40313f20a86bcb55703a554eed9585301382dce9e6ee4e"
+    },
+    {
+      "module": "publisher",
+      "name": "index generations in the existing atomic publication batch",
+      "find_sha256": "70f11fac41689c1072560d27069114007b02d0243f065ef655fe369ca38b199a"
+    },
+    {
+      "module": "publisher",
+      "name": "keep every original commit count check and verify the derived index",
+      "find_sha256": "a8bb39784bd6788e8b20890996a6faa3e99fdd65e60b2f2f04b27389eff061c3"
+    },
+    {
+      "module": "oauthMcp",
+      "name": "check index readiness before advertising tools",
+      "find_sha256": "595846ab949b8a77663bbf25708589537215d805fbffee8f5b299d3087dd71b4"
+    },
+    {
+      "module": "oauthMcp",
+      "name": "hide search from the tool catalog until ready",
+      "find_sha256": "53fbcfb8f86e671e504ce79df3a2a6e2a842571ad25547767855861d12775e8d"
+    },
+    {
+      "module": "mcp",
+      "name": "check legacy search readiness",
+      "find_sha256": "095b0b766197e877880ba27f559cbd728e3109e554244b5adbdba9d51be2bf6b"
+    },
+    {
+      "module": "mcp",
+      "name": "hide legacy search from catalog",
+      "find_sha256": "fe76ed084f4b3ebca17d7bf99a8b86d33a3f2cc22d3684e17d13416f595330f1"
+    },
+    {
+      "module": "mcp",
+      "name": "hide legacy search calls until ready",
+      "find_sha256": "b051b353199c47fece3cd012352f770126a23e6ea00e4ebf9b4d47bc2dcd8c39"
+    }
+  ]
+}

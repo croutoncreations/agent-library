@@ -5961,6 +5961,7 @@ function rtIdBytes(id) {
 // RT_MAX_ID_BYTES is refused before any reply echoes that id, and rtFit bounds every reply the handler then sends.
 const RT_MAX_ID_BYTES = 1024;
 function rtChunkLimit(msg) {
+  if (msg?.method === "tools/call" && msg.params?.name === "search_artifacts") return { maxBytes: 65536, idTooLong: rtIdBytes(msg.id) > RT_MAX_ID_BYTES };
   const a = msg?.method === "tools/call" && msg.params?.name === "read_artifact" ? msg.params.arguments : void 0;
   if (!a || typeof a !== "object" || Array.isArray(a) || a.cursor == null && a.max_bytes == null) return null;
   const m = a.max_bytes;
@@ -6100,6 +6101,136 @@ async function readTextChunk(ctx, projectId, artifactId, opts = {}) {
   if (rtEncodedSize(out, mcp, idBytes) > maxBytes) throw tooSmall();
   return out;
 }
+// Ranked lexical search. See docs/ranked-search.md for semantics, rollout and live pagination.
+const RS_SCHEMA = { type: "object", additionalProperties: false, required: ["query"], properties: {
+  query: { type: "string", minLength: 1, maxLength: 200 },
+  project_ids: { type: "array", maxItems: 20, items: { type: "string", maxLength: 64 } },
+  kind: { type: "string", enum: ["markdown", "html", "json", "csv", "binary"] },
+  updated_after: { type: "string" }, updated_before: { type: "string" },
+  limit: { type: "integer", minimum: 1, maximum: 50 }, cursor: { type: "string", maxLength: 512 }
+} };
+function rsQuery(params) {
+  const out = {};
+  for (const [k, v] of params) {
+    if (!(k in RS_SCHEMA.properties) || k in out) throw new HttpError(400, "invalid_input", "Unknown or repeated search parameter");
+    out[k] = k === "project_ids" ? v.split(",") : k === "limit" ? Number(v) : v;
+  }
+  return out;
+}
+// Reuse the shared read-authorization predicates, correlated to each candidate's project.
+function rsScope(ctx) {
+  const marker = {}, gate = rtReadAuthzSql(ctx, marker), params = [];
+  let n = 0;
+  const sql = gate.sql.replace(/\?/g, () => { const v = gate.params[n++]; if (v === marker) return "p.id"; params.push(v); return "?"; });
+  return { sql, params };
+}
+function rsInvalid(message) { throw new HttpError(400, "invalid_input", message); }
+function rsNormalize(a) {
+  if (!a || typeof a !== "object" || Array.isArray(a)) rsInvalid("Search arguments must be an object");
+  for (const k of Object.keys(a)) if (!(k in RS_SCHEMA.properties)) rsInvalid("Unknown search parameter");
+  if (typeof a.query !== "string" || a.query.length > 200 || !a.query.trim()) rsInvalid("query must contain 1-200 characters");
+  const query = a.query.normalize("NFC").trim().replace(/\s+/g, " ");
+  // Operators and punctuation are separators; quoted text has no special phrase syntax.
+  const terms = [...new Set((query.toLowerCase().match(/[\p{L}\p{N}\p{M}]+/gu) || []))];
+  if (!terms.length || terms.length > 16) rsInvalid("query must contain 1-16 words");
+  const ids = a.project_ids === undefined ? null : a.project_ids;
+  if (ids !== null && (!Array.isArray(ids) || ids.length > 20 || ids.some(x => typeof x !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(x)))) rsInvalid("project_ids must contain at most 20 project IDs");
+  if (a.kind !== undefined && !RS_SCHEMA.properties.kind.enum.includes(a.kind)) rsInvalid("Invalid kind");
+  const limit = a.limit ?? 20;
+  if (!Number.isInteger(limit) || limit < 1 || limit > 50) rsInvalid("limit must be 1-50");
+  const dates = {};
+  for (const k of ["updated_after", "updated_before"]) if (a[k] !== undefined) {
+    if (typeof a[k] !== "string" || a[k].length > 40 || !/^\d{4}-\d\d-\d\dT/.test(a[k]) || !Number.isFinite(Date.parse(a[k]))) rsInvalid(k + " must be an ISO timestamp");
+    dates[k] = new Date(a[k]).toISOString();
+  }
+  if (dates.updated_after && dates.updated_before && dates.updated_after >= dates.updated_before) rsInvalid("Invalid time range");
+  return { query, terms, project_ids: ids === null ? null : [...new Set(ids)].sort(), kind: a.kind ?? null, limit, ...dates };
+}
+// The installation-local signing key lives only in D1; pagination consumes no OAuth KV operations.
+async function rsSearchState(env) {
+  return await env.DB.prepare("SELECT ready=1 AND NOT EXISTS(SELECT 1 FROM artifact_search_missing) AS ready, cursor_key FROM artifact_search_state WHERE id=1").first();
+}
+async function rsReady(env) { return !!await env.DB.prepare("SELECT ready FROM artifact_search_state WHERE id=1").first("ready"); }
+// Catalog gating is constant-size; unrelated MCP calls never depend on search state.
+async function rsToolReady(env,msg) {
+  if(msg.method!=="tools/list" && !(msg.method==="tools/call" && msg.params?.name==="search_artifacts")) return true;
+  try { return !!await env.DB.prepare("SELECT ready FROM artifact_search_state WHERE id=1").first("ready"); }
+  catch { return false; } // A search outage must not take the existing tool catalog down.
+}
+function rsBase64(bytes) { return btoa(String.fromCharCode(...bytes)).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,""); }
+function rsUnbase64(s) { return Uint8Array.from(atob(s.replace(/-/g,"+").replace(/_/g,"/")), c=>c.charCodeAt(0)); }
+async function rsSigningKey(secret) { return crypto.subtle.importKey("raw", new TextEncoder().encode(secret), {name:"HMAC",hash:"SHA-256"}, false, ["sign","verify"]); }
+async function rsCursorEncode(secret,binding,after) {
+  const payload=rsBase64(new TextEncoder().encode(JSON.stringify({b:binding,a:after,e:nowMs()+900000})));
+  const signature=await crypto.subtle.sign("HMAC",await rsSigningKey(secret),new TextEncoder().encode(payload));
+  return "sc2."+payload+"."+rsBase64(new Uint8Array(signature));
+}
+async function rsCursorDecode(secret,binding,cursor) {
+  const bad=()=>new HttpError(400,"invalid_cursor","Expired, invalid or mismatched search cursor; start again");
+  if(typeof cursor!=="string" || cursor.length>512 || !/^sc2\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{43}$/.test(cursor)) throw bad();
+  try {
+    const [,payload,sig]=cursor.split(".");
+    if(!await crypto.subtle.verify("HMAC",await rsSigningKey(secret),rsUnbase64(sig),new TextEncoder().encode(payload))) throw bad();
+    const v=JSON.parse(new TextDecoder("utf-8",{fatal:true}).decode(rsUnbase64(payload)));
+    if(v.b!==binding || !Number.isSafeInteger(v.e) || v.e<=nowMs() || !Array.isArray(v.a) || v.a.length!==3 || !Number.isInteger(v.a[0]) || typeof v.a[1]!=="string" || v.a[1].length>40 || typeof v.a[2]!=="string" || v.a[2].length>64) throw bad();
+    return v.a;
+  }catch { throw bad(); }
+}
+async function searchArtifacts(ctx, args, transport = "api") {
+  if (ctx.publisher) throw new HttpError(403, "forbidden", "Search is unavailable to publishers");
+  const a = rsNormalize(args), scope = rsScope(ctx);
+  const searchState = await rsSearchState(ctx.env);
+  if (!searchState?.ready) throw new HttpError(503, "search_initializing", "Search is being prepared; finish the bounded search backfill and retry");
+  const kinds = ["markdown", "html", ...(appConnectEnabled(ctx.env) ? ["json", "csv"] : []), ...(!ctx.oauthConnection || ctx.ftConn?.file_access === 1 ? ["binary"] : [])];
+  if (a.kind && !kinds.includes(a.kind)) rsInvalid("kind is unavailable on this connection");
+  if (a.project_ids?.length) {
+    const allowed = await db(ctx).prepare(`SELECT p.id FROM projects p WHERE ${scope.sql} AND p.id IN (SELECT value FROM json_each(?))`).bind(...scope.params, JSON.stringify(a.project_ids)).all();
+    if (allowed.results.length !== a.project_ids.length) throw new HttpError(404, "not_found", "Project not found");
+  }
+  const binding = await sha256Hex(JSON.stringify([ctx.principal.id, ctx.grant?.id ?? null, !!ctx.oauthConnection, !!ctx.apiCredential, kinds, a]));
+  const after = args.cursor === undefined ? null : await rsCursorDecode(searchState.cursor_key,binding,args.cursor);
+  if (a.project_ids?.length === 0) return { results: [], has_more: false, next_cursor: null };
+  const match = a.terms.map(t => '"' + t + '"').join(" AND ");
+  const titleScore = a.terms.map(() => "CASE WHEN instr(lower(a.title),?)>0 THEN 1 ELSE 0 END").join(" + ");
+  const where = [scope.sql, "a.trashed_at IS NULL", "a.head_rev>0", "s.revision_id=r.id", "s.sha256=r.sha256", "s.title=a.title",
+    "a.kind IN (SELECT value FROM json_each(?))",
+    "(a.generation_id IS NULL OR EXISTS (SELECT 1 FROM publisher_generations pg WHERE pg.id=a.generation_id AND pg.publisher_id=a.publisher_id AND pg.state='committed'))"];
+  const values = [...scope.params, JSON.stringify(a.kind ? [a.kind] : kinds)];
+  if (a.project_ids !== null) { where.push("p.id IN (SELECT value FROM json_each(?))"); values.push(JSON.stringify(a.project_ids)); }
+  for (const [k, op] of [["updated_after", ">"], ["updated_before", "<"]]) if (a[k]) { where.push(`a.updated_at ${op} ?`); values.push(a[k]); }
+  // No corpus-wide rank statistic: hidden documents cannot affect the order of authorized hits.
+  const sql = `WITH hits AS (
+    SELECT a.id, a.project_id, p.title AS project_title, a.title, a.kind, a.updated_at, r.rev_no, r.sha256,
+      (CASE WHEN lower(a.title)=lower(?) THEN 1000 ELSE 0 END + (${titleScore})) AS score,
+      CASE WHEN (${titleScore})>0 THEN 'title' ELSE 'body' END AS matched_field,
+      CASE WHEN a.kind='binary' THEN a.title ELSE substr(snippet(artifact_search,4,'','',' … ',40),1,500) END AS snippet
+    FROM artifact_search s JOIN artifacts a ON a.id=s.artifact_id JOIN projects p ON p.id=a.project_id
+      JOIN revisions r ON r.id=a.head_revision_id AND r.artifact_id=a.id AND r.project_id=a.project_id AND r.rev_no=a.head_rev
+    WHERE artifact_search MATCH ? AND ${where.join(" AND ")}
+  ) SELECT * FROM hits ${after ? "WHERE score < ? OR (score = ? AND (updated_at < ? OR (updated_at = ? AND id > ?)))" : ""}
+    ORDER BY score DESC, updated_at DESC, id ASC LIMIT ?`;
+  const tail = after ? [after[0], after[0], after[1], after[1], after[2]] : [];
+  const rows = (await db(ctx).prepare(sql).bind(a.query, ...a.terms, ...a.terms, match, ...values, ...tail, a.limit + 1).all()).results;
+  const origin = appOrigin(ctx.env.APP_HOST);
+  const results = rows.slice(0, a.limit).map(r => ({
+    project_id: r.project_id, project_title: r.project_title, artifact_id: r.id, title: r.title, kind: r.kind,
+    matched_field: r.matched_field, snippet: (r.snippet || r.title).slice(0,500), indexed_body: r.kind !== "binary",
+    revision: r.rev_no, sha256: r.sha256, updated_at: r.updated_at,
+    web_url: origin ? artifactWebUrl(origin,r.project_id,r.id) + "?v=" + r.rev_no : null,
+    preview_url: origin ? previewWebUrl(origin,r.project_id,r.id) + "?v=" + r.rev_no : null
+  }));
+  const token = "x".repeat(512); // Conservative reservation for the signed cursor in both encoded copies.
+  const out = { results, has_more: rows.length > a.limit, next_cursor: null };
+  // Budget the complete duplicated JSON MCP envelope (including JSON escaping and the echoed ID), not just snippets.
+  const wire = () => new TextEncoder().encode(JSON.stringify({ jsonrpc: "2.0", id: "", result: { content: [{ type: "text", text: JSON.stringify({ ...out, next_cursor: token }) }], structuredContent: { ...out, next_cursor: token }, isError: false } })).length + (ctx.rpcIdBytes ?? 1024);
+  while (results.length && wire() > 65536) { results.pop(); out.has_more = true; }
+  if (out.has_more && results.length) {
+    const last = rows[results.length-1];
+    out.next_cursor = await rsCursorEncode(searchState.cursor_key,binding,[last.score,last.updated_at,last.id]);
+  }
+  return out;
+}
+
 async function getArtifact(ctx, projectId, artifactId, revNo) {
   await authorizeProject(ctx, projectId, false);
   const a = await loadArtifact(ctx, projectId, artifactId);
@@ -6934,7 +7065,8 @@ async function handleOAuthMcp(req, env, ctx) {
   if (rtLim?.idTooLong) return reply(RT_ID_TOO_LONG, 400);
   const pv = req.headers.get("mcp-protocol-version");
   if (pv && !SUPPORTED.includes(pv)) return reply(rpcErr(null, -32600, "Unsupported protocol version"), 400);
-  const tool = msg.method === "tools/call" ? ftToolsFor(env, conn).find((t) => t.name === msg.params?.name) : void 0;
+  const searchReady = await rsToolReady(env,msg);
+  const tool = msg.method === "tools/call" ? ftToolsFor(env, conn).filter(t => t.name !== "search_artifacts" || searchReady).find((t) => t.name === msg.params?.name) : void 0;
   if (tool?.write && !tokenScopes.has(SCOPES.write)) return insufficientScope(ctx.auth, [SCOPES.read, SCOPES.write]);
   try {
     await rateLimit(env, `${tool?.write ? "w" : "r"}:oauth:${conn.id}`, tool?.write ? 20 : 60);
@@ -6955,7 +7087,7 @@ async function handleOAuthMcp(req, env, ctx) {
     case "ping":
       return reply(rpc(msg.id, {}));
     case "tools/list":
-      return reply(rpc(msg.id, { tools: ftToolsFor(env, conn).filter((t) => anyWrite || !t.write).map(({ name, title, description, inputSchema, annotations }) => ({
+      return reply(rpc(msg.id, { tools: ftToolsFor(env, conn).filter((t) => (t.name !== "search_artifacts" || searchReady) && (anyWrite || !t.write)).map(({ name, title, description, inputSchema, annotations }) => ({
         name,
         title,
         description: WEB_URL_OUTPUT_SCHEMAS[name] ? description + WEB_URL_TOOL_NOTE : description,
@@ -6972,6 +7104,15 @@ async function handleOAuthMcp(req, env, ctx) {
       if (tool.name === "list_projects") {
         const result = withWebUrls("list_projects", args, void 0, { projects: conn.projects.map((p) => ({ id: p.id, title: p.title, can_write: projectWrite(p) })) }, appOrigin(env.APP_HOST));
         return reply(rpc(msg.id, { content: [{ type: "text", text: JSON.stringify(result) }], structuredContent: result, isError: false }));
+      }
+      if (tool.name === "search_artifacts") {
+        try {
+          const result = await searchArtifacts({ env, requestId: randomId("req",9), principal: { id: conn.owner_principal_id, kind: "agent" }, grant: { id: conn.id }, oauthConnection: true, ftConn: conn, rpcIdBytes: rtIdBytes(msg.id) }, args, "mcp");
+          return reply(rpc(msg.id, { content: [{ type: "text", text: JSON.stringify(result) }], structuredContent: result, isError: false }));
+        } catch(e) {
+          if (!(e instanceof HttpError)) throw e;
+          return reply(rpc(msg.id, toolError({ status: e.status, code: e.code, message: e.message })));
+        }
       }
       let proj = conn.projects.length === 1 && args.project_id === void 0 ? conn.projects[0] : void 0;
       if (args.project_id !== void 0) proj = conn.projects.find((p) => p.id === args.project_id);
@@ -7035,6 +7176,7 @@ var init_mcp = __esm({
     RT_MAXB = { type: "integer", minimum: 4096, maximum: 524288, description: "Upper bound in bytes for this whole tool result as encoded (default 65536)" };
     RW = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false };
     TOOLS = [
+      { name: "search_artifacts", title: "Search library", description: "Ranked lexical search across currently readable projects. All words must match stored title/text; punctuation separates words. Returns bounded plain-text excerpts and revision-pinned links. Live pagination expires after 15 minutes.", inputSchema: RS_SCHEMA, annotations: RO, write: false, run: (c, p, a) => searchArtifacts(c,a,"mcp") },
       {
         name: "list_projects",
         title: "List projects",
@@ -8046,6 +8188,17 @@ var __appConnectPublisher = (() => {
     SELECT ?, ?, ?, ?, ?, ?, ?, 1, ?, ? WHERE ${gate}`).bind(sid, p.id, g.source_revision, now, g.exported_at, g.coverage, mArt, mSha, JSON.stringify(files), ...gp));
     q.push(env.DB.prepare(`UPDATE publisher_generations SET state = 'committed', snapshot_id = ?, receipt = ?, committed_at = ? WHERE publisher_id = ? AND id = ? AND state = 'staged' AND ${gate}`).bind(sid, receiptText, now, p.id, id, ...gp));
     q.push(env.DB.prepare(`INSERT INTO audits (at, actor_id, project_id, action, object_id, rev_no, result, request_id) SELECT ?, ?, ?, 'generation.commit', ?, ?, 'ok', ? WHERE ${gate}`).bind(now, p.principal_id, p.project_id, sid, g.source_revision, requestId, ...gp));
+    // Derived generation index writes are explicit, not insert triggers: old Workers validate exact
+    // D1 meta.changes for their nine-statement commit. Keep those checks intact on the new Worker too.
+    q.push(env.DB.prepare(`INSERT OR IGNORE INTO artifact_search_keys(artifact_id)
+      SELECT a.id FROM artifacts a WHERE a.publisher_id=? AND a.generation_id=? AND ${gate}`).bind(p.id,id,...gp));
+    q.push(env.DB.prepare(`INSERT OR REPLACE INTO artifact_search (rowid,artifact_id,revision_id,sha256,title,body)
+      SELECT k.search_id,a.id,r.id,r.sha256,a.title,COALESCE(r.body,'') FROM artifacts a JOIN artifact_search_keys k ON k.artifact_id=a.id
+      JOIN revisions r ON r.id=a.head_revision_id AND r.artifact_id=a.id AND r.project_id=a.project_id AND r.rev_no=a.head_rev
+      JOIN publisher_generations pg ON pg.id=a.generation_id AND pg.publisher_id=a.publisher_id AND pg.state='committed'
+      WHERE a.publisher_id=? AND a.generation_id=? AND a.trashed_at IS NULL AND ${gate}`).bind(p.id,id,...gp));
+    q.push(env.DB.prepare(`SELECT count(*) AS indexed_count FROM artifact_search s JOIN artifacts a ON a.id=s.artifact_id
+      WHERE a.publisher_id=? AND a.generation_id=? AND s.revision_id=a.head_revision_id`).bind(p.id,id));
     let res;
     try {
       res = await env.DB.batch(q);
@@ -8073,7 +8226,7 @@ var __appConnectPublisher = (() => {
       throw new live_HttpError(413, "quota_exceeded", "Retained generation quota exceeded or generation changed; nothing was written", { max_retained_bytes: h.maxRetainedBytes, max_retained_parts: h.maxRetainedParts });
     }
     const expect = [1, parts.length, parts.length, 1, 1, parts.length, 1, 1, 1];
-    if (res.some((r, i) => (r.meta.changes ?? 0) !== expect[i])) {
+    if (res.slice(0, expect.length).some((r, i) => (r.meta.changes ?? 0) !== expect[i]) || res.at(-1).results[0].indexed_count !== parts.length + 1) {
       console.error("generation_commit_partial", requestId);
       throw new live_HttpError(500, "internal", "Generation commit inconsistency");
     }
@@ -10163,6 +10316,7 @@ var A2 = { type: "string", description: "Artifact ID" };
 var K2 = { type: "string", description: "Idempotency key (8-128 chars); reuse it when retrying the same request" };
 var unwrap2 = /* @__PURE__ */ __name((r) => r && typeof r.status === "number" && "body" in r ? r.body : r, "unwrap");
 var TOOLS2 = [
+  { name: "search_artifacts", description: "Ranked lexical search of currently readable projects, with excerpts and revision-pinned links. All words must match. Live pagination.", inputSchema: RS_SCHEMA, annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }, run: (c,a) => searchArtifacts(c,a,"mcp") },
   { name: "list_projects", description: "List projects this identity may access.", inputSchema: S2({}, []), run: /* @__PURE__ */ __name((c) => listProjects(c), "run") },
   {
     name: "list_artifacts",
@@ -10294,6 +10448,7 @@ async function handleMcp(req, env, requestId, origin) {
     throw e;
   }
   const reply = /* @__PURE__ */ __name((body2) => new Response(rtFit(body2, rtLim), { status: 200, headers: hdr }), "reply");
+  const searchReady = await rsToolReady(env,msg);
   switch (msg.method) {
     case "initialize": {
       const want = msg.params?.protocolVersion;
@@ -10308,14 +10463,15 @@ async function handleMcp(req, env, requestId, origin) {
     case "ping":
       return reply(rpc2(msg.id, {}));
     case "tools/list":
-      return reply(rpc2(msg.id, { tools: TOOLS2.map(({ name, description, inputSchema }) => ({
+      return reply(rpc2(msg.id, { tools: TOOLS2.filter(t => t.name !== "search_artifacts" || searchReady).map(({ name, description, inputSchema, annotations }) => ({
+        annotations,
         name,
         description: WEB_URL_OUTPUT_SCHEMAS[name] ? description + WEB_URL_TOOL_NOTE : description,
         inputSchema,
         ...WEB_URL_OUTPUT_SCHEMAS[name] ? { outputSchema: WEB_URL_OUTPUT_SCHEMAS[name] } : {}
       })) }));
     case "tools/call": {
-      const tool = TOOLS2.find((t) => t.name === msg.params?.name);
+      const tool = TOOLS2.filter(t => t.name !== "search_artifacts" || searchReady).find((t) => t.name === msg.params?.name);
       if (!tool) return reply(rpcErr2(msg.id, -32602, "Unknown tool"));
       const args = msg.params?.arguments ?? {};
       if (typeof args !== "object" || Array.isArray(args)) return reply(rpcErr2(msg.id, -32602, "arguments must be an object"));
@@ -10852,7 +11008,17 @@ var APP_HTML = `<!doctype html>
 </body>
 </html>
 `;
-var APP_CSS = `
+var APP_CSS = `/* Global ranked search uses text nodes, including highlighted excerpts. */
+.search-form{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+.search-form input{min-width:180px;flex:1}
+.search-form select{max-width:100%}
+.search-results{list-style:none;padding:0;display:grid;gap:12px}
+.search-hit{min-width:0;overflow-wrap:anywhere}
+.search-title{font-size:1.12rem;font-weight:600}
+.search-snippet{white-space:pre-wrap;line-height:1.6;margin-bottom:0}
+.search-hit mark{background:var(--accent-soft);color:var(--fg);border-radius:2px}
+@media(max-width:540px){.search-form input{flex-basis:100%}.search-form select{flex:1;min-width:0}}
+
 /* Agent Library design pass (Oct 9). Quiet blue/black/gray surfaces in the Nibit family (4px grid, 4/8/12 radii,
    restrained blue accent), with Library's own readable contrast: muted text stays >= 4.5:1 in both themes.
    Follows the device colour scheme. Structure: persistent sidebar (desktop) / bottom tab bar (mobile). */
@@ -11678,6 +11844,7 @@ function route() {
     if (p[2] === "grants") { location.replace("#/settings/tokens"); return; }
     return viewList(p[1], false);
   }
+  if (p[0] === "search") return viewSearch();
   if (p[0] === "projects") return viewProjects();
   return viewHome();
 }
@@ -11726,6 +11893,78 @@ function viewLogin(note) {
   pass.focus();
 }
 
+function searchEntry() {
+  var link = h("a", { class: "btn", href: "#/search", hidden: true }, icon("search"), "Search library");
+  api("GET", "/api/search/status").then(function (r) { link.hidden = !r.ready; }).catch(function () {});
+  return link;
+}
+// ---------- global ranked search ----------
+async function viewSearch() {
+  var alive = true, seq = 0, cursor = null, active = null;
+  S.cleanups.push(function () { alive = false; seq++; });
+  shell([{t:"Home",href:"#/"},{t:"Search"}], h("p", {role:"status",text:"Checking search availability…"}));
+  try {
+    var availability = await api("GET", "/api/search/status");
+    if (!alive) return;
+    if (!availability.ready) {
+      shell([{t:"Home",href:"#/"},{t:"Search"}], stateBox("", "search", "Search is being prepared", "An administrator needs to finish indexing existing documents. Refresh after indexing is complete."));
+      return;
+    }
+  } catch(e) { if (alive) shell([{t:"Search"}], stateBox("error", "alert", "Search unavailable", "Refresh to check again.")); return; }
+
+  var query = h("input", { type: "search", name: "query", required: true, maxLength: 200, placeholder: "Search titles and stored text", "aria-label": "Search library", class: "grow" });
+  var project = h("select", { name: "project", "aria-label": "Project filter" }, h("option", { value: "", text: "All projects" }));
+  var submit = h("button", { type: "submit" }, icon("search"), "Search");
+  var status = h("p", { role: "status", "aria-live": "polite", class: "muted" });
+  var list = h("ol", { class: "search-results", "aria-label": "Search results" });
+  var more = h("button", { type: "button", class: "secondary", hidden: true, onclick: function () { load(true); } }, "More results");
+  var form = h("form", { class: "search-form card", role: "search", onsubmit: function (e) { e.preventDefault(); load(false); } },
+    h("label", { class: "sr", htmlFor: "global-search-query", text: "Search library" }), query,
+    h("label", { class: "small muted", htmlFor: "global-search-project", text: "Project" }), project, submit);
+  query.id = "global-search-query"; project.id = "global-search-project";
+  project.addEventListener("change", function () { if (query.value.trim()) load(false); });
+  function highlight(text, words) {
+    var fragment = document.createDocumentFragment(), terms = words.toLowerCase().match(/[\p{L}\p{N}\p{M}]+/gu) || [];
+    if (!terms.length) { fragment.append(document.createTextNode(text)); return fragment; }
+    var re = new RegExp("(" + terms.join("|") + ")", "giu"), last = 0, match;
+    while ((match = re.exec(text))) { fragment.append(document.createTextNode(text.slice(last, match.index)), h("mark", { text: match[0] })); last = match.index + match[0].length; }
+    fragment.append(document.createTextNode(text.slice(last))); return fragment;
+  }
+  async function load(append) {
+    var my = ++seq, requested = append ? active : { query: query.value.trim(), project: project.value };
+    if (!requested || !requested.query) return;
+    if (!append) { active = requested; cursor = null; list.replaceChildren(); }
+    more.hidden = true; submit.disabled = true; list.setAttribute("aria-busy", "true"); status.textContent = "Searching…";
+    var params = new URLSearchParams({ query: requested.query });
+    if (requested.project) params.set("project_ids", requested.project);
+    if (append && cursor) params.set("cursor", cursor);
+    try {
+      var result = await api("GET", "/api/search?" + params);
+      if (!alive || my !== seq) return;
+      result.results.forEach(function (r) {
+        list.append(h("li", { class: "card search-hit" },
+          h("a", { class: "search-title", href: r.preview_url || r.web_url || "/p/" + enc(r.project_id) + "/a/" + enc(r.artifact_id) + "/preview?v=" + r.revision }, highlight(r.title, requested.query)),
+          h("p", { class: "meta", text: r.project_title + " · " + kindLabel(r) + " · Version " + r.revision + " · " + fmtDate(r.updated_at) }),
+          h("p", { class: "search-snippet" }, highlight(r.snippet, requested.query)),
+          !r.indexed_body ? h("p", { class: "muted small", text: "Title match only · No indexed body" }) : null));
+      });
+      cursor = result.next_cursor; more.hidden = !result.has_more;
+      status.textContent = list.children.length ? list.children.length + " results shown" + (result.has_more ? " · More available" : "") : "No matches. Try fewer words or choose another project.";
+    } catch (e) {
+      if (!alive || my !== seq) return;
+      status.textContent = "Search couldn't load. " + (e.message || "Try again.");
+      if (append) more.hidden = false;
+    } finally { if (alive && my === seq) { submit.disabled = false; list.removeAttribute("aria-busy"); } }
+  }
+  shell([{ t: "Home", href: "#/" }, { t: "Search" }], pageHead("Search library", { sub: "Find documents across your projects. Searches stored words in titles and text; all words must match. This does not interpret questions." }), form, status, list, more);
+  status.textContent = "Enter words to search all your projects.";
+  try {
+    var projects = await api("GET", "/api/projects");
+    if (!alive) return;
+    projects.projects.forEach(function (p) { project.append(h("option", { value: p.id, text: p.title })); });
+  } catch (e) { if (alive) status.textContent = "Project filters couldn't load. Search all projects or refresh to retry."; }
+  if (alive) query.focus();
+}
 // ---------- home: authorized recents and browser-local personal favorites ----------
 function favoriteButton(pid, aid, changed, title) {
   var uid = S.me && S.me.id;
@@ -11827,7 +12066,7 @@ async function viewHome() {
   window.addEventListener("storage", changed); document.addEventListener("visibilitychange", foreground);
   S.cleanups.push(function () { alive = false; ++seq; window.removeEventListener("storage", changed); document.removeEventListener("visibilitychange", foreground); });
   shell([{ t: "Home" }], pageHead("Home", { sub: "Recently edited documents across your projects. Favorites are saved for your account on this device.",
-      actions: h("a", { class: "btn secondary", href: "#/projects" }, icon("folder"), "All projects") }),
+      actions: [searchEntry(), h("a", { class: "btn secondary", href: "#/projects" }, icon("folder"), "All projects")] }),
     h("div", { class: "toolbar" }, homeTabs, h("span", { class: "spacer" }),
       h("label", { class: "row small muted" }, "Sort", sorting), refresh),
     msg, list, empty, more);
@@ -14464,6 +14703,7 @@ __name(verifyApiKey, "verifyApiKey");
 var MAX_BODY2 = 65e5;
 var SEG = "([A-Za-z0-9_-]{1,64})";
 var R2 = {
+  search: /^\/v1\/search$/,
   projects: /^\/v1\/projects$/,
   files: new RegExp(`^/v1/projects/${SEG}/files$`),
   file: new RegExp(`^/v1/projects/${SEG}/files/${SEG}$`),
@@ -14566,6 +14806,10 @@ async function route2(req, env, url, requestId) {
   await rateLimit(env, `${write ? "w" : "r"}:${k.principalId}`, write ? lim2.writesPerMin : lim2.readsPerMin);
   const origin = appOrigin(env.APP_HOST);
   let g;
+  if (R2.search.test(path)) {
+    if (m !== "GET") throw new HttpError(405,"method_not_allowed","Method not allowed");
+    return json(await searchArtifacts({ env, requestId, apiCredential: true, principal: { id: k.principalId, kind: "agent" }, grant: { id: k.credentialId } }, rsQuery(url.searchParams)));
+  }
   if (R2.projects.test(path)) {
     if (m !== "GET") throw new HttpError(405, "method_not_allowed", "Method not allowed");
     return json({ projects: k.projects.map((p) => ({ id: p.id, title: p.title, access: p.can_write ? "read_write" : "read", ...origin ? { web_url: projectWebUrl(origin, p.id) } : {} })) });
@@ -14969,6 +15213,8 @@ async function route3(req, env, url, requestId) {
   await enforceRate(ctx, m !== "GET" && m !== "HEAD");
   const key = /* @__PURE__ */ __name(() => idemKey(req.headers.get("idempotency-key")), "key");
   const seg = path.split("/").slice(2);
+  if (seg[0] === "search" && seg[1] === "status" && seg.length === 2 && m === "GET") { requireHuman(ctx); return json({ready: await rsReady(env)}); }
+  if (seg[0] === "search" && seg.length === 1 && m === "GET") { requireHuman(ctx); return json(await searchArtifacts(ctx, rsQuery(url.searchParams))); }
   if (seg[0] === "me" && m === "GET") return json({ principal: ctx.principal, csrf: ctx.csrf ?? null, api_base: ctx.env.MCP_HOST ? originFor(ctx.env.MCP_HOST) + "/v1" : null });
   if (seg[0] === "logout" && m === "POST") {
     requireHuman(ctx);
