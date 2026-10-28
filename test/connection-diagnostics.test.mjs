@@ -164,8 +164,14 @@ test("real owner UI: matching safe ID and copy output, configured setup URL, exi
     // destination before touching its filter, or we can toggle the old reader filter.
     await page.waitForFunction((tab) => document.querySelector('.tabs a[aria-current="page"]')?.getAttribute("href") === "#/settings/" + tab, {}, tab);
     if (tab === "api-keys" || tab === "tokens") {
-      await page.waitForSelector("input[type=checkbox]"); await page.click("input[type=checkbox]");
-      assert.equal(await page.$eval("input[type=checkbox]", (el) => el.checked), true);
+      // The selected tab is rendered before its API response populates the list.
+      // Wait for that final layout, then target the labelled filter (not a scope
+      // checkbox in the creation form). The locator also waits for a stable box
+      // before sending real pointer input, including after the mobile resize.
+      await page.waitForSelector("ul.list > li");
+      const filter = "label.muted.small input[type=checkbox]";
+      await page.locator(filter).click();
+      assert.equal(await page.$eval(filter, (el) => el.checked), true);
     }
     await page.waitForSelector(selector); await page.evaluate(() => document.querySelectorAll(".connection-summary").forEach((d) => { d.open = true; }));
     const cards = await page.$$eval(".connection-summary", (ds) => ds.map((d) => JSON.parse(d.querySelector("textarea").value)));
