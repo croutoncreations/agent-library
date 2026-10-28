@@ -26,7 +26,7 @@ npm run check:self-host-upload
 npm test
 ```
 
-The full suite starts real local Wrangler services and uses the official MCP SDK client. Browser tests need Google Chrome and Puppeteer 24.16.2 at `~/.npm-packages/lib/node_modules/puppeteer` (set `CHROME_PATH` for a nonstandard Chrome location). Fixtures need ffmpeg. `.github/workflows/ci.yml` shows the Linux setup. A test skipped because of a missing browser is not a pass, so report skips. New test listeners get their port in `test/ports.mjs`.
+The full suite starts real local Wrangler services and uses the official MCP SDK client. Browser tests need Google Chrome and Puppeteer 24.16.2 at `~/.npm-packages/lib/node_modules/puppeteer` (set `CHROME_PATH` for a nonstandard Chrome location). Fixtures need ffmpeg. `.github/workflows/ci.yml` shows the Linux setup. A test skipped because of a missing browser is not a pass, so report skips. New test listeners get their port in `test/ports.mjs`. If another checkout is running tests, choose an unused centralized port namespace with `AGENT_LIBRARY_TEST_PORT_OFFSET=3000 npm test` (integer 0–5000); server, inspector and helper ports shift together without changing test assertions.
 
 ## Changing what ships
 

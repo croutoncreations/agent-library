@@ -12,7 +12,9 @@ Tell the agent:
 
 > Use Agent Library for files I should read or edit across devices. Start by listing the projects your connection permits. Keep Markdown as Markdown. Read the current revision before editing, include the expected revision and a fresh idempotency key for each new mutation, and preserve my changes on a conflict. Return the library's human-facing file URL. Do not request broader access or change grants.
 
-Tools: `list_projects`, `list_artifacts`, `read_artifact`, `read_file`, `create_markdown`, `save_markdown`, `upload_file`, `upload_begin`, `upload_finish`, `artifact_history`, `diff_revisions`, `restore_revision` and `restore_metadata` (plus `read_records` with App Connect enabled). Read-only connections only see the read tools. Clients that can't do remote MCP with OAuth can use the HTTP API below.
+Templates: use `list_templates`, inspect a pinned revision with `read_artifact`, then `create_from_template` with an explicit date when required. Fill the independent copy using `save_markdown`. Template definitions are maintained by the owner. See [Document templates](templates.md).
+
+Tools: `list_projects`, `list_artifacts`, `read_artifact`, `read_file`, `create_markdown`, `save_markdown`, `upload_file`, `upload_begin`, `upload_finish`, `artifact_history`, `diff_revisions`, `restore_revision`, `restore_metadata`, `list_templates` and `create_from_template` (plus `read_records` with App Connect enabled). Read-only connections only see the read tools. Clients that can't do remote MCP with OAuth can use the HTTP API below.
 
 ### Files
 

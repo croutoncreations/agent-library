@@ -377,3 +377,11 @@ main > .tabs,main > nav.tabs{margin:16px 0 12px}
 @media (max-width:400px){.j-kids{margin-left:8px}.j-line{padding-left:18px}}
 @media (max-width:400px) and (pointer:coarse){.j-line{padding-left:28px}}
 @media (max-width:760px){.data-table{font-size:13.5px}.data-table th,.data-table td{padding:6px 10px;max-width:18em}.json-tree{padding:10px;font-size:13px}}
+
+/* Template picker and copy form share the normal document/editor layout. */
+.template-form{display:grid;gap:12px;min-width:0}
+.template-form label{display:grid;gap:5px;min-width:0}
+.template-form select,.template-form input{width:100%;min-width:0;max-width:100%}
+.template-preview{max-height:320px;overflow:auto;overflow-wrap:anywhere;border:1px solid var(--line);border-radius:8px;padding:16px}
+.template-note{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+@media(max-width:600px){.template-form .row>label{flex:1 1 100%}.template-preview{max-height:240px;padding:12px}}

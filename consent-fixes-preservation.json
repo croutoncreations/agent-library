@@ -1,8 +1,8 @@
 {
-  "base_history_fixes_sha256": "d1a5a560bb674bcbd74f476e36445dcf84bf3876028b9ac7b4d932570edaa59e",
-  "integrated_sha256": "4919da74595f4191cad684e2def1a84b1a69cf190d8aec0a0dc79fc57517f808",
+  "base_history_fixes_sha256": "8b9310759bff53068d00bf411a773c3fdb90a16b4a3b0894a19d56f6cd763eab",
+  "integrated_sha256": "927c370ab3c03704d8744ad5e0b64bcabbe82e2ecdb2c17a73be28fb1a27e8cc",
   "preserved_prefix_sha256": "eed00b8e2211d132c82cb55702d056b9e924a36ca5572b40d437f60167d967d2",
-  "preserved_suffix_sha256": "63e9ca360062e23d9b82d1560856260557fc704366a62d458594ab8d7e25f2e1",
+  "preserved_suffix_sha256": "2e0d7d42918bb61cde566950cbba8bf73e9691ffb261398333f64520a85f025e",
   "oauth_server_module_sha256": {
     "history_fixes": "91a78326ca0baa4270689cfd3c07c84ec1a12be1affa76573fe574e95f76498c",
     "candidate": "884c2b441d62ab29357d8e763fd63c15c31abf7a044407f6503747cbb11a6450"

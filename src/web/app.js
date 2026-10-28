@@ -691,10 +691,10 @@ async function viewList(pid, trash) {
   var cursor = null, seq = 0, qTimer = null;
 
   function row(a) {
-    var info = h("span", { class: "meta", text: kindLabel(a) + " · Updated " + fmtDate(a.updated_at) + " · rev " + a.revision + (a.folder ? " · " + a.folder : "") + (a.tags && a.tags.length ? " · #" + a.tags.join(" #") : "") });
+    var info = h("span", { class: "meta", text: (a.is_template ? "Template" : kindLabel(a)) + " · Updated " + fmtDate(a.updated_at) + " · rev " + a.revision + (a.folder ? " · " + a.folder : "") + (a.tags && a.tags.length ? " · #" + a.tags.join(" #") : "") });
     var href = "#/p/" + enc(pid) + "/a/" + enc(a.id);
     var main = h("div", { class: "grow" }, trash ? h("span", { text: a.title }) : rowLink(href, a.title), info);
-    var li = h("li", trash ? null : { class: "link" }, h("span", { class: "ficon-sm", "aria-hidden": "true" }, icon(kindIcon(a))), main, h("span", { class: "badge", text: kindLabel(a) }));
+    var li = h("li", trash ? null : { class: "link" }, h("span", { class: "ficon-sm", "aria-hidden": "true" }, icon(kindIcon(a))), main, h("span", { class: "badge", text: a.is_template ? "Template" : kindLabel(a) }));
     if (trash) li.append(h("button", { type: "button", class: "secondary", onclick: async function (e) {
       e.target.disabled = true;
       try { await api("PATCH", "/api/projects/" + enc(pid) + "/artifacts/" + enc(a.id), { expected_meta_version: a.meta_version, trashed: false }, { key: uuid() }); li.remove(); showMsg(msg, "Restored \"" + a.title + "\".", true); }
@@ -743,19 +743,77 @@ async function viewList(pid, trash) {
     var dtitle = h("input", { type: "text", placeholder: "Document title", required: true, maxLength: 200, "aria-label": "New document title" });
     var dkind = h("select", { "aria-label": "Document type" }, h("option", { value: "markdown", text: "Markdown" }), h("option", { value: "html", text: "HTML page" }));
     var cmsg = h("p", { class: "msg", role: "status" });
+    var start = h("select", { "aria-label": "Start from" }, h("option", { value: "", text: "Blank document" }));
+    var startLabel = h("label", { hidden: true }, "Start from", start);
+    var localNow = new Date();
+    var date = h("input", { type: "date", "aria-label": "Template date", value: localNow.getFullYear() + "-" + String(localNow.getMonth() + 1).padStart(2, "0") + "-" + String(localNow.getDate()).padStart(2, "0") });
+    var dateLabel = h("label", { hidden: true }, "Date", date);
+    var templateHelp = h("p", { class: "muted small", role: "status", text: "Loading templates…" });
+    var templatePreview = h("div", { class: "template-preview prose", hidden: true, tabIndex: 0, "aria-label": "Template preview" });
+    var templateInfo = h("p", { class: "muted small", hidden: true });
+    var templateRetry = h("button", { type: "button", class: "secondary", hidden: true, onclick: loadTemplates }, "Reload templates");
+    var templates = {}, selectedTemplate = null, previewSeq = 0, previewTimer, previewReady = false, creating = false;
     var pending = null;
+    var createBtn = h("button", { type: "submit" }, "Create");
+    async function loadTemplates() {
+      templateHelp.textContent = "Loading templates…"; templateRetry.hidden = true;
+      try {
+        var cursor = null, items = [];
+        do {
+          var page = await api("GET", "/api/projects/" + enc(pid) + "/templates" + (cursor ? "?cursor=" + enc(cursor) : ""));
+          items = items.concat(page.templates); cursor = page.next_cursor;
+        } while (cursor);
+        templates = {};
+        start.replaceChildren(h("option", { value: "", text: "Blank document" }));
+        items.forEach(function (t) { templates[t.id] = t; start.append(h("option", { value: t.id, text: t.name + (t.description ? " — " + t.description : "") })); });
+        if (selectedTemplate) {
+          if (!templates[selectedTemplate.id]) { start.append(h("option", { value: selectedTemplate.id, text: selectedTemplate.name + " (unavailable)" })); }
+          start.value = selectedTemplate.id; // Never silently replace its pinned revision.
+        }
+        startLabel.hidden = items.length === 0;
+        templateHelp.textContent = items.length ? "Templates create independent Markdown documents." : "No templates yet. Open a Markdown document and choose Save as template.";
+      } catch (err) { templateHelp.textContent = "Couldn't load templates: " + err.message + ". Blank document is still available."; templateRetry.hidden = false; }
+    }
+    function previewInput() { return { template_id: selectedTemplate.id, template_revision: selectedTemplate.revision, title: dtitle.value.trim(), date: date.value || undefined }; }
+    function scheduleTemplatePreview() {
+      clearTimeout(previewTimer); previewReady = false;
+      var seq = ++previewSeq;
+      dateLabel.hidden = !selectedTemplate; templateInfo.hidden = !selectedTemplate; templatePreview.hidden = !selectedTemplate;
+      dkind.disabled = !!selectedTemplate; createBtn.textContent = selectedTemplate ? "Use template" : "Create";
+      createBtn.disabled = creating || !!selectedTemplate;
+      if (!selectedTemplate) { templatePreview.replaceChildren(); return; }
+      templateInfo.textContent = selectedTemplate.name + " · v" + selectedTemplate.revision + (selectedTemplate.description ? " · " + selectedTemplate.description : "");
+      templatePreview.textContent = "Loading preview…";
+      previewTimer = setTimeout(async function () {
+        try {
+          var r = await api("POST", "/api/projects/" + enc(pid) + "/templates/preview", previewInput());
+          if (seq !== previewSeq) return;
+          templatePreview.innerHTML = r.html;
+          templatePreview.append(h("p", { class: "muted small", text: "Placeholders: " + (r.placeholders.join(", ") || "none") + ". Unknown placeholders stay literal." + (r.truncated ? " Preview shortened; creation uses the full revision." : "") }));
+          previewReady = true; createBtn.disabled = creating;
+        } catch (err) { if (seq !== previewSeq) return; templatePreview.textContent = "Preview unavailable: " + err.message; }
+      }, 160);
+    }
+    start.addEventListener("change", function () { selectedTemplate = templates[start.value] || null; scheduleTemplatePreview(); });
+    dtitle.addEventListener("input", scheduleTemplatePreview); date.addEventListener("input", scheduleTemplatePreview);
+    S.cleanups.push(function () { clearTimeout(previewTimer); previewSeq++; });
     var newDoc = h("div", { class: "card", hidden: true },
-      h("form", { class: "row", onsubmit: async function (e) {
-        e.preventDefault();
+      h("form", { class: "template-form", onsubmit: async function (e) {
+        e.preventDefault(); if (creating || (selectedTemplate && !previewReady)) return;
         var t = dtitle.value.trim(); if (!t) return;
         var kind = dkind.value === "html" ? "html" : "markdown";
-        var body = kind === "html" ? "<h1>" + escHtml(t) + "</h1>\n<p></p>\n" : "# " + t + "\n\n";
-        if (!pending || pending.t !== t || pending.kind !== kind) pending = { t: t, kind: kind, key: uuid() };
-        var req = kind === "html" ? { title: t, body: body, kind: "html" } : { title: t, body: body };
-        // New documents open in the editor (there is nothing to read yet).
-        try { var r = await api("POST", "/api/projects/" + enc(pid) + "/artifacts", req, { key: pending.key }); pending = null; location.hash = "#/p/" + enc(pid) + "/a/" + enc(r.artifact_id) + "/edit"; }
+        var req = selectedTemplate ? previewInput() : { title: t, body: kind === "html" ? "<h1>" + escHtml(t) + "</h1>\n<p></p>\n" : "# " + t + "\n\n", kind: kind };
+        var path = "/api/projects/" + enc(pid) + "/artifacts" + (selectedTemplate ? "/from-template" : "");
+        var signature = JSON.stringify([path, req]);
+        if (!pending || pending.signature !== signature) pending = { signature: signature, key: uuid() };
+        creating = true; createBtn.disabled = true;
+        try { var r = await api("POST", path, req, { key: pending.key }); pending = null; location.hash = "#/p/" + enc(pid) + "/a/" + enc(r.artifact_id) + "/edit"; }
         catch (err) { showErr(cmsg, err); }
-      } }, dtitle, dkind, h("button", { type: "submit" }, "Create"), h("button", { type: "button", class: "secondary", onclick: function () { newDoc.hidden = true; } }, "Cancel")), cmsg);
+        finally { creating = false; createBtn.disabled = !!selectedTemplate && !previewReady; }
+      } }, h("div", { class: "row" }, h("label", null, "Title", dtitle), h("label", null, "Document type", dkind)),
+        startLabel, templateHelp, templateRetry, dateLabel, templateInfo, templatePreview,
+        h("div", { class: "row" }, createBtn, h("button", { type: "button", class: "secondary", onclick: function () { newDoc.hidden = true; newDocBtn.setAttribute("aria-expanded", "false"); } }, "Cancel"))), cmsg);
+    loadTemplates();
     var upHelp = h("p", { class: "muted small", text: "Images (PNG, JPEG, WebP, GIF), videos (MP4, WebM) or PDF, up to 5 MB. CSV or JSON data files (UTF-8), up to 1 MB." });
     dataFilesEnabled(pid).then(function (on) { if (on === false) upHelp.textContent = "Images (PNG, JPEG, WebP, GIF), videos (MP4, WebM) or PDF, up to 5 MB."; });
     var upload = h("div", { class: "card", hidden: true }, upHelp, uploadForm(pid, null, function () { load(true); }, "all"));
@@ -1162,10 +1220,17 @@ async function viewArtifact(pid, aid, initialTab) {
 
   // metadata: rename / folder / tags / trash, guarded by expected_meta_version
   var fTitle = h("input", { type: "text", maxLength: 200 }), fFolder = h("input", { type: "text", maxLength: 200 }), fTags = h("input", { type: "text", placeholder: "comma,separated" });
+  var fDescription = A.meta.is_template ? h("input", { type: "text", maxLength: 280, "aria-label": "Template description", value: A.meta.template_description || "" }) : null;
   function fillMeta() {
     if (document.activeElement !== fTitle) fTitle.value = A.meta.title;
     if (document.activeElement !== fFolder) fFolder.value = A.meta.folder || "";
     if (document.activeElement !== fTags) fTags.value = (A.meta.tags || []).join(", ");
+    if (fDescription && document.activeElement !== fDescription) fDescription.value = A.meta.template_description || "";
+    if (A.templateSourceNote) {
+      A.templateSourceNote.hidden = !A.meta.source;
+      A.templateSourceNote.replaceChildren();
+      if (A.meta.source) A.templateSourceNote.append(h("a", { href: "#/p/" + enc(pid) + "/a/" + enc(A.meta.source.artifact_id) + "?v=" + A.meta.source.revision, text: (A.meta.source.role === "template" ? "Created from " : "Copied from ") + A.meta.source.title + " · v" + A.meta.source.revision }));
+    }
     titleEl.textContent = A.meta.title;
     setCrumbs(projCrumbs(pid, [{ t: A.meta.title }]));
   }
@@ -1173,6 +1238,7 @@ async function viewArtifact(pid, aid, initialTab) {
   async function patchMeta(fields, okText) {
     try {
       var r = await api("PATCH", base, Object.assign({ expected_meta_version: A.meta.meta_version }, fields), { key: uuid() });
+      if (fDescription) A.meta.template_description = r.template_description;
       A.meta.meta_version = r.meta_version; A.meta.title = r.title; A.meta.folder = r.folder; A.meta.tags = r.tags; A.meta.trashed = r.trashed;
       fillMeta(); showMsg(metaMsg, okText, true); return r;
     } catch (err) {
@@ -1182,10 +1248,10 @@ async function viewArtifact(pid, aid, initialTab) {
     }
   }
   var details = h("details", null, h("summary", { text: "Details" }),
-    h("div", { class: "grid2" }, h("label", null, "Title", fTitle), h("label", null, "Folder", fFolder), h("label", null, "Tags", fTags)),
+    h("div", { class: "grid2" }, h("label", null, "Title", fTitle), h("label", null, "Folder", fFolder), h("label", null, "Tags", fTags), fDescription ? h("label", null, "Template description", fDescription) : null),
     h("div", { class: "row" },
       h("button", { type: "button", onclick: function () {
-        patchMeta({ title: fTitle.value.trim(), folder: fFolder.value.trim(), tags: fTags.value.split(",").map(function (s) { return s.trim(); }).filter(Boolean) }, "Details saved.");
+        patchMeta({ ...(fDescription ? { template_description: fDescription.value } : {}), title: fTitle.value.trim(), folder: fFolder.value.trim(), tags: fTags.value.split(",").map(function (s) { return s.trim(); }).filter(Boolean) }, "Details saved.");
       } }, "Save details"),
       h("button", { type: "button", class: "danger", onclick: async function () {
         if (!confirm("Move \"" + A.meta.title + "\" to trash? History is kept and it can be restored.")) return;
@@ -1194,6 +1260,41 @@ async function viewArtifact(pid, aid, initialTab) {
         if (r) location.hash = "#/p/" + enc(pid) + "/trash";
       } }, "Move to trash")),
     h("p", { class: "muted small", text: "ID " + aid + " - " + A.meta.kind }), metaMsg);
+  if (A.meta.kind === "markdown") {
+    var templateForm = h("div", { hidden: true, class: "card" });
+    var saveTemplateBtn = h("button", { type: "button", class: "secondary", onclick: async function () {
+      saveTemplateBtn.disabled = true;
+      try {
+        // Capture the visible editor's saved revision; unsaved content is not silently copied.
+        var pinned = A.rev;
+        var preview = await api("GET", base + "/preview?rev=" + pinned);
+        var name = h("input", { type: "text", required: true, maxLength: 200, value: A.meta.title, "aria-label": "Template name" });
+        var desc = h("input", { type: "text", maxLength: 280, "aria-label": "New template description" });
+        var previewBox = h("div", { class: "template-preview prose", tabIndex: 0, "aria-label": "Source template preview" });
+        previewBox.innerHTML = preview.html;
+        var smsg = h("p", { class: "msg", role: "status" }), attempt = null, busy = false;
+        var submit = h("button", { type: "submit" }, "Save template");
+        templateForm.replaceChildren(h("form", { class: "template-form", onsubmit: async function (e) {
+          e.preventDefault(); if (busy) return;
+          var req = { source_artifact_id: aid, source_revision: pinned, title: name.value.trim(), description: desc.value };
+          var signature = JSON.stringify(req); if (!attempt || attempt.signature !== signature) attempt = { signature: signature, key: uuid() };
+          busy = true; submit.disabled = true;
+          try {
+            var r = await api("POST", "/api/projects/" + enc(pid) + "/templates", req, { key: attempt.key });
+            location.hash = "#/p/" + enc(pid) + "/a/" + enc(r.artifact_id) + "/edit";
+          } catch (err) { showErr(smsg, err); }
+          finally { busy = false; submit.disabled = false; }
+        } }, h("label", null, "Template name", name), h("label", null, "Description (optional)", desc),
+          h("p", { class: "muted small", text: "Project: " + (projectTitles[pid] || pid) + ". Copies saved revision v" + pinned + " shown below. Unsaved edits are excluded. {{title}}, {{project}} and {{date}} are replaced once when used; other braces stay literal." }),
+          previewBox, h("div", { class: "row" }, submit, h("button", { type: "button", class: "secondary", onclick: function () { templateForm.hidden = true; saveTemplateBtn.focus(); } }, "Cancel")), smsg));
+        templateForm.hidden = false; name.focus();
+      } catch (err) { showErr(metaMsg, err); }
+      finally { saveTemplateBtn.disabled = false; }
+    } }, "Save as template");
+    var detailActions = details.querySelector(".row");
+    detailActions.insertBefore(saveTemplateBtn, detailActions.lastElementChild);
+    details.append(templateForm);
+  }
   fillMeta();
 
   // shared panels
@@ -1991,7 +2092,10 @@ function renderMarkdownEditor(A, data, ui) {
   }
 
   var docMeta = h("p", { class: "doc-meta", text: (isHtml ? "Page" : "Doc") + " · " + (projectTitles[pid] || pid) + " · updated " + fmtDate(A.meta.updated_at) });
-  shell(projCrumbs(pid, [{ t: A.meta.title }]), h("div", { class: "titlebar" }, ui.titleEl, copyBar(A, function () { return ta.value; }, offlineToggle(A))), docMeta, banner, conflictBox, ui.tabNav);
+  var templateNote = A.meta.is_template ? h("p", { class: "template-note" }, h("span", { class: "badge", text: "Template" }), " Edits affect future copies only.") : null;
+  var sourceNote = h("p", { class: "muted small", hidden: !A.meta.source });
+  A.templateSourceNote = sourceNote;
+  shell(projCrumbs(pid, [{ t: A.meta.title }]), h("div", { class: "titlebar" }, ui.titleEl, copyBar(A, function () { return ta.value; }, offlineToggle(A))), docMeta, templateNote, sourceNote, banner, conflictBox, ui.tabNav);
   // Save status/button and Details sit below the document; the status stays announced (aria-live).
   ui.below.append(h("div", { class: "footbar" }, statusEl, h("span", { class: "spacer" }), saveBtn), ui.details);
   ui.fillMeta();

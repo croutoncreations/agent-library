@@ -6,7 +6,7 @@
 import {readFileSync,writeFileSync} from 'node:fs';
 import {createHash} from 'node:crypto';
 const sha=b=>createHash('sha256').update(b).digest('hex');
-const DESIGN='7f0efe692300652541d205e65bccd8257dec6b77aa4394b9f0822c294903be60';
+const DESIGN='a88fe632213e4e110c1bfe5644cc01d32aeaff7688a272159984de61264f7f75';
 const input=readFileSync('src/index.js','utf8');
 if(sha(input)!==DESIGN)throw Error('Input is not the design bundle 7f0efe69; run build-design-bundle.mjs --consent-style first');
 const once=(s,needle,what)=>{const i=s.indexOf(needle);if(i<0||s.indexOf(needle,i+1)>=0)throw Error('Expected exactly one '+what);return i;};

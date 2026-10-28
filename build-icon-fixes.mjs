@@ -11,7 +11,7 @@
 import {readFileSync,writeFileSync} from 'node:fs';
 import {createHash} from 'node:crypto';
 const sha=b=>createHash('sha256').update(b).digest('hex');
-const UI_FIXES='d4eb0b0af347a33f4fd34fd13da1b0336c1363de0cbbbff36c9bc53385bcc097';
+const UI_FIXES='16483c0748dc26b1d4691fd99893e745498482736c233bfd482a7cd38e0c9f59';
 const input=readFileSync('src/index.js','utf8');
 if(sha(input)!==UI_FIXES)throw Error('Input is not the UI-fixes bundle d4eb0b0a; run build-ui-fixes.mjs first');
 const once=(s,needle,what,from=0)=>{const i=s.indexOf(needle,from);if(i<0||s.indexOf(needle,i+1)>=0)throw Error('Expected exactly one '+what);return i;};
