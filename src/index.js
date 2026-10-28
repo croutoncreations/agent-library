@@ -276,9 +276,10 @@ async function authorizeProject(ctx, projectId, write) {
 }
 function protectSql(ctx, artifactId) {
   if (ctx.principal.kind !== "agent" || ctx.publisher || artifactId === void 0) return { sql: "1", params: [] };
-  return { sql: "NOT EXISTS (SELECT 1 FROM artifacts WHERE id = ? AND publisher_id IS NOT NULL)", params: [artifactId] };
+  return { sql: "NOT EXISTS (SELECT 1 FROM artifacts WHERE id = ? AND (publisher_id IS NOT NULL OR is_template = 1))", params: [artifactId] };
 }
 function contentWriteSql(ctx, artifactId) {
+  if (ctx.principal.kind === "agent" && artifactId !== void 0) return { sql: "NOT EXISTS (SELECT 1 FROM artifacts WHERE id = ? AND (is_template = 1 OR (publisher_id IS NOT NULL AND ? = 0)))", params: [artifactId, ctx.publisher ? 1 : 0] };
   if (ctx.publisher || artifactId === void 0) return { sql: "1", params: [] };
   return { sql: "NOT EXISTS (SELECT 1 FROM artifacts WHERE id = ? AND publisher_id IS NOT NULL)", params: [artifactId] };
 }
@@ -5791,10 +5792,164 @@ var init_formats = __esm({
 });
 
 // src/service.ts
+// Project-scoped Markdown starting content. Template identity and copy provenance are immutable;
+// description uses the existing metadata timeline. No separate content/version store.
+function tplDenyPublisher(ctx) {
+  if (ctx.publisher) throw new HttpError(404, "not_found", "Not found");
+}
+function tplAssertMaintenance(ctx, a) {
+  if (a.is_template && ctx.principal.kind !== "human") throw new HttpError(403, "template_owner_only", "Only the owner can maintain template definitions");
+}
+function tplLinks(ctx, pid, id) {
+  const origin = appOrigin(ctx.env.APP_HOST);
+  return origin ? { web_url: artifactWebUrl(origin, pid, id), preview_url: previewWebUrl(origin, pid, id) } : {};
+}
+function tplDate(v, required) {
+  if (v == null && !required) return null;
+  if (typeof v !== "string" || !/^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$/.test(v) || v.slice(0, 4) === "0000" || new Date(v + "T00:00:00Z").toISOString().slice(0, 10) !== v)
+    throw new HttpError(400, "invalid_date", "Supply a valid calendar date as YYYY-MM-DD");
+  return v;
+}
+function tplReplace(body, title, project, date) {
+  const values = { title, project, date };
+  return body.replace(/\{\{(title|project|date)\}\}/g, (_, k) => values[k]);
+}
+async function listTemplates(ctx, projectId, q = {}) {
+  tplDenyPublisher(ctx);
+  await authorizeProject(ctx, projectId, false);
+  const limit = q.limit == null ? 50 : int(Number(q.limit), "limit", 1, 50);
+  const cursor = q.cursor == null ? "" : str(q.cursor, "cursor", 64);
+  const az = rtReadAuthzSql(ctx, projectId);
+  const r = await db(ctx).prepare(`SELECT a.id, a.title, a.template_description, a.head_rev, r.sha256
+    FROM artifacts a JOIN revisions r ON r.id = a.head_revision_id
+    WHERE a.project_id = ? AND a.is_template = 1 AND a.kind = 'markdown' AND a.trashed_at IS NULL
+      AND a.publisher_id IS NULL AND a.id > ? AND ${az.sql} ORDER BY a.id LIMIT ?`)
+    .bind(projectId, cursor, ...az.params, limit + 1).all();
+  const rows = r.results.slice(0, limit);
+  return { templates: rows.map(a => ({ id: a.id, template_id: a.id, name: a.title, description: a.template_description,
+    kind: "markdown", revision: a.head_rev, sha256: a.sha256, ...tplLinks(ctx, projectId, a.id) })),
+    next_cursor: r.results.length > limit ? rows[rows.length - 1].id : null };
+}
+async function tplSource(ctx, pid, id, revision, definition) {
+  const az = rtReadAuthzSql(ctx, pid);
+  // Read access, availability, project and pinned content are checked in the same statement.
+  const r = await db(ctx).prepare(`SELECT r.body FROM revisions r JOIN artifacts a ON a.id = r.artifact_id AND a.project_id = r.project_id
+    WHERE a.id = ? AND a.project_id = ? AND r.rev_no = ? AND a.kind = 'markdown' AND a.publisher_id IS NULL
+    AND a.trashed_at IS NULL ${definition ? "AND a.is_template = 1" : ""} AND ${az.sql}`)
+    .bind(id, pid, revision, ...az.params).first();
+  if (!r) throw new HttpError(404, "not_found", "Source is not available");
+  return { body: r.body };
+}
+async function tplCopy(ctx, projectId, input, key, definition = false) {
+  tplDenyPublisher(ctx);
+  if (definition) requireHuman(ctx);
+  await authorizeProject(ctx, projectId, true);
+  const sourceId = str(definition ? input.source_artifact_id : input.template_id, "source_id", 64, { min: 1 });
+  const revision = int(definition ? input.source_revision : input.template_revision, "source_revision", 1);
+  const title = str(input.title, "title", 200, { min: 1 });
+  const description = definition ? str(input.description ?? "", "description", 280) : "";
+  const date = definition ? null : tplDate(input.date, false);
+  const folder = str(input.folder, "folder", 200, { optional: true });
+  const folderId = input.folder_id ?? null;
+  const note = provenance(ctx, input)[4];
+  const i = { projectId, op: definition ? "template.create" : "template.use", key,
+    digest: await sha256Hex(JSON.stringify([sourceId, revision, title, description, date, folder, folderId, note])) };
+  // Replay before reading mutable project title or template availability; authorization still precedes replay.
+  const prior = await idemLookup(ctx, i);
+  if (prior) return prior;
+  const src = await tplSource(ctx, projectId, sourceId, revision, !definition);
+  await folderCheck(ctx, projectId, folderId);
+  const project = await db(ctx).prepare("SELECT title FROM projects WHERE id = ?").bind(projectId).first();
+  if (!definition) tplDate(date, src.body.includes("{{date}}"));
+  const body = mdBody(definition ? src.body : tplReplace(src.body, title, project.title, date));
+  const id = randomId("art"), rid = randomId("rev"), now = nowIso(), hash = await sha256Hex(body);
+  const az = authzSql(ctx, projectId);
+  // All writes share this fence inside a single serialized D1 transaction. The idempotency insert is first,
+  // so competing identical requests roll back rather than leaving a second copy/revision/audit behind.
+  const gate = `${az.sql} AND EXISTS (SELECT 1 FROM artifacts WHERE id = ? AND project_id = ? AND kind = 'markdown'
+    AND trashed_at IS NULL AND publisher_id IS NULL ${definition ? "" : "AND is_template = 1"})
+    AND (? IS NULL OR EXISTS (SELECT 1 FROM folders WHERE id = ? AND project_id = ?))
+    AND (SELECT COUNT(*) FROM artifacts WHERE project_id = ? AND publisher_id IS NULL) < ?`;
+  const gp = [...az.params, sourceId, projectId, folderId, folderId, projectId, projectId, LIMITS.artifactsPerProject];
+  const result = { status: 201, body: { artifact_id: id, kind: "markdown", revision: 1, revision_id: rid, sha256: hash,
+    ...tplLinks(ctx, projectId, id), source_artifact_id: sourceId, source_revision: revision,
+    ...definition ? { is_template: true } : { source_template_id: sourceId, source_template_revision: revision, date } } };
+  const ownGate = "EXISTS (SELECT 1 FROM idempotency WHERE principal_id = ? AND project_id = ? AND op = ? AND key = ? AND response = ?)";
+  const ownParams = [ctx.principal.id, projectId, i.op, key, JSON.stringify(result.body)];
+  const created = "EXISTS (SELECT 1 FROM artifacts WHERE id = ?)";
+  const out = await runBatch(ctx, [
+    idemInsert(ctx, i, 201, result.body, gate, gp),
+    db(ctx).prepare(`INSERT INTO artifacts (id, project_id, kind, title, folder, folder_id, head_rev, head_revision_id, created_at, updated_at,
+      is_template, template_description, source_artifact_id, source_revision, source_role, template_date)
+      SELECT ?, ?, 'markdown', ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${ownGate}`)
+      .bind(id, projectId, title, folder, folderId, rid, now, now, definition ? 1 : 0, description, sourceId, revision, definition ? "document" : "template", date, ...ownParams),
+    db(ctx).prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, size, sha256, mime, created_at, via_kind, via_id, via_label, client_info, change_note)
+      SELECT ?, ?, ?, 1, ?, ?, ?, ?, 'text/markdown', ?, ?, ?, ?, ?, ? WHERE ${created}`)
+      .bind(rid, id, projectId, ctx.principal.id, body, new TextEncoder().encode(body).length, hash, now, ...provenance(ctx, { change_note: note }), id),
+    audit(ctx, projectId, definition ? "template.create" : "template.use", id, 1, "ok", created, [id])
+  ], i);
+  if (!Array.isArray(out)) return out;
+  if (!out[1].meta.changes) {
+    const replay = await idemLookup(ctx, i); if (replay) return replay;
+    await tplSource(ctx, projectId, sourceId, revision, !definition);
+    await folderCheck(ctx, projectId, folderId);
+    const n = await db(ctx).prepare("SELECT COUNT(*) AS n FROM artifacts WHERE project_id = ? AND publisher_id IS NULL").bind(projectId).first("n");
+    if (n >= LIMITS.artifactsPerProject) throw new HttpError(413, "quota_exceeded", "Artifact limit reached");
+    throw new HttpError(403, "forbidden", "Grant no longer valid");
+  }
+  return result;
+}
+async function createFromTemplate(ctx, pid, input, key) { return tplCopy(ctx, pid, input, key, false); }
+async function saveAsTemplate(ctx, pid, input, key) { return tplCopy(ctx, pid, input, key, true); }
+async function previewTemplate(ctx, pid, input) {
+  tplDenyPublisher(ctx);
+  await authorizeProject(ctx, pid, false);
+  const revision = int(input.template_revision, "template_revision", 1);
+  const src = await tplSource(ctx, pid, str(input.template_id, "template_id", 64), revision, true);
+  const date = tplDate(input.date, src.body.includes("{{date}}"));
+  const project = await db(ctx).prepare("SELECT title FROM projects WHERE id = ?").bind(pid).first();
+  const title = str(input.title ?? "", "title", 200);
+  const text = mdBody(tplReplace(src.body, title, project.title, date));
+  // Bound the rendered preview and let the ordinary revision reader handle full content.
+  const bounded = text.slice(0, 24000);
+  return { revision, placeholders: [...new Set(src.body.match(/\{\{(?:title|project|date)\}\}/g) ?? [])],
+    html: renderMarkdown(bounded, () => null), truncated: text.length > bounded.length };
+}
+async function tplProvenance(ctx, pid, a) {
+  if (!a.source_artifact_id || ctx.publisher) return {};
+  const az = rtReadAuthzSql(ctx, pid);
+  const source = await db(ctx).prepare(`SELECT title FROM artifacts WHERE id = ? AND project_id = ? AND trashed_at IS NULL AND publisher_id IS NULL AND ${az.sql}`)
+    .bind(a.source_artifact_id, pid, ...az.params).first();
+  return source ? { source: { artifact_id: a.source_artifact_id, revision: a.source_revision, role: a.source_role,
+    title: source.title, ...tplLinks(ctx, pid, a.source_artifact_id) } } : {};
+}
+
+function tplTools(oauth = false) {
+  const project = { type: "string", maxLength: 64, description: "Project ID from list_projects" };
+  const text = { type: "string", maxLength: 64 };
+  const schema = (properties, required) => ({ type: "object", properties: { project_id: project, ...properties }, required: oauth ? required : ["project_id", ...required], additionalProperties: false });
+  const ro = { readOnlyHint: true, destructiveHint: false, openWorldHint: false };
+  const rw = { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false };
+  return [
+    { name: "list_templates", title: "List document templates", write: false, annotations: ro,
+      description: "List available Markdown templates in this project, without bodies, with revision/hash and authenticated owner UI links (not sharing links). Read the returned template ID with read_artifact at its explicit revision before use; max_bytes/cursor supports long content. Definitions are maintained by the owner only.",
+      inputSchema: schema({ cursor: text, limit: { type: "integer", minimum: 1, maximum: 50 } }, []),
+      run: oauth ? (c, p, a) => listTemplates(c, p, a) : (c, a) => listTemplates(c, a.project_id, a) },
+    { name: "create_from_template", title: "Create document from template", write: true, annotations: rw,
+      description: "Create one independent Markdown document from a pinned template revision in this project. Returns ID, revision/hash, authenticated document/preview URLs (not sharing links) and source template ID/revision. Read the template first. Supply date as YYYY-MM-DD from the user's date/timezone context when {{date}} occurs. Only {{title}}, {{project}}, {{date}} are replaced, once; other braces stay literal. Then fill the copy with ordinary save_markdown. Always set change_note to one line on why. Reuse the same inputs and idempotency_key on retry.",
+      inputSchema: schema({ template_id: text, template_revision: { type: "integer", minimum: 1 }, title: { type: "string", minLength: 1, maxLength: 200 },
+        date: { type: "string", pattern: "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" }, folder: { type: "string", maxLength: 200 }, folder_id: text,
+        change_note: { type: "string", maxLength: 280 }, idempotency_key: { type: "string", minLength: 8, maxLength: 128 } }, ["template_id", "template_revision", "title", "idempotency_key"]),
+      run: oauth ? async (c, p, a) => (await createFromTemplate(c, p, a, idemKey(a.idempotency_key))).body
+        : async (c, a) => (await createFromTemplate(c, a.project_id, a, idemKey(a.idempotency_key))).body }
+  ];
+}
+
 function requireAppConnect(ctx) {
   if (!appConnectEnabled(ctx.env)) throw new HttpError(404, "not_found", "Not found");
 }
 function assertWritable(ctx, a, what) {
+  tplAssertMaintenance(ctx, a);
   if (!a?.publisher_id || ctx.publisher) return;
   if (what === "content" || ctx.principal.kind === "agent")
     throw new HttpError(403, "protected_source", "This file is a source export owned by a connected app and cannot be modified here");
@@ -6585,7 +6740,7 @@ async function getArtifact(ctx, projectId, artifactId, revNo) {
   const rev = await db(ctx).prepare("SELECT * FROM revisions WHERE artifact_id = ? AND project_id = ? AND rev_no = ?").bind(artifactId, projectId, revNo ?? a.head_rev).first();
   if (!rev) throw new HttpError(404, "not_found", "Revision not found");
   return {
-    artifact: artifactView(a, appConnectEnabled(ctx.env)),
+    artifact: { ...artifactView(a, appConnectEnabled(ctx.env)), ...await tplProvenance(ctx, projectId, a) },
     revision: { rev: rev.rev_no, id: rev.id, size: rev.size, sha256: rev.sha256, mime: rev.mime, created_at: rev.created_at, author_id: rev.author_id },
     ...a.kind === "markdown" || a.kind === "html" ? { body: rev.body } : a.kind === "json" || a.kind === "csv" ? { content: rev.body, content_url: `/api/projects/${projectId}/artifacts/${artifactId}/content?rev=${rev.rev_no}` } : { content_url: `/api/projects/${projectId}/artifacts/${artifactId}/content?rev=${rev.rev_no}` }
   };
@@ -6793,6 +6948,8 @@ async function updateMetadata(ctx, projectId, artifactId, input, key, internal) 
   assertWritable(ctx, a, "meta");
   const title = input.title !== void 0 ? str(input.title, "title", 200, { min: 1 }) : a.title;
   const folder = input.folder !== void 0 ? str(input.folder, "folder", 200) : a.folder;
+  if (input.template_description !== undefined && !a.is_template) throw new HttpError(400, "invalid_input", "Not a template");
+  const description = input.template_description !== undefined ? str(input.template_description, "template_description", 280) : a.template_description;
   let tags = a.tags;
   if (input.tags !== void 0) {
     if (!Array.isArray(input.tags) || input.tags.length > 20) throw new HttpError(400, "invalid_input", "tags must be an array (max 20)");
@@ -6806,12 +6963,12 @@ async function updateMetadata(ctx, projectId, artifactId, input, key, internal) 
   const next = expected + 1;
   const gate = "EXISTS (SELECT 1 FROM artifacts WHERE id = ? AND meta_version = ? AND meta_request_id = ?)";
   const gp = [artifactId, next, ctx.requestId];
-  const body2 = { artifact_id: artifactId, meta_version: next, title, folder, tags: JSON.parse(tags), trashed: !!trashed };
+  const body2 = { artifact_id: artifactId, meta_version: next, title, folder, tags: JSON.parse(tags), trashed: !!trashed, ...a.is_template ? { template_description: description } : {} };
   const out2 = await runBatch(ctx, [
-    db(ctx).prepare(`UPDATE artifacts SET title = ?, folder = ?, tags = ?, trashed_at = ?, meta_version = ?, meta_request_id = ?, updated_at = ?
-      WHERE id = ? AND project_id = ? AND meta_version = ? AND ${az.sql}`).bind(title, folder, tags, trashed, next, ctx.requestId, nowIso(), artifactId, projectId, expected, ...az.params),
+    db(ctx).prepare(`UPDATE artifacts SET title = ?, folder = ?, tags = ?, trashed_at = ?, template_description = ?, meta_version = ?, meta_request_id = ?, updated_at = ?
+      WHERE id = ? AND project_id = ? AND meta_version = ? AND ${az.sql}`).bind(title, folder, tags, trashed, description, next, ctx.requestId, nowIso(), artifactId, projectId, expected, ...az.params),
     metaBaselineInsert(ctx, a, gate, gp),
-    metaVersionInsert(ctx, a, next, { title, folder, tags, trashed: !!trashed, restoredFrom }, input, gate, gp),
+    metaVersionInsert(ctx, a, next, { title, folder, tags, trashed: !!trashed, description, restoredFrom }, input, gate, gp),
     idemInsert(ctx, i, 200, body2, gate, gp),
     audit(
       ctx,
@@ -7119,17 +7276,17 @@ async function diffRevisions(ctx, projectId, artifactId, fromQ, toQ) {
 // document, i.e. revision 1's author). INSERT OR IGNORE keeps it to exactly one row even under concurrent retries.
 function metaBaselineInsert(ctx, a, gate, gp) {
   return db(ctx).prepare(
-    `INSERT OR IGNORE INTO meta_versions (id, artifact_id, project_id, version, title, folder, tags, trashed, author_id, via_kind, via_id, via_label, client_info, change_note, restored_from, created_at)
-     SELECT ?, ?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT author_id FROM revisions WHERE artifact_id = ? AND project_id = ? AND rev_no = 1), ?), NULL, NULL, NULL, NULL, 'baseline', NULL, ?
+    `INSERT OR IGNORE INTO meta_versions (id, artifact_id, project_id, version, title, folder, tags, trashed, template_description, author_id, via_kind, via_id, via_label, client_info, change_note, restored_from, created_at)
+     SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT author_id FROM revisions WHERE artifact_id = ? AND project_id = ? AND rev_no = 1), ?), NULL, NULL, NULL, NULL, 'baseline', NULL, ?
      WHERE ${gate} AND NOT EXISTS (SELECT 1 FROM meta_versions WHERE artifact_id = ? AND project_id = ?)`
-  ).bind(randomId("mvb"), a.id, a.project_id, a.meta_version, a.title, a.folder, a.tags, a.trashed_at ? 1 : 0, a.id, a.project_id, ctx.principal.id, a.updated_at ?? nowIso(), ...gp, a.id, a.project_id);
+  ).bind(randomId("mvb"), a.id, a.project_id, a.meta_version, a.title, a.folder, a.tags, a.trashed_at ? 1 : 0, a.template_description, a.id, a.project_id, ctx.principal.id, a.updated_at ?? nowIso(), ...gp, a.id, a.project_id);
 }
 function metaVersionInsert(ctx, a, version, v, input, gate, gp) {
   const note = input?.change_note ?? (v.restoredFrom ? "Restored details from version " + v.restoredFrom : null);
   return db(ctx).prepare(
-    `INSERT INTO meta_versions (id, artifact_id, project_id, version, title, folder, tags, trashed, author_id, via_kind, via_id, via_label, client_info, change_note, restored_from, created_at)
-     SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${gate}`
-  ).bind(randomId("mv"), a.id, a.project_id, version, v.title, v.folder, v.tags, v.trashed ? 1 : 0, ctx.principal.id, ...provenance(ctx, { change_note: note }), v.restoredFrom, nowIso(), ...gp);
+    `INSERT INTO meta_versions (id, artifact_id, project_id, version, title, folder, tags, trashed, template_description, author_id, via_kind, via_id, via_label, client_info, change_note, restored_from, created_at)
+     SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${gate}`
+  ).bind(randomId("mv"), a.id, a.project_id, version, v.title, v.folder, v.tags, v.trashed ? 1 : 0, v.description, ctx.principal.id, ...provenance(ctx, { change_note: note }), v.restoredFrom, nowIso(), ...gp);
 }
 async function metaHistory(ctx, projectId, artifactId, authorized = false, cursor) {
   if (!authorized) {
@@ -7137,7 +7294,7 @@ async function metaHistory(ctx, projectId, artifactId, authorized = false, curso
     await loadArtifact(ctx, projectId, artifactId, { allowTrashed: ctx.principal.kind === "human" });
   }
   const before = cursor === void 0 || cursor === null || cursor === "" ? null : int(Number(cursor), "cursor", 1);
-  const cols = `SELECT m.version, m.title, m.folder, m.tags, m.trashed, m.author_id, m.via_kind, m.via_id, m.via_label, m.client_info, m.change_note, m.restored_from, m.created_at,
+  const cols = `SELECT m.version, m.title, m.folder, m.tags, m.trashed, m.template_description, m.author_id, m.via_kind, m.via_id, m.via_label, m.client_info, m.change_note, m.restored_from, m.created_at,
        p.label AS author_label
      FROM meta_versions m LEFT JOIN principals p ON p.id = m.author_id
      WHERE m.artifact_id = ? AND m.project_id = ?`;
@@ -7148,7 +7305,7 @@ async function metaHistory(ctx, projectId, artifactId, authorized = false, curso
   const next_cursor = r.results.length > HISTORY_PAGE ? String(rows[rows.length - 1].version) : null;
   const me = ctx.principal.kind === "human" ? ctx.principal.id : null;
   return { next_cursor, meta_versions: rows.map((m) => ({
-    version: m.version, title: m.title, folder: m.folder, tags: JSON.parse(m.tags), trashed: !!m.trashed, created_at: m.created_at,
+    version: m.version, title: m.title, template_description: m.template_description, folder: m.folder, tags: JSON.parse(m.tags), trashed: !!m.trashed, created_at: m.created_at,
     baseline: m.change_note === "baseline" && !m.via_kind,
     who: m.change_note === "baseline" && !m.via_kind ? "Before history was recorded" : whoLabel(m, me),
     via: m.via_kind ? { kind: m.via_kind, id: m.via_id, label: m.via_label } : null,
@@ -7161,7 +7318,7 @@ async function restoreMetadata(ctx, projectId, artifactId, input, key) {
   await authorizeProject(ctx, projectId, true);
   const expected = int(input.expected_meta_version, "expected_meta_version", 1);
   const from = int(input.from_version, "from_version", 1);
-  const row = await db(ctx).prepare("SELECT title, folder, tags, trashed FROM meta_versions WHERE artifact_id = ? AND project_id = ? AND version = ?").bind(artifactId, projectId, from).first();
+  const row = await db(ctx).prepare("SELECT title, folder, tags, trashed, template_description FROM meta_versions WHERE artifact_id = ? AND project_id = ? AND version = ?").bind(artifactId, projectId, from).first();
   if (!row) {
     // A trashed document doesn't exist for agents: answer as for any other missing document, so an agent can't
     // probe which details versions it has.
@@ -7174,6 +7331,7 @@ async function restoreMetadata(ctx, projectId, artifactId, input, key) {
   return updateMetadata(ctx, projectId, artifactId, {
     expected_meta_version: expected, title: row.title, folder: row.folder, tags: JSON.parse(row.tags),
     ...keepTrash ? {} : { trashed: !!row.trashed },
+    ...(await loadArtifact(ctx, projectId, artifactId, { allowTrashed: true })).is_template ? { template_description: row.template_description } : {},
     change_note: input.change_note
   }, key, { restoredFrom: from });
 }
@@ -7237,6 +7395,7 @@ var init_service = __esm({
       project_id: a.project_id,
       kind: a.kind,
       title: a.title,
+      ...a.is_template ? { is_template: true, template_description: a.template_description } : {},
       folder: a.folder,
       tags: JSON.parse(a.tags),
       revision: a.head_rev,
@@ -7525,6 +7684,7 @@ var init_mcp = __esm({
     RT_MAXB = { type: "integer", minimum: 4096, maximum: 524288, description: "Upper bound in bytes for this whole tool result as encoded (default 65536)" };
     RW = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false };
     TOOLS = [
+      ...tplTools(true),
       { name: "list_changes", title: "List project changes", description: "Poll published changes in one explicit project. WITHOUT cursor establishes a current checkpoint and returns NO history (initialized=true). Store next_cursor; follow has_more, then poll again. At-least-once: deduplicate by event_id. Cursors expire after 30 days; checkpoint BEFORE reconciling current content. Publishers excluded. No bodies or push notifications.", inputSchema: S({ project_id: { type: "string", maxLength: 64 }, cursor: { type: "string", maxLength: 2048 }, limit: { type: "integer", minimum: 1, maximum: 50 } }, ["project_id"]), annotations: RO, write: false, run: (c,p,a) => listChanges(c,p,a) },
       { name: "search_artifacts", title: "Search library", description: "Ranked lexical search across currently readable projects. All words must match stored title/text; punctuation separates words. Returns bounded plain-text excerpts and revision-pinned links. Live pagination expires after 15 minutes.", inputSchema: RS_SCHEMA, annotations: RO, write: false, run: (c, p, a) => searchArtifacts(c,a,"mcp") },
       {
@@ -10036,10 +10196,10 @@ async function exportBackup(ctx, projectId) {
   const pubFiles = await DB.prepare("SELECT COUNT(*) AS n FROM artifacts WHERE project_id = ? AND publisher_id IS NOT NULL").bind(projectId).first("n").catch(() => 0);
   if (pubFiles) throw new HttpError(409, "backup_unsupported", "This project contains app exports; backup of App Connect projects is not supported yet");
   const [arts, revs, comments] = await DB.batch([
-    DB.prepare("SELECT id, kind, title, folder, tags, head_rev, head_revision_id, meta_version, trashed_at, created_at, updated_at FROM artifacts WHERE project_id = ? AND head_rev > 0").bind(projectId),
+    DB.prepare("SELECT id, kind, title, folder, tags, head_rev, head_revision_id, meta_version, trashed_at, created_at, updated_at, is_template, template_description, source_artifact_id, source_revision, source_role, template_date FROM artifacts WHERE project_id = ? AND head_rev > 0").bind(projectId),
     DB.prepare("SELECT id, artifact_id, rev_no, author_id, body, blob_key, size, sha256, mime, restored_from, created_at, via_kind, via_id, via_label, client_info, change_note FROM revisions WHERE project_id = ?").bind(projectId),
     DB.prepare("SELECT id, artifact_id, rev_no, author_id, body, created_at FROM comments WHERE project_id = ?").bind(projectId),
-    DB.prepare("SELECT id, artifact_id, version, title, folder, tags, trashed, author_id, via_kind, via_id, via_label, client_info, change_note, restored_from, created_at FROM meta_versions WHERE project_id = ?").bind(projectId)
+    DB.prepare("SELECT id, artifact_id, version, title, folder, tags, trashed, author_id, via_kind, via_id, via_label, client_info, change_note, restored_from, created_at, template_description FROM meta_versions WHERE project_id = ?").bind(projectId)
   ]).then(([a, r, c, mv]) => (metaVersionsExport = mv.results, [a, r, c]));
   const blobs = {};
   for (const r of revs.results) {
@@ -10053,7 +10213,8 @@ async function exportBackup(ctx, projectId) {
   }
   await DB.prepare("INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id) VALUES (?, ?, ?, 'backup.export', ?, 'ok', ?)").bind(nowIso(), ctx.principal.id, projectId, projectId, ctx.requestId).run();
   return {
-    schema: SCHEMA,
+    schema: arts.results.some(a => a.is_template || a.source_artifact_id) ? "agent-library-backup/2" : SCHEMA,
+    features: ["document_templates/1"],
     exported_at: nowIso(),
     project: { id: p.id, title: p.title, created_at: p.created_at },
     artifacts: arts.results,
@@ -10067,11 +10228,23 @@ __name(exportBackup, "exportBackup");
 async function restoreBackup(ctx, backup) {
   requireHuman(ctx);
   const DB = ctx.env.DB;
-  if (backup?.schema !== SCHEMA) throw new HttpError(400, "bad_backup", "Unsupported backup schema");
+  if (backup?.schema !== SCHEMA && backup?.schema !== "agent-library-backup/2") throw new HttpError(400, "bad_backup", "Unsupported backup schema");
   const existing = await DB.prepare("SELECT COUNT(*) AS n FROM projects").first("n");
   if (existing) throw new HttpError(409, "store_not_empty", "Restore targets an empty isolated store only");
   const pid = String(backup.project?.id ?? "");
   if (!/^[A-Za-z0-9_-]{3,64}$/.test(pid)) throw new HttpError(400, "bad_backup", "Bad project id");
+  for (const a of backup.artifacts ?? []) {
+    if (a.is_template != null && a.is_template !== 0 && a.is_template !== 1) throw new HttpError(400, "bad_backup", "Invalid template identity");
+    if (a.is_template && (a.kind !== "markdown" || a.publisher_id)) throw new HttpError(400, "bad_backup", "Invalid template kind");
+    str(a.template_description ?? "", "template_description", 280);
+    if (a.source_artifact_id != null) {
+      str(a.source_artifact_id, "source_artifact_id", 64, { min: 1 });
+      int(a.source_revision, "source_revision", 1);
+      if (!["document", "template"].includes(a.source_role)) throw new HttpError(400, "bad_backup", "Invalid source role");
+    }
+    if (a.template_date != null) tplDate(a.template_date, true);
+  }
+  for (const v of Array.isArray(backup.meta_versions) ? backup.meta_versions : []) str(v.template_description ?? "", "template_description", 280);
   const blobs = backup.blobs ?? {};
   const decoded = /* @__PURE__ */ new Map();
   for (const r of backup.revisions) {
@@ -10094,14 +10267,14 @@ async function restoreBackup(ctx, backup) {
     stmts.push(DB.prepare("INSERT OR IGNORE INTO principals (id, kind, issuer, subject, label, created_at) VALUES (?, 'agent', 'restored', ?, ?, ?)").bind(a, a, "restored " + a, nowIso()));
   stmts.push(DB.prepare("INSERT INTO projects (id, owner_id, title, created_at) VALUES (?, ?, ?, ?)").bind(pid, ctx.principal.id, backup.project.title, backup.project.created_at));
   for (const a of backup.artifacts)
-    stmts.push(DB.prepare(`INSERT INTO artifacts (id, project_id, kind, title, folder, tags, head_rev, head_revision_id, meta_version, trashed_at, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(a.id, pid, a.kind, a.title, a.folder, a.tags, a.head_rev, a.head_revision_id, a.meta_version, a.trashed_at, a.created_at, a.updated_at));
+    stmts.push(DB.prepare(`INSERT INTO artifacts (id, project_id, kind, title, folder, tags, head_rev, head_revision_id, meta_version, trashed_at, created_at, updated_at, is_template, template_description, source_artifact_id, source_revision, source_role, template_date)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(a.id, pid, a.kind, a.title, a.folder, a.tags, a.head_rev, a.head_revision_id, a.meta_version, a.trashed_at, a.created_at, a.updated_at, a.is_template ?? 0, a.template_description ?? "", a.source_artifact_id ?? null, a.source_revision ?? null, a.source_role ?? null, a.template_date ?? null));
   for (const r of backup.revisions)
     stmts.push(DB.prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, blob_key, size, sha256, mime, restored_from, created_at, via_kind, via_id, via_label, client_info, change_note)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(r.id, r.artifact_id, pid, r.rev_no, r.author_id, r.body, r.blob_key, r.size, r.sha256, r.mime, r.restored_from, r.created_at, r.via_kind ?? null, r.via_id ?? null, r.via_label ?? null, r.client_info ?? null, r.change_note ?? null));
   for (const v of backup.meta_versions ?? [])
-    stmts.push(DB.prepare(`INSERT INTO meta_versions (id, artifact_id, project_id, version, title, folder, tags, trashed, author_id, via_kind, via_id, via_label, client_info, change_note, restored_from, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(v.id, v.artifact_id, pid, v.version, v.title, v.folder, v.tags, v.trashed ? 1 : 0, v.author_id, v.via_kind ?? null, v.via_id ?? null, v.via_label ?? null, v.client_info ?? null, v.change_note ?? null, v.restored_from ?? null, v.created_at));
+    stmts.push(DB.prepare(`INSERT INTO meta_versions (id, artifact_id, project_id, version, title, folder, tags, trashed, author_id, via_kind, via_id, via_label, client_info, change_note, restored_from, created_at, template_description)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(v.id, v.artifact_id, pid, v.version, v.title, v.folder, v.tags, v.trashed ? 1 : 0, v.author_id, v.via_kind ?? null, v.via_id ?? null, v.via_label ?? null, v.client_info ?? null, v.change_note ?? null, v.restored_from ?? null, v.created_at, v.template_description ?? ""));
   for (const c of backup.comments)
     stmts.push(DB.prepare("INSERT INTO comments (id, project_id, artifact_id, rev_no, author_id, body, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(c.id, pid, c.artifact_id, c.rev_no, c.author_id, c.body, c.created_at));
   stmts.push(DB.prepare("INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id) VALUES (?, ?, ?, 'backup.restore', ?, 'ok', ?)").bind(nowIso(), ctx.principal.id, pid, pid, ctx.requestId));
@@ -10676,6 +10849,7 @@ var A2 = { type: "string", description: "Artifact ID" };
 var K2 = { type: "string", description: "Idempotency key (8-128 chars); reuse it when retrying the same request" };
 var unwrap2 = /* @__PURE__ */ __name((r) => r && typeof r.status === "number" && "body" in r ? r.body : r, "unwrap");
 var TOOLS2 = [
+  ...tplTools(false),
   { name: "list_changes", description: "Poll published changes in one explicit project. WITHOUT cursor establishes a current checkpoint and returns NO history (initialized=true). Store next_cursor; follow has_more, then poll again. At-least-once: deduplicate by event_id. Cursors expire after 30 days; checkpoint BEFORE reconciling current content. Publishers excluded. No bodies or push notifications.", inputSchema: S2({ project_id: { type: "string", maxLength: 64 }, cursor: { type: "string", maxLength: 2048 }, limit: { type: "integer", minimum: 1, maximum: 50 } }, ["project_id"]), run: (c,a) => listChanges(c,a.project_id,a) },
   { name: "search_artifacts", description: "Ranked lexical search of currently readable projects, with excerpts and revision-pinned links. All words must match. Live pagination.", inputSchema: RS_SCHEMA, annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }, run: (c,a) => searchArtifacts(c,a,"mcp") },
   { name: "list_projects", description: "List projects this identity may access.", inputSchema: S2({}, []), run: /* @__PURE__ */ __name((c) => listProjects(c), "run") },
@@ -10824,7 +10998,7 @@ async function handleMcp(req, env, requestId, origin) {
     case "ping":
       return reply(rpc2(msg.id, {}));
     case "tools/list":
-      return reply(rpc2(msg.id, { tools: TOOLS2.filter(t => t.name !== "search_artifacts" || searchReady).map(({ name, description, inputSchema, annotations }) => ({
+      return reply(rpc2(msg.id, { tools: TOOLS2.filter(t => (t.name !== "search_artifacts" || searchReady) && (!t.write || !!ctx.grant?.can_write)).map(({ name, description, inputSchema, annotations }) => ({
         annotations,
         name,
         description: WEB_URL_OUTPUT_SCHEMAS[name] ? description + WEB_URL_TOOL_NOTE : description,
@@ -11800,6 +11974,14 @@ main > .tabs,main > nav.tabs{margin:16px 0 12px}
 @media (max-width:400px){.j-kids{margin-left:8px}.j-line{padding-left:18px}}
 @media (max-width:400px) and (pointer:coarse){.j-line{padding-left:28px}}
 @media (max-width:760px){.data-table{font-size:13.5px}.data-table th,.data-table td{padding:6px 10px;max-width:18em}.json-tree{padding:10px;font-size:13px}}
+
+/* Template picker and copy form share the normal document/editor layout. */
+.template-form{display:grid;gap:12px;min-width:0}
+.template-form label{display:grid;gap:5px;min-width:0}
+.template-form select,.template-form input{width:100%;min-width:0;max-width:100%}
+.template-preview{max-height:320px;overflow:auto;overflow-wrap:anywhere;border:1px solid var(--line);border-radius:8px;padding:16px}
+.template-note{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+@media(max-width:600px){.template-form .row>label{flex:1 1 100%}.template-preview{max-height:240px;padding:12px}}
 `;
 var APP_JS = String.raw`(function () {
 "use strict";
@@ -12646,10 +12828,10 @@ async function viewList(pid, trash) {
   var cursor = null, seq = 0, qTimer = null;
 
   function row(a) {
-    var info = h("span", { class: "meta", text: kindLabel(a) + " · Updated " + fmtDate(a.updated_at) + " · rev " + a.revision + (a.folder ? " · " + a.folder : "") + (a.tags && a.tags.length ? " · #" + a.tags.join(" #") : "") });
+    var info = h("span", { class: "meta", text: (a.is_template ? "Template" : kindLabel(a)) + " · Updated " + fmtDate(a.updated_at) + " · rev " + a.revision + (a.folder ? " · " + a.folder : "") + (a.tags && a.tags.length ? " · #" + a.tags.join(" #") : "") });
     var href = "#/p/" + enc(pid) + "/a/" + enc(a.id);
     var main = h("div", { class: "grow" }, trash ? h("span", { text: a.title }) : rowLink(href, a.title), info);
-    var li = h("li", trash ? null : { class: "link" }, h("span", { class: "ficon-sm", "aria-hidden": "true" }, icon(kindIcon(a))), main, h("span", { class: "badge", text: kindLabel(a) }));
+    var li = h("li", trash ? null : { class: "link" }, h("span", { class: "ficon-sm", "aria-hidden": "true" }, icon(kindIcon(a))), main, h("span", { class: "badge", text: a.is_template ? "Template" : kindLabel(a) }));
     if (trash) li.append(h("button", { type: "button", class: "secondary", onclick: async function (e) {
       e.target.disabled = true;
       try { await api("PATCH", "/api/projects/" + enc(pid) + "/artifacts/" + enc(a.id), { expected_meta_version: a.meta_version, trashed: false }, { key: uuid() }); li.remove(); showMsg(msg, "Restored \"" + a.title + "\".", true); }
@@ -12698,19 +12880,77 @@ async function viewList(pid, trash) {
     var dtitle = h("input", { type: "text", placeholder: "Document title", required: true, maxLength: 200, "aria-label": "New document title" });
     var dkind = h("select", { "aria-label": "Document type" }, h("option", { value: "markdown", text: "Markdown" }), h("option", { value: "html", text: "HTML page" }));
     var cmsg = h("p", { class: "msg", role: "status" });
+    var start = h("select", { "aria-label": "Start from" }, h("option", { value: "", text: "Blank document" }));
+    var startLabel = h("label", { hidden: true }, "Start from", start);
+    var localNow = new Date();
+    var date = h("input", { type: "date", "aria-label": "Template date", value: localNow.getFullYear() + "-" + String(localNow.getMonth() + 1).padStart(2, "0") + "-" + String(localNow.getDate()).padStart(2, "0") });
+    var dateLabel = h("label", { hidden: true }, "Date", date);
+    var templateHelp = h("p", { class: "muted small", role: "status", text: "Loading templates…" });
+    var templatePreview = h("div", { class: "template-preview prose", hidden: true, tabIndex: 0, "aria-label": "Template preview" });
+    var templateInfo = h("p", { class: "muted small", hidden: true });
+    var templateRetry = h("button", { type: "button", class: "secondary", hidden: true, onclick: loadTemplates }, "Reload templates");
+    var templates = {}, selectedTemplate = null, previewSeq = 0, previewTimer, previewReady = false, creating = false;
     var pending = null;
+    var createBtn = h("button", { type: "submit" }, "Create");
+    async function loadTemplates() {
+      templateHelp.textContent = "Loading templates…"; templateRetry.hidden = true;
+      try {
+        var cursor = null, items = [];
+        do {
+          var page = await api("GET", "/api/projects/" + enc(pid) + "/templates" + (cursor ? "?cursor=" + enc(cursor) : ""));
+          items = items.concat(page.templates); cursor = page.next_cursor;
+        } while (cursor);
+        templates = {};
+        start.replaceChildren(h("option", { value: "", text: "Blank document" }));
+        items.forEach(function (t) { templates[t.id] = t; start.append(h("option", { value: t.id, text: t.name + (t.description ? " — " + t.description : "") })); });
+        if (selectedTemplate) {
+          if (!templates[selectedTemplate.id]) { start.append(h("option", { value: selectedTemplate.id, text: selectedTemplate.name + " (unavailable)" })); }
+          start.value = selectedTemplate.id; // Never silently replace its pinned revision.
+        }
+        startLabel.hidden = items.length === 0;
+        templateHelp.textContent = items.length ? "Templates create independent Markdown documents." : "No templates yet. Open a Markdown document and choose Save as template.";
+      } catch (err) { templateHelp.textContent = "Couldn't load templates: " + err.message + ". Blank document is still available."; templateRetry.hidden = false; }
+    }
+    function previewInput() { return { template_id: selectedTemplate.id, template_revision: selectedTemplate.revision, title: dtitle.value.trim(), date: date.value }; }
+    function scheduleTemplatePreview() {
+      clearTimeout(previewTimer); previewReady = false;
+      var seq = ++previewSeq;
+      dateLabel.hidden = !selectedTemplate; templateInfo.hidden = !selectedTemplate; templatePreview.hidden = !selectedTemplate;
+      dkind.disabled = !!selectedTemplate; createBtn.textContent = selectedTemplate ? "Use template" : "Create";
+      createBtn.disabled = creating || !!selectedTemplate;
+      if (!selectedTemplate) { templatePreview.replaceChildren(); return; }
+      templateInfo.textContent = selectedTemplate.name + " · v" + selectedTemplate.revision + (selectedTemplate.description ? " · " + selectedTemplate.description : "");
+      templatePreview.textContent = "Loading preview…";
+      previewTimer = setTimeout(async function () {
+        try {
+          var r = await api("POST", "/api/projects/" + enc(pid) + "/templates/preview", previewInput());
+          if (seq !== previewSeq) return;
+          templatePreview.innerHTML = r.html;
+          templatePreview.append(h("p", { class: "muted small", text: "Placeholders: " + (r.placeholders.join(", ") || "none") + ". Unknown placeholders stay literal." + (r.truncated ? " Preview shortened; creation uses the full revision." : "") }));
+          previewReady = true; createBtn.disabled = creating;
+        } catch (err) { if (seq !== previewSeq) return; templatePreview.textContent = "Preview unavailable: " + err.message; }
+      }, 160);
+    }
+    start.addEventListener("change", function () { selectedTemplate = templates[start.value] || null; scheduleTemplatePreview(); });
+    dtitle.addEventListener("input", scheduleTemplatePreview); date.addEventListener("input", scheduleTemplatePreview);
+    S.cleanups.push(function () { clearTimeout(previewTimer); previewSeq++; });
     var newDoc = h("div", { class: "card", hidden: true },
-      h("form", { class: "row", onsubmit: async function (e) {
-        e.preventDefault();
+      h("form", { class: "template-form", onsubmit: async function (e) {
+        e.preventDefault(); if (creating || (selectedTemplate && !previewReady)) return;
         var t = dtitle.value.trim(); if (!t) return;
         var kind = dkind.value === "html" ? "html" : "markdown";
-        var body = kind === "html" ? "<h1>" + escHtml(t) + "</h1>\n<p></p>\n" : "# " + t + "\n\n";
-        if (!pending || pending.t !== t || pending.kind !== kind) pending = { t: t, kind: kind, key: uuid() };
-        var req = kind === "html" ? { title: t, body: body, kind: "html" } : { title: t, body: body };
-        // New documents open in the editor (there is nothing to read yet).
-        try { var r = await api("POST", "/api/projects/" + enc(pid) + "/artifacts", req, { key: pending.key }); pending = null; location.hash = "#/p/" + enc(pid) + "/a/" + enc(r.artifact_id) + "/edit"; }
+        var req = selectedTemplate ? previewInput() : { title: t, body: kind === "html" ? "<h1>" + escHtml(t) + "</h1>\n<p></p>\n" : "# " + t + "\n\n", kind: kind };
+        var path = "/api/projects/" + enc(pid) + "/artifacts" + (selectedTemplate ? "/from-template" : "");
+        var signature = JSON.stringify([path, req]);
+        if (!pending || pending.signature !== signature) pending = { signature: signature, key: uuid() };
+        creating = true; createBtn.disabled = true;
+        try { var r = await api("POST", path, req, { key: pending.key }); pending = null; location.hash = "#/p/" + enc(pid) + "/a/" + enc(r.artifact_id) + "/edit"; }
         catch (err) { showErr(cmsg, err); }
-      } }, dtitle, dkind, h("button", { type: "submit" }, "Create"), h("button", { type: "button", class: "secondary", onclick: function () { newDoc.hidden = true; } }, "Cancel")), cmsg);
+        finally { creating = false; createBtn.disabled = !!selectedTemplate && !previewReady; }
+      } }, h("div", { class: "row" }, h("label", null, "Title", dtitle), h("label", null, "Document type", dkind)),
+        startLabel, templateHelp, templateRetry, dateLabel, templateInfo, templatePreview,
+        h("div", { class: "row" }, createBtn, h("button", { type: "button", class: "secondary", onclick: function () { newDoc.hidden = true; newDocBtn.setAttribute("aria-expanded", "false"); } }, "Cancel"))), cmsg);
+    loadTemplates();
     var upHelp = h("p", { class: "muted small", text: "Images (PNG, JPEG, WebP, GIF), videos (MP4, WebM) or PDF, up to 5 MB. CSV or JSON data files (UTF-8), up to 1 MB." });
     dataFilesEnabled(pid).then(function (on) { if (on === false) upHelp.textContent = "Images (PNG, JPEG, WebP, GIF), videos (MP4, WebM) or PDF, up to 5 MB."; });
     var upload = h("div", { class: "card", hidden: true }, upHelp, uploadForm(pid, null, function () { load(true); }, "all"));
@@ -13117,10 +13357,17 @@ async function viewArtifact(pid, aid, initialTab) {
 
   // metadata: rename / folder / tags / trash, guarded by expected_meta_version
   var fTitle = h("input", { type: "text", maxLength: 200 }), fFolder = h("input", { type: "text", maxLength: 200 }), fTags = h("input", { type: "text", placeholder: "comma,separated" });
+  var fDescription = A.meta.is_template ? h("input", { type: "text", maxLength: 280, "aria-label": "Template description", value: A.meta.template_description || "" }) : null;
   function fillMeta() {
     if (document.activeElement !== fTitle) fTitle.value = A.meta.title;
     if (document.activeElement !== fFolder) fFolder.value = A.meta.folder || "";
     if (document.activeElement !== fTags) fTags.value = (A.meta.tags || []).join(", ");
+    if (fDescription && document.activeElement !== fDescription) fDescription.value = A.meta.template_description || "";
+    if (A.templateSourceNote) {
+      A.templateSourceNote.hidden = !A.meta.source;
+      A.templateSourceNote.replaceChildren();
+      if (A.meta.source) A.templateSourceNote.append(h("a", { href: "#/p/" + enc(pid) + "/a/" + enc(A.meta.source.artifact_id) + "?v=" + A.meta.source.revision, text: (A.meta.source.role === "template" ? "Created from " : "Copied from ") + A.meta.source.title + " · v" + A.meta.source.revision }));
+    }
     titleEl.textContent = A.meta.title;
     setCrumbs(projCrumbs(pid, [{ t: A.meta.title }]));
   }
@@ -13128,6 +13375,7 @@ async function viewArtifact(pid, aid, initialTab) {
   async function patchMeta(fields, okText) {
     try {
       var r = await api("PATCH", base, Object.assign({ expected_meta_version: A.meta.meta_version }, fields), { key: uuid() });
+      if (fDescription) A.meta.template_description = r.template_description;
       A.meta.meta_version = r.meta_version; A.meta.title = r.title; A.meta.folder = r.folder; A.meta.tags = r.tags; A.meta.trashed = r.trashed;
       fillMeta(); showMsg(metaMsg, okText, true); return r;
     } catch (err) {
@@ -13137,10 +13385,10 @@ async function viewArtifact(pid, aid, initialTab) {
     }
   }
   var details = h("details", null, h("summary", { text: "Details" }),
-    h("div", { class: "grid2" }, h("label", null, "Title", fTitle), h("label", null, "Folder", fFolder), h("label", null, "Tags", fTags)),
+    h("div", { class: "grid2" }, h("label", null, "Title", fTitle), h("label", null, "Folder", fFolder), h("label", null, "Tags", fTags), fDescription ? h("label", null, "Template description", fDescription) : null),
     h("div", { class: "row" },
       h("button", { type: "button", onclick: function () {
-        patchMeta({ title: fTitle.value.trim(), folder: fFolder.value.trim(), tags: fTags.value.split(",").map(function (s) { return s.trim(); }).filter(Boolean) }, "Details saved.");
+        patchMeta({ ...(fDescription ? { template_description: fDescription.value } : {}), title: fTitle.value.trim(), folder: fFolder.value.trim(), tags: fTags.value.split(",").map(function (s) { return s.trim(); }).filter(Boolean) }, "Details saved.");
       } }, "Save details"),
       h("button", { type: "button", class: "danger", onclick: async function () {
         if (!confirm("Move \"" + A.meta.title + "\" to trash? History is kept and it can be restored.")) return;
@@ -13149,6 +13397,41 @@ async function viewArtifact(pid, aid, initialTab) {
         if (r) location.hash = "#/p/" + enc(pid) + "/trash";
       } }, "Move to trash")),
     h("p", { class: "muted small", text: "ID " + aid + " - " + A.meta.kind }), metaMsg);
+  if (A.meta.kind === "markdown") {
+    var templateForm = h("div", { hidden: true, class: "card" });
+    var saveTemplateBtn = h("button", { type: "button", class: "secondary", onclick: async function () {
+      saveTemplateBtn.disabled = true;
+      try {
+        // Capture the visible editor's saved revision; unsaved content is not silently copied.
+        var pinned = A.rev;
+        var preview = await api("GET", base + "/preview?rev=" + pinned);
+        var name = h("input", { type: "text", required: true, maxLength: 200, value: A.meta.title, "aria-label": "Template name" });
+        var desc = h("input", { type: "text", maxLength: 280, "aria-label": "New template description" });
+        var previewBox = h("div", { class: "template-preview prose", tabIndex: 0, "aria-label": "Source template preview" });
+        previewBox.innerHTML = preview.html;
+        var smsg = h("p", { class: "msg", role: "status" }), attempt = null, busy = false;
+        var submit = h("button", { type: "submit" }, "Save template");
+        templateForm.replaceChildren(h("form", { class: "template-form", onsubmit: async function (e) {
+          e.preventDefault(); if (busy) return;
+          var req = { source_artifact_id: aid, source_revision: pinned, title: name.value.trim(), description: desc.value };
+          var signature = JSON.stringify(req); if (!attempt || attempt.signature !== signature) attempt = { signature: signature, key: uuid() };
+          busy = true; submit.disabled = true;
+          try {
+            var r = await api("POST", "/api/projects/" + enc(pid) + "/templates", req, { key: attempt.key });
+            location.hash = "#/p/" + enc(pid) + "/a/" + enc(r.artifact_id) + "/edit";
+          } catch (err) { showErr(smsg, err); }
+          finally { busy = false; submit.disabled = false; }
+        } }, h("label", null, "Template name", name), h("label", null, "Description (optional)", desc),
+          h("p", { class: "muted small", text: "Project: " + (projectTitles[pid] || pid) + ". Copies saved revision v" + pinned + " shown below. Unsaved edits are excluded. {{title}}, {{project}} and {{date}} are replaced once when used; other braces stay literal." }),
+          previewBox, h("div", { class: "row" }, submit, h("button", { type: "button", class: "secondary", onclick: function () { templateForm.hidden = true; saveTemplateBtn.focus(); } }, "Cancel")), smsg));
+        templateForm.hidden = false; name.focus();
+      } catch (err) { showErr(metaMsg, err); }
+      finally { saveTemplateBtn.disabled = false; }
+    } }, "Save as template");
+    var detailActions = details.querySelector(".row");
+    detailActions.insertBefore(saveTemplateBtn, detailActions.lastElementChild);
+    details.append(templateForm);
+  }
   fillMeta();
 
   // shared panels
@@ -14229,7 +14512,10 @@ function renderMarkdownEditor(A, data, ui) {
   }
 
   var docMeta = h("p", { class: "doc-meta" }, (isHtml ? "Page" : "Doc") + " · ", h("span", { dataset: { projectTitle: pid }, text: projectTitles[pid] || pid }), " · updated " + fmtDate(A.meta.updated_at));
-  shell(projCrumbs(pid, [{ t: A.meta.title }]), h("div", { class: "titlebar" }, ui.titleEl, copyBar(A, function () { return ta.value; }, offlineToggle(A))), docMeta, banner, conflictBox, ui.tabNav);
+  var templateNote = A.meta.is_template ? h("p", { class: "template-note" }, h("span", { class: "badge", text: "Template" }), " Edits affect future copies only.") : null;
+  var sourceNote = h("p", { class: "muted small", hidden: !A.meta.source });
+  A.templateSourceNote = sourceNote;
+  shell(projCrumbs(pid, [{ t: A.meta.title }]), h("div", { class: "titlebar" }, ui.titleEl, copyBar(A, function () { return ta.value; }, offlineToggle(A))), docMeta, templateNote, sourceNote, banner, conflictBox, ui.tabNav);
   // Save status/button and Details sit below the document; the status stays announced (aria-live).
   ui.below.append(h("div", { class: "footbar" }, statusEl, h("span", { class: "spacer" }), saveBtn), ui.details);
   ui.fillMeta();
@@ -15067,6 +15353,8 @@ var R2 = {
   search: /^\/v1\/search$/,
   projects: /^\/v1\/projects$/,
   changes: new RegExp(`^/v1/projects/${SEG}/changes$`),
+  templates: new RegExp(`^/v1/projects/${SEG}/templates$`),
+  templateCreate: new RegExp(`^/v1/projects/${SEG}/files/from-template$`),
   files: new RegExp(`^/v1/projects/${SEG}/files$`),
   file: new RegExp(`^/v1/projects/${SEG}/files/${SEG}$`),
   content: new RegExp(`^/v1/projects/${SEG}/files/${SEG}/content$`),
@@ -15136,7 +15424,7 @@ var P1_FIELDS = ["id", "project_id", "kind", "title", "folder", "tags", "revisio
 function fileView2(origin, a, env) {
   const base = appConnectEnabled(env) ? a : Object.fromEntries(P1_FIELDS.map((k) => [k, a[k]]));
   const linkable = appConnectEnabled(env) ? ["markdown", "html", "json", "csv"].includes(a.kind) : a.kind === "markdown" || a.kind === "html";
-  return { ...base, ...origin ? { web_url: artifactWebUrl(origin, a.project_id, a.id), ...linkable ? { preview_url: previewWebUrl(origin, a.project_id, a.id) } : {} } : {} };
+  return { ...base, ...a.is_template ? { is_template: true, template_description: a.template_description } : {}, ...a.source ? { source: a.source } : {}, ...origin ? { web_url: artifactWebUrl(origin, a.project_id, a.id), ...linkable ? { preview_url: previewWebUrl(origin, a.project_id, a.id) } : {} } : {} };
 }
 __name(fileView2, "fileView");
 function withLinks(origin, pid, r) {
@@ -15179,6 +15467,17 @@ async function route2(req, env, url, requestId) {
   if (g = R2.changes.exec(path)) {
     if (m !== "GET") throw new HttpError(405, "method_not_allowed", "Method not allowed");
     return json(await listChanges(projectCtx(env,k,requestId,g[1]),g[1],chQuery(url.searchParams)));
+  }
+  if (g = R2.templates.exec(path)) {
+    if (m !== "GET") throw new HttpError(405, "method_not_allowed", "Method not allowed");
+    const pid = g[1];
+    return json(await listTemplates(projectCtx(env, k, requestId, pid), pid, { cursor: url.searchParams.get("cursor"), limit: url.searchParams.get("limit") }));
+  }
+  if (g = R2.templateCreate.exec(path)) {
+    if (m !== "POST") throw new HttpError(405, "method_not_allowed", "Method not allowed");
+    const pid = g[1]; writeAllowed(k, pid);
+    const result = await createFromTemplate(projectCtx(env, k, requestId, pid), pid, await readJson(req), idemKey(req.headers.get("idempotency-key")));
+    return json(result.body, result.status);
   }
   if (g = R2.files.exec(path)) {
     const pid = g[1];
@@ -15632,6 +15931,12 @@ async function route3(req, env, url, requestId) {
     await listGrants(ctx, pid);
     return json(await reconcileUploads(env, { projectId: pid, limit: 100 }));
   }
+  if (rest[0] === "templates" && rest.length === 1) {
+    if (m === "GET") return json(await listTemplates(ctx, pid, { cursor: url.searchParams.get("cursor"), limit: url.searchParams.get("limit") }));
+    if (m === "POST") return out(await saveAsTemplate(ctx, pid, await body(req), key()));
+  }
+  if (rest[0] === "templates" && rest[1] === "preview" && rest.length === 2 && m === "POST") return json(await previewTemplate(ctx, pid, await body(req)));
+  if (rest[0] === "artifacts" && rest[1] === "from-template" && rest.length === 2 && m === "POST") return out(await createFromTemplate(ctx, pid, await body(req), key()));
   if (rest[0] === "backup" && m === "GET") return json(await exportBackup(ctx, pid));
   if (rest[0] === "uploads") {
     if (rest.length === 1 && m === "POST") return out(await uploadBegin(ctx, pid, await body(req), key()));

@@ -1,0 +1,221 @@
+{
+  "base_changes_sha256": "404225003e403da78c767ea2a84187a232d0212b5e6920537dd7f97595007b00",
+  "integrated_sha256": "1a422ef12ece0536535cc8bff3e8f51cc7f5bb476d372860ae89f6d0a22f78e2",
+  "sources": {
+    "src/templates/service.js": "0fd91f2fade24c824789bd0da643f1c1152920319531610d7e2adf1fa83728fd",
+    "src/templates/tools.js": "a3aae7f9d4fca0f7af22dbee37b7b09d12efbe9643a3c21d0fd83819d89e014b"
+  },
+  "patches": [
+    {
+      "module": "// src/service.ts",
+      "name": "shared template service and schemas",
+      "find_sha256": "990995796303ae28bc68934e504c2b6e7f0f96c0f983ddbb77909c58bbaead9f",
+      "replace_sha256": "6bd6579c0e2aefd0cdcdac3004e01614280cfa60cf63cfeda3c0b2aae53963ec"
+    },
+    {
+      "module": "// src/service.ts",
+      "name": "template identity in ordinary artifact views",
+      "find_sha256": "40a4ac2c7c15e5c25903161707ae74040846a0e39131f83ad555e90e5f9469e9",
+      "replace_sha256": "1b25fdbaaf0b7a3aa3806c5a6afdae58489764355c9aaf7678b5ba5008252d1c"
+    },
+    {
+      "module": "// src/service.ts",
+      "name": "safe source provenance on reads",
+      "find_sha256": "18995b2d8431abe1870b6bb5b10ce69b4405c307828e2fea7a457d996b7ae55a",
+      "replace_sha256": "b505d0f51ffd556e0d55c1b55becd700f013f695f4cdbd54c77706226b2217d1"
+    },
+    {
+      "module": "// src/service.ts",
+      "name": "owner-only generic maintenance",
+      "find_sha256": "7cb27896761f37affa17d7d158dfdb123bd9535fd217da1daa94f62b90713136",
+      "replace_sha256": "d7dbccded21226d57818196dc2dd80b5f371c06fbdfc01479e2b84d4983fd1b4"
+    },
+    {
+      "module": "// src/auth.ts",
+      "name": "agent metadata and trash write fence",
+      "find_sha256": "01df0cfa1228ac004383c4643f48c27c8be956543c52c121581c3c7f942f5846",
+      "replace_sha256": "e71c9a8bb8ab89040dfd27cff6ae1358793bb58ac7a988259ae7f451dbbe1243"
+    },
+    {
+      "module": "// src/auth.ts",
+      "name": "agent content and restore write fence",
+      "find_sha256": "690806f17da78a7e318f867998145f33e9999a7b44c05db0a1e9c1709086e385",
+      "replace_sha256": "7338a35f617596ac8ead7aa765d15c4ba72be4c3d76998f25384575f048a676e"
+    },
+    {
+      "module": "// src/service.ts",
+      "name": "description validation",
+      "find_sha256": "591f7eed64016320b8e4121063708061030a4557a664831a44f3fca20ec85f41",
+      "replace_sha256": "160fad09094d618a4852217ee178269bf7791b4db7c0e6ffd596b556cb3ffeab"
+    },
+    {
+      "module": "// src/service.ts",
+      "name": "description in metadata result",
+      "find_sha256": "51fd34a39cfbcbf996bb413c07538ac2d0be58662fae803b0296f47dbdd6b314",
+      "replace_sha256": "d19f2eb2de93c546e66e02110f1a3ced1c33a791aac6887a10038a2ebe3962ad"
+    },
+    {
+      "module": "// src/service.ts",
+      "name": "description metadata update",
+      "find_sha256": "1aba2cc701abd5e91897e0c19c03860f2f63fba7148e2dff3d63a7c4c32db96f",
+      "replace_sha256": "70e23d5183d41ebe8d5914ac38695f9d1da823e79b3276f0805e1031f5ef09c5"
+    },
+    {
+      "module": "// src/service.ts",
+      "name": "description metadata binding",
+      "find_sha256": "cb25d594956fec7639f8dc865889b8fc26460bb3484609211f2161b0c86dafa5",
+      "replace_sha256": "6dbd23366f068960f959a953f16ac11ff45a7bf757d0206ba09157ba6a26d68a"
+    },
+    {
+      "module": "// src/service.ts",
+      "name": "description version value",
+      "find_sha256": "728a79145e1821f63aef930fff35a3d74fd79505bc5500ef453b080d9ad80290",
+      "replace_sha256": "9aa8d609fcc2abb700d659fb45e1e5743dec0a4a86a03baa5559d28831c165a7"
+    },
+    {
+      "module": "// src/service.ts",
+      "name": "description baseline column",
+      "find_sha256": "e86aa8bb0cc0416225791c7b0698ffd5409d4978b34f6f87fc0fc19adbe1bf27",
+      "replace_sha256": "8168f7443518a7670be7941f9c178723ee5fc82bec276ce4d3dba6627258eb34"
+    },
+    {
+      "module": "// src/service.ts",
+      "name": "description baseline value",
+      "find_sha256": "508218cca1c8577e500bcdfc9b03948635a813abc5aa8e54aa7b634bbef4d604",
+      "replace_sha256": "9982da6215d60228fa42ea200e10195332f66da16689e03eb26bb2d52a7b4790"
+    },
+    {
+      "module": "// src/service.ts",
+      "name": "description version column",
+      "find_sha256": "0e37bc5b8403ba470c276b45c8bbac47a0a9856ed44bb06ed8f6a5aa6c9b55df",
+      "replace_sha256": "8b604719a729fe1caca7ccdccbb765f40cf2ff4345886aea736387cc215fcc5c"
+    },
+    {
+      "module": "// src/service.ts",
+      "name": "description version binding",
+      "find_sha256": "654b5bcfa5061297e744309c655da92024e50b23372445a6b9cbd4c5fd0c2137",
+      "replace_sha256": "1f33ccdd0bf0a62f9e2a18cd191707485fe920f0a735c9450a3377cb02995515"
+    },
+    {
+      "module": "// src/service.ts",
+      "name": "description history select",
+      "find_sha256": "898cc5ed675f1eda115be095489b399b2c6473781a1dd79bc4d3992914aade54",
+      "replace_sha256": "e7ceec2c65af5ea454c25c8154448dbb5f561723c4e6d9817daea705f67c9fd9"
+    },
+    {
+      "module": "// src/service.ts",
+      "name": "description history result",
+      "find_sha256": "48ed563188708ca2f23b394189ed299d7f7fe9847128fc81e33fdf35f4fce851",
+      "replace_sha256": "44d0074ea369c28b1d49ea842e59e7b428f016dee19cfc889da9495175f3d283"
+    },
+    {
+      "module": "// src/service.ts",
+      "name": "description restore read",
+      "find_sha256": "bfd4e51b6644325bfbf6e27619c50555a90320e73bc85ff126056f489539529d",
+      "replace_sha256": "32d91239d2848d331b661cf5f003bf72deb8ec7a34b2c30a72f22be1720cfad7"
+    },
+    {
+      "module": "// src/service.ts",
+      "name": "description restore value",
+      "find_sha256": "ba5e76e77a58a77e872bcb87d49510f50314070f911648ed6c26faf2d5673a81",
+      "replace_sha256": "123f26904b7b823726c5df37cd3eacbac51346255c9ce0fba83fcd1eab48293c"
+    },
+    {
+      "module": "// src/oauth/mcp.ts",
+      "name": "OAuth template tools",
+      "find_sha256": "976ff313e7abe0d863b6ebe4b9253106881f902f1905812c5950b3e4728773ca",
+      "replace_sha256": "382752ba061e7bd5d70efbc34446f5986df430528175df28d19542baa8e5299b"
+    },
+    {
+      "module": "// src/mcp.ts",
+      "name": "legacy read-only template discovery",
+      "find_sha256": "b4d878165fb873d4355411ac8bbf0aac857cd0a6b9fde6975f0ec24cf87c0f11",
+      "replace_sha256": "ce0273d2a524cdf05c73e3d3951ce1c9d3a02295c93bbe3a8d99632af3e8313d"
+    },
+    {
+      "module": "// src/mcp.ts",
+      "name": "legacy template tools",
+      "find_sha256": "79c6f0c0d38784e95eeb0b581185c7453d565c05cd88048b4f9c218ac4a353e5",
+      "replace_sha256": "994685167aca128821c2f3a502b65a758f25284179d1e745983f15364ef1c6a7"
+    },
+    {
+      "module": "// src/api/v1.ts",
+      "name": "v1 route pattern",
+      "find_sha256": "9fd3238843a24dd6745eced13ebea35989cba36e44d7cc1dae4ce2d3681afbae",
+      "replace_sha256": "44b546c61156535f123ee88cbee2038ab0aec90ab96f9274e40cf32318f1b90d"
+    },
+    {
+      "module": "// src/api/v1.ts",
+      "name": "v1 templates before generic file route",
+      "find_sha256": "92c859499285f293d0c4fb401da5a3198d3324977faba15bec3d359821eb1f43",
+      "replace_sha256": "01048f06ade113d671987716eb3dc846608441bc0745c8f4d2325ed378b5c107"
+    },
+    {
+      "module": "// src/api/v1.ts",
+      "name": "template identity in flag-off v1 views",
+      "find_sha256": "0164e6e392102ef768322d4067a7df28491f0ad1632d16574d2bdc797291daf5",
+      "replace_sha256": "8ad7e3daec34a70eb45c0886ad5c7c65469041f83def0416f98c83027540a051"
+    },
+    {
+      "module": "// src/index.ts",
+      "name": "owner template routes",
+      "find_sha256": "c905f414833534761230589f266d5131b67e6362fcb8b9d364cb4d328a0c3867",
+      "replace_sha256": "e4861f0ff354c7601d26308195e68e5a4180bafbf62a3c61f8a0323f636cf1ae"
+    },
+    {
+      "module": "// src/backup.ts",
+      "name": "template backup fields",
+      "find_sha256": "ce7651f49ea10065e6d24c3a36a6894b7b6a5eb156e5e84742fa2c3a4d3486bb",
+      "replace_sha256": "9de50b555d6b135a1fe6f31236021589a18a86ce10698ebdb0b8bcd615f7b8e2"
+    },
+    {
+      "module": "// src/backup.ts",
+      "name": "description backup history",
+      "find_sha256": "7c355c75f594b70b2dd561dc53a88ea70dd04451b846432dbad52257e5ac5d0e",
+      "replace_sha256": "7ca07b7a9226471ddcf26ee24a66af06d340956ec826877f916091b0db69e56c"
+    },
+    {
+      "module": "// src/backup.ts",
+      "name": "backup capabilities",
+      "find_sha256": "fbbc6a315cee7e9bb3daeeb0710ef9d48439e5e415868a09f9ae079881d329d9",
+      "replace_sha256": "e19d89f5b2719ca5ded233e454b6b413c6efc258ff217cd8d706e35f59223757"
+    },
+    {
+      "module": "// src/backup.ts",
+      "name": "accept legacy and template-aware backups",
+      "find_sha256": "24f08ce314a9f4bd0d034b1350a636611a0f0c00ff13dfe6ae1757c69862c99b",
+      "replace_sha256": "ea28037e3716148f890c5cbac20752864cbe9f04da372f730e8855f036f2f55b"
+    },
+    {
+      "module": "// src/backup.ts",
+      "name": "validate template backup metadata",
+      "find_sha256": "0a5b8e09197bc734fcd6bdf1abb27c8495804b9bead49ed53c4c519368626735",
+      "replace_sha256": "3b71d27c97ed607a387c2486768967e8c0131846ca5dff96507cdc92faac640e"
+    },
+    {
+      "module": "// src/backup.ts",
+      "name": "restore template fields",
+      "find_sha256": "e6a33546a44ba97ccfa066942102a53a807518dd32a1bf4da51fd648ec5fa6f4",
+      "replace_sha256": "56203651681ae9c81440558f9dd1051ca5c0d3c4011f147257bf0840e17ef841"
+    },
+    {
+      "module": "// src/backup.ts",
+      "name": "restore template bindings",
+      "find_sha256": "6ca739ba35fdbae106352480fb5ec860474f3e7dcedb726a8e40a579afc0ca00",
+      "replace_sha256": "87e253c69b2b485401a74fb526296dd326ed50f1a06848b606e4bf45dfc27fce"
+    },
+    {
+      "module": "// src/backup.ts",
+      "name": "restore description history column",
+      "find_sha256": "171621927c363ffac294d12a5114537b4da0d94500c91372b6abba91e199428f",
+      "replace_sha256": "9fa8ec4dd3ac3b91939b9168d053f56b6976c10f9fee50c8cc62018bcfb1f462"
+    },
+    {
+      "module": "// src/backup.ts",
+      "name": "restore description history binding",
+      "find_sha256": "f86ef03badb6f8b94e0334e890c8d09e36073b435f6ce7b9c0f9e4c1652dd455",
+      "replace_sha256": "23667b2e44042616f4510e67cc86f646f7fc54a7bc5c0aa5559d25d97534e76d"
+    }
+  ],
+  "requires_migration": "0016_document_templates.sql"
+}
