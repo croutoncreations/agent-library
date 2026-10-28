@@ -212,4 +212,9 @@ test('stable search keys survive artifacts rowid reassignment and later updates'
 test('standalone backfill resolves the pinned local Wrangler without global Wrangler in PATH',async()=>{
  const r=await promisify(execFile)(process.execPath,['scripts/search/backfill.mjs','--config','wrangler.local.toml','--local','--persist-to',server.dir,'--after','0','--limit','1'],{env:{...process.env,PATH:dirname(process.execPath),WRANGLER_SEND_METRICS:'false'}});
  const results=JSON.parse(r.stdout);assert.equal(results.at(-1).results[0].processed,1);assert.equal(results.at(-1).results[0].ready,1);
+ const config='tmp/backfill-env-fixture.toml';
+ writeFileSync(config,'name="backfill-env-fixture"\ncompatibility_date="2025-09-01"\n[[env.fixture.d1_databases]]\nbinding="DB"\ndatabase_name="agent-library-db"\ndatabase_id="00000000-0000-0000-0000-000000000000"\n');
+ const selected=await promisify(execFile)(process.execPath,['scripts/search/backfill.mjs','--config',config,'--env','fixture','--local','--persist-to',server.dir,'--after','0','--limit','1'],{env:{...process.env,PATH:dirname(process.execPath),WRANGLER_SEND_METRICS:'false'}});
+ assert.equal(JSON.parse(selected.stdout).at(-1).results[0].processed,1);
+
 });

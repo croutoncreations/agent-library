@@ -15,6 +15,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   if (!get('--config') || (args.includes('--remote') === args.includes('--local'))) throw Error('Pass --config <file> and exactly one of --local / --remote. Remote execution requires operator authorization.');
   const after=Number(get('--after') ?? 0), limit=Number(get('--limit') ?? 25);
   const cmd=['d1','execute','DB','--config',get('--config'),args.includes('--remote')?'--remote':'--local','--command',backfillSql(after,limit),'--json'];
+  if (get('--env')) cmd.push('--env',get('--env'));
   if (get('--persist-to')) cmd.push('--persist-to',get('--persist-to'));
   const require = createRequire(import.meta.url);
   const pkg = require.resolve('wrangler/package.json');
