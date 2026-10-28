@@ -2,6 +2,13 @@
 // No replica sessions: a cursor never advances past uncommitted sequence allocation.
 const CH_RETENTION_MS = 30 * 86400000;
 const CH_MAX_BYTES = 65536;
+const CH_COVERAGE_SQL = `(SELECT group_concat(g, ',') FROM (
+  SELECT pb.id || ':' || pb.current_snapshot_id AS g FROM publishers pb
+  JOIN publisher_generations pg ON pg.snapshot_id=pb.current_snapshot_id
+  LEFT JOIN change_generation_coverage cv ON cv.publisher_id=pb.id
+  WHERE pb.project_id=p.id AND cv.snapshot_id IS NOT pb.current_snapshot_id
+  ORDER BY pb.id
+))`;
 function chQuery(q) {
   for (const k of q.keys())
     if (!["cursor", "limit"].includes(k))
@@ -159,10 +166,7 @@ async function listChanges(ctx, projectId, opts = {}) {
   // Both SELECTs use the same transaction. The second repeats the live authorization fence.
   const stateSql = `SELECT COALESCE(s.high,0) high,COALESCE(s.floor,0) floor,
     (SELECT file_access FROM oauth_connections WHERE id=?) file_access,
-    (SELECT group_concat(pb.id || ':' || pb.current_snapshot_id, ',') FROM publishers pb
-      JOIN publisher_generations pg ON pg.snapshot_id=pb.current_snapshot_id
-      LEFT JOIN change_generation_coverage cv ON cv.publisher_id=pb.id
-      WHERE pb.project_id=p.id AND cv.snapshot_id IS NOT pb.current_snapshot_id) coverage_gap,
+    ${CH_COVERAGE_SQL} coverage_gap,
     COALESCE((SELECT epoch FROM change_scope_epochs WHERE transport=? AND connection_id=? AND project_id=?),0) epoch
     FROM projects p LEFT JOIN project_change_state s ON s.project_id=p.id WHERE p.id=? AND ${az.sql}`;
   const [stateResult, eventResult] = await ctx.env.DB.batch([

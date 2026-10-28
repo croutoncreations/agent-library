@@ -257,3 +257,23 @@ test("opaque cursors hide global counters, use fresh nonces and reject ciphertex
     (e) => e.code === "invalid_cursor",
   );
 });
+
+test("publisher coverage fingerprints stay ordered across scan order and query-plan changes", () => {
+  const coverage = vm.runInNewContext(
+    readFileSync("src/changes/service.js", "utf8") + ";CH_COVERAGE_SQL",
+  );
+  const d = new DatabaseSync(":memory:");
+  d.exec(`CREATE TABLE publishers(id TEXT PRIMARY KEY,project_id TEXT,current_snapshot_id TEXT);
+    CREATE TABLE publisher_generations(snapshot_id TEXT);
+    CREATE TABLE change_generation_coverage(publisher_id TEXT,snapshot_id TEXT);
+    INSERT INTO publishers VALUES('pub_b','p','snp_b'),('pub_a','p','snp_a'),('pub_c','p','snp_c'),('pub_x','q','snp_x');
+    INSERT INTO publisher_generations VALUES('snp_b'),('snp_a'),('snp_c'),('snp_x');
+    INSERT INTO change_generation_coverage VALUES('pub_c','snp_c');`);
+  const query = `SELECT ${coverage} AS gap FROM (SELECT 'p' AS id) p`;
+  assert.equal(d.prepare(query).get().gap, "pub_a:snp_a,pub_b:snp_b");
+  d.exec(
+    "CREATE INDEX reverse_gap_plan ON publishers(project_id,id DESC); PRAGMA reverse_unordered_selects=ON;",
+  );
+  assert.equal(d.prepare(query).get().gap, "pub_a:snp_a,pub_b:snp_b");
+  d.close();
+});
