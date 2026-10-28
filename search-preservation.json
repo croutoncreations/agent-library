@@ -1,6 +1,6 @@
 {
-  "base_file_tools_fixes_sha256": "a568dcd27738591e1ae242f2545b80763b673f70369cafd702ea68618baeb6ad",
-  "integrated_sha256": "b05bba1f78981db60789308a5f13fb58d86769d582c890bf7c654f8189d52e8c",
+  "base_file_tools_fixes_sha256": "4ac5c01ac877ce09edcd33afba77b5457c1a676c28d7d0b4e0f814cd60808374",
+  "integrated_sha256": "9a49990d7762bdc423a8ba41b1c93c713b846aaf784cb4a22f20805fd53617ed",
   "sources_sha256": {
     "service.js": "c67d4ef992ffbb47bb87929e5f40f08adf658505e7f7623e034e1d9b4b33b605",
     "browser.js": "869e1802b3027e8a7576439a3fc0a1dac905f9e189133f8cb8c57c4febe51ec7",

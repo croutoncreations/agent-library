@@ -864,6 +864,30 @@ function settingsTabs(active) {
 function connHead(sub) {
   return pageHead("Connections", { sub: sub || "Apps and keys that can use your library. Signing in to an app never grants access by itself: an app can only use the projects you approved, and you can revoke it at any time." });
 }
+// Safe owner-side comparison; this is a saved grant view, never a remote client probe.
+function connectionSummary(type, id, label, projects, expires, activity, status, checkedAt) {
+  var value = JSON.stringify({ connection: { type: type, id: id, display_label: label, label_source: type === "oauth" || type === "publisher" ? "registered app name (self-reported)" : "owner-assigned label" }, status: status,
+    saved_access_checked_at: checkedAt || null, expires_at: expires || null, last_activity_at: activity || null,
+    projects: projects, successful_operations: "not measured",
+    check: "Saved access checked. Ask the intended client to " + (type === "publisher" ? "GET /v1/publisher/connection-info" : type === "api_key" ? "GET /v1/connection-info" : "run connection_info") + " and compare IDs. This does not prove the client is connected or test reads, rendering, transfers or writes." }, null, 2);
+  var field = h("textarea", { readOnly: true, rows: 9, class: "full-w", "aria-label": "Safe connection summary", value: value });
+  var feedback = h("p", { class: "msg", role: "status", "aria-live": "polite" });
+  return h("details", { class: "connection-summary" }, h("summary", { text: "Connection ID: " + id }),
+    h("p", { class: "small muted", text: "Saved access checked · successful operations: not measured. Last activity is authentication/request telemetry, not proof of a file operation." }), field,
+    h("button", { type: "button", class: "secondary", onclick: function () { field.select(); copyText(value, feedback); } }, icon("copy"), "Copy safe summary"), feedback);
+}
+function connectionHelp() {
+  var base = /^https?:\/\//.test(API_BASE_HINT) ? API_BASE_HINT.replace(/\/v1\/?$/, "") : null;
+  return h("details", { class: "card connection-help" }, h("summary", { text: "Connect or troubleshoot an agent" }),
+    h("p", { text: "Registering an app, signing in, granting project access and making a request from your agent are separate steps." }),
+    h("p", null, "MCP URL: ", h("code", { text: base ? base + "/mcp" : "Unavailable until installation settings load; reconnect and refresh." })),
+    h("p", null, "API base: ", h("code", { text: API_BASE_HINT })),
+    h("p", { text: "ChatGPT: add a connector in Settings → Apps. Claude: add a remote MCP connector. Codex or Cursor: add a remote MCP server in your client's MCP settings. Use the MCP URL above, sign in and select the intended projects." }),
+    h("p", { text: "Ask the intended agent to run connection_info with no arguments. API key clients: GET /v1/connection-info. Publishers: GET /v1/publisher/connection-info (own destination only). Compare the returned ID with the card below." }),
+    h("p", { text: "Wrong project or ID? Check this connection's project selection or reconnect from the intended client. For an expired or revoked connection, inspect its status here and reconnect. Permission changes use the existing owner controls." }),
+    h("p", { text: "401/403: authentication or permission failure. Offline/network failure: check connectivity, then retry. 5xx: server failure; retry later. None proves an external client's state. Never paste credentials or request headers into chat." }),
+    h("a", { href: "https://github.com/croutoncreations/agent-library/blob/main/docs/agent-setup.md", target: "_blank", rel: "noopener" }, "MCP and API setup guide"));
+}
 function connCard(o) {
   // o: { name, sub, status, access:[{title, access}], foot:[text], actions:[el], inactive }
   return h("article", { class: "conn" + (o.inactive ? " inactive" : ""), "aria-label": o.name },
@@ -873,6 +897,7 @@ function connCard(o) {
     o.accessLabel ? h("div", { class: "small muted", text: o.accessLabel }) : null,
     o.access ? (o.access.length ? h("ul", { class: "conn-access", "aria-label": "Saved project access" }, o.access.map(function (p) { return h("li", null, h("b", { text: p.title }), h("span", { text: p.access })); }))
       : h("p", { class: "small muted", text: "No projects. This connection can't open anything." })) : null,
+    o.diagnostic || null,
     o.foot && o.foot.length ? h("div", { class: "conn-foot" }, o.foot.map(function (t) { return h("span", { text: t }); })) : null);
 }
 function statusLabel(st) {
@@ -899,6 +924,7 @@ async function viewApps() {
         catch (err) { showErr(msg, err); e.target.disabled = false; }
       } }, "Disconnect") : null;
       conns.append(connCard({ name: c.client_name, sub: "Reader app · returns to " + c.redirect_host, status: statusBadge(c.status), inactive: c.status !== "active",
+        diagnostic: connectionSummary("oauth", c.id, c.client_name, c.projects, c.expires_at, c.last_used_at, c.status, data.checked_at),
         accessLabel: c.status === "active" ? "Can currently use:" : "Had access to (no longer active):",
         access: c.projects.map(function (p) { return { title: p.title, access: accessText(p.access) }; }),
         foot: [c.files === false && c.status === "active" ? "Documents only: reconnect to include files" : null, c.last_used_at ? "Last used " + fmtDate(c.last_used_at) : "Not used yet", "Connected " + fmtDate(c.created_at), c.status === "active" ? "Expires " + fmtDate(c.expires_at) : null].filter(Boolean),
@@ -906,11 +932,11 @@ async function viewApps() {
     });
   }
   async function load() {
-    try { data = await api("GET", "/api/access"); draw(); }
+    try { data = await api("GET", "/api/access"); data.checked_at = new Date().toISOString(); draw(); }
     catch (err) { conns.removeAttribute("aria-busy"); if (err.status === 401) return; conns.replaceChildren(stateBox("error", "alert", "Connections couldn't load", (err.status === 0 ? "You appear to be offline." : err.message) + " No access was changed.", h("button", { type: "button", class: "secondary", onclick: load }, icon("refresh"), "Try again"))); }
   }
   showAll.addEventListener("change", function () { if (data) draw(); });
-  shell([{ t: "Connections" }], connHead(), settingsTabs("apps"),
+  shell([{ t: "Connections" }], connHead(), connectionHelp(), settingsTabs("apps"),
     h("div", { class: "callout" }, icon("plug"), h("span", null, h("strong", { text: "Reader apps" }), " read (and, if you allowed it, edit) documents and files in the projects listed on each card. Apps connected before files were available see documents only until you reconnect them. Disconnecting takes effect immediately and doesn't affect other apps.")),
     msg, conns, h("p", null, h("label", { class: "muted small" }, showAll, "Show disconnected and expired")));
   load();
@@ -950,10 +976,11 @@ function viewPublishingApps() {
       status:statusBadge(c.disabled?"disabled":active.length?"active":"registered"),inactive:!!c.disabled,
       accessLabel:active.length?"Publishes into:":"Not connected to any project yet. Connect from the app and choose a destination; you approve it on a consent page.",
       access:active.length?active.map(function(p){return {title:projectTitles[p.project_id]||p.project_id,access:(p.folder_id?"own folder":"project root")+(p.current_source_revision!=null?" · export rev "+p.current_source_revision:" · no exports yet")};}):undefined,
+      diagnostic: h("div", null, pubs.map(function(p) { return connectionSummary("publisher", p.publisher_id, c.display_name, [{ project_id: p.project_id, folder_id: p.folder_id, access: "own files only" }], null, null, c.disabled ? "disabled" : p.status, c.checked_at); })),
       foot:["Callbacks: "+(c.redirect_uris||[]).join(", ")].concat(c.suggested_project||c.suggested_folder?["Suggests: "+(c.suggested_project||"first project")+" / "+(c.suggested_folder||"app name")]:[]).concat(["Registered "+fmtDate(c.created_at)])}),
       h("details",null,h("summary",{text:"Public client ID (not a secret)"}),h("div",{class:"row"},id,h("button",{type:"button",class:"secondary",onclick:function(){id.select();copyText(c.client_id,msg);}},icon("copy"),"Copy"))));
   });}
-  async function load(){try{var cs=(await api("GET","/api/app-clients")).app_clients;if(!current())return;draw(cs);form.hidden=false;allowed=cs.length<100;if(!allowed)showMsg(msg,"The registration list is full. Ask for help before adding another app.");var p=pending();if(p){name.value=p.display_name;origins.value=p.origins.join("\n");callbacks.value=p.redirect_uris.join("\n");sugProject.value=p.suggested_project||"";sugFolder.value=p.suggested_folder||"";var matches=cs.filter(function(c){return same(c,p);});if(matches.length===1&&!matches[0].disabled){localStorage.removeItem(key);showMsg(msg,"Registration confirmed. Use the public client ID below.");}else{allowed=false;showMsg(msg,"A previous registration is unresolved. Nothing will be submitted again. Refresh to check its result; if it stays unresolved, ask for help before registering again.");}}setBusy(false);}catch(err){if(!current())return;allowed=false;form.hidden=true;showMsg(msg,err.status===404?"Publishing app registration is unavailable.":err.status===403?"Only the authorized owner can register publishing apps.":"Could not safely check registrations. Refresh to try again.");}}
+  async function load(){try{var cs=(await api("GET","/api/app-clients")).app_clients;if(!current())return;cs.forEach(function(c){c.checked_at=new Date().toISOString();});draw(cs);form.hidden=false;allowed=cs.length<100;if(!allowed)showMsg(msg,"The registration list is full. Ask for help before adding another app.");var p=pending();if(p){name.value=p.display_name;origins.value=p.origins.join("\n");callbacks.value=p.redirect_uris.join("\n");sugProject.value=p.suggested_project||"";sugFolder.value=p.suggested_folder||"";var matches=cs.filter(function(c){return same(c,p);});if(matches.length===1&&!matches[0].disabled){localStorage.removeItem(key);showMsg(msg,"Registration confirmed. Use the public client ID below.");}else{allowed=false;showMsg(msg,"A previous registration is unresolved. Nothing will be submitted again. Refresh to check its result; if it stays unresolved, ask for help before registering again.");}}setBusy(false);}catch(err){if(!current())return;allowed=false;form.hidden=true;showMsg(msg,err.status===404?"Publishing app registration is unavailable.":err.status===403?"Only the authorized owner can register publishing apps.":"Could not safely check registrations. Refresh to try again.");}}
   function values(){function lines(value,min,re,label){var xs=value.split(/\r?\n/).map(function(x){return x.trim();}).filter(Boolean);if(xs.length<min||xs.length>3||new Set(xs).size!==xs.length)throw Error(label+": use "+min+"–3 distinct values, one per line.");xs.forEach(function(x){if(x.length>300||!re.test(x))throw Error(label+": enter an exact HTTPS URL or supported local development URL.");var u=new URL(x);if((label==="Origins"?u.origin:u.href)!==x||u.hostname.indexOf("..")>=0||u.hostname.charAt(0)==="."||u.hostname.endsWith("."))throw Error(label+": use the canonical exact URL without normalization.");if(u.port&&(+u.port<1||+u.port>65535))throw Error(label+": invalid port.");});return xs;}var n=name.value.trim();if(!n||n.length>80)throw Error("App name must contain 1–80 characters.");return {display_name:n,origins:lines(origins.value,0,/^(https:\/\/[a-z0-9.-]+|http:\/\/(localhost|127\.0\.0\.1))(:\d{1,5})?$/,"Origins"),redirect_uris:lines(callbacks.value,1,/^(https:\/\/[a-z0-9.-]+|http:\/\/(localhost|127\.0\.0\.1))(:\d{1,5})?\/[A-Za-z0-9/_.~-]*$/,"Callbacks"),suggested_project:sugg(sugProject.value,"Suggested project"),suggested_folder:sugg(sugFolder.value,"Suggested folder")};}
   function sugg(v,label){v=v.trim();if(!v)return null;if(v.length>80||/[\/\u0000-\u001f\u007f]/.test(v))throw Error(label+": 1–80 characters, without /.");return v;}
   async function register(){if(!current()||busy||!allowed)return;var v,sent=false;try{v=values();}catch(err){showMsg(msg,err.message);return;}setBusy(true);
@@ -967,7 +994,7 @@ function viewPublishingApps() {
     try{if(navigator.locks)await navigator.locks.request(key,create);else await create();}catch(err){var rejected=sent&&[400,401,403,404,413,422,429].indexOf(err.status)>=0;if(rejected&&localStorage.getItem(key)===JSON.stringify(v))localStorage.removeItem(key);if(current()){allowed=rejected;showMsg(msg,rejected?"Registration was rejected ("+err.status+"). Review the details or sign in again before trying again.":"Registration could not be confirmed. Refresh to check its result. Nothing will be submitted again automatically.");}}finally{if(current())setBusy(false);}
   }
   S.cleanups.push(function(){alive=false;});
-  shell([{t:"Connections"}],connHead(),settingsTabs("publishing"),h("div",{class:"callout"},icon("upload"),h("span",null,h("strong",{text:"Publishing apps"})," send their own files into the one project and folder you choose when you connect them. They can't read anything else. Reader apps and keys are approved separately.")),msg,list,form);api("GET","/api/projects").then(function(r){r.projects.forEach(function(p){projectTitles[p.id]=p.title;});}).catch(function(){}).then(load);
+  shell([{t:"Connections"}],connHead(),connectionHelp(),settingsTabs("publishing"),h("div",{class:"callout"},icon("upload"),h("span",null,h("strong",{text:"Publishing apps"})," send their own files into the one project and folder you choose when you connect them. They can't read anything else. Reader apps and keys are approved separately.")),msg,list,form);api("GET","/api/projects").then(function(r){r.projects.forEach(function(p){projectTitles[p.id]=p.title;});}).catch(function(){}).then(load);
 }
 
 // ---------- settings: agent tokens (advanced: scripts and local agents) + backup ----------
@@ -997,13 +1024,14 @@ async function viewTokens() {
         try { await api("PATCH", "/api/projects/" + enc(g.project_id) + "/grants/" + enc(g.id), { revoke: true }); toast("Revoked " + g.label); load(); }
         catch (err) { showErr(msg, err); e.target.disabled = false; }
       } }, "Revoke"));
+      li.append(connectionSummary("legacy_grant", g.id, g.label, [{ project_id: g.project_id, title: g.project_title, access: g.access }], g.expires_at, null, g.status, data.checked_at));
       list.append(li);
     });
   }
   async function load() {
     try {
       var r = await Promise.all([api("GET", "/api/access"), api("GET", "/api/projects")]);
-      data = r[0]; projects = r[1].projects;
+      data = r[0]; data.checked_at = new Date().toISOString(); projects = r[1].projects;
       if (!proj.options.length) projects.forEach(function (p) { projectTitles[p.id] = p.title; proj.append(h("option", { value: p.id, text: p.title })); });
       draw();
     } catch (err) { showErr(msg, err); }
@@ -1040,7 +1068,7 @@ async function viewTokens() {
     } catch (err) { showErr(bmsg, err); }
     backupBtn.disabled = false;
   } }, icon("download"), "Download backup");
-  shell([{ t: "Connections" }], connHead(), settingsTabs("tokens"),
+  shell([{ t: "Connections" }], connHead(), connectionHelp(), settingsTabs("tokens"),
     h("div", { class: "callout" }, icon("key"), h("span", null, h("strong", { text: "Agent tokens (advanced)" }), " are for your own scripts or local agents that can't sign in. Each token covers one project, expires, and can be revoked immediately. Most apps should connect as a reader app instead.")),
     msg, list, h("p", null, h("label", { class: "muted small" }, showAll, "Show revoked and expired")),
     h("details", null, h("summary", { text: "Create a token" }), h("div", { class: "card" }, form)), tokenBox,
@@ -1150,13 +1178,14 @@ async function viewApiKeys() {
             catch (err) { showErr(msg, err); e.target.disabled = false; }
           } }, "Revoke")), editHost);
       }
+      li.append(connectionSummary("api_key", k.id, k.label, k.projects, k.expires_at, k.last_used_at, k.status, data.checked_at));
       list.append(li);
     });
   }
   async function load() {
     try {
       var r = await Promise.all([api("GET", "/api/api-keys"), api("GET", "/api/projects")]);
-      data = r[0]; projects = r[1].projects;
+      data = r[0]; data.checked_at = new Date().toISOString(); projects = r[1].projects;
       projects.forEach(function (p) { projectTitles[p.id] = p.title; });
       if (!picker) { picker = scopePicker(projects, []); pickerHost.replaceChildren(picker.el); }
       draw();
@@ -1177,7 +1206,7 @@ async function viewApiKeys() {
     h("div", { class: "grid2" }, h("label", null, "Label", label), h("label", null, "Lifetime", life)),
     pickerHost,
     h("div", { class: "row" }, h("span", { class: "spacer" }), h("button", { type: "submit" }, "Create key")));
-  shell([{ t: "Connections" }], connHead(), settingsTabs("api-keys"),
+  shell([{ t: "Connections" }], connHead(), connectionHelp(), settingsTabs("api-keys"),
     h("div", { class: "callout" }, icon("key"), h("span", null, h("strong", { text: "API keys" }), " are for apps that use the REST API (for example Muse). Each key covers only the projects you pick, expires (90 days at most) and can be replaced or revoked at any time. The key itself is shown once.")),
     msg, box, list, h("p", null, h("label", { class: "muted small" }, showAll, "Show revoked and expired")),
     h("details", null, h("summary", { text: "Create an API key" }), h("div", { class: "card" }, form)));

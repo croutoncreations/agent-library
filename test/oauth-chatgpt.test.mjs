@@ -270,7 +270,8 @@ test("read+write connection: real MCP SDK client initializes, lists tools, creat
   const c = new Client({ name: "chatgpt-sim", version: "1" });
   await c.connect(new StreamableHTTPClientTransport(new URL(RESOURCE), { requestInit: { headers: { authorization: `Bearer ${rwToken}` } } }));
   const tools = (await c.listTools()).tools;
-  assert.deepEqual(tools.map((x) => x.name).sort(), ["artifact_history", "create_from_template", "create_markdown", "diff_revisions", "list_artifacts", "list_changes", "list_projects", "list_templates", "read_artifact", "read_file", "restore_metadata", "restore_revision", "save_markdown", "search_artifacts", "upload_begin", "upload_file", "upload_finish"]);
+  assert.deepEqual(tools.map((x) => x.name).sort(), ["artifact_history", "connection_info", "create_from_template", "create_markdown", "diff_revisions", "list_artifacts", "list_changes", "list_projects", "list_templates", "read_artifact", "read_file", "restore_metadata", "restore_revision", "save_markdown", "search_artifacts", "upload_begin", "upload_file", "upload_finish"]);
+  assert.equal(tools.find((x) => x.name === "connection_info").annotations.readOnlyHint, true);
   assert.equal(tools.find((x) => x.name === "restore_revision").annotations.readOnlyHint, false);
   assert.equal(tools.find((x) => x.name === "diff_revisions").annotations.readOnlyHint, true);
   assert.equal(tools.find((x) => x.name === "read_artifact").annotations.readOnlyHint, true);
