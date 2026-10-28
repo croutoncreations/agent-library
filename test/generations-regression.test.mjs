@@ -60,8 +60,10 @@ test("generation regressions: TTL scope, committed retention, auth/epoch, closur
     assert.equal((await begin(tokA, g1)).status, 201);
     await putAll(tokA, g1);
     assert.deepEqual(await fileNames(), [], "staged parts must not be visible as artifacts");
+    assert.equal((await owner.req("GET", "/api/search?query=" + encodeURIComponent("синтетика"))).body.results.length, 0, "staged generation text is not searchable");
     const c1 = await commit(tokA, "g_reg_one", { idem: "commit-g1" });
     assert.equal(c1.status, 201, c1.text);
+    assert.equal((await owner.req("GET", "/api/search?query=" + encodeURIComponent("синтетика"))).body.results.length, 3, "committed generation payloads are indexed atomically");
     const r1 = c1.json.snapshot;
     assert.equal(r1.publisher_id, A.publisher_id); assert.equal(r1.source_revision, 1); assert.ok(r1.snapshot_id.startsWith("snp_"));
     assert.equal(r1.files.length, 4);

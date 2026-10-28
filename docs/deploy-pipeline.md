@@ -102,13 +102,23 @@ New migrations must be **additive and retry-safe**: `CREATE TABLE/INDEX … IF N
 ### Destructive migrations
 
 Only these statements are auto-applied:
-- `CREATE TABLE/INDEX/VIEW/TRIGGER`;
+- `CREATE TABLE/INDEX/VIEW/TRIGGER`, and retry-safe `CREATE VIRTUAL TABLE IF NOT EXISTS … USING fts5` for the derived search index;
 - `ALTER TABLE … ADD`;
 - `INSERT [OR IGNORE] INTO`.
 
 Anything else, such as `DROP`, `DELETE`, `UPDATE`, `REPLACE`, renames, `PRAGMA` or table rebuilds, needs:
 1. a `-- owner-approved-destructive: <who> <date> <reason>` line in the file (CI fails without it);
-2. a manual window. Take a private export (`npx wrangler d1 export DB --remote --env hosted --output backup.sql`), note a Time Travel bookmark, then run `npx wrangler d1 migrations apply DB --remote --env hosted` yourself;
+2. a manual window. Record and verify a **D1 Time Travel restore point** before changing data:
+
+   ```sh
+   npx wrangler d1 time-travel info DB --env hosted --json
+   ```
+
+   Save its nonempty `bookmark`, timestamp and database identity privately with the change record. If the lookup fails or returns no bookmark, stop the window. Confirm the recovery window fits the installation's Time Travel retention (7 days on Free, 30 days on Paid) and that the database supports Time Travel. Then run `npx wrangler d1 migrations apply DB --remote --env hosted` yourself. Restoration is a separate, explicitly owner-approved destructive action using the bookmark, as shown below.
+
+   **Do not use a whole-database `wrangler d1 export` as this runbook's recovery prerequisite after migration 0014.** Cloudflare does not export databases containing virtual tables. Do not drop the live FTS table to make an export work: its maintenance triggers and running Worker depend on it. Time Travel preserves the database state including the search schema. Project backups remain useful for artifact portability, but do not replace the database restore point. For retention beyond Time Travel, prepare and verify a separate installation-specific archival/recovery procedure before the window; this runbook does not claim a tested SQL-export workaround.
+
+   References: [Time Travel requirements and retention](https://developers.cloudflare.com/d1/reference/time-travel/), [virtual-table export limitation](https://developers.cloudflare.com/d1/best-practices/import-export-data/#known-limitations-1).
 3. a push to `main`. The preflight sees the migration as applied and continues.
 
 ## Recovery
@@ -123,7 +133,11 @@ Anything else, such as `DROP`, `DELETE`, `UPDATE`, `REPLACE`, renames, `PRAGMA` 
 | Secret rotated | Nothing to do. The preflight looks through `secret`-triggered versions to the code version underneath. |
 | Out-of-band deploy (dashboard edit or manual deploy) | The preflight refuses. Bring that source into `main`; if it should become the new baseline, update `baseline` in the deploy repo's `deploy/production.json`. |
 
-Worker rollback restores code and config only, not D1, R2 or KV.
+Worker rollback restores code and config only, not D1, R2 or KV. After a database restore or import, restart the [bounded search backfill](ranked-search.md#required-infrastructure--rollout) from `--after 0`. Search readiness checks suppress results if any published current heads are missing from the restored index. The FTS key map uses explicit integer primary keys, so ordinary VACUUM does not invalidate it.
+
+### Search rollout readiness
+
+Migration 0014 seeds search as unavailable on an existing installation. Automatic deployment can proceed, but Home and both MCP catalogs hide search until the bounded backfill has verified completeness; direct HTTP searches return `503 search_initializing`. Deploy the new Worker first, then run the operator-authorized backfill from `--after 0` until `processed=0` and `ready=1`. A zero-row batch alone never makes an incomplete index ready. Fresh empty installations are immediately ready. Old-Worker generation writes made during rollback are detected by the completeness probe and require backfill before search resumes. See [ranked search rollout](ranked-search.md#required-infrastructure--rollout).
 
 ## Branch protection
 

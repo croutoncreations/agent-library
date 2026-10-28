@@ -1,0 +1,10 @@
+/* Global ranked search uses text nodes, including highlighted excerpts. */
+.search-form{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+.search-form input{min-width:180px;flex:1}
+.search-form select{max-width:100%}
+.search-results{list-style:none;padding:0;display:grid;gap:12px}
+.search-hit{min-width:0;overflow-wrap:anywhere}
+.search-title{font-size:1.12rem;font-weight:600}
+.search-snippet{white-space:pre-wrap;line-height:1.6;margin-bottom:0}
+.search-hit mark{background:var(--accent-soft);color:var(--fg);border-radius:2px}
+@media(max-width:540px){.search-form input{flex-basis:100%}.search-form select{flex:1;min-width:0}}

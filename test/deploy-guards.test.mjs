@@ -215,3 +215,10 @@ test('only additive SQL may be auto-applied; comment/quote/identifier tricks are
   ];
   for (const sql of destructive) assert.notDeepEqual(nonAdditiveStatements(sql), [], sql);
 });
+
+test('FTS5 virtual indexes are additive only with IF NOT EXISTS; other virtual modules stay gated', async () => {
+  const { nonAdditiveStatements } = await import('../scripts/deploy/lib.mjs');
+  assert.deepEqual(nonAdditiveStatements('CREATE VIRTUAL TABLE IF NOT EXISTS search_idx USING fts5(title, body);'), []);
+  assert.equal(nonAdditiveStatements('CREATE VIRTUAL TABLE search_idx USING fts5(title);').length, 1);
+  assert.equal(nonAdditiveStatements('CREATE VIRTUAL TABLE IF NOT EXISTS idx USING other(title);').length, 1);
+});
