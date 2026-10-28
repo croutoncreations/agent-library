@@ -67,6 +67,7 @@ Agent Library is a personal library: one owner, many agents.
 - [Connecting agents](docs/agent-setup.md): MCP (OAuth) and API keys, scopes, revocation.
 - [App Connect](docs/app-connect.md): let your own apps store their data in your library.
 - [Architecture](docs/architecture.md): how the pieces fit, the security model and how the bundle is built.
+- [Changes feed](docs/project-changes.md): checkpoints, incremental polling, retention and resync.
 - [Operations](docs/operations.md): upgrades, backup and restore, rollback.
 - [Deploy pipeline](docs/deploy-pipeline.md) (optional): auto-deploy your installation from GitHub on every push to `main`.
 - [Version history](docs/version-history.md) and [upload finalization](docs/upload-finalization.md): design notes.

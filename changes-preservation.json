@@ -1,0 +1,60 @@
+{
+  "base_search_sha256": "026f37911d77c6276f1a0611b453dc06e0a45b0063496e7216d83b6283103eab",
+  "integrated_sha256": "753687ced0eee90707db20b02d852a195baa980645de5e388e775b252d272c45",
+  "sources_sha256": {
+    "service.js": "be31bd9304335cf8d03c1d1edd1eab2da15fa85307ed652ea246e3231b224a16",
+    "generation-batch.js": "9ce97b4355bbac3c6ae2b1dc4f9fa1c7a2d8538638ac83595e1cc10e2ab45d7b"
+  },
+  "patches": [
+    {
+      "module": "service",
+      "name": "shared durable changes polling service",
+      "find_sha256": "b1ca91c55ea8be241724b9e4ab54c01e92608ceee87e34402c5bd5b84f9c0e9b"
+    },
+    {
+      "module": "oauthMcp",
+      "name": "OAuth MCP list_changes",
+      "find_sha256": "976ff313e7abe0d863b6ebe4b9253106881f902f1905812c5950b3e4728773ca"
+    },
+    {
+      "module": "oauthMcp",
+      "name": "require explicit project on changes even for single project connections",
+      "find_sha256": "92d7251156c49a8e28caf43eef8344af4b05e9bb3bcf7f88bb2a8f0854661d75"
+    },
+    {
+      "module": "mcp",
+      "name": "legacy MCP list_changes",
+      "find_sha256": "79c6f0c0d38784e95eeb0b581185c7453d565c05cd88048b4f9c218ac4a353e5"
+    },
+    {
+      "module": "service",
+      "name": "bound the complete changes MCP response",
+      "find_sha256": "a934a26863056e031593460fdfecf8de389a445f9940e112919d4fca76169517"
+    },
+    {
+      "module": "v1",
+      "name": "machine API changes route",
+      "find_sha256": "64151a991a478c93867cb5da52f02239ce49f67a7d1fd09f82ca3a2f5e59bfed"
+    },
+    {
+      "module": "v1",
+      "name": "machine API changes handler",
+      "find_sha256": "25906e4fbe003a1f0255a84e6440033f3eca94258fcf29f74a853765d3f7fa95"
+    },
+    {
+      "module": "index",
+      "name": "owner API changes route",
+      "find_sha256": "c85c0e533f78d2a3bb689371dba84be0c3b755ba44817f3667b03a5c0d5e8f67"
+    },
+    {
+      "module": "index",
+      "name": "bounded changes retention on existing cron",
+      "find_sha256": "430875474a99618cc6813f1c34d30b850dbcc20552bace6c5ed77c30e1d49d83"
+    },
+    {
+      "module": "publisher",
+      "name": "generation checks count direct writes, excluding trigger side effects",
+      "find_sha256": "c5c07658aecac05200ed8d42eb616cdbf060a0f8370e9632244c1624e7edfa52"
+    }
+  ]
+}

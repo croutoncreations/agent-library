@@ -14,7 +14,7 @@ import { sha256 } from './lib.mjs';
 const root = resolve('.');
 const esbuild = createRequire(join(root, 'package.json')).resolve('esbuild');
 const dir = mkdtempSync(join(tmpdir(), 'al-bundle-'));
-const outputs = ['src/index.js', 'bundle-preservation.json', 'design-bundle-preservation.json', 'service-fixes-preservation.json', 'ui-fixes-preservation.json', 'icon-fixes-preservation.json', 'history-fixes-preservation.json', 'consent-fixes-preservation.json', 'session-fixes-preservation.json', 'upload-fixes-preservation.json', 'portability-fixes-preservation.json', 'auth-fixes-preservation.json', 'app-connect-fixes-preservation.json', 'read-fixes-preservation.json', 'file-tools-fixes-preservation.json', 'search-preservation.json'];
+const outputs = ['src/index.js', 'bundle-preservation.json', 'design-bundle-preservation.json', 'service-fixes-preservation.json', 'ui-fixes-preservation.json', 'icon-fixes-preservation.json', 'history-fixes-preservation.json', 'consent-fixes-preservation.json', 'session-fixes-preservation.json', 'upload-fixes-preservation.json', 'portability-fixes-preservation.json', 'auth-fixes-preservation.json', 'app-connect-fixes-preservation.json', 'read-fixes-preservation.json', 'file-tools-fixes-preservation.json', 'search-preservation.json', 'changes-preservation.json'];
 let bad = [];
 try {
   cpSync(root, dir, { recursive: true, filter: (s) => !/\/(node_modules|\.git|\.wrangler|tmp|\.artifacts)(\/|$)/.test(s.slice(root.length)) });
@@ -34,6 +34,7 @@ try {
   execFileSync('node', ['build-read-fixes.mjs'], { cwd: dir, env, stdio: 'inherit' });
   execFileSync('node', ['build-file-tools-fixes.mjs'], { cwd: dir, env, stdio: 'inherit' });
   execFileSync('node', ['build-search.mjs'], { cwd: dir, env, stdio: 'inherit' });
+  execFileSync('node', ['build-changes.mjs'], { cwd: dir, env, stdio: 'inherit' });
   for (const f of outputs) {
     const a = sha256(readFileSync(join(root, f))), b = sha256(readFileSync(join(dir, f)));
     console.log(`${a === b ? 'same' : 'DIFF'} ${f} ${b}`);

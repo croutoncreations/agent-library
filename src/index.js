@@ -5962,6 +5962,7 @@ function rtIdBytes(id) {
 const RT_MAX_ID_BYTES = 1024;
 function rtChunkLimit(msg) {
   if (msg?.method === "tools/call" && msg.params?.name === "search_artifacts") return { maxBytes: 65536, idTooLong: rtIdBytes(msg.id) > RT_MAX_ID_BYTES };
+  if (msg?.method === "tools/call" && msg.params?.name === "list_changes") return { maxBytes: 65536, idTooLong: rtIdBytes(msg.id) > RT_MAX_ID_BYTES };
   const a = msg?.method === "tools/call" && msg.params?.name === "read_artifact" ? msg.params.arguments : void 0;
   if (!a || typeof a !== "object" || Array.isArray(a) || a.cursor == null && a.max_bytes == null) return null;
   const m = a.max_bytes;
@@ -6231,6 +6232,350 @@ async function searchArtifacts(ctx, args, transport = "api") {
   return out;
 }
 
+// Durable project polling. D1 primary reads + one batch snapshot for auth, boundary and events.
+// No replica sessions: a cursor never advances past uncommitted sequence allocation.
+const CH_RETENTION_MS = 30 * 86400000;
+const CH_MAX_BYTES = 65536;
+function chQuery(q) {
+  for (const k of q.keys())
+    if (!["cursor", "limit"].includes(k))
+      throw new HttpError(400, "invalid_input", "Unknown query parameter");
+  return {
+    cursor: q.get("cursor") ?? undefined,
+    limit: q.has("limit") ? Number(q.get("limit")) : undefined,
+  };
+}
+function chBytes(v) {
+  return new TextEncoder().encode(JSON.stringify(v)).length;
+}
+function chB64(bytes) {
+  return btoa(String.fromCharCode(...bytes))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+function chUn64(s) {
+  return Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/")), (c) =>
+    c.charCodeAt(0),
+  );
+}
+async function chKey(env) {
+  const secret = await env.DB.prepare(
+    "SELECT secret FROM change_feed_key WHERE id=1",
+  ).first("secret");
+  if (typeof secret !== "string" || !/^[a-f0-9]{64}$/.test(secret))
+    throw new HttpError(
+      503,
+      "changes_unavailable",
+      "Changes feed migration/key is unavailable",
+    );
+  return crypto.subtle.importKey(
+    "raw",
+    Uint8Array.from(secret.match(/../g), (hex) => parseInt(hex, 16)),
+    "AES-GCM",
+    false,
+    ["encrypt", "decrypt"],
+  );
+}
+// Authenticated encryption also hides the global sequence and other scope internals. A merely
+// base64-encoded signed cursor would let readers infer activity counts outside their project.
+async function chEncode(key, v) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const data = new TextEncoder().encode(JSON.stringify(v));
+  const ciphertext = new Uint8Array(
+    await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, data),
+  );
+  return "pc1." + chB64(iv) + "." + chB64(ciphertext);
+}
+async function chDecode(key, cursor) {
+  if (typeof cursor !== "string" || cursor.length > 2048)
+    throw new HttpError(400, "invalid_cursor", "Malformed changes cursor");
+  if (!/^pc[0-9]+\./.test(cursor))
+    throw new HttpError(400, "invalid_cursor", "Malformed changes cursor");
+  if (!cursor.startsWith("pc1."))
+    throw new HttpError(
+      400,
+      "unsupported_cursor_version",
+      "Expected a pc1 changes cursor",
+    );
+  try {
+    const parts = cursor.split(".");
+    if (parts.length !== 3) throw 0;
+    const iv = chUn64(parts[1]),
+      ciphertext = chUn64(parts[2]);
+    if (
+      iv.length !== 12 ||
+      chB64(iv) !== parts[1] ||
+      chB64(ciphertext) !== parts[2]
+    )
+      throw 0;
+    const data = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv },
+      key,
+      ciphertext,
+    );
+    const v = JSON.parse(new TextDecoder().decode(data));
+    if (
+      !Array.isArray(v) ||
+      v.length !== 8 ||
+      !v.slice(3, 7).every((n) => Number.isSafeInteger(n) && n >= 0) ||
+      typeof v[7] !== "string" ||
+      (v[4] && v[4] < v[3])
+    )
+      throw 0;
+    return v;
+  } catch {
+    throw new HttpError(
+      400,
+      "invalid_cursor",
+      "Malformed or modified changes cursor",
+    );
+  }
+}
+function chKinds(ctx) {
+  if (!ctx.oauthConnection)
+    return ["markdown", "html", "json", "csv", "binary"];
+  // The App Connect kind gate applies independently of approval to read binaries.
+  const kinds = ["markdown", "html"];
+  if (appConnectEnabled(ctx.env)) kinds.push("json", "csv");
+  if (ctx.ftConn?.file_access === 1) kinds.push("binary");
+  return kinds;
+}
+async function listChanges(ctx, projectId, opts = {}) {
+  if (typeof projectId !== "string" || !projectId || projectId.length > 64)
+    throw new HttpError(
+      400,
+      "project_required",
+      "Pass one explicit project_id",
+    );
+  if (ctx.publisher)
+    throw new HttpError(
+      403,
+      "forbidden",
+      "Publishers cannot use the project changes feed",
+    );
+  await authorizeProject(ctx, projectId, false);
+  const limit = opts.limit ?? 50;
+  if (!Number.isInteger(limit) || limit < 1 || limit > 50)
+    throw new HttpError(
+      400,
+      "invalid_input",
+      "limit must be an integer from 1 to 50",
+    );
+  const az = rtReadAuthzSql(ctx, projectId);
+  const transport = ctx.oauthConnection
+    ? "oauth"
+    : ctx.apiCredential
+      ? "api"
+      : "grant";
+  const connection =
+    ctx.principal.kind === "human"
+      ? "owner:" + ctx.principal.id
+      : transport + ":" + ctx.grant.id;
+  const kinds = chKinds(ctx);
+  const mode = kinds.join(",");
+  const key = await chKey(ctx.env);
+  const c = opts.cursor == null ? null : await chDecode(key, opts.cursor);
+  if (c && c[0] !== projectId)
+    throw new HttpError(
+      400,
+      "cursor_wrong_project",
+      "Changes cursor belongs to another project",
+    );
+  if (c && (c[1] !== connection || c[2] !== mode))
+    throw new HttpError(
+      409,
+      "cursor_scope_changed",
+      "Reconcile current state and establish a new checkpoint for this scope",
+    );
+  const after = c?.[3] ?? 0,
+    boundary = c?.[4] ?? 0;
+  // Both SELECTs use the same transaction. The second repeats the live authorization fence.
+  const stateSql = `SELECT COALESCE(s.high,0) high,COALESCE(s.floor,0) floor,
+    (SELECT file_access FROM oauth_connections WHERE id=?) file_access,
+    (SELECT group_concat(pb.id || ':' || pb.current_snapshot_id, ',') FROM publishers pb
+      JOIN publisher_generations pg ON pg.snapshot_id=pb.current_snapshot_id
+      LEFT JOIN change_generation_coverage cv ON cv.publisher_id=pb.id
+      WHERE pb.project_id=p.id AND cv.snapshot_id IS NOT pb.current_snapshot_id) coverage_gap,
+    COALESCE((SELECT epoch FROM change_scope_epochs WHERE transport=? AND connection_id=? AND project_id=?),0) epoch
+    FROM projects p LEFT JOIN project_change_state s ON s.project_id=p.id WHERE p.id=? AND ${az.sql}`;
+  const [stateResult, eventResult] = await ctx.env.DB.batch([
+    ctx.env.DB.prepare(stateSql).bind(
+      ctx.grant?.id ?? "",
+      transport,
+      ctx.grant?.id ?? "",
+      projectId,
+      projectId,
+      ...az.params,
+    ),
+    ctx.env.DB.prepare(
+      `SELECT e.*,a.trashed_at,a.head_rev,a.id current_id FROM project_changes e
+      LEFT JOIN artifacts a ON a.id=e.artifact_id AND a.project_id=e.project_id
+      WHERE e.project_id=? AND e.seq>? AND e.seq<=COALESCE(NULLIF(?,0),(SELECT high FROM project_change_state WHERE project_id=?),0)
+      AND e.kind IN (${kinds.map(() => "?").join(",")}) AND ${az.sql}
+      ORDER BY e.seq LIMIT ?`,
+    ).bind(
+      projectId,
+      after,
+      boundary,
+      projectId,
+      ...kinds,
+      ...az.params,
+      limit + 1,
+    ),
+  ]);
+  const state = stateResult.results[0];
+  if (!state)
+    throw new HttpError(
+      404,
+      "not_found",
+      "Project not found or access removed",
+    );
+  if (
+    ctx.oauthConnection &&
+    !!state.file_access !== (ctx.ftConn?.file_access === 1)
+  )
+    throw new HttpError(
+      409,
+      "cursor_scope_changed",
+      "Connection file access changed during this poll; retry with the current scope",
+    );
+  const coverage = await sha256Hex(state.coverage_gap ?? "");
+  if (c && c[7] !== coverage)
+    throw new HttpError(
+      409,
+      "cursor_scope_changed",
+      "Publication coverage changed after Worker rollback; reconcile and take a new checkpoint",
+      { resync_required: true },
+    );
+  if (c && c[6] !== state.epoch)
+    throw new HttpError(
+      409,
+      "cursor_scope_changed",
+      "Project scope changed; reconcile and take a new checkpoint",
+    );
+  if (c && (after < state.floor || c[5] < nowMs() - CH_RETENTION_MS))
+    throw new HttpError(
+      410,
+      "cursor_expired",
+      "Changes cursor expired; take a checkpoint BEFORE listing current content, then consume changes and deduplicate by event_id",
+      {
+        resync_required: true,
+        oldest_usable_cursor: await chEncode(key, [
+          projectId,
+          connection,
+          mode,
+          Math.max(after, state.floor),
+          0,
+          nowMs(),
+          state.epoch,
+          coverage,
+        ]),
+      },
+    );
+  const upper = boundary || state.high;
+  const issued = c && boundary ? c[5] : nowMs();
+  const encode = (a, b) =>
+    chEncode(key, [
+      projectId,
+      connection,
+      mode,
+      a,
+      b,
+      issued,
+      state.epoch,
+      coverage,
+    ]);
+  const out = {
+    changes: [],
+    next_cursor: "",
+    has_more: false,
+    initialized: !c,
+    checkpoint: !c,
+    retention_days: 30,
+  };
+  if (!c) {
+    out.next_cursor = await encode(state.high, 0);
+    return out;
+  }
+  let last = after;
+  const rows = eventResult.results;
+  for (const e of rows.slice(0, limit)) {
+    const item = {
+      event_id: "chg_" + e.event_id,
+      type: e.type,
+      project_id: projectId,
+      artifact_id: e.artifact_id,
+      occurred_at: e.at,
+    };
+    if (
+      !e.current_id ||
+      e.trashed_at ||
+      !e.head_rev ||
+      e.type === "artifact.trashed"
+    )
+      item.tombstone = true;
+    else {
+      item.revision = e.revision;
+      item.sha256 = e.sha256;
+      item.meta_version = e.meta_version;
+      item.changed_fields = JSON.parse(e.changed_fields);
+      item.restored_from = e.restored_from;
+      item.connection_label = String(e.connection_label ?? "Unknown connection")
+        .replace(/[\u0000-\u001f\u007f]/g, " ")
+        .slice(0, 120);
+      const origin = appOrigin(ctx.env.APP_HOST);
+      if (origin)
+        item.web_url = artifactWebUrl(origin, projectId, e.artifact_id); // No old-version URLs: ordinary readers do not gain history access.
+    }
+    out.changes.push(item);
+    out.next_cursor = await encode(e.seq, upper);
+    // Complete MCP response includes JSON text AND structured content. Reserve a bounded RPC id + envelope.
+    if (
+      chBytes({
+        jsonrpc: "2.0",
+        id: "x".repeat(1024),
+        result: {
+          content: [{ type: "text", text: JSON.stringify(out) }],
+          structuredContent: out,
+          isError: false,
+        },
+      }) >
+      CH_MAX_BYTES - 1024
+    ) {
+      out.changes.pop();
+      break;
+    }
+    last = e.seq;
+  }
+  out.has_more = rows.length > out.changes.length;
+  out.next_cursor = await encode(
+    out.has_more ? last : upper,
+    out.has_more ? upper : 0,
+  );
+  return out;
+}
+async function cleanupChanges(env) {
+  // Bounded work on the existing 15 minute cron. Deletion trigger preserves the oldest usable sequence.
+  const [result, count] = await env.DB.batch([
+    env.DB.prepare(
+      `DELETE FROM project_changes WHERE seq IN
+    (SELECT seq FROM project_changes WHERE at < ? ORDER BY at,seq LIMIT 1000)`,
+    ).bind(new Date(nowMs() - CH_RETENTION_MS).toISOString()),
+    // D1 meta.changes includes the retention-floor trigger writes. Measure direct deletes instead.
+    env.DB.prepare("SELECT changes() AS deleted"),
+  ]);
+  const deleted = count.results[0].deleted;
+  if (deleted === 1000)
+    console.warn(
+      JSON.stringify({
+        event: "project_changes_cleanup_batch_full",
+        deleted,
+        limit: 1000,
+      }),
+    );
+  return result;
+}
 async function getArtifact(ctx, projectId, artifactId, revNo) {
   await authorizeProject(ctx, projectId, false);
   const a = await loadArtifact(ctx, projectId, artifactId);
@@ -7114,6 +7459,7 @@ async function handleOAuthMcp(req, env, ctx) {
           return reply(rpc(msg.id, toolError({ status: e.status, code: e.code, message: e.message })));
         }
       }
+      if (tool.name === "list_changes" && !args.project_id) return reply(rpc(msg.id, toolError({ status: 400, code: "project_required", message: "Pass one explicit project_id" })));
       let proj = conn.projects.length === 1 && args.project_id === void 0 ? conn.projects[0] : void 0;
       if (args.project_id !== void 0) proj = conn.projects.find((p) => p.id === args.project_id);
       if (!proj) {
@@ -7176,6 +7522,7 @@ var init_mcp = __esm({
     RT_MAXB = { type: "integer", minimum: 4096, maximum: 524288, description: "Upper bound in bytes for this whole tool result as encoded (default 65536)" };
     RW = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false };
     TOOLS = [
+      { name: "list_changes", title: "List project changes", description: "Poll published changes in one explicit project. WITHOUT cursor establishes a current checkpoint and returns NO history (initialized=true). Store next_cursor; follow has_more, then poll again. At-least-once: deduplicate by event_id. Cursors expire after 30 days; checkpoint BEFORE reconciling current content. Publishers excluded. No bodies or push notifications.", inputSchema: S({ project_id: { type: "string", maxLength: 64 }, cursor: { type: "string", maxLength: 2048 }, limit: { type: "integer", minimum: 1, maximum: 50 } }, ["project_id"]), annotations: RO, write: false, run: (c,p,a) => listChanges(c,p,a) },
       { name: "search_artifacts", title: "Search library", description: "Ranked lexical search across currently readable projects. All words must match stored title/text; punctuation separates words. Returns bounded plain-text excerpts and revision-pinned links. Live pagination expires after 15 minutes.", inputSchema: RS_SCHEMA, annotations: RO, write: false, run: (c, p, a) => searchArtifacts(c,a,"mcp") },
       {
         name: "list_projects",
@@ -8201,7 +8548,17 @@ var __appConnectPublisher = (() => {
       WHERE a.publisher_id=? AND a.generation_id=? AND s.revision_id=a.head_revision_id`).bind(p.id,id));
     let res;
     try {
-      res = await env.DB.batch(q);
+      // The context lives only inside this atomic batch. A rolled-back older Worker does not opt in,
+      // so trigger side effects cannot break its exact generation row-count checks.
+      const measured = await env.DB.batch([
+        env.DB.prepare("INSERT INTO change_generation_context VALUES(1)"),
+        ...q.flatMap(stmt => [stmt, env.DB.prepare("SELECT changes() AS direct_changes")]),
+        env.DB.prepare(`INSERT INTO change_generation_coverage(publisher_id,snapshot_id)
+          SELECT id,current_snapshot_id FROM publishers WHERE id=? AND current_snapshot_id=?
+          ON CONFLICT(publisher_id) DO UPDATE SET snapshot_id=excluded.snapshot_id`).bind(p.id,sid),
+        env.DB.prepare("DELETE FROM change_generation_context WHERE id=1")
+      ]);
+      res = q.map((_, i) => ({ ...measured[1+2*i], meta: { ...measured[1+2*i].meta, changes: measured[2+2*i].results[0].direct_changes } }));
     } catch (e) {
       const again = await generation(env, p, id).catch(() => null);
       if (again?.state === "committed")
@@ -10316,6 +10673,7 @@ var A2 = { type: "string", description: "Artifact ID" };
 var K2 = { type: "string", description: "Idempotency key (8-128 chars); reuse it when retrying the same request" };
 var unwrap2 = /* @__PURE__ */ __name((r) => r && typeof r.status === "number" && "body" in r ? r.body : r, "unwrap");
 var TOOLS2 = [
+  { name: "list_changes", description: "Poll published changes in one explicit project. WITHOUT cursor establishes a current checkpoint and returns NO history (initialized=true). Store next_cursor; follow has_more, then poll again. At-least-once: deduplicate by event_id. Cursors expire after 30 days; checkpoint BEFORE reconciling current content. Publishers excluded. No bodies or push notifications.", inputSchema: S2({ project_id: { type: "string", maxLength: 64 }, cursor: { type: "string", maxLength: 2048 }, limit: { type: "integer", minimum: 1, maximum: 50 } }, ["project_id"]), run: (c,a) => listChanges(c,a.project_id,a) },
   { name: "search_artifacts", description: "Ranked lexical search of currently readable projects, with excerpts and revision-pinned links. All words must match. Live pagination.", inputSchema: RS_SCHEMA, annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }, run: (c,a) => searchArtifacts(c,a,"mcp") },
   { name: "list_projects", description: "List projects this identity may access.", inputSchema: S2({}, []), run: /* @__PURE__ */ __name((c) => listProjects(c), "run") },
   {
@@ -14705,6 +15063,7 @@ var SEG = "([A-Za-z0-9_-]{1,64})";
 var R2 = {
   search: /^\/v1\/search$/,
   projects: /^\/v1\/projects$/,
+  changes: new RegExp(`^/v1/projects/${SEG}/changes$`),
   files: new RegExp(`^/v1/projects/${SEG}/files$`),
   file: new RegExp(`^/v1/projects/${SEG}/files/${SEG}$`),
   content: new RegExp(`^/v1/projects/${SEG}/files/${SEG}/content$`),
@@ -14813,6 +15172,10 @@ async function route2(req, env, url, requestId) {
   if (R2.projects.test(path)) {
     if (m !== "GET") throw new HttpError(405, "method_not_allowed", "Method not allowed");
     return json({ projects: k.projects.map((p) => ({ id: p.id, title: p.title, access: p.can_write ? "read_write" : "read", ...origin ? { web_url: projectWebUrl(origin, p.id) } : {} })) });
+  }
+  if (g = R2.changes.exec(path)) {
+    if (m !== "GET") throw new HttpError(405, "method_not_allowed", "Method not allowed");
+    return json(await listChanges(projectCtx(env,k,requestId,g[1]),g[1],chQuery(url.searchParams)));
   }
   if (g = R2.files.exec(path)) {
     const pid = g[1];
@@ -15253,6 +15616,7 @@ async function route3(req, env, url, requestId) {
     if (rest.length === 1 && m === "POST") return json(await createGrant(ctx, pid, await body(req)), 201);
     if (rest.length === 2 && m === "PATCH") return json(await updateGrant(ctx, pid, rest[1], await body(req)));
   }
+  if (rest[0] === "changes" && rest.length === 1 && m === "GET") return json(await listChanges(ctx,pid,chQuery(url.searchParams)));
   if (rest[0] === "audit" && m === "GET") return json(await listAudit(ctx, pid));
   if (rest[0] === "folders" && rest.length === 1) {
     if (m === "GET") return json(await listFolders(ctx, pid));
@@ -15336,6 +15700,7 @@ __name(route3, "route");
 var index_default = {
   // Cron: expire abandoned uploads and delete their R2 objects (bounded, idempotent).
   async scheduled(_ev, env, ctx) {
+    ctx.waitUntil(cleanupChanges(env));
     ctx.waitUntil(reconcileUploads(env, { limit: 100 }).then((r) => console.log("reconcile", JSON.stringify(r))));
   },
   async fetch(req, env, ctx) {
