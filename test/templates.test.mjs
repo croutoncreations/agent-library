@@ -321,8 +321,11 @@ test('Chrome: save/cancel template, pinned picker, preview safety, mobile/keyboa
     await page.screenshot({ path: 'tmp/test-evidence/templates-copy-mobile.png', fullPage: true });
     // The provenance link opens the source template itself (pinned revision), not an unavailable-item page.
     await page.evaluate(() => [...document.querySelectorAll('a')].find(a => a.textContent.includes('Created from UI Research')).click());
-    await page.waitForFunction(id => location.hash.includes('/a/' + id), {}, uiTemplate);
+    await page.waitForFunction(id => location.hash.includes('/a/' + id) && /[?&]v=1\b/.test(location.hash), {}, uiTemplate);
     await page.waitForFunction(() => /UI Research/.test(document.querySelector('h1')?.textContent || ''));
+    // The template is at revision 2 by now; the pinned link opens History on version 1, not the current one.
+    await page.waitForFunction(() => /VERSION 1/.test(document.querySelector('main')?.innerText || ''));
+    assert.doesNotMatch(await page.$eval('main', e => e.innerText), /VERSION 2/);
     assert.equal(await page.evaluate(() => /not available|couldn.t find|not found/i.test(document.querySelector('main')?.textContent || '')), false, 'source opens, not an unavailable page');
     assert.deepEqual(errors, []);
     // Empty and loading failures keep Blank usable and explain template saving.
