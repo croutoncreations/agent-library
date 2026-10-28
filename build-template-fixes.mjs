@@ -44,6 +44,8 @@ add(service, 'description restore value', '...keepTrash ? {} : { trashed: !!row.
 add('// src/oauth/mcp.ts', 'OAuth template tools', '    TOOLS = [\n', '    TOOLS = [\n      ...tplTools(true),\n');
 add('// src/mcp.ts', 'legacy read-only template discovery', 'tools: TOOLS2.filter(t => t.name !== "search_artifacts" || searchReady).map(', 'tools: TOOLS2.filter(t => (t.name !== "search_artifacts" || searchReady) && (!t.write || !!ctx.grant?.can_write)).map(');
 add('// src/mcp.ts', 'legacy template tools', 'var TOOLS2 = [\n', 'var TOOLS2 = [\n  ...tplTools(false),\n');
+// Legacy /mcp picks the rate bucket from a fixed name set; a copy is a write (artifact + revision + audit).
+add('// src/mcp.ts', 'legacy write rate bucket', '"restore_revision", "restore_metadata"]);', '"restore_revision", "restore_metadata", "create_from_template"]);');
 // /v1 participates in existing authentication, per-project contexts, rate limits and idempotency validation.
 add('// src/api/v1.ts', 'v1 route pattern', '  files: new RegExp(`^/v1/projects/${SEG}/files$`),', '  templates: new RegExp(`^/v1/projects/${SEG}/templates$`),\n  templateCreate: new RegExp(`^/v1/projects/${SEG}/files/from-template$`),\n  files: new RegExp(`^/v1/projects/${SEG}/files$`),');
 add('// src/api/v1.ts', 'v1 templates before generic file route', '  if (g = R2.files.exec(path)) {', `  if (g = R2.templates.exec(path)) {

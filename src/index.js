@@ -10975,7 +10975,7 @@ async function handleMcp(req, env, requestId, origin) {
   if (msg.id === void 0) return new Response(null, { status: 202 });
   const rtLim = rtChunkLimit(msg);
   if (rtLim?.idTooLong) return new Response(JSON.stringify(RT_ID_TOO_LONG), { status: 400, headers: hdr });
-  const MUTATING = /* @__PURE__ */ new Set(["create_markdown", "save_markdown", "add_comment", "upload_begin", "upload_finish", "trash_artifact", "restore_revision", "restore_metadata"]);
+  const MUTATING = /* @__PURE__ */ new Set(["create_markdown", "save_markdown", "add_comment", "upload_begin", "upload_finish", "trash_artifact", "restore_revision", "restore_metadata", "create_from_template"]);
   try {
     await enforceRate(ctx, msg.method === "tools/call" && MUTATING.has(msg.params?.name));
   } catch (e) {
@@ -12911,7 +12911,7 @@ async function viewList(pid, trash) {
         templateHelp.textContent = items.length ? "Templates create independent Markdown documents." : "No templates yet. Open a Markdown document and choose Save as template.";
       } catch (err) { templateHelp.textContent = "Couldn't load templates: " + err.message + ". Blank document is still available."; templateRetry.hidden = false; }
     }
-    function previewInput() { return { template_id: selectedTemplate.id, template_revision: selectedTemplate.revision, title: dtitle.value.trim(), date: date.value }; }
+    function previewInput() { return { template_id: selectedTemplate.id, template_revision: selectedTemplate.revision, title: dtitle.value.trim(), date: date.value || undefined }; }
     function scheduleTemplatePreview() {
       clearTimeout(previewTimer); previewReady = false;
       var seq = ++previewSeq;

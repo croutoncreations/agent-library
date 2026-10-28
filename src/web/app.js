@@ -774,7 +774,7 @@ async function viewList(pid, trash) {
         templateHelp.textContent = items.length ? "Templates create independent Markdown documents." : "No templates yet. Open a Markdown document and choose Save as template.";
       } catch (err) { templateHelp.textContent = "Couldn't load templates: " + err.message + ". Blank document is still available."; templateRetry.hidden = false; }
     }
-    function previewInput() { return { template_id: selectedTemplate.id, template_revision: selectedTemplate.revision, title: dtitle.value.trim(), date: date.value }; }
+    function previewInput() { return { template_id: selectedTemplate.id, template_revision: selectedTemplate.revision, title: dtitle.value.trim(), date: date.value || undefined }; }
     function scheduleTemplatePreview() {
       clearTimeout(previewTimer); previewReady = false;
       var seq = ++previewSeq;

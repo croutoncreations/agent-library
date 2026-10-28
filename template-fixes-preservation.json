@@ -1,6 +1,6 @@
 {
-  "base_changes_sha256": "404225003e403da78c767ea2a84187a232d0212b5e6920537dd7f97595007b00",
-  "integrated_sha256": "1a422ef12ece0536535cc8bff3e8f51cc7f5bb476d372860ae89f6d0a22f78e2",
+  "base_changes_sha256": "4fd601e71fb05952cc5e4fecb1d02130bd4c9cedee89f3bd7ab679c159244379",
+  "integrated_sha256": "e32b41de245608378cc664e396a4a38d51d1b97871a7302f21651b8102a3ff2e",
   "sources": {
     "src/templates/service.js": "0fd91f2fade24c824789bd0da643f1c1152920319531610d7e2adf1fa83728fd",
     "src/templates/tools.js": "a3aae7f9d4fca0f7af22dbee37b7b09d12efbe9643a3c21d0fd83819d89e014b"
@@ -137,6 +137,12 @@
       "name": "legacy template tools",
       "find_sha256": "79c6f0c0d38784e95eeb0b581185c7453d565c05cd88048b4f9c218ac4a353e5",
       "replace_sha256": "994685167aca128821c2f3a502b65a758f25284179d1e745983f15364ef1c6a7"
+    },
+    {
+      "module": "// src/mcp.ts",
+      "name": "legacy write rate bucket",
+      "find_sha256": "514b29fad95fdd9fa5fced7a56e06fa1c4f9835ade98f1adc02bc81c5ecfc13a",
+      "replace_sha256": "add9a22fce5c91c7d9d6459ccc0fea7d08f154525a5ec792f55369ab7520d112"
     },
     {
       "module": "// src/api/v1.ts",

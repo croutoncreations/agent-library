@@ -77,8 +77,14 @@ test('OAuth and legacy MCP list -> pinned read -> create -> fill via real SDK; r
   assert.equal(filled.isError, false);
   assert.equal((await owner.req('GET', path(copy) + '/history')).body.revisions[1].change_note, 'Start research report');
   assert.equal((await legacy.call('list_templates', { project_id: P })).data.templates[0].id, template);
+  // A copy is a write: legacy /mcp must charge the write bucket, not the read bucket.
+  const counters = async () => Object.fromEntries((await sql("SELECT substr(k,1,1) AS b, SUM(n) AS n FROM rate_counters WHERE k LIKE 'w:%' OR k LIKE 'r:%' GROUP BY b")).map(r => [r.b, r.n]));
+  const c0 = await counters();
   const made2 = await legacy.call('create_from_template', { project_id: P, ...use(), idempotency_key: key() });
   assert.equal(made2.isError, false, JSON.stringify(made2.data));
+  const c1 = await counters();
+  assert.equal((c1.w ?? 0) - (c0.w ?? 0), 1, 'legacy create_from_template counts as one write');
+  assert.equal((c1.r ?? 0) - (c0.r ?? 0), 0, 'and not as a read');
   const denied = await ro.call('create_from_template', input); assert.equal(denied.isError, true);
 });
 
@@ -343,6 +349,21 @@ test('Chrome: save/cancel template, pinned picker, preview safety, mobile/keyboa
     await clickText('Create');
     await page.waitForFunction(() => location.hash.includes('/a/'));
     await page.waitForSelector('h1');
+    assert.deepEqual(errors, []);
+    // A template without {{date}} still works after the date field is cleared.
+    const plainSrc = (await owner.req('POST', base + '/artifacts', { title: 'Plain source', body: 'No variables here' })).body.artifact_id;
+    const plain = (await owner.req('POST', base + '/templates', { source_artifact_id: plainSrc, source_revision: 1, title: 'Plain template' })).body.artifact_id;
+    await page.goto(h.appUi + `/p/${P}`);
+    await page.waitForSelector('[aria-label="Start from"]');
+    await clickText('New document');
+    await page.waitForFunction(id => [...document.querySelector('[aria-label="Start from"]').options].some(o => o.value === id), {}, plain);
+    await page.type('[aria-label="New document title"]', 'Plain copy');
+    await page.select('[aria-label="Start from"]', plain);
+    await page.$eval('[aria-label="Template date"]', e => { e.value = ''; e.dispatchEvent(new Event('input', { bubbles: true })); e.dispatchEvent(new Event('change', { bubbles: true })); });
+    await page.waitForFunction(() => [...document.querySelectorAll('button')].some(b => b.textContent === 'Use template' && !b.disabled));
+    await clickText('Use template');
+    await page.waitForFunction(() => location.hash.includes('/a/') && !document.querySelector('[role=alert]:not([hidden])')?.textContent?.includes('date'));
+    await page.waitForFunction(() => [...document.querySelectorAll('p')].some(e => e.textContent.includes('Created from Plain template')));
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
 });
