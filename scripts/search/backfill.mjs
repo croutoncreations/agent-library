@@ -2,6 +2,8 @@
 // One bounded, restartable batch. Never loads document bodies into Node or out of the installation.
 import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
+import { createRequire } from 'node:module';
+import { dirname, join } from 'node:path';
 export function backfillSql(after = 0, limit = 25) {
   if (!Number.isSafeInteger(after) || after < 0 || !Number.isInteger(limit) || limit < 1 || limit > 50) throw Error('after must be >=0; limit must be 1-50');
   const range = `SELECT rowid FROM artifacts WHERE rowid>${after} ORDER BY rowid LIMIT ${limit}`;
@@ -14,5 +16,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   const after=Number(get('--after') ?? 0), limit=Number(get('--limit') ?? 25);
   const cmd=['d1','execute','DB','--config',get('--config'),args.includes('--remote')?'--remote':'--local','--command',backfillSql(after,limit),'--json'];
   if (get('--persist-to')) cmd.push('--persist-to',get('--persist-to'));
-  process.stdout.write(execFileSync('wrangler',cmd,{encoding:'utf8',env:{...process.env,WRANGLER_SEND_METRICS:'false'}}));
+  const require = createRequire(import.meta.url);
+  const pkg = require.resolve('wrangler/package.json');
+  const cli = join(dirname(pkg), require(pkg).bin.wrangler);
+  process.stdout.write(execFileSync(process.execPath,[cli,...cmd],{encoding:'utf8',env:{...process.env,WRANGLER_SEND_METRICS:'false'}}));
 }

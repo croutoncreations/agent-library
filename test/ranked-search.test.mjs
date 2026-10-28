@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { promisify } from 'node:util';
+import { dirname } from 'node:path';
 import { createRequire } from 'node:module';
 import { grant, mcpClient, sha256 } from './helpers.mjs';
 import { SERVER_PORTS } from './ports.mjs';
@@ -206,4 +207,9 @@ test('stable search keys survive artifacts rowid reassignment and later updates'
  assert.equal((await search({query:'stablekeyneedle'})).body.results[0].artifact_id,id);
  assert.equal((await owner.req('PUT',`/api/projects/search-notes/artifacts/${id}`,{expected_revision:1,body:'stablekeysecondneedle'})).status,200);
  assert.equal((await search({query:'stablekeysecondneedle'})).body.results[0].revision,2);
+});
+
+test('standalone backfill resolves the pinned local Wrangler without global Wrangler in PATH',async()=>{
+ const r=await promisify(execFile)(process.execPath,['scripts/search/backfill.mjs','--config','wrangler.local.toml','--local','--persist-to',server.dir,'--after','0','--limit','1'],{env:{...process.env,PATH:dirname(process.execPath),WRANGLER_SEND_METRICS:'false'}});
+ const results=JSON.parse(r.stdout);assert.equal(results.at(-1).results[0].processed,1);assert.equal(results.at(-1).results[0].ready,1);
 });

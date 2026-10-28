@@ -6150,7 +6150,7 @@ function rsNormalize(a) {
 async function rsSearchState(env) {
   return await env.DB.prepare("SELECT ready=1 AND NOT EXISTS(SELECT 1 FROM artifact_search_missing) AS ready, cursor_key FROM artifact_search_state WHERE id=1").first();
 }
-async function rsReady(env) { return !!(await rsSearchState(env))?.ready; }
+async function rsReady(env) { return !!await env.DB.prepare("SELECT ready FROM artifact_search_state WHERE id=1").first("ready"); }
 // Catalog gating is constant-size; unrelated MCP calls never depend on search state.
 async function rsToolReady(env,msg) {
   if(msg.method!=="tools/list" && !(msg.method==="tools/call" && msg.params?.name==="search_artifacts")) return true;

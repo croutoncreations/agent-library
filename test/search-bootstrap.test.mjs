@@ -56,3 +56,9 @@ test('MCP initialize/ping/unrelated calls bypass search; catalogs use only the s
  assert.equal(await ctx.rsToolReady(outage,{method:'tools/list'}),false);
  assert.equal(await ctx.rsToolReady(outage,{method:'ping'}),true);
 });
+
+test('owner status reads only the singleton flag, without a corpus scan',async()=>{
+ const queries=[],ctx=createContext({});runInContext(readFileSync('src/search/service.js','utf8'),ctx);
+ const env={DB:{prepare(q){queries.push(q);return{first:async()=>1};}}};
+ assert.equal(await ctx.rsReady(env),true);assert.deepEqual(queries,['SELECT ready FROM artifact_search_state WHERE id=1']);
+});
