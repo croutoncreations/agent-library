@@ -210,6 +210,8 @@ test('stable search keys survive artifacts rowid reassignment and later updates'
 });
 
 test('standalone backfill resolves the pinned local Wrangler without global Wrangler in PATH',async()=>{
+ mkdirSync('tmp',{recursive:true});
+ await create('search-notes','Standalone backfill fixture','Synthetic standalone CLI verification.');
  const r=await promisify(execFile)(process.execPath,['scripts/search/backfill.mjs','--config','wrangler.local.toml','--local','--persist-to',server.dir,'--after','0','--limit','1'],{env:{...process.env,PATH:dirname(process.execPath),WRANGLER_SEND_METRICS:'false'}});
  const results=JSON.parse(r.stdout);assert.equal(results.at(-1).results[0].processed,1);assert.equal(results.at(-1).results[0].ready,1);
  const config='tmp/backfill-env-fixture.toml';
