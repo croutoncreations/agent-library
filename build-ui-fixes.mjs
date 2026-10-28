@@ -1,14 +1,14 @@
 // UI fixes integration step (run AFTER build-service-fixes.mjs).
-// Starts from the service-fixes bundle 087789d7 and replaces exact, hash-pinned regions inside the browser
+// Starts from the service-fixes bundle e43008c1 and replaces exact, hash-pinned regions inside the browser
 // home module (// src/home.ts) and UI module (// src/ui.ts) only; every byte outside those modules must stay
 // identical. Each anchor must match exactly once. The TypeScript sources are NOT rebuilt (see build-design-bundle.mjs).
 // No config, credentials, database or network is used.
 import {readFileSync,writeFileSync} from 'node:fs';
 import {createHash} from 'node:crypto';
 const sha=b=>createHash('sha256').update(b).digest('hex');
-const SERVICE='b2fdc93fd5be675b049f0a6361b3538b9a0fa3ecbf11b15fe75cd9fada827853';
+const SERVICE='a3c7f3830859eb44df2d6637495b8b190e6e4529a971d870015992cb958020e0';
 const input=readFileSync('src/index.js','utf8');
-if(sha(input)!==SERVICE)throw Error('Input is not the service-fixes bundle 087789d7; run build-service-fixes.mjs first');
+if(sha(input)!==SERVICE)throw Error('Input is not the service-fixes bundle e43008c1; run build-service-fixes.mjs first');
 const once=(s,needle,what,from=0)=>{const i=s.indexOf(needle,from);if(i<0||s.indexOf(needle,i+1)>=0)throw Error('Expected exactly one '+what);return i;};
 const start=once(input,'// src/home.ts\n','home module start');
 const end=once(input,'\n// src/pwa-icons.ts\n','ui module end')+1;

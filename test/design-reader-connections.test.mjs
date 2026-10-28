@@ -133,14 +133,18 @@ test("connections: publishing apps are separate; only a connected publisher show
 
 test("connections: API key project picker is one aligned list with a live selected count", { skip: !haveChrome && "Chrome not installed" }, async () => {
   await page.goto(`${APP}/#/settings/api-keys`); await page.waitForSelector(".scope-row");
-  await page.evaluate(() => { document.querySelector("details").open = true; });
+  await page.evaluate(() => {
+    [...document.querySelectorAll("details")].find((d) => d.querySelector("summary")?.textContent === "Create an API key").open = true;
+  });
   const info = () => page.evaluate(() => {
     const rows = [...document.querySelectorAll(".scope-row")];
     return { count: document.querySelector(".scope-count").textContent, on: rows.filter((r) => r.classList.contains("on")).length,
-      selectLefts: new Set(rows.map((r) => Math.round(r.querySelector("select").getBoundingClientRect().left))).size, n: rows.length };
+      selectLefts: new Set(rows.map((r) => Math.round(r.querySelector("select").getBoundingClientRect().left))).size,
+      visibleRows: rows.filter((r) => { const b = r.querySelector("select").getBoundingClientRect(); return b.width > 0 && b.height > 0; }).length, n: rows.length };
   });
   const a = await info();
   assert.ok(a.n >= 2); assert.equal(a.count, "None selected"); assert.equal(a.on, 0);
+  assert.equal(a.visibleRows, a.n, "measure the open, visible project picker rather than hidden zero-width controls");
   assert.equal(a.selectLefts, 1, "access selects share one column");
   await page.evaluate(() => { const s = document.querySelector(".scope-row select"); s.value = "read_write"; s.dispatchEvent(new Event("change")); });
   const b = await info();

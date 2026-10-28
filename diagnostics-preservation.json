@@ -1,0 +1,56 @@
+{
+  "base_templates_sha256": "db21401e546a9608c4019dbc25869af111c8faa1c522352d548d872ec688a49a",
+  "integrated_sha256": "17b9676bab21fe5733dea728b5205c16e4e05ec63da097b7d5dc97ff61ef5b60",
+  "preserved_outside_patches_sha256": "11a00855599b0089533b4168fda097cf03f43bb2c74a0449f822f2a2171bacac",
+  "module_sha256": "df2e6ca3dc94291592f403f82d491de4dd327cbc793b1b161a275c5576939a5a",
+  "patches": [
+    {
+      "name": "shared diagnostic serializer",
+      "module": "// src/service.ts",
+      "find_sha256": "9c4d65a6a7f5ca3a6638eea02da709d67a55ff54f37e253c71259da57980c6b1",
+      "replace_sha256": "8c0933b231ab8f7ba4f8fb0f65b66e54843a27bc79ab25397a5e4dfc33f70e1d"
+    },
+    {
+      "name": "OAuth diagnostic before project selection",
+      "module": "// src/oauth/mcp.ts",
+      "find_sha256": "089e67a7f624e1bb1e05e70a05da3331aee1ee6dd90cc3f19bd47a51b5ad7138",
+      "replace_sha256": "406563dc3487bdf3ff86344efadd515e2264aa1b6a5e35c1264379730c78984c"
+    },
+    {
+      "name": "OAuth diagnostic discovery",
+      "module": "// src/oauth/mcp.ts",
+      "find_sha256": "976ff313e7abe0d863b6ebe4b9253106881f902f1905812c5950b3e4728773ca",
+      "replace_sha256": "2679af68e05759ddbea843e78a44011b56f1dc78162250885357fe56bb058e96"
+    },
+    {
+      "name": "publisher own-destination diagnostic",
+      "module": "// src/api/publisher.ts — isolated readable-generation integration",
+      "find_sha256": "d55dd8ab38e487e83da10bd8a884007bfe3e2466d930df3d9fbc8db0a24f69d3",
+      "replace_sha256": "071de214332e77a56adee5e87365cf6371aa66cee5409dd81a6ec97d79e09d38"
+    },
+    {
+      "name": "legacy diagnostic discovery",
+      "module": "// src/mcp.ts",
+      "find_sha256": "79c6f0c0d38784e95eeb0b581185c7453d565c05cd88048b4f9c218ac4a353e5",
+      "replace_sha256": "971c5cfd9bfe26ac899f90ffa630a1da655eb08ee8cefe200494642c914d1dfe"
+    },
+    {
+      "name": "key safe diagnostic metadata",
+      "module": "// src/api/credentials.ts",
+      "find_sha256": "caf678946b838d4c124e68c54437ee7a32714ea450cde06959263a5fec68545f",
+      "replace_sha256": "f225c5318dc009f1e0a66974fe40fba900b9c568274862687b9718cc42f07f55"
+    },
+    {
+      "name": "machine diagnostic route",
+      "module": "// src/api/v1.ts",
+      "find_sha256": "3e087cc9134c012aef7b9e8a2dc6ff2c64bfb26efb11427ee302f2604dfd62bd",
+      "replace_sha256": "3b20b228106956220c3e522e543ca71df82c06a3a67a000eda9f8ad4a383062e"
+    },
+    {
+      "name": "key diagnostic after authentication and rate limit",
+      "module": "// src/api/v1.ts",
+      "find_sha256": "ad47d9de14ca666cedc5d9c15c11bf568766e8d9e3cb71eb0ef0945a527f41a7",
+      "replace_sha256": "603a7a05f6f176b36d8d5ae8417384a4482d4080a4b73e89caec5ca964e2a6d0"
+    }
+  ]
+}

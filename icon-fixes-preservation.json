@@ -1,6 +1,6 @@
 {
-  "base_ui_fixes_sha256": "16483c0748dc26b1d4691fd99893e745498482736c233bfd482a7cd38e0c9f59",
-  "integrated_sha256": "27dbe85aa665b400bdc8038b2d1522ba23e9d14d82048f29db79736a459a52e5",
+  "base_ui_fixes_sha256": "a98387dcdcbe6ccce7aafa5d9018d93af084c7b3b6562560509caafd9c615160",
+  "integrated_sha256": "3e4f839ae2113980483e26759843fb1862e13f310943cbeb6a3f3fe5de308739",
   "preserved_prefix_sha256": "7b63b75199a100363c540f22a728fc56762dda7cf7bd40f944295a3d5eae4054",
   "preserved_suffix_sha256": "971299a181f1ce2af75d678f1d8312862bf9488bb6e49425bd82c2f90df1ed63",
   "pwa_icons_module_sha256": {

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Bounded post-deploy checks against production. At most ~12 requests, 10 s each,
+// Bounded post-deploy checks against production. At most 27 requests, 10 s each,
 // no uploads, no project listing beyond the synthetic smoke credential's scope.
 //
 // Levels (each reported separately in the receipt; a lower level never counts as a higher one):
@@ -81,6 +81,24 @@ if (!token || !smokeProject) {
     must(projects.some((p) => p.id === smokeProject), 'smoke project not visible');
     must(projects.length === 1, `smoke credential must be scoped to one synthetic project, sees ${projects.length}`);
     return `200, project ${smokeProject}`;
+  });
+  await check('app', 'connection diagnostic reports only this authenticated synthetic scope', async () => {
+    const r = await req(`${MCP}/v1/connection-info`, { headers: auth });
+    must(r.status === 200, `diagnostic status ${r.status}`);
+    must((r.headers.get('cache-control') ?? '').includes('no-store'), 'diagnostic must not be cached');
+    const d = await r.json();
+    must(d.connection?.type === 'api_key' && typeof d.connection.id === 'string' && d.connection.id.length > 0, 'missing safe connection identity');
+    must(d.projects?.length === 1 && d.projects[0].id === smokeProject, 'diagnostic scope differs from the synthetic credential');
+    must(d.projects[0].can_read === true && typeof d.projects[0].can_write === 'boolean', 'missing effective capabilities');
+    if (smokeFile) must(d.projects[0].can_write === true, 'synthetic workflow credential lacks write capability');
+    must(Number.isFinite(Date.parse(d.checked_at)), 'missing diagnostic check time');
+    must(d.successful_operations === 'not measured', 'activity must not imply a successful document operation');
+    return `200, safe connection ${d.connection.id}, exactly the synthetic project; metadata only`;
+  });
+  await check('app', 'connection diagnostic rejects arbitrary identity parameters', async () => {
+    const r = await req(`${MCP}/v1/connection-info?connection_id=not-a-connection`, { headers: auth });
+    must(r.status === 400, `expected 400, got ${r.status}`);
+    return '400; callers cannot request another connection';
   });
   if (!smokeFile) {
     results.push({ level: 'workflow', name: 'synthetic artifact round trip', ok: null, detail: 'SKIPPED: AL_SMOKE_FILE_ID not configured' });

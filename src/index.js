@@ -5990,6 +5990,26 @@ async function runBatch(ctx, stmts, i) {
     throw e;
   }
 }
+// Inputs come only from existing authenticated, live scope evaluators. Never serialize a credential row.
+function connectionInfo(type, id, label, projects, expires, activity, extra = {}) {
+  const iso = (v) => v == null ? null : new Date(v).toISOString();
+  return {
+    connection: { type, id, display_label: String(label).slice(0, 200), label_source: type === "oauth" || type === "publisher" ? "registered app name (self-reported; not proof of caller identity)" : "owner-assigned label" },
+    checked_at: nowIso(), expires_at: iso(expires), last_activity_at: iso(activity),
+    successful_operations: "not measured",
+    projects: projects.map((p) => ({ id: p.id, title: p.title, can_read: true, can_write: !!p.can_write })),
+    restrictions: ["Editing remains subject to file ownership, supported kinds, quotas and expected revisions.", "This check authenticates this request and evaluates current access. It does not test document rendering, binary transfers or writes."],
+    next_action: "Compare this connection ID in Connections. If a project is missing, check its selection or reconnect from the intended client. Expired or revoked credentials require owner inspection and cannot diagnose themselves.",
+    ...extra
+  };
+}
+async function legacyConnectionInfo(ctx) {
+  if (ctx.principal.kind !== "agent" || !ctx.grant) throw new HttpError(403, "forbidden", "Use an agent connection");
+  const row = await db(ctx).prepare("SELECT expires_at, revoked_at FROM grants WHERE id = ?").bind(ctx.grant.id).first();
+  if (!row || row.revoked_at !== null || row.expires_at <= nowMs()) throw new HttpError(401, "grant_expired", "Grant revoked or expired");
+  const { projects } = await listProjects(ctx);
+  return connectionInfo("legacy_grant", ctx.grant.id, ctx.principal.label, projects, row.expires_at, null);
+}
 async function listProjects(ctx) {
   if (ctx.principal.kind === "agent") {
     const p = await db(ctx).prepare("SELECT id, title FROM projects WHERE id = ?").bind(ctx.grant.project_id).first();
@@ -7608,6 +7628,10 @@ async function handleOAuthMcp(req, env, ctx) {
       if (typeof args !== "object" || Array.isArray(args)) return reply(rpcErr(msg.id, -32602, "arguments must be an object"));
       const allowed = new Set(Object.keys(tool.inputSchema.properties));
       for (const k of Object.keys(args)) if (!allowed.has(k)) return reply(rpcErr(msg.id, -32602, `Unknown argument ${k}`));
+      if (tool.name === "connection_info") {
+        const result = connectionInfo("oauth", conn.id, conn.client_name, conn.projects.map((p) => ({ ...p, can_write: projectWrite(p) })), conn.expires_at, conn.last_used_at, { files: conn.file_access === 1 });
+        return reply(rpc(msg.id, { content: [{ type: "text", text: JSON.stringify(result) }], structuredContent: result, isError: false }));
+      }
       if (tool.name === "list_projects") {
         const result = withWebUrls("list_projects", args, void 0, { projects: conn.projects.map((p) => ({ id: p.id, title: p.title, can_write: projectWrite(p) })) }, appOrigin(env.APP_HOST));
         return reply(rpc(msg.id, { content: [{ type: "text", text: JSON.stringify(result) }], structuredContent: result, isError: false }));
@@ -7684,6 +7708,7 @@ var init_mcp = __esm({
     RT_MAXB = { type: "integer", minimum: 4096, maximum: 524288, description: "Upper bound in bytes for this whole tool result as encoded (default 65536)" };
     RW = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false };
     TOOLS = [
+      { name: "connection_info", title: "Check connection access", description: "Identify this authenticated connection and its current effective project access. No document reads or writes. Compare the safe ID in Connections.", inputSchema: S({}, []), annotations: RO, write: false },
       ...tplTools(true),
       { name: "list_changes", title: "List project changes", description: "Poll published changes in one explicit project. WITHOUT cursor establishes a current checkpoint and returns NO history (initialized=true). Store next_cursor; follow has_more, then poll again. At-least-once: deduplicate by event_id. Cursors expire after 30 days; checkpoint BEFORE reconciling current content. Publishers excluded. No bodies or push notifications.", inputSchema: S({ project_id: { type: "string", maxLength: 64 }, cursor: { type: "string", maxLength: 2048 }, limit: { type: "integer", minimum: 1, maximum: 50 } }, ["project_id"]), annotations: RO, write: false, run: (c,p,a) => listChanges(c,p,a) },
       { name: "search_artifacts", title: "Search library", description: "Ranked lexical search across currently readable projects. All words must match stored title/text; punctuation separates words. Returns bounded plain-text excerpts and revision-pinned links. Live pagination expires after 15 minutes.", inputSchema: RS_SCHEMA, annotations: RO, write: false, run: (c, p, a) => searchArtifacts(c,a,"mcp") },
@@ -9117,6 +9142,23 @@ var __appConnectPublisher = (() => {
     const generationResponse = await routeGeneration(req, env, p, requestId);
     if (generationResponse) return generationResponse;
     let g;
+    if (path === "/v1/publisher/connection-info") {
+      only("GET");
+      if (url.search) throw new live_HttpError(400, "invalid_input", "This diagnostic accepts no parameters");
+      const project = await env.DB.prepare("SELECT id, title FROM projects WHERE id = ?").bind(p.project_id).first();
+      // Reuse the actual publisher write gate; metadata reads remain available when writes are blocked.
+      let canWrite = true, writeRestrictions = [];
+      try { await assertStillAuthorized(env, p); }
+      catch (e) {
+        if (!(e instanceof live_HttpError) || ![401, 403].includes(e.status)) throw e;
+        canWrite = false;
+        writeRestrictions.push(p.client_disabled !== null ? "Writes blocked: app client disabled; ask the owner to inspect this app." : "Writes blocked: " + e.message);
+      }
+      return live_json(connectionInfo("publisher", p.id, p.display_name, [], null, null, {
+        destination: { project_id: project.id, title: project.title, folder_id: p.folder_id, can_read_own_files: true, can_write_own_files: canWrite },
+        restrictions: ["Only this publisher's own files in its approved destination; no general project browsing.", "Kind rules, quotas, revisions and snapshot ordering still apply. No rendering, transfer or write was tested."].concat(writeRestrictions)
+      }), 200, { "cache-control": "no-store" });
+    }
     if (R.me.test(path)) {
       only("GET");
       return live_json(await me(env, p));
@@ -10849,6 +10891,7 @@ var A2 = { type: "string", description: "Artifact ID" };
 var K2 = { type: "string", description: "Idempotency key (8-128 chars); reuse it when retrying the same request" };
 var unwrap2 = /* @__PURE__ */ __name((r) => r && typeof r.status === "number" && "body" in r ? r.body : r, "unwrap");
 var TOOLS2 = [
+  { name: "connection_info", description: "Identify this authenticated grant and current project access. Read-only; compare the safe ID in Connections.", inputSchema: S2({}, []), annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }, run: (c) => legacyConnectionInfo(c) },
   ...tplTools(false),
   { name: "list_changes", description: "Poll published changes in one explicit project. WITHOUT cursor establishes a current checkpoint and returns NO history (initialized=true). Store next_cursor; follow has_more, then poll again. At-least-once: deduplicate by event_id. Cursors expire after 30 days; checkpoint BEFORE reconciling current content. Publishers excluded. No bodies or push notifications.", inputSchema: S2({ project_id: { type: "string", maxLength: 64 }, cursor: { type: "string", maxLength: 2048 }, limit: { type: "integer", minimum: 1, maximum: 50 } }, ["project_id"]), run: (c,a) => listChanges(c,a.project_id,a) },
   { name: "search_artifacts", description: "Ranked lexical search of currently readable projects, with excerpts and revision-pinned links. All words must match. Live pagination.", inputSchema: RS_SCHEMA, annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }, run: (c,a) => searchArtifacts(c,a,"mcp") },
@@ -13001,6 +13044,30 @@ function settingsTabs(active) {
 function connHead(sub) {
   return pageHead("Connections", { sub: sub || "Apps and keys that can use your library. Signing in to an app never grants access by itself: an app can only use the projects you approved, and you can revoke it at any time." });
 }
+// Safe owner-side comparison; this is a saved grant view, never a remote client probe.
+function connectionSummary(type, id, label, projects, expires, activity, status, checkedAt) {
+  var value = JSON.stringify({ connection: { type: type, id: id, display_label: label, label_source: type === "oauth" || type === "publisher" ? "registered app name (self-reported)" : "owner-assigned label" }, status: status,
+    saved_access_checked_at: checkedAt || null, expires_at: expires || null, last_activity_at: activity || null,
+    projects: projects, successful_operations: "not measured",
+    check: "Saved access checked. Ask the intended client to " + (type === "publisher" ? "GET /v1/publisher/connection-info" : type === "api_key" ? "GET /v1/connection-info" : "run connection_info") + " and compare IDs. This does not prove the client is connected or test reads, rendering, transfers or writes." }, null, 2);
+  var field = h("textarea", { readOnly: true, rows: 9, class: "full-w", "aria-label": "Safe connection summary", value: value });
+  var feedback = h("p", { class: "msg", role: "status", "aria-live": "polite" });
+  return h("details", { class: "connection-summary" }, h("summary", { text: "Connection ID: " + id }),
+    h("p", { class: "small muted", text: "Saved access checked · successful operations: not measured. Last activity is authentication/request telemetry, not proof of a file operation." }), field,
+    h("button", { type: "button", class: "secondary", onclick: function () { field.select(); copyText(value, feedback); } }, icon("copy"), "Copy safe summary"), feedback);
+}
+function connectionHelp() {
+  var base = /^https?:\/\//.test(API_BASE_HINT) ? API_BASE_HINT.replace(/\/v1\/?$/, "") : null;
+  return h("details", { class: "card connection-help" }, h("summary", { text: "Connect or troubleshoot an agent" }),
+    h("p", { text: "Registering an app, signing in, granting project access and making a request from your agent are separate steps." }),
+    h("p", null, "MCP URL: ", h("code", { text: base ? base + "/mcp" : "Unavailable until installation settings load; reconnect and refresh." })),
+    h("p", null, "API base: ", h("code", { text: API_BASE_HINT })),
+    h("p", { text: "ChatGPT: add a connector in Settings → Apps. Claude: add a remote MCP connector. Codex or Cursor: add a remote MCP server in your client's MCP settings. Use the MCP URL above, sign in and select the intended projects." }),
+    h("p", { text: "Ask the intended agent to run connection_info with no arguments. API key clients: GET /v1/connection-info. Publishers: GET /v1/publisher/connection-info (own destination only). Compare the returned ID with the card below." }),
+    h("p", { text: "Wrong project or ID? Check this connection's project selection or reconnect from the intended client. For an expired or revoked connection, inspect its status here and reconnect. Permission changes use the existing owner controls." }),
+    h("p", { text: "401/403: authentication or permission failure. Offline/network failure: check connectivity, then retry. 5xx: server failure; retry later. None proves an external client's state. Never paste credentials or request headers into chat." }),
+    h("a", { href: "https://github.com/croutoncreations/agent-library/blob/main/docs/agent-setup.md", target: "_blank", rel: "noopener" }, "MCP and API setup guide"));
+}
 function connCard(o) {
   // o: { name, sub, status, access:[{title, access}], foot:[text], actions:[el], inactive }
   return h("article", { class: "conn" + (o.inactive ? " inactive" : ""), "aria-label": o.name },
@@ -13010,6 +13077,7 @@ function connCard(o) {
     o.accessLabel ? h("div", { class: "small muted", text: o.accessLabel }) : null,
     o.access ? (o.access.length ? h("ul", { class: "conn-access", "aria-label": "Saved project access" }, o.access.map(function (p) { return h("li", null, h("b", { text: p.title }), h("span", { text: p.access })); }))
       : h("p", { class: "small muted", text: "No projects. This connection can't open anything." })) : null,
+    o.diagnostic || null,
     o.foot && o.foot.length ? h("div", { class: "conn-foot" }, o.foot.map(function (t) { return h("span", { text: t }); })) : null);
 }
 function statusLabel(st) {
@@ -13036,6 +13104,7 @@ async function viewApps() {
         catch (err) { showErr(msg, err); e.target.disabled = false; }
       } }, "Disconnect") : null;
       conns.append(connCard({ name: c.client_name, sub: "Reader app · returns to " + c.redirect_host, status: statusBadge(c.status), inactive: c.status !== "active",
+        diagnostic: connectionSummary("oauth", c.id, c.client_name, c.projects, c.expires_at, c.last_used_at, c.status, data.checked_at),
         accessLabel: c.status === "active" ? "Can currently use:" : "Had access to (no longer active):",
         access: c.projects.map(function (p) { return { title: p.title, access: accessText(p.access) }; }),
         foot: [c.files === false && c.status === "active" ? "Documents only: reconnect to include files" : null, c.last_used_at ? "Last used " + fmtDate(c.last_used_at) : "Not used yet", "Connected " + fmtDate(c.created_at), c.status === "active" ? (new Date(c.expires_at).getUTCFullYear() >= 9000 ? "Until you disconnect" : "Expires " + fmtDate(c.expires_at)) : null].filter(Boolean),
@@ -13043,11 +13112,11 @@ async function viewApps() {
     });
   }
   async function load() {
-    try { data = await api("GET", "/api/access"); draw(); }
+    try { data = await api("GET", "/api/access"); data.checked_at = new Date().toISOString(); draw(); }
     catch (err) { conns.removeAttribute("aria-busy"); if (err.status === 401) return; conns.replaceChildren(stateBox("error", "alert", "Connections couldn't load", (err.status === 0 ? "You appear to be offline." : err.message) + " No access was changed.", h("button", { type: "button", class: "secondary", onclick: load }, icon("refresh"), "Try again"))); }
   }
   showAll.addEventListener("change", function () { if (data) draw(); });
-  shell([{ t: "Connections" }], connHead(), settingsTabs("apps"),
+  shell([{ t: "Connections" }], connHead(), connectionHelp(), settingsTabs("apps"),
     h("div", { class: "callout" }, icon("plug"), h("span", null, h("strong", { text: "Reader apps" }), " read (and, if you allowed it, edit) documents and files in the projects listed on each card. Apps connected before files were available see documents only until you reconnect them. Disconnecting takes effect immediately and doesn't affect other apps.")),
     msg, conns, h("p", null, h("label", { class: "muted small" }, showAll, "Show disconnected and expired")));
   load();
@@ -13087,10 +13156,11 @@ function viewPublishingApps() {
       status:statusBadge(c.disabled?"disabled":active.length?"active":"registered"),inactive:!!c.disabled,
       accessLabel:active.length?"Publishes into:":"Not connected to any project yet. Connect from the app and choose a destination; you approve it on a consent page.",
       access:active.length?active.map(function(p){return {title:projectTitles[p.project_id]||p.project_id,access:(p.folder_id?"own folder":"project root")+(p.current_source_revision!=null?" · export rev "+p.current_source_revision:" · no exports yet")};}):undefined,
+      diagnostic: h("div", null, pubs.map(function(p) { return connectionSummary("publisher", p.publisher_id, c.display_name, [{ project_id: p.project_id, folder_id: p.folder_id, access: "own files only" }], null, null, c.disabled ? "disabled" : p.status, c.checked_at); })),
       foot:["Callbacks: "+(c.redirect_uris||[]).join(", ")].concat(c.suggested_project||c.suggested_folder?["Suggests: "+(c.suggested_project||"first project")+" / "+(c.suggested_folder||"app name")]:[]).concat(["Registered "+fmtDate(c.created_at)])}),
       h("details",null,h("summary",{text:"Public client ID (not a secret)"}),h("div",{class:"row"},id,h("button",{type:"button",class:"secondary",onclick:function(){id.select();copyText(c.client_id,msg);}},icon("copy"),"Copy"))));
   });}
-  async function load(){try{var cs=(await api("GET","/api/app-clients")).app_clients;if(!current())return;draw(cs);form.hidden=false;allowed=cs.length<100;if(!allowed)showMsg(msg,"The registration list is full. Ask for help before adding another app.");var p=pending();if(p){name.value=p.display_name;origins.value=p.origins.join("\n");callbacks.value=p.redirect_uris.join("\n");sugProject.value=p.suggested_project||"";sugFolder.value=p.suggested_folder||"";var matches=cs.filter(function(c){return same(c,p);});if(matches.length===1&&!matches[0].disabled){localStorage.removeItem(key);showMsg(msg,"Registration confirmed. Use the public client ID below.");}else{allowed=false;showMsg(msg,"A previous registration is unresolved. Nothing will be submitted again. Refresh to check its result; if it stays unresolved, ask for help before registering again.");}}setBusy(false);}catch(err){if(!current())return;allowed=false;form.hidden=true;showMsg(msg,err.status===404?"Publishing app registration is unavailable.":err.status===403?"Only the authorized owner can register publishing apps.":"Could not safely check registrations. Refresh to try again.");}}
+  async function load(){try{var cs=(await api("GET","/api/app-clients")).app_clients;if(!current())return;cs.forEach(function(c){c.checked_at=new Date().toISOString();});draw(cs);form.hidden=false;allowed=cs.length<100;if(!allowed)showMsg(msg,"The registration list is full. Ask for help before adding another app.");var p=pending();if(p){name.value=p.display_name;origins.value=p.origins.join("\n");callbacks.value=p.redirect_uris.join("\n");sugProject.value=p.suggested_project||"";sugFolder.value=p.suggested_folder||"";var matches=cs.filter(function(c){return same(c,p);});if(matches.length===1&&!matches[0].disabled){localStorage.removeItem(key);showMsg(msg,"Registration confirmed. Use the public client ID below.");}else{allowed=false;showMsg(msg,"A previous registration is unresolved. Nothing will be submitted again. Refresh to check its result; if it stays unresolved, ask for help before registering again.");}}setBusy(false);}catch(err){if(!current())return;allowed=false;form.hidden=true;showMsg(msg,err.status===404?"Publishing app registration is unavailable.":err.status===403?"Only the authorized owner can register publishing apps.":"Could not safely check registrations. Refresh to try again.");}}
   function values(){function lines(value,min,re,label){var xs=value.split(/\r?\n/).map(function(x){return x.trim();}).filter(Boolean);if(xs.length<min||xs.length>3||new Set(xs).size!==xs.length)throw Error(label+": use "+min+"–3 distinct values, one per line.");xs.forEach(function(x){if(x.length>300||!re.test(x))throw Error(label+": enter an exact HTTPS URL or supported local development URL.");var u=new URL(x);if((label==="Origins"?u.origin:u.href)!==x||u.hostname.indexOf("..")>=0||u.hostname.charAt(0)==="."||u.hostname.endsWith("."))throw Error(label+": use the canonical exact URL without normalization.");if(u.port&&(+u.port<1||+u.port>65535))throw Error(label+": invalid port.");});return xs;}var n=name.value.trim();if(!n||n.length>80)throw Error("App name must contain 1–80 characters.");return {display_name:n,origins:lines(origins.value,0,/^(https:\/\/[a-z0-9.-]+|http:\/\/(localhost|127\.0\.0\.1))(:\d{1,5})?$/,"Origins"),redirect_uris:lines(callbacks.value,1,/^(https:\/\/[a-z0-9.-]+|http:\/\/(localhost|127\.0\.0\.1))(:\d{1,5})?\/[A-Za-z0-9/_.~-]*$/,"Callbacks"),suggested_project:sugg(sugProject.value,"Suggested project"),suggested_folder:sugg(sugFolder.value,"Suggested folder")};}
   function sugg(v,label){v=v.trim();if(!v)return null;if(v.length>80||/[\/\u0000-\u001f\u007f]/.test(v))throw Error(label+": 1–80 characters, without /.");return v;}
   async function register(){if(!current()||busy||!allowed)return;var v,sent=false;try{v=values();}catch(err){showMsg(msg,err.message);return;}setBusy(true);
@@ -13104,7 +13174,7 @@ function viewPublishingApps() {
     try{if(navigator.locks)await navigator.locks.request(key,create);else await create();}catch(err){var rejected=sent&&[400,401,403,404,413,422,429].indexOf(err.status)>=0;if(rejected&&localStorage.getItem(key)===JSON.stringify(v))localStorage.removeItem(key);if(current()){allowed=rejected;showMsg(msg,rejected?"Registration was rejected ("+err.status+"). Review the details or sign in again before trying again.":"Registration could not be confirmed. Refresh to check its result. Nothing will be submitted again automatically.");}}finally{if(current())setBusy(false);}
   }
   S.cleanups.push(function(){alive=false;});
-  shell([{t:"Connections"}],connHead(),settingsTabs("publishing"),h("div",{class:"callout"},icon("upload"),h("span",null,h("strong",{text:"Publishing apps"})," send their own files into the one project and folder you choose when you connect them. They can't read anything else. Reader apps and keys are approved separately.")),msg,list,form);api("GET","/api/projects").then(function(r){r.projects.forEach(function(p){projectTitles[p.id]=p.title;});}).catch(function(){}).then(load);
+  shell([{t:"Connections"}],connHead(),connectionHelp(),settingsTabs("publishing"),h("div",{class:"callout"},icon("upload"),h("span",null,h("strong",{text:"Publishing apps"})," send their own files into the one project and folder you choose when you connect them. They can't read anything else. Reader apps and keys are approved separately.")),msg,list,form);api("GET","/api/projects").then(function(r){r.projects.forEach(function(p){projectTitles[p.id]=p.title;});}).catch(function(){}).then(load);
 }
 
 // ---------- settings: agent tokens (advanced: scripts and local agents) + backup ----------
@@ -13134,13 +13204,14 @@ async function viewTokens() {
         try { await api("PATCH", "/api/projects/" + enc(g.project_id) + "/grants/" + enc(g.id), { revoke: true }); toast("Revoked " + g.label); load(); }
         catch (err) { showErr(msg, err); e.target.disabled = false; }
       } }, "Revoke"));
+      li.append(connectionSummary("legacy_grant", g.id, g.label, [{ project_id: g.project_id, title: g.project_title, access: g.access }], g.expires_at, null, g.status, data.checked_at));
       list.append(li);
     });
   }
   async function load() {
     try {
       var r = await Promise.all([api("GET", "/api/access"), api("GET", "/api/projects")]);
-      data = r[0]; projects = r[1].projects;
+      data = r[0]; data.checked_at = new Date().toISOString(); projects = r[1].projects;
       if (!proj.options.length) projects.forEach(function (p) { projectTitles[p.id] = p.title; proj.append(h("option", { value: p.id, text: p.title })); });
       draw();
     } catch (err) { showErr(msg, err); }
@@ -13177,7 +13248,7 @@ async function viewTokens() {
     } catch (err) { showErr(bmsg, err); }
     backupBtn.disabled = false;
   } }, icon("download"), "Download backup");
-  shell([{ t: "Connections" }], connHead(), settingsTabs("tokens"),
+  shell([{ t: "Connections" }], connHead(), connectionHelp(), settingsTabs("tokens"),
     h("div", { class: "callout" }, icon("key"), h("span", null, h("strong", { text: "Agent tokens (advanced)" }), " are for your own scripts or local agents that can't sign in. Each token covers one project, expires, and can be revoked immediately. Most apps should connect as a reader app instead.")),
     msg, list, h("p", null, h("label", { class: "muted small" }, showAll, "Show revoked and expired")),
     h("details", null, h("summary", { text: "Create a token" }), h("div", { class: "card" }, form)), tokenBox,
@@ -13287,13 +13358,14 @@ async function viewApiKeys() {
             catch (err) { showErr(msg, err); e.target.disabled = false; }
           } }, "Revoke")), editHost);
       }
+      li.append(connectionSummary("api_key", k.id, k.label, k.projects, k.expires_at, k.last_used_at, k.status, data.checked_at));
       list.append(li);
     });
   }
   async function load() {
     try {
       var r = await Promise.all([api("GET", "/api/api-keys"), api("GET", "/api/projects")]);
-      data = r[0]; projects = r[1].projects;
+      data = r[0]; data.checked_at = new Date().toISOString(); projects = r[1].projects;
       projects.forEach(function (p) { projectTitles[p.id] = p.title; });
       if (!picker) { picker = scopePicker(projects, []); pickerHost.replaceChildren(picker.el); }
       draw();
@@ -13314,7 +13386,7 @@ async function viewApiKeys() {
     h("div", { class: "grid2" }, h("label", null, "Label", label), h("label", null, "Lifetime", life)),
     pickerHost,
     h("div", { class: "row" }, h("span", { class: "spacer" }), h("button", { type: "submit" }, "Create key")));
-  shell([{ t: "Connections" }], connHead(), settingsTabs("api-keys"),
+  shell([{ t: "Connections" }], connHead(), connectionHelp(), settingsTabs("api-keys"),
     h("div", { class: "callout" }, icon("key"), h("span", null, h("strong", { text: "API keys" }), " are for apps that use the REST API (for example Muse). Each key covers only the projects you pick, expires (90 days at most) and can be replaced or revoked at any time. The key itself is shown once.")),
     msg, box, list, h("p", null, h("label", { class: "muted small" }, showAll, "Show revoked and expired")),
     h("details", null, h("summary", { text: "Create an API key" }), h("div", { class: "card" }, form)));
@@ -15337,6 +15409,8 @@ async function verifyApiKey(env, authz) {
     await env.DB.prepare("UPDATE api_credentials SET last_used_at = ? WHERE id = ?").bind(nowMs(), row.id).run().catch(() => {
     });
   return {
+    expiresAt: row.expires_at,
+    lastActivityAt: row.last_used_at,
     credentialId: row.id,
     ownerId: row.owner_principal_id,
     principalId: row.principal_id,
@@ -15350,6 +15424,7 @@ __name(verifyApiKey, "verifyApiKey");
 var MAX_BODY2 = 65e5;
 var SEG = "([A-Za-z0-9_-]{1,64})";
 var R2 = {
+  connectionInfo: /^\/v1\/connection-info$/,
   search: /^\/v1\/search$/,
   projects: /^\/v1\/projects$/,
   changes: new RegExp(`^/v1/projects/${SEG}/changes$`),
@@ -15459,6 +15534,11 @@ async function route2(req, env, url, requestId) {
   if (R2.search.test(path)) {
     if (m !== "GET") throw new HttpError(405,"method_not_allowed","Method not allowed");
     return json(await searchArtifacts({ env, requestId, apiCredential: true, principal: { id: k.principalId, kind: "agent" }, grant: { id: k.credentialId } }, rsQuery(url.searchParams)));
+  }
+  if (R2.connectionInfo.test(path)) {
+    if (m !== "GET") throw new HttpError(405, "method_not_allowed", "Method not allowed");
+    if (url.search) throw new HttpError(400, "invalid_input", "This diagnostic accepts no parameters");
+    return json(connectionInfo("api_key", k.credentialId, k.label, k.projects, k.expiresAt, k.lastActivityAt), 200, { "cache-control": "no-store" });
   }
   if (R2.projects.test(path)) {
     if (m !== "GET") throw new HttpError(405, "method_not_allowed", "Method not allowed");

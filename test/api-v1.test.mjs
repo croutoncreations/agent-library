@@ -323,7 +323,7 @@ test("browser: create multi-project key (shown once), expiry visible, replace + 
     await Promise.all([page.waitForFunction(() => document.body.innerText.includes("SYN-A")), page.click('button[type="submit"]')]);
     await page.goto(APP + "/#/settings/api-keys");
     await page.waitForFunction(() => document.querySelector("h1")?.textContent === "Connections" && document.querySelector('select[data-pid="syn-a"]'));
-    await page.evaluate(() => { document.querySelector("details summary").click(); });
+    await page.evaluate(() => { [...document.querySelectorAll("details summary")].find((s) => s.textContent === "Create an API key").click(); });
     await page.type('input[aria-label="Key label"]', "Muse (browser)");
     await page.select('select[aria-label="Lifetime"]', "7");
     await page.select('select[data-pid="syn-a"]', "read_write");

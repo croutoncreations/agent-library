@@ -1,6 +1,6 @@
 {
-  "base_changes_sha256": "4fd601e71fb05952cc5e4fecb1d02130bd4c9cedee89f3bd7ab679c159244379",
-  "integrated_sha256": "e32b41de245608378cc664e396a4a38d51d1b97871a7302f21651b8102a3ff2e",
+  "base_changes_sha256": "a8617f32234405af9450919cecfc9ae49172032b60e33af7313503583be3b110",
+  "integrated_sha256": "db21401e546a9608c4019dbc25869af111c8faa1c522352d548d872ec688a49a",
   "sources": {
     "src/templates/service.js": "0fd91f2fade24c824789bd0da643f1c1152920319531610d7e2adf1fa83728fd",
     "src/templates/tools.js": "a3aae7f9d4fca0f7af22dbee37b7b09d12efbe9643a3c21d0fd83819d89e014b"

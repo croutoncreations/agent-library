@@ -1,5 +1,5 @@
 // App icon integration step (run AFTER build-ui-fixes.mjs).
-// Starts from the UI-fixes bundle d4eb0b0a and replaces the installed-app (PWA) icons with the approved "Fold"
+// Starts from the UI-fixes bundle 260ec845 and replaces the installed-app (PWA) icons with the approved "Fold"
 // brand mark the nav already shows (src/web/brand/app-*.png, made by scripts/design/make-app-icons.mjs).
 // Changes exactly these spans; every other byte must stay identical:
 //   1. the icon data module (// src/pwa-icons.ts), rebuilt from the committed PNGs
@@ -11,9 +11,9 @@
 import {readFileSync,writeFileSync} from 'node:fs';
 import {createHash} from 'node:crypto';
 const sha=b=>createHash('sha256').update(b).digest('hex');
-const UI_FIXES='16483c0748dc26b1d4691fd99893e745498482736c233bfd482a7cd38e0c9f59';
+const UI_FIXES='a98387dcdcbe6ccce7aafa5d9018d93af084c7b3b6562560509caafd9c615160';
 const input=readFileSync('src/index.js','utf8');
-if(sha(input)!==UI_FIXES)throw Error('Input is not the UI-fixes bundle d4eb0b0a; run build-ui-fixes.mjs first');
+if(sha(input)!==UI_FIXES)throw Error('Input is not the UI-fixes bundle 260ec845; run build-ui-fixes.mjs first');
 const once=(s,needle,what,from=0)=>{const i=s.indexOf(needle,from);if(i<0||s.indexOf(needle,i+1)>=0)throw Error('Expected exactly one '+what);return i;};
 
 // New icon file name -> committed PNG. Old names are served the matching new image.

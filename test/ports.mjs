@@ -7,13 +7,14 @@
 export const INSPECTOR_OFFSET = 1000;
 export const OIDC_OFFSET = 2000;
 
-// Concurrent checkouts can reserve a different bank without changing any listener individually.
-const bankOffset = Number(process.env.AGENT_LIBRARY_TEST_PORT_OFFSET ?? process.env.AGENT_LIBRARY_TEST_PORT_SHIFT ?? 0);
-if (!Number.isInteger(bankOffset) || bankOffset < 0 || bankOffset > 5000) throw Error("AGENT_LIBRARY_TEST_PORT_OFFSET must be an integer from 0 to 5000");
-const bank = (ports) => Object.fromEntries(Object.entries(ports).map(([name, port]) => [name, port + bankOffset]));
-
 /** wrangler dev servers, by startServer() name (App Connect harness servers are named `ac-<port>`). */
-export const SERVER_PORTS = Object.freeze(bank({
+// Parallel worktrees may choose separate deterministic ranges; never reuse another run's listeners.
+const offset = Number(process.env.AGENT_LIBRARY_TEST_PORT_OFFSET ?? process.env.AGENT_LIBRARY_TEST_PORT_SHIFT ?? 0);
+// One complete run spans 2098 ports, including derived inspector/OIDC ports.
+// A 3000-port stride keeps every supported pair of runs disjoint below 32768.
+if (!Number.isInteger(offset) || offset < 0 || offset > 6000 || offset % 3000 !== 0) throw new Error("AGENT_LIBRARY_TEST_PORT_OFFSET must be 0, 3000 or 6000");
+const range = (ports) => Object.freeze(Object.fromEntries(Object.entries(ports).map(([name, port]) => [name, port + offset])));
+export const SERVER_PORTS = range({
   a2: 21010, a4: 21011, a6: 21012, a9: 21013, a11: 21014, a12: 21015, "a12-restore": 21016,
   sec: 21017, limits: 21018, hosted: 21019, acp2: 21020, acoff: 21021, apiv1: 21022, acp3: 21023,
   "design-shell": 21024, generations: 21025, "design-reader": 21026, "mobile-tables": 21027,
@@ -21,14 +22,14 @@ export const SERVER_PORTS = Object.freeze(bank({
   "bridge-contract": 21032, "readable-generation-contract": 21033, history: 21034, "consent-capture": 21035, "hosted-session": 21036,
   "data-preview": 21037, "chunked-reads": 21038, "ranked-search": 21041, "project-changes": 21042, "oauth-files": 21039, "smoke-setup": 21040,
   templates: 21043, "templates-restore": 21044, "templates-legacy-restore": 21047,
-  "marketing-capture": 21045, "marketing-clips": 21046,
-}));
+  diagnostics: 21048, "marketing-capture": 21045, "marketing-clips": 21046,
+});
 
 /** Plain node:http listeners that tests start next to a server. */
-export const AUX_PORTS = Object.freeze(bank({
+export const AUX_PORTS = range({
   hostedJwks: 23100, oauthBrowserOidc: 23101, oauthBrowserCallback: 23102, oauthBrowserHop: 23103,
   chatgptOidc: 23104, chatgptCallback: 23105, hostedSessionJwks: 23106, hostedSessionAccess: 23107,
-}));
+});
 
 /** Every port bound during a run, for the uniqueness check. */
 export function allBoundPorts() {
