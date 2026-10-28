@@ -313,6 +313,11 @@ test('Chrome: save/cancel template, pinned picker, preview safety, mobile/keyboa
     const created = (await owner.req('GET', path(lostId))).body;
     assert.equal(created.artifact.source.revision, 1); assert.match(created.body, /Date: 2026-10-27/); assert.doesNotMatch(created.body, /Later template/);
     await page.screenshot({ path: 'tmp/test-evidence/templates-copy-mobile.png', fullPage: true });
+    // The provenance link opens the source template itself (pinned revision), not an unavailable-item page.
+    await page.evaluate(() => [...document.querySelectorAll('a')].find(a => a.textContent.includes('Created from UI Research')).click());
+    await page.waitForFunction(id => location.hash.includes('/a/' + id), {}, uiTemplate);
+    await page.waitForFunction(() => /UI Research/.test(document.querySelector('h1')?.textContent || ''));
+    assert.equal(await page.evaluate(() => /not available|couldn.t find|not found/i.test(document.querySelector('main')?.textContent || '')), false, 'source opens, not an unavailable page');
     assert.deepEqual(errors, []);
     // Empty and loading failures keep Blank usable and explain template saving.
     const empty = 'empty-templates'; await owner.req('POST', '/api/projects', { id: empty, title: 'Empty project' });
