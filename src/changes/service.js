@@ -2,12 +2,11 @@
 // No replica sessions: a cursor never advances past uncommitted sequence allocation.
 const CH_RETENTION_MS = 30 * 86400000;
 const CH_MAX_BYTES = 65536;
-const CH_COVERAGE_SQL = `(SELECT group_concat(g, ',') FROM (
+const CH_COVERAGE_SQL = `(SELECT group_concat(g, ',' ORDER BY g) FROM (
   SELECT pb.id || ':' || pb.current_snapshot_id AS g FROM publishers pb
   JOIN publisher_generations pg ON pg.snapshot_id=pb.current_snapshot_id
   LEFT JOIN change_generation_coverage cv ON cv.publisher_id=pb.id
   WHERE pb.project_id=p.id AND cv.snapshot_id IS NOT pb.current_snapshot_id
-  ORDER BY pb.id
 ))`;
 function chQuery(q) {
   for (const k of q.keys())

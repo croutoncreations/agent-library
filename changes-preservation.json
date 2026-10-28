@@ -1,8 +1,8 @@
 {
   "base_search_sha256": "026f37911d77c6276f1a0611b453dc06e0a45b0063496e7216d83b6283103eab",
-  "integrated_sha256": "5dc89a1a12f68fa6924edeb50ad04ba7dffa9e964df2f90669af9057b367a908",
+  "integrated_sha256": "fee127f520565091a3d95f645ed1e3d81c87ec7a3c61625f6b3c85e8ab5c1674",
   "sources_sha256": {
-    "service.js": "ea3e06c10f1deb5ab391d6547ffd02f1cb3ddea8aff942b2bb71ccd621f92844",
+    "service.js": "29dabf986ac32241002ecf083c1595dbfc2f7b3136ff7a31a469f33257f3c42a",
     "generation-batch.js": "9ce97b4355bbac3c6ae2b1dc4f9fa1c7a2d8538638ac83595e1cc10e2ab45d7b"
   },
   "patches": [
