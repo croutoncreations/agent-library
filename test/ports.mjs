@@ -8,7 +8,7 @@ export const INSPECTOR_OFFSET = 1000;
 export const OIDC_OFFSET = 2000;
 
 // Concurrent checkouts can reserve a different bank without changing any listener individually.
-const bankOffset = Number(process.env.AGENT_LIBRARY_TEST_PORT_OFFSET ?? 0);
+const bankOffset = Number(process.env.AGENT_LIBRARY_TEST_PORT_OFFSET ?? process.env.AGENT_LIBRARY_TEST_PORT_SHIFT ?? 0);
 if (!Number.isInteger(bankOffset) || bankOffset < 0 || bankOffset > 5000) throw Error("AGENT_LIBRARY_TEST_PORT_OFFSET must be an integer from 0 to 5000");
 const bank = (ports) => Object.fromEntries(Object.entries(ports).map(([name, port]) => [name, port + bankOffset]));
 
@@ -19,7 +19,7 @@ export const SERVER_PORTS = Object.freeze(bank({
   "design-shell": 21024, generations: 21025, "design-reader": 21026, "mobile-tables": 21027,
   uipolish: 21028, weblinks: 21029, "oauth-browser": 21030, oauth: 21031,
   "bridge-contract": 21032, "readable-generation-contract": 21033, history: 21034, "consent-capture": 21035, "hosted-session": 21036,
-  "data-preview": 21037, "chunked-reads": 21038, "ranked-search": 21041, "oauth-files": 21039, "smoke-setup": 21040,
+  "data-preview": 21037, "chunked-reads": 21038, "ranked-search": 21041, "project-changes": 21042, "oauth-files": 21039, "smoke-setup": 21040,
   "marketing-capture": 21045, "marketing-clips": 21046,
 }));
 
