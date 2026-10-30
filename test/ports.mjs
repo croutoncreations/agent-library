@@ -22,7 +22,7 @@ export const SERVER_PORTS = range({
   "bridge-contract": 21032, "readable-generation-contract": 21033, history: 21034, "consent-capture": 21035, "hosted-session": 21036,
   "data-preview": 21037, "chunked-reads": 21038, "ranked-search": 21041, "project-changes": 21042, "oauth-files": 21039, "smoke-setup": 21040,
   templates: 21043, "templates-restore": 21044, "templates-legacy-restore": 21047,
-  diagnostics: 21048, "marketing-capture": 21045, "marketing-clips": 21046,
+  diagnostics: 21048, "file-types": 21049, "marketing-capture": 21045, "marketing-clips": 21046,
 });
 
 /** Plain node:http listeners that tests start next to a server. */
