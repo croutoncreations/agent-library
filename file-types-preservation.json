@@ -1,10 +1,10 @@
 {
   "base_diagnostics_sha256": "17b9676bab21fe5733dea728b5205c16e4e05ec63da097b7d5dc97ff61ef5b60",
-  "integrated_sha256": "0d7e841d3a4a1604a45e7975a788a810d246f5bc7d05a3db87b2f81a078ec7c3",
+  "integrated_sha256": "cea551a7d442927605e0890073072e7bad69968f1fdf6a4a3886d3dc79a6b1cf",
   "preserved_outside_patches_sha256": "78d1b1c17c5e3acc4265c085d0c8bf78d4f697655cc1500edfbcb44bc2973497",
   "sources_sha256": {
     "home-types.js": "b2625b8f7a991973ca6c84e044918c8b8c3005c7af8721e50f48dd00ee261654",
-    "browser.js": "e71c4b345e5ab66a6bb33f790d460a621d4f46e07d8672c0f59e4f7f9d7101d4",
+    "browser.js": "65afbb3f60b6258da2cf6b4d7a6e8577e787ba00aeb105011e52432ebd5f1270",
     "browser.css": "0eb3f5b2952a6661335de446963c7c3d5a1a53d1bb2d428d1323298212b74cd9"
   },
   "patches": [
@@ -108,7 +108,7 @@
       "name": "ui: thumbnails and type filter helpers",
       "module": "// src/ui.ts",
       "find_sha256": "81bcf3ea5954073fece07463dbbe3470c23d9bf7692c635606fabb17e44ff27a",
-      "replace_sha256": "7f1bc02753bc5f49bce12a2f606930d84226de7ca3930e8b143ea04eee27c5be"
+      "replace_sha256": "db5aa09a5e844ef6d9718f11693cbdd8db5e5c14841f886d03c9ccd0dca8a604"
     },
     {
       "name": "ui: icon by file type",

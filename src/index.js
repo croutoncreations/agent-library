@@ -12592,8 +12592,8 @@ function typeFilterSelect(value) {
 }
 var THUMBS = { gen: 0, active: 0, queue: [], starts: [], timer: 0, pausedUntil: 0, io: null, watched: new Set(), made: new Map(), failed: new Set(), tries: new Map(), waiting: new Map() };
 var THUMB_MAX_ACTIVE = 3, THUMB_PER_MIN = 30, THUMB_TIMEOUT = 20000, THUMB_KEEP = 300, THUMB_PX = 96, THUMB_TRIES = 2;
-// Only one frame is needed: larger files keep the type icon instead of being downloaded whole.
-var THUMB_MAX_BYTES = { image: 5 * 1048576, video: 2 * 1048576 };
+// Larger files keep the type icon instead of being downloaded whole (uploads are currently capped at 5 MiB anyway).
+var THUMB_MAX_BYTES = 10 * 1048576;
 // Sign-out or a different principal: forget every thumbnail and stop pending work. In-flight work from before is discarded.
 function thumbClear() {
   THUMBS.gen++; THUMBS.queue = []; THUMBS.waiting = new Map(); THUMBS.failed = new Set(); THUMBS.tries = new Map(); THUMBS.pausedUntil = 0;
@@ -12687,9 +12687,11 @@ function thumbFetch(job) {
     var type = (r.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
     if (!THUMB_MIME.test(type)) return end(null, "fail");
     var size = Number(r.headers.get("content-length"));
-    if (Number.isFinite(size) && size > THUMB_MAX_BYTES[job.video ? "video" : "image"]) { if (ctl) ctl.abort(); return end(null, "fail"); }
+    if (Number.isFinite(size) && size > THUMB_MAX_BYTES) { if (ctl) ctl.abort(); return end(null, "fail"); }
     return r.blob().then(function (b) {
       if (finished) return;
+      // No (or a wrong) Content-Length: enforce the cap on what actually arrived, before decoding.
+      if (b.size > THUMB_MAX_BYTES) return end(null, "fail");
       cancel = thumbFromBlob(b, job.video, function (u) { end(u, u ? "ok" : "fail"); });
     });
   }).catch(function () { end(null, "retry"); });
@@ -12725,25 +12727,28 @@ function fileThumb(a, pid, noPreview) {
   return box;
 }
 // Offline: a saved image copy is already on this device; draw a small thumbnail from it, one at a time so a long list
-// never decodes many full-size images at once. Pending work stops and thumbnails are revoked on navigation.
+// never decodes many full-size images at once. Same size cap as online. Each step has a timeout and errors are
+// swallowed, so one image that never decodes can't stall the rest. Pending work stops and thumbnails are revoked on
+// navigation.
 var OFFLINE_THUMBS = Promise.resolve();
 function offlineThumb(it) {
   var box = h("span", { class: "ficon-sm", "aria-hidden": "true", dataset: { type: HOME.typeOf(it) } }, icon(kindIcon(it)));
-  if (it.blob && /^image\/(png|jpeg|webp|gif)$/.test(it.mime || "")) {
+  if (it.blob && it.blob.size <= THUMB_MAX_BYTES && /^image\/(png|jpeg|webp|gif)$/.test(it.mime || "")) {
     var alive = true;
     S.cleanups.push(function () { alive = false; });
     OFFLINE_THUMBS = OFFLINE_THUMBS.then(function () {
       if (!alive) return;
       return new Promise(function (done) {
-        thumbFromBlob(it.blob, false, function (u) {
-          done();
+        var cancel = null, timer = setTimeout(function () { if (cancel) cancel(); done(); }, THUMB_TIMEOUT);
+        cancel = thumbFromBlob(it.blob, false, function (u) {
+          clearTimeout(timer); done();
           if (!u) return;
           if (!alive) return URL.revokeObjectURL(u);
           S.cleanups.push(function () { URL.revokeObjectURL(u); });
           thumbShow(box, u);
         });
       });
-    });
+    }).catch(function () {});
   }
   return box;
 }
