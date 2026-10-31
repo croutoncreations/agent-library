@@ -80,3 +80,7 @@ Rate limits and upload TTLs have defaults and optional vars. See [wrangler.examp
 ## Templates
 
 Project-scoped Markdown templates reuse artifact revisions and metadata history; identity and copy provenance are additive fields. Owner-only definition maintenance is enforced in the shared service and transaction fences. Both MCP transports, /v1 and the owner picker use the same implementation, integrated by `build-template-fixes.mjs`. See [Document templates](templates.md) for date/retry semantics, /2 backup compatibility and rollback notes.
+
+## File types
+
+File types in the browser UI (`src/file-types/`, integrated by the final `build-file-types.mjs` step): lists label files by their stored MIME type ("PNG image", "MP4 video", "PDF"), Home can filter and sort by type, and list rows show small thumbnails for images and videos. Thumbnails are drawn in the browser from the revision-pinned `/content` URL, lazily and within a per-minute budget, kept as 96px object URLs for the session and dropped on sign-out. The owner list route adds `mime` only with `?include=mime`, and owner search adds it for human sessions only, so MCP, `/v1` and default `/api` shapes are unchanged. No migration.

@@ -6097,7 +6097,7 @@ async function listArtifacts(ctx, projectId, q) {
   const folder = q.folderId ?? "";
   if (folder && folder !== "root" && !/^fld_[A-Za-z0-9_-]{1,40}$/.test(folder)) throw new HttpError(400, "invalid_input", "folder_id must be a folder id or root");
   const r = await db(ctx).prepare(
-    `SELECT ${ART_COLS} FROM artifacts a LEFT JOIN revisions r ON r.id = a.head_revision_id
+    `SELECT ${ART_COLS}, r.mime AS head_mime FROM artifacts a LEFT JOIN revisions r ON r.id = a.head_revision_id
      WHERE a.project_id = ? AND a.head_rev > 0 AND (a.trashed_at IS NOT NULL) = ?
        AND (? = '' OR a.title LIKE ? ESCAPE '\\' OR r.body LIKE ? ESCAPE '\\')
        AND (? = '' OR a.kind = ?)
@@ -6106,7 +6106,7 @@ async function listArtifacts(ctx, projectId, q) {
   ).bind(projectId, q.trashed ? 1 : 0, term, like, like, kind, kind, folder, folder, folder, LIMITS.pageSize + 1, offset).all();
   const rows = r.results.slice(0, LIMITS.pageSize);
   return {
-    artifacts: rows.map((a) => artifactView(a, appConnectEnabled(ctx.env))),
+    artifacts: rows.map((a) => q.withMime ? { ...artifactView(a, appConnectEnabled(ctx.env)), mime: a.head_mime ?? null } : artifactView(a, appConnectEnabled(ctx.env))),
     next_cursor: r.results.length > LIMITS.pageSize ? String(offset + LIMITS.pageSize) : null
   };
 }
@@ -6376,7 +6376,7 @@ async function searchArtifacts(ctx, args, transport = "api") {
   for (const [k, op] of [["updated_after", ">"], ["updated_before", "<"]]) if (a[k]) { where.push(`a.updated_at ${op} ?`); values.push(a[k]); }
   // No corpus-wide rank statistic: hidden documents cannot affect the order of authorized hits.
   const sql = `WITH hits AS (
-    SELECT a.id, a.project_id, p.title AS project_title, a.title, a.kind, a.updated_at, r.rev_no, r.sha256,
+    SELECT a.id, a.project_id, p.title AS project_title, a.title, a.kind, a.updated_at, r.rev_no, r.sha256, r.mime,
       (CASE WHEN lower(a.title)=lower(?) THEN 1000 ELSE 0 END + (${titleScore})) AS score,
       CASE WHEN (${titleScore})>0 THEN 'title' ELSE 'body' END AS matched_field,
       CASE WHEN a.kind='binary' THEN a.title ELSE substr(snippet(artifact_search,4,'','',' … ',40),1,500) END AS snippet
@@ -6391,7 +6391,7 @@ async function searchArtifacts(ctx, args, transport = "api") {
   const results = rows.slice(0, a.limit).map(r => ({
     project_id: r.project_id, project_title: r.project_title, artifact_id: r.id, title: r.title, kind: r.kind,
     matched_field: r.matched_field, snippet: (r.snippet || r.title).slice(0,500), indexed_body: r.kind !== "binary",
-    revision: r.rev_no, sha256: r.sha256, updated_at: r.updated_at,
+    revision: r.rev_no, sha256: r.sha256, updated_at: r.updated_at, ...(ctx.principal?.kind === "human" && !ctx.oauthConnection && !ctx.apiCredential ? { mime: r.mime } : {}),
     web_url: origin ? artifactWebUrl(origin,r.project_id,r.id) + "?v=" + r.rev_no : null,
     preview_url: origin ? previewWebUrl(origin,r.project_id,r.id) + "?v=" + r.rev_no : null
   }));
@@ -11389,7 +11389,7 @@ init_service();
 // src/home.ts
 var HOME_JS = String.raw`var HOME = (function () {
   function key(uid) { return "al:home:" + encodeURIComponent(uid); }
-  function empty() { return { favorites: [], tab: "recent", sort: "newest" }; }
+  function empty() { return { favorites: [], tab: "recent", sort: "newest", type: "all" }; }
   function read(uid) {
     var out = empty();
     if (!uid) return out;
@@ -11402,13 +11402,14 @@ var HOME_JS = String.raw`var HOME = (function () {
         var k = JSON.stringify([x.pid, x.aid]); if (seen.has(k)) return false; seen.add(k); return true;
       }).map(function (x) { return { pid: x.pid, aid: x.aid }; });
       if (v.tab === "favorites") out.tab = v.tab;
-      if (["newest", "oldest", "title"].indexOf(v.sort) >= 0) out.sort = v.sort;
+      if (["newest", "oldest", "title", "type"].indexOf(v.sort) >= 0) out.sort = v.sort;
+      if (TYPES.indexOf(v.type) >= 0) out.type = v.type;
     } catch (e) {}
     return out;
   }
   function write(uid, v) {
     if (!uid) throw new Error("Sign in to save favorites.");
-    localStorage.setItem(key(uid), JSON.stringify({ favorites: v.favorites, tab: v.tab, sort: v.sort }));
+    localStorage.setItem(key(uid), JSON.stringify({ favorites: v.favorites, tab: v.tab, sort: v.sort, type: v.type }));
   }
   function has(v, pid, aid) { return v.favorites.some(function (x) { return x.pid === pid && x.aid === aid; }); }
   function toggle(uid, pid, aid) {
@@ -11417,11 +11418,25 @@ var HOME_JS = String.raw`var HOME = (function () {
     else v.favorites.push({ pid: pid, aid: aid });
     write(uid, v); return has(v, pid, aid);
   }
-  function prefs(uid, tab, sort) { var v = read(uid); v.tab = tab; v.sort = sort; write(uid, v); }
+  function prefs(uid, tab, sort, type) { var v = read(uid); v.tab = tab; v.sort = sort; if (type !== undefined) v.type = type; write(uid, v); }
+  // File types (src/file-types). One group per list item, in the order the Type sort uses.
+  var TYPES = ["doc", "page", "image", "video", "pdf", "csv", "json", "file"];
+  function typeOf(a) {
+    if (!a) return "file";
+    if (a.kind === "markdown") return "doc";
+    if (a.kind === "html") return "page";
+    if (a.kind === "csv" || a.kind === "json") return a.kind;
+    var m = typeof a.mime === "string" ? a.mime.toLowerCase() : "";
+    if (m.indexOf("image/") === 0) return "image";
+    if (m.indexOf("video/") === 0) return "video";
+    if (m === "application/pdf") return "pdf";
+    return "file";
+  }
   function order(rows, mode) {
     return rows.slice().sort(function (a, b) {
       var at = Date.parse(a.updated_at), bt = Date.parse(b.updated_at), av = Number.isFinite(at), bv = Number.isFinite(bt);
-      if (mode !== "title") {
+      if (mode === "type") { var d = TYPES.indexOf(typeOf(a)) - TYPES.indexOf(typeOf(b)); if (d) return d; }
+      if (mode !== "title" && mode !== "type") {
         if (av !== bv) return av ? -1 : 1;
         if (av && at !== bt) return mode === "oldest" ? at - bt : bt - at;
       }
@@ -11457,12 +11472,12 @@ var HOME_JS = String.raw`var HOME = (function () {
     async function scan(s, firstOnly) {
       try {
         do {
-          check(); var path = "/api/projects/" + encodeURIComponent(s.p.id) + "/artifacts";
-          if (s.cursor !== null) path += "?cursor=" + encodeURIComponent(s.cursor);
+          check(); var path = "/api/projects/" + encodeURIComponent(s.p.id) + "/artifacts?include=mime";
+          if (s.cursor !== null) path += "&cursor=" + encodeURIComponent(s.cursor);
           var result = await call("GET", path); check();
           result.artifacts.forEach(function (a) {
             if (a.project_id === s.p.id && !a.trashed && typeof a.id === "string" && typeof a.title === "string")
-              s.rows.push({ pid: s.p.id, id: a.id, title: a.title, kind: a.kind, updated_at: a.updated_at, revision: a.revision });
+              s.rows.push({ pid: s.p.id, id: a.id, title: a.title, kind: a.kind, mime: typeof a.mime === "string" ? a.mime : null, updated_at: a.updated_at, revision: a.revision });
           });
           s.cursor = result.next_cursor == null ? null : String(result.next_cursor);
           if (s.cursor !== null) {
@@ -11513,7 +11528,7 @@ var HOME_JS = String.raw`var HOME = (function () {
     var final = await call("GET", "/api/projects"); check();
     return collect(final.projects);
   }
-  return { read: read, has: has, toggle: toggle, prefs: prefs, order: order, load: load, EARLY: EARLY, cacheRead: cacheRead, cacheWrite: cacheWrite, cacheClear: cacheClear };
+  return { typeOf: typeOf, TYPES: TYPES, read: read, has: has, toggle: toggle, prefs: prefs, order: order, load: load, EARLY: EARLY, cacheRead: cacheRead, cacheWrite: cacheWrite, cacheClear: cacheClear };
 })();`;
 
 // src/editor-bundle.ts
@@ -11586,7 +11601,15 @@ var APP_HTML = `<!doctype html>
 </body>
 </html>
 `;
-var APP_CSS = `/* Global ranked search uses text nodes, including highlighted excerpts. */
+var APP_CSS = `/* File type thumbnails: the media covers the type icon once it has loaded. */
+.ficon-sm{position:relative;overflow:hidden}
+.ficon-sm > .thumb{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:0;pointer-events:none;background:var(--sunk)}
+.ficon-sm.has-thumb > .thumb{opacity:1}
+.ficon-sm.has-thumb > svg{visibility:hidden}
+.search-hit{display:grid;grid-template-columns:auto minmax(0,1fr);column-gap:12px;align-items:start}
+.search-hit > *{grid-column:2}
+.search-hit > .ficon-sm{grid-column:1;grid-row:1 / span 4}
+/* Global ranked search uses text nodes, including highlighted excerpts. */
 .search-form{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
 .search-form input{min-width:180px;flex:1}
 .search-form select{max-width:100%}
@@ -12157,6 +12180,7 @@ var ICONS = {
   image: ["M5 3h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z", "M8.5 10a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3z", "M21 15l-5-5L5 21"],
   user: ["M20 21a8 8 0 0 0-16 0", "M12 13a5 5 0 1 0 0-10 5 5 0 0 0 0 10z"],
   table: ["M5 3h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z", "M3 9h18", "M3 15h18", "M9 9v12"],
+  video: ["M3 6a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z", "M17 10l4-2.5v9L17 14"],
   braces: ["M8 3H7a2 2 0 0 0-2 2v5a2 2 0 0 1-2 2 2 2 0 0 1 2 2v5a2 2 0 0 0 2 2h1", "M16 21h1a2 2 0 0 0 2-2v-5a2 2 0 0 1 2-2 2 2 0 0 1-2-2V5a2 2 0 0 0-2-2h-1"],
 };
 function icon(name) {
@@ -12285,7 +12309,7 @@ function clearAllDrafts() {
 
 // Drop drafts that belong to any principal other than the one now signed in (identity isolation).
 function purgeForeignDrafts(principalId) {
-  HOME.cacheClear(principalId);
+  HOME.cacheClear(principalId); thumbClear();
   var mine = "al:draft:" + principalId + ":";
   try { for (var i = localStorage.length - 1; i >= 0; i--) { var k = localStorage.key(i); if (k && k.indexOf("al:draft:") === 0 && k.indexOf(mine) !== 0) localStorage.removeItem(k); } } catch (e) {}
 }
@@ -12294,7 +12318,7 @@ function purgeForeignDrafts(principalId) {
 // logout still clears all drafts; a different principal signing in purges them.
 function onUnauthenticated() {
   var wasIn = !!S.me;
-  HOME.cacheClear(null);
+  HOME.cacheClear(null); thumbClear();
   S.me = null; S.csrf = null;
   runCleanups(true);
   if (wasIn && hostedApp() && !signingOut && reloadForSignIn()) return;
@@ -12389,7 +12413,7 @@ function skeletonRows(list, n) {
 }
 function doneLoading(list) { list.removeAttribute("aria-busy"); }
 function rowLink(href, title) { return h("a", { class: "stretch", href: href, text: title }); }
-function kindIcon(a) { return a.kind === "binary" ? (/^image\//.test(a.mime || "") ? "image" : "file") : a.kind === "csv" ? "table" : a.kind === "json" ? "braces" : "doc"; }
+function kindIcon(a) { var t = HOME.typeOf(a); return t === "image" ? "image" : t === "video" ? "video" : t === "csv" ? "table" : t === "json" ? "braces" : t === "file" ? "file" : "doc"; }
 // Move focus to the new page content after in-app navigation, so keyboard and screen-reader users land on it.
 // Decided when the route changes; applied after the new view has replaced main's content (shell), so a control
 // that was inside the old view (tab, document row, Load more…) can't leave focus stranded on <body>.
@@ -12440,7 +12464,7 @@ async function logout() {
   if (renewing) await renewing;
   try { await api("POST", "/api/logout", {}, { noAuthRedirect: true }); } catch (e) {}
   clearAllDrafts();
-  HOME.cacheClear(null);
+  HOME.cacheClear(null); thumbClear();
   resumeClear();
   await OFF.clear();
   S.me = null; S.csrf = null;
@@ -12528,7 +12552,7 @@ async function viewSearch() {
       var result = await api("GET", "/api/search?" + params);
       if (!alive || my !== seq) return;
       result.results.forEach(function (r) {
-        list.append(h("li", { class: "card search-hit" },
+        list.append(h("li", { class: "card search-hit" }, fileThumb({ id: r.artifact_id, kind: r.kind, mime: r.mime, revision: r.revision }, r.project_id),
           h("a", { class: "search-title", href: r.preview_url || r.web_url || "/p/" + enc(r.project_id) + "/a/" + enc(r.artifact_id) + "/preview?v=" + r.revision }, highlight(r.title, requested.query)),
           h("p", { class: "meta", text: r.project_title + " · " + kindLabel(r) + " · Version " + r.revision + " · " + fmtDate(r.updated_at) }),
           h("p", { class: "search-snippet" }, highlight(r.snippet, requested.query)),
@@ -12551,6 +12575,183 @@ async function viewSearch() {
   } catch (e) { if (alive) status.textContent = "Project filters couldn't load. Search all projects or refresh to retry."; }
   if (alive) query.focus();
 }
+// ---------- file types: specific labels, Home type filter and list thumbnails (src/file-types) ----------
+// Labels come from the head revision's stored MIME type. Thumbnails are made from the revision-pinned content itself, only
+// for the image and video types the server serves inline (never SVG, HTML or PDF). Each one is a single request, made only
+// while its row is on screen, a few at a time and within a per-minute budget well under the owner's read limit; a 429
+// pauses the queue for the server's Retry-After. The bytes are decoded in the browser and kept only as a 96px image for the
+// session (content responses are no-store); everything is dropped when the signed-in identity changes. Any failure keeps
+// the type icon.
+var FILE_TYPE_FILTERS = [["all", "All types"], ["doc", "Docs"], ["page", "Pages"], ["image", "Images"], ["video", "Videos"], ["pdf", "PDFs"], ["csv", "CSV files"], ["json", "JSON files"], ["file", "Other files"]];
+var FILE_TYPE_NOUNS = { doc: "docs", page: "pages", image: "images", video: "videos", pdf: "PDFs", csv: "CSV files", json: "JSON files", file: "other files" };
+var FILE_MIME_LABELS = { "image/png": "PNG image", "image/jpeg": "JPEG image", "image/webp": "WebP image", "image/gif": "GIF image", "video/mp4": "MP4 video", "video/webm": "WebM video", "application/pdf": "PDF" };
+var THUMB_MIME = /^(image\/(png|jpeg|webp|gif)|video\/(mp4|webm))$/;
+function fileTypeName(t) { return FILE_TYPE_NOUNS[t] || "items"; }
+function typeFilterSelect(value) {
+  return h("select", { "aria-label": "Filter by type" }, FILE_TYPE_FILTERS.map(function (x) { return h("option", { value: x[0], selected: value === x[0], text: x[1] }); }));
+}
+var THUMBS = { gen: 0, active: 0, queue: [], starts: [], timer: 0, pausedUntil: 0, io: null, watched: new Set(), made: new Map(), failed: new Set(), tries: new Map(), waiting: new Map() };
+var THUMB_MAX_ACTIVE = 3, THUMB_PER_MIN = 30, THUMB_TIMEOUT = 20000, THUMB_KEEP = 300, THUMB_PX = 96, THUMB_TRIES = 2;
+// Larger files keep the type icon instead of being downloaded whole (uploads are currently capped at 5 MiB anyway).
+var THUMB_MAX_BYTES = 10 * 1048576;
+// Sign-out or a different principal: forget every thumbnail and stop pending work. In-flight work from before is discarded.
+function thumbClear() {
+  THUMBS.gen++; THUMBS.queue = []; THUMBS.waiting = new Map(); THUMBS.failed = new Set(); THUMBS.tries = new Map(); THUMBS.pausedUntil = 0;
+  THUMBS.made.forEach(function (u) { URL.revokeObjectURL(u); }); THUMBS.made = new Map();
+  if (THUMBS.io) { THUMBS.io.disconnect(); THUMBS.io = null; }
+  THUMBS.watched = new Set();
+}
+function thumbShow(box, u) {
+  var img = h("img", { class: "thumb", src: u, alt: "", decoding: "async" });
+  img.addEventListener("load", function () { box.classList.add("has-thumb"); });
+  img.addEventListener("error", function () { img.remove(); });
+  box.append(img);
+}
+function thumbForget(box) { if (THUMBS.io) THUMBS.io.unobserve(box); THUMBS.watched.delete(box); box._thumbJob = null; }
+// Decodes an image or video Blob and draws a centred, cropped 96px square. cb(objectURL or null); never throws.
+function thumbFromBlob(blob, video, cb) {
+  var src = URL.createObjectURL(blob), media, called = false;
+  function finish(u) { if (called) { if (u) URL.revokeObjectURL(u); return; } called = true; URL.revokeObjectURL(src); if (media) media.removeAttribute("src"); cb(u); }
+  function draw(w, hgt) {
+    try {
+      if (!w || !hgt) return finish(null);
+      var c = document.createElement("canvas"), s = Math.max(THUMB_PX / w, THUMB_PX / hgt);
+      c.width = THUMB_PX; c.height = THUMB_PX;
+      c.getContext("2d").drawImage(media, (THUMB_PX - w * s) / 2, (THUMB_PX - hgt * s) / 2, w * s, hgt * s);
+      c.toBlob(function (b) { finish(b ? URL.createObjectURL(b) : null); }, "image/webp", 0.85);
+    } catch (e) { finish(null); }
+  }
+  if (video) {
+    media = document.createElement("video");
+    media.muted = true; media.playsInline = true; media.preload = "auto";
+    media.addEventListener("loadedmetadata", function () {
+      var d = isFinite(media.duration) ? media.duration : 0;
+      try { media.currentTime = d > 0.2 ? Math.min(0.5, d / 2) : 0.01; } catch (e) { finish(null); }
+    });
+    media.addEventListener("seeked", function () { draw(media.videoWidth, media.videoHeight); });
+  } else {
+    media = new Image();
+    media.addEventListener("load", function () { draw(media.naturalWidth, media.naturalHeight); });
+  }
+  media.addEventListener("error", function () { finish(null); });
+  media.src = src;
+  return function () { finish(null); };
+}
+function thumbPump() {
+  var now = Date.now();
+  if (THUMBS.pausedUntil > now) return thumbLater(THUMBS.pausedUntil - now);
+  THUMBS.starts = THUMBS.starts.filter(function (t) { return now - t < 60000; });
+  while (THUMBS.active < THUMB_MAX_ACTIVE && THUMBS.queue.length) {
+    var job = THUMBS.queue[0];
+    // Only rows still on the page and on screen; rows scrolled away re-queue when they come back into view.
+    var boxes = (THUMBS.waiting.get(job.url) || []).filter(function (b) { return b.isConnected && b._inView !== false; });
+    if (!boxes.length) { THUMBS.queue.shift(); THUMBS.waiting.delete(job.url); continue; }
+    THUMBS.waiting.set(job.url, boxes);
+    if (THUMBS.starts.length >= THUMB_PER_MIN) return thumbLater(60050 - (now - THUMBS.starts[0]));
+    THUMBS.queue.shift(); THUMBS.starts.push(now); THUMBS.active++;
+    thumbFetch(job);
+  }
+}
+function thumbLater(ms) { if (!THUMBS.timer) THUMBS.timer = setTimeout(function () { THUMBS.timer = 0; thumbPump(); }, Math.max(250, ms)); }
+function thumbFetch(job) {
+  var gen = THUMBS.gen, finished = false, cancel = null, ctl = "AbortController" in window ? new AbortController() : null;
+  var timer = setTimeout(function () { if (ctl) ctl.abort(); if (cancel) cancel(); end(null, "retry"); }, THUMB_TIMEOUT);
+  // outcome: "ok", "requeue" (429: back of the pause), "retry" (timeout, network, 5xx: tried again when next on screen,
+  // up to THUMB_TRIES times) or "fail" (this revision can't be previewed, including a decode that never finishes).
+  function end(u, outcome) {
+    if (finished) { if (u) URL.revokeObjectURL(u); return; }
+    finished = true; clearTimeout(timer); THUMBS.active--;
+    if (gen !== THUMBS.gen) { if (u) URL.revokeObjectURL(u); thumbPump(); return; }
+    var boxes = THUMBS.waiting.get(job.url) || [];
+    if (outcome === "requeue") { THUMBS.queue.unshift(job); thumbPump(); return; }
+    THUMBS.waiting.delete(job.url);
+    if (u) {
+      THUMBS.made.set(job.url, u);
+      if (THUMBS.made.size > THUMB_KEEP) { var old = THUMBS.made.keys().next().value; URL.revokeObjectURL(THUMBS.made.get(old)); THUMBS.made.delete(old); }
+      boxes.forEach(function (b) { thumbForget(b); thumbShow(b, u); });
+    } else {
+      var n = (THUMBS.tries.get(job.url) || 0) + 1; THUMBS.tries.set(job.url, n);
+      if (outcome === "fail" || n >= THUMB_TRIES) { THUMBS.failed.add(job.url); boxes.forEach(thumbForget); }
+    }
+    thumbPump();
+  }
+  fetch(job.url, { credentials: "same-origin", cache: "no-store", signal: ctl ? ctl.signal : undefined }).then(function (r) {
+    if (finished) return;
+    if (gen !== THUMBS.gen) return end(null, "retry");
+    if (r.status === 429) {
+      var wait = Number(r.headers.get("retry-after"));
+      THUMBS.pausedUntil = Date.now() + (Number.isFinite(wait) && wait > 0 ? Math.min(wait, 120) * 1000 : 30000);
+      return end(null, "requeue");
+    }
+    if (!r.ok) return end(null, r.status >= 500 || r.status === 401 ? "retry" : "fail");
+    var type = (r.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
+    if (!THUMB_MIME.test(type)) return end(null, "fail");
+    var size = Number(r.headers.get("content-length"));
+    if (Number.isFinite(size) && size > THUMB_MAX_BYTES) { if (ctl) ctl.abort(); return end(null, "fail"); }
+    return r.blob().then(function (b) {
+      if (finished) return;
+      // No (or a wrong) Content-Length: enforce the cap on what actually arrived, before decoding.
+      if (b.size > THUMB_MAX_BYTES) return end(null, "fail");
+      cancel = thumbFromBlob(b, job.video, function (u) { end(u, u ? "ok" : "fail"); });
+    });
+  }).catch(function () { end(null, "retry"); });
+}
+function thumbWant(box, job) {
+  var have = THUMBS.made.get(job.url);
+  if (have) { thumbForget(box); return thumbShow(box, have); }
+  if (THUMBS.failed.has(job.url)) return thumbForget(box);
+  var boxes = THUMBS.waiting.get(job.url);
+  if (boxes) { if (boxes.indexOf(box) < 0) boxes.push(box); thumbPump(); return; }
+  THUMBS.waiting.set(job.url, [box]); THUMBS.queue.push(job); thumbPump();
+}
+function thumbObserve(box, job) {
+  if (THUMBS.made.has(job.url)) return thumbShow(box, THUMBS.made.get(job.url));
+  if (THUMBS.failed.has(job.url)) return;
+  if (!("IntersectionObserver" in window)) return thumbWant(box, job);
+  if (!THUMBS.io) THUMBS.io = new IntersectionObserver(function (entries) {
+    entries.forEach(function (e) {
+      e.target._inView = e.isIntersecting;
+      if (e.isIntersecting && e.target._thumbJob) thumbWant(e.target, e.target._thumbJob);
+    });
+    thumbPump();
+  }, { rootMargin: "200px 0px" });
+  // Rows replaced by a redraw or navigation are never seen again: stop observing them.
+  if (THUMBS.watched.size >= 200) THUMBS.watched.forEach(function (b) { if (!b.isConnected) thumbForget(b); });
+  box._thumbJob = job; box._inView = false; THUMBS.io.observe(box); THUMBS.watched.add(box);
+}
+// a: { id, kind, mime, revision }. noPreview: icon only (trash: trashed content isn't served).
+function fileThumb(a, pid, noPreview) {
+  var t = HOME.typeOf(a), box = h("span", { class: "ficon-sm", "aria-hidden": "true", dataset: { type: t } }, icon(kindIcon(a)));
+  if (noPreview || !a.id || !(a.revision > 0) || !THUMB_MIME.test(a.mime || "")) return box;
+  thumbObserve(box, { video: t === "video", url: "/api/projects/" + enc(pid) + "/artifacts/" + enc(a.id) + "/content?rev=" + enc(String(a.revision)) });
+  return box;
+}
+// Offline: a saved image copy is already on this device; draw a small thumbnail from it, one at a time so a long list
+// never decodes many full-size images at once. Same size cap as online. Each step has a timeout and errors are
+// swallowed, so one image that never decodes can't stall the rest. Pending work stops and thumbnails are revoked on
+// navigation.
+var OFFLINE_THUMBS = Promise.resolve();
+function offlineThumb(it) {
+  var box = h("span", { class: "ficon-sm", "aria-hidden": "true", dataset: { type: HOME.typeOf(it) } }, icon(kindIcon(it)));
+  if (it.blob && it.blob.size <= THUMB_MAX_BYTES && /^image\/(png|jpeg|webp|gif)$/.test(it.mime || "")) {
+    var alive = true;
+    S.cleanups.push(function () { alive = false; });
+    OFFLINE_THUMBS = OFFLINE_THUMBS.then(function () {
+      if (!alive) return;
+      return new Promise(function (done) {
+        var cancel = null, timer = setTimeout(function () { if (cancel) cancel(); done(); }, THUMB_TIMEOUT);
+        cancel = thumbFromBlob(it.blob, false, function (u) {
+          clearTimeout(timer); done();
+          if (!u) return;
+          if (!alive) return URL.revokeObjectURL(u);
+          S.cleanups.push(function () { URL.revokeObjectURL(u); });
+          thumbShow(box, u);
+        });
+      });
+    }).catch(function () {});
+  }
+  return box;
+}
 // ---------- home: authorized recents and browser-local personal favorites ----------
 function favoriteButton(pid, aid, changed, title) {
   var uid = S.me && S.me.id;
@@ -12572,7 +12773,7 @@ function favoriteButton(pid, aid, changed, title) {
 }
 async function viewHome() {
   var uid = S.me.id, alive = true, seq = 0, rows = [], visible = HOME.EARLY, failed = 0, partial = false, loadedAt = 0;
-  var pref = HOME.read(uid), tab = pref.tab, mode = pref.sort;
+  var pref = HOME.read(uid), tab = pref.tab, mode = pref.sort, ftype = pref.type, typing = typeFilterSelect(pref.type);
   var msg = h("p", { class: "msg", role: "status", "aria-live": "polite" });
   var list = h("ul", { class: "list home-list", "aria-label": "Home documents" }), empty = h("div", { hidden: true });
   // A filter over one list (not separate panels): a labelled group of toggle buttons with aria-pressed.
@@ -12581,32 +12782,33 @@ async function viewHome() {
   function markFilter() { recent.setAttribute("aria-pressed", String(tab !== "favorites")); favorites.setAttribute("aria-pressed", String(tab === "favorites")); }
   var more = h("button", { type: "button", class: "secondary", hidden: true }, "Show more");
   var refresh = h("button", { type: "button", class: "ghost" }, icon("refresh"), "Refresh");
-  var sorting = h("select", { "aria-label": "Sort documents" }, [["newest", "Newest edit first"], ["oldest", "Oldest edit first"], ["title", "Title A–Z"]].map(function (x) { return h("option", { value: x[0], selected: mode === x[0], text: x[1] }); }));
+  var sorting = h("select", { "aria-label": "Sort documents" }, [["newest", "Newest edit first"], ["oldest", "Oldest edit first"], ["title", "Title A–Z"], ["type", "Type"]].map(function (x) { return h("option", { value: x[0], selected: mode === x[0], text: x[1] }); }));
   function current(my) { return alive && !!S.me && S.me.id === uid && my === seq; }
   function draw() {
     if (!alive || !S.me || S.me.id !== uid) return;
     markFilter();
     // First pages are exact only for the newest documents; other views wait for the full list.
-    if (partial && (tab === "favorites" || mode !== "newest")) { list.hidden = false; empty.hidden = true; more.hidden = true; skeletonRows(list, 4); return; }
+    if (partial && (tab === "favorites" || mode !== "newest" || ftype !== "all")) { list.hidden = false; empty.hidden = true; more.hidden = true; skeletonRows(list, 4); return; }
     doneLoading(list);
-    var fav = HOME.read(uid), selected = rows.filter(function (a) { return tab !== "favorites" || HOME.has(fav, a.pid, a.id); });
+    var fav = HOME.read(uid), selected = rows.filter(function (a) { return (tab !== "favorites" || HOME.has(fav, a.pid, a.id)) && (ftype === "all" || HOME.typeOf(a) === ftype); });
     selected = HOME.order(selected, mode); list.replaceChildren();
     selected.slice(0, visible).forEach(function (a) {
       var href = "#/p/" + enc(a.pid) + "/a/" + enc(a.id);
       var stamp = Number.isFinite(Date.parse(a.updated_at)) ? "Edited " + fmtDate(a.updated_at) : "Edit time unavailable";
       var details = h("span", { class: "meta", text: kindLabel(a) + " · " + a.project_title + " · " + stamp + " · rev " + a.revision });
       list.append(h("li", { class: "link", dataset: { projectId: a.pid, artifactId: a.id } },
-        h("span", { class: "ficon-sm", "aria-hidden": "true" }, icon(kindIcon(a))),
+        fileThumb(a, a.pid),
         h("div", { class: "grow" }, rowLink(href, a.title), details),
         h("span", { class: "badge", text: kindLabel(a) }), favoriteButton(a.pid, a.id, draw, a.title)));
     });
     list.hidden = !selected.length; empty.replaceChildren(); empty.hidden = !!selected.length;
     if (!selected.length) empty.append(failed ? stateBox("error", "alert", "Nothing could be loaded", "Some projects didn't respond. Nothing was changed. Try again.", h("button", { type: "button", class: "secondary", onclick: function () { load(); } }, icon("refresh"), "Try again"))
+      : ftype !== "all" && rows.some(function (a) { return tab !== "favorites" || HOME.has(fav, a.pid, a.id); }) ? stateBox("", "search", "No " + fileTypeName(ftype) + " here", "Nothing in this view matches the type filter.", h("button", { type: "button", class: "secondary", onclick: function () { ftype = "all"; typing.value = "all"; visible = HOME.EARLY; remember(); draw(); } }, "Show all types"))
       : tab === "favorites" ? stateBox("", "home", "No favorites yet", "Star a document from its page or from Recently edited to keep it here. Favorites are saved on this device.")
       : stateBox("", "doc", "No documents yet", "Open a project to write your first document, or connect an app to publish into one.", h("a", { class: "btn", href: "#/projects" }, icon("folder"), "Open projects")));
     more.hidden = partial || selected.length <= visible;
   }
-  function remember() { try { HOME.prefs(uid, tab, mode); } catch (e) { showMsg(msg, "View preferences could not be saved in this browser."); } }
+  function remember() { try { HOME.prefs(uid, tab, mode, ftype); } catch (e) { showMsg(msg, "View preferences could not be saved in this browser."); } }
   // quiet: a list is already on screen (cached or earlier load); refresh it in place without the skeleton.
   async function load(quiet) {
     quiet = quiet === true;
@@ -12644,9 +12846,10 @@ async function viewHome() {
   recent.addEventListener("click", function () { tab = "recent"; remember(); draw(); });
   favorites.addEventListener("click", function () { tab = "favorites"; remember(); draw(); });
   sorting.addEventListener("change", function () { mode = sorting.value; visible = HOME.EARLY; remember(); draw(); });
+  typing.addEventListener("change", function () { ftype = typing.value; visible = HOME.EARLY; remember(); draw(); });
   more.addEventListener("click", function () { visible += HOME.EARLY; draw(); });
   refresh.addEventListener("click", function () { load(rows.length > 0 && !partial); });
-  function changed(e) { if (e.key === "al:home:" + encodeURIComponent(uid)) { pref = HOME.read(uid); tab = pref.tab; mode = pref.sort; sorting.value = mode; draw(); } }
+  function changed(e) { if (e.key === "al:home:" + encodeURIComponent(uid)) { pref = HOME.read(uid); tab = pref.tab; mode = pref.sort; sorting.value = mode; if (ftype !== pref.type) visible = HOME.EARLY; ftype = pref.type; typing.value = ftype; draw(); } }
   // Returning to the tab refreshes in place at most once a minute, and retries a load that never completed.
   function foreground() { if (!document.hidden && !refresh.disabled && (!loadedAt || Date.now() - loadedAt > 60000)) load(rows.length > 0 && !partial); }
   window.addEventListener("storage", changed); document.addEventListener("visibilitychange", foreground);
@@ -12654,10 +12857,11 @@ async function viewHome() {
   shell([{ t: "Home" }], pageHead("Home", { sub: "Recently edited documents across your projects. Favorites are saved for your account on this device.",
       actions: [searchEntry(), h("a", { class: "btn secondary", href: "#/projects" }, icon("folder"), "All projects")] }),
     h("div", { class: "toolbar" }, homeTabs, h("span", { class: "spacer" }),
-      h("label", { class: "row small muted" }, "Sort", sorting), refresh),
+      h("label", { class: "row small muted" }, "Type", typing), h("label", { class: "row small muted" }, "Sort", sorting), refresh),
     msg, list, empty, more);
   // Show this tab's last complete list at once, then refresh it in place.
   var cached = HOME.cacheRead(uid);
+  if (cached && cached.rows.some(function (a) { return !("mime" in a); })) cached = null;
   if (cached) {
     rows = cached.rows; loadedAt = cached.at;
     cached.projects.forEach(function (p) { projectTitles[p.id] = p.title; });
@@ -12860,7 +13064,10 @@ function uploadForm(pid, target, onDone, accept) {
   return h("div", null, form, msg);
 }
 
-function kindLabel(a) { return a.kind === "markdown" ? "Doc" : a.kind === "html" ? "Page" : a.kind === "csv" ? "CSV" : a.kind === "json" ? "JSON" : "File"; }
+function kindLabel(a) {
+  if (a.kind === "binary") { var m = typeof a.mime === "string" ? a.mime.toLowerCase() : ""; return FILE_MIME_LABELS[m] || m || "File"; }
+  return a.kind === "markdown" ? "Doc" : a.kind === "html" ? "Page" : a.kind === "csv" ? "CSV" : a.kind === "json" ? "JSON" : "File";
+}
 function isTextDoc(kind) { return kind === "markdown" || kind === "html"; }
 function escHtml(s) { return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
 async function viewList(pid, trash) {
@@ -12874,7 +13081,7 @@ async function viewList(pid, trash) {
     var info = h("span", { class: "meta", text: (a.is_template ? "Template" : kindLabel(a)) + " · Updated " + fmtDate(a.updated_at) + " · rev " + a.revision + (a.folder ? " · " + a.folder : "") + (a.tags && a.tags.length ? " · #" + a.tags.join(" #") : "") });
     var href = "#/p/" + enc(pid) + "/a/" + enc(a.id);
     var main = h("div", { class: "grow" }, trash ? h("span", { text: a.title }) : rowLink(href, a.title), info);
-    var li = h("li", trash ? null : { class: "link" }, h("span", { class: "ficon-sm", "aria-hidden": "true" }, icon(kindIcon(a))), main, h("span", { class: "badge", text: a.is_template ? "Template" : kindLabel(a) }));
+    var li = h("li", trash ? null : { class: "link" }, fileThumb(a, pid, trash), main, h("span", { class: "badge", text: a.is_template ? "Template" : kindLabel(a) }));
     if (trash) li.append(h("button", { type: "button", class: "secondary", onclick: async function (e) {
       e.target.disabled = true;
       try { await api("PATCH", "/api/projects/" + enc(pid) + "/artifacts/" + enc(a.id), { expected_meta_version: a.meta_version, trashed: false }, { key: uuid() }); li.remove(); showMsg(msg, "Restored \"" + a.title + "\".", true); }
@@ -12893,7 +13100,7 @@ async function viewList(pid, trash) {
     var my = ++seq;
     if (reset) { cursor = null; list.hidden = false; empty.hidden = true; if (!list.children.length) skeletonRows(list, 3); else list.setAttribute("aria-busy", "true"); }
     var term = q.value.trim();
-    var qs = "?q=" + enc(term) + (cursor ? "&cursor=" + enc(cursor) : "") + (trash ? "&trashed=1" : "");
+    var qs = "?q=" + enc(term) + (cursor ? "&cursor=" + enc(cursor) : "") + (trash ? "&trashed=1" : "") + "&include=mime";
     try {
       var r = await api("GET", "/api/projects/" + enc(pid) + "/artifacts" + qs);
       if (my !== seq) return;
@@ -14823,7 +15030,7 @@ async function viewOfflineHome() {
     if (it.pid !== last) { last = it.pid; list.append(h("li", { class: "group", text: it.project_title || it.pid })); }
     var href = "#/p/" + enc(it.pid) + "/a/" + enc(it.aid);
     list.append(h("li", { class: "link", onclick: function (e) { if (e.target.tagName !== "A") location.hash = href; } },
-      h("div", { class: "grow" }, h("a", { href: href, text: it.title }), h("small", { class: "muted", text: "rev " + it.rev + " · " + fmtBytes(it.size) + " · " + offAge(it.saved_at) + " · " + offExpiryText(it, !!kept[it.pid]) })),
+      offlineThumb(it), h("div", { class: "grow" }, h("a", { href: href, text: it.title }), h("small", { class: "muted", text: "rev " + it.rev + " · " + fmtBytes(it.size) + " · " + offAge(it.saved_at) + " · " + offExpiryText(it, !!kept[it.pid]) })),
       h("span", { class: "badge", text: kindLabel(it) })));
   });
   resumeApply("list");
@@ -16026,7 +16233,7 @@ async function route3(req, env, url, requestId) {
     if (rest.length === 1 && m === "GET") {
       const kind = url.searchParams.get("kind") ?? void 0, folderId = url.searchParams.get("folder_id") ?? void 0;
       if (kind !== void 0 || folderId !== void 0) requireAppConnect(ctx);
-      return json(await listArtifacts(ctx, pid, { query: url.searchParams.get("q") ?? void 0, cursor: url.searchParams.get("cursor") ?? void 0, trashed: url.searchParams.get("trashed") === "1", kind, folderId }));
+      return json(await listArtifacts(ctx, pid, { query: url.searchParams.get("q") ?? void 0, cursor: url.searchParams.get("cursor") ?? void 0, trashed: url.searchParams.get("trashed") === "1", kind, folderId, withMime: ctx.principal.kind === "human" && url.searchParams.get("include") === "mime" }));
     }
     if (rest.length === 1 && m === "POST") {
       const b = await body(req);

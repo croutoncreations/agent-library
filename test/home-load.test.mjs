@@ -35,7 +35,7 @@ function api({ projects, data, errors = {}, finalProjects = projects }) {
     await new Promise((r) => setImmediate(r));
     log.push(path);
     if (path === "/api/projects") return { projects: listed++ ? finalProjects : projects };
-    const m = /^\/api\/projects\/([^/]+)\/artifacts(?:\?cursor=(\d+))?$/.exec(path);
+    const m = /^\/api\/projects\/([^/]+)\/artifacts\?include=mime(?:&cursor=(\d+))?$/.exec(path);
     const pid = decodeURIComponent(m[1]), off = Number(m[2] ?? 0);
     if (errors[pid]) throw Object.assign(new Error("fail"), { status: errors[pid] });
     const all = data[pid] ?? [];
@@ -56,8 +56,8 @@ test("home: first pages are shown before older pages, and already hold the newes
 
   assert.ok(early, "early result delivered");
   const firstPages = log.slice(0, earlyAt);
-  assert.deepEqual(firstPages.slice(1).sort(), ["/api/projects/big/artifacts", "/api/projects/hidden/artifacts", "/api/projects/small/artifacts"]);
-  assert.ok(log.slice(earlyAt).includes("/api/projects/big/artifacts?cursor=50"), "older pages load after the early result");
+  assert.deepEqual(firstPages.slice(1).sort(), ["/api/projects/big/artifacts?include=mime", "/api/projects/hidden/artifacts?include=mime", "/api/projects/small/artifacts?include=mime"]);
+  assert.ok(log.slice(earlyAt).includes("/api/projects/big/artifacts?include=mime&cursor=50"), "older pages load after the early result");
   assert.equal(early.rows.length, 60);
   assert.equal(result.rows.length, 140);
   assert.equal(result.failed, 0, "403 is not a failure");
@@ -79,8 +79,8 @@ test("home: a timestamp tie across the first page boundary is fetched before the
   let early = null, earlyAt = -1;
   const result = await HOME.load(call, () => true, (r) => { early = r; earlyAt = log.length; });
   assert.ok(early, "early result still delivered once the tie is resolved");
-  assert.ok(log.slice(0, earlyAt).includes("/api/projects/big/artifacts?cursor=50"), "the tied page is fetched first");
-  assert.ok(!log.slice(0, earlyAt).includes("/api/projects/big/artifacts?cursor=100"), "but no further than needed");
+  assert.ok(log.slice(0, earlyAt).includes("/api/projects/big/artifacts?include=mime&cursor=50"), "the tied page is fetched first");
+  assert.ok(!log.slice(0, earlyAt).includes("/api/projects/big/artifacts?include=mime&cursor=100"), "but no further than needed");
   assert.deepEqual(ids(HOME.order(early.rows, "newest").slice(0, HOME.EARLY)), ids(HOME.order(result.rows, "newest").slice(0, HOME.EARLY)));
   assert.equal(result.rows.length, 125);
 });
@@ -92,7 +92,7 @@ test("home: a first page shortened by client-side filtering is fetched further b
   const { call, log } = api({ projects: P("big", "small"), data: { big, small: docs("small", 30, 600, 1) } });
   let early = null, earlyAt = -1;
   const result = await HOME.load(call, () => true, (r) => { early = r; earlyAt = log.length; });
-  assert.ok(log.slice(0, earlyAt).includes("/api/projects/big/artifacts?cursor=50"));
+  assert.ok(log.slice(0, earlyAt).includes("/api/projects/big/artifacts?include=mime&cursor=50"));
   assert.deepEqual(ids(HOME.order(early.rows, "newest").slice(0, HOME.EARLY)), ids(HOME.order(result.rows, "newest").slice(0, HOME.EARLY)));
 });
 

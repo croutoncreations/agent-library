@@ -1,0 +1,234 @@
+{
+  "base_diagnostics_sha256": "17b9676bab21fe5733dea728b5205c16e4e05ec63da097b7d5dc97ff61ef5b60",
+  "integrated_sha256": "cea551a7d442927605e0890073072e7bad69968f1fdf6a4a3886d3dc79a6b1cf",
+  "preserved_outside_patches_sha256": "78d1b1c17c5e3acc4265c085d0c8bf78d4f697655cc1500edfbcb44bc2973497",
+  "sources_sha256": {
+    "home-types.js": "b2625b8f7a991973ca6c84e044918c8b8c3005c7af8721e50f48dd00ee261654",
+    "browser.js": "65afbb3f60b6258da2cf6b4d7a6e8577e787ba00aeb105011e52432ebd5f1270",
+    "browser.css": "0eb3f5b2952a6661335de446963c7c3d5a1a53d1bb2d428d1323298212b74cd9"
+  },
+  "patches": [
+    {
+      "name": "owner list: head revision MIME type on request",
+      "module": "// src/service.ts",
+      "find_sha256": "9aa0bbcdaa536dd3238e5351d87ca6e2e163abdbe9ba65917a074881ef945ddf",
+      "replace_sha256": "1b6b321acecc767e63b84bcb5f33ecb0be568b96b838e20c7f6bfb502fd1cc62"
+    },
+    {
+      "name": "owner list: add mime only when asked",
+      "module": "// src/service.ts",
+      "find_sha256": "b4739a5cda4c6dbdf677a49f80bdfb847368f2e5e004bce4f5e8cdcddb44bc2c",
+      "replace_sha256": "b4fafd98eb6665acc0a53bee0a6e00b040140a8846346737748bbfbd7034196c"
+    },
+    {
+      "name": "owner list route: ?include=mime",
+      "module": "// src/index.ts",
+      "find_sha256": "fa85ae7aacb4527452f5b00032ff761ccb59bcda9e1417527c6e579430d1d45c",
+      "replace_sha256": "d79151adf7ccf1cf8b1aed3ac9bccdb24f497de9d59517a1475eab6bfab946d4"
+    },
+    {
+      "name": "search: select the head revision MIME type",
+      "module": "// src/service.ts",
+      "find_sha256": "ae35ba7b3e237ba0eca0685ec4e33544d8c685b7c12e01ad0857999a27c66987",
+      "replace_sha256": "dee2596994bab849c262935ed7313a2becb2bf24ee90e63d9baa4e8facd9c3d1"
+    },
+    {
+      "name": "search: MIME type in owner browser results only",
+      "module": "// src/service.ts",
+      "find_sha256": "371129e7413c6e878146df79c67d676f7b76490b82e6b811ab4f27e48cc8e694",
+      "replace_sha256": "309d634bd6329fbe597131e3faaf5aed7423fc4c5ae3c4c1dd2a3ab56236cbfd"
+    },
+    {
+      "name": "home: type preference default",
+      "module": "// src/home.ts",
+      "find_sha256": "e9499b4f02ebe96121615686750876254ab03c486437fd2fb95762a08b5455f2",
+      "replace_sha256": "83025588b4471860291d24375f0d87e65d283b214b023bf4483f381aefdf96f3"
+    },
+    {
+      "name": "home: read type sort and type filter",
+      "module": "// src/home.ts",
+      "find_sha256": "f997c7b839a096748161c07b6354289b2690fcb5489b15f6e83e5a8a079599c7",
+      "replace_sha256": "9c5cbe33d6305f05fc70b5db78a1c5069b4eba7e5e1b45039783516c91ba0ebb"
+    },
+    {
+      "name": "home: save type filter",
+      "module": "// src/home.ts",
+      "find_sha256": "be8252ea68c14e2d44f427525d8c726d572931397724b5b824195ae4b5c97b3f",
+      "replace_sha256": "94ffed58f1fb22c0def86095d1534009e42ceb9fff94b1c37c8f9fa33ebfb4f7"
+    },
+    {
+      "name": "home: prefs keeps the type filter unless given",
+      "module": "// src/home.ts",
+      "find_sha256": "82b010518eadabf0940c482b7e81673a8361b8ae0ff7a51852efb3d5d8595950",
+      "replace_sha256": "640361b1cca30fc098fa9462fe8e42faa806b571bf2ec6c26d9cd3dea1419a63"
+    },
+    {
+      "name": "home: type grouping helper",
+      "module": "// src/home.ts",
+      "find_sha256": "2f031f6cfc3c3a18ff5d747b782397b38af04d344c7fdedab33626aed5640564",
+      "replace_sha256": "3baef74764f53df8ea8ea33bc41becff68ba4e6071a06c2e8d938cd80bd16aa2"
+    },
+    {
+      "name": "home: sort by type, then title",
+      "module": "// src/home.ts",
+      "find_sha256": "e919b3cf360a4ecafd3fe309645a6c4139b17d94d0ee56fdaba137cddc000aae",
+      "replace_sha256": "1d4d7b2b9dd45d8b90e61b1ebf805e596a346995a7d1e142256c15c28be4645c"
+    },
+    {
+      "name": "home: list pages carry the MIME type",
+      "module": "// src/home.ts",
+      "find_sha256": "61ead5dab5f31e9101080a5dbf3c6979b7b180a264bcb3e0f49f0e27a1e41060",
+      "replace_sha256": "5a60bb78b4659a790bcef746ed5f8aa3c9169971d996c7c6953ce0f01241091f"
+    },
+    {
+      "name": "home: keep the MIME type on each row",
+      "module": "// src/home.ts",
+      "find_sha256": "b277dd1a79a377f17e4d30a90cacb6b1faee8f8b5a41187d39966a74d59056ed",
+      "replace_sha256": "566f3b940566a124f164a1e88966019574cd5cb097c4ea0a46e6551b6ef3336f"
+    },
+    {
+      "name": "home: export type helpers",
+      "module": "// src/home.ts",
+      "find_sha256": "4c4ad04518a0c44f899808b613564c8d9e8c013878a469e6b4058e30dfd9ed1e",
+      "replace_sha256": "0eb5fb2122e2476f70f9af63ea56495f9bfc0fc101cd1c16696112a9173f5159"
+    },
+    {
+      "name": "ui: styles",
+      "module": "// src/ui.ts",
+      "find_sha256": "dbf4cdd569563992bd40313f20a86bcb55703a554eed9585301382dce9e6ee4e",
+      "replace_sha256": "0fd871181962fb326d089e757a33bc7ffc197eefcfc42a3ddcf7471139bea6b8"
+    },
+    {
+      "name": "ui: video icon",
+      "module": "// src/ui.ts",
+      "find_sha256": "f5ce64a754a672e0bc7837df198dfc9a704d263a53efffd167ad1cbf973c0fd7",
+      "replace_sha256": "6d9b90304d7052a651a2830113f20aab3e9598afc17c1d8b30963617b1dbde89"
+    },
+    {
+      "name": "ui: thumbnails and type filter helpers",
+      "module": "// src/ui.ts",
+      "find_sha256": "81bcf3ea5954073fece07463dbbe3470c23d9bf7692c635606fabb17e44ff27a",
+      "replace_sha256": "db5aa09a5e844ef6d9718f11693cbdd8db5e5c14841f886d03c9ccd0dca8a604"
+    },
+    {
+      "name": "ui: icon by file type",
+      "module": "// src/ui.ts",
+      "find_sha256": "bc1edec1e02250026be462013c638d160b6b4fe9562d092f3b5d1fd88cd9c289",
+      "replace_sha256": "0c6468e18cbe2a09454ad87e01736ed6d1c5ef8667842ef008e62cfb2496e60e"
+    },
+    {
+      "name": "ui: specific file label",
+      "module": "// src/ui.ts",
+      "find_sha256": "6ba4a9631ffe9d1959d6d634d43af90c3148de3bbe80f2d864116ac487609fa6",
+      "replace_sha256": "3edea4530e900b0d0606ddd2a17b9d422f266fbbe7816b3636678419c4e31f1e"
+    },
+    {
+      "name": "ui: home view reads the type filter",
+      "module": "// src/ui.ts",
+      "find_sha256": "17b7b12f8e437ffd8245504115e8586e12c3732c1e05f9be13de11c2b7644a1f",
+      "replace_sha256": "96a40c88c00d7e316121316845383b52a937fba625db56f8e8fb249cc7cf17e3"
+    },
+    {
+      "name": "ui: home sort by type option",
+      "module": "// src/ui.ts",
+      "find_sha256": "339ad9c1c8ff1cc67f22eee4aadfeac5be156fead73b8f0291e67bda904e21b6",
+      "replace_sha256": "ff1e1280d000e778d8745cf26d19d108a3a9a26b3ef7b4a1830fe6626e7a90ef"
+    },
+    {
+      "name": "ui: filtered and re-sorted views wait for the complete list",
+      "module": "// src/ui.ts",
+      "find_sha256": "058bb10f57d894306721eaf6b31ca29648ceef3c8c077c674c7d5bd7e8ab91b4",
+      "replace_sha256": "88571fc9831b479546e3426d58abdde2b391dfec22b6f866c6cec61b30affbba"
+    },
+    {
+      "name": "ui: home applies the type filter",
+      "module": "// src/ui.ts",
+      "find_sha256": "feb434a141bad1322bbc8988533393a2c020e1b189f11304632a8448bffe26a3",
+      "replace_sha256": "c53f2eae7d668f703d3f5896dc898a24ffee95832fdf65ce035121373eae5a9a"
+    },
+    {
+      "name": "ui: home row thumbnail",
+      "module": "// src/ui.ts",
+      "find_sha256": "a596bca50aa1f03335bec46af803af3e73f7e899ba6f1a16fc90cfa8525ff093",
+      "replace_sha256": "cec11e2b24457ecb31b3ccf81389be05c4c2c31efe0000a12da8453fea10bc17"
+    },
+    {
+      "name": "ui: home empty state for a type filter",
+      "module": "// src/ui.ts",
+      "find_sha256": "0efe52d459bf6a974d8f8c4b53598c8e6fe0880b9e0dac1d42d56a421227af0c",
+      "replace_sha256": "26be12bcd31ea76368725fb121c90e6de2851c64690219364247923b90a275be"
+    },
+    {
+      "name": "ui: home saves the type filter",
+      "module": "// src/ui.ts",
+      "find_sha256": "0698a8812d90ed6975b58ec4731604fd965da155bfe1a46976b9ed9037640d73",
+      "replace_sha256": "2e46bb6b155b5e4880cf330b33165954ef2502a5c01e4cc6abba1dc3d2748afa"
+    },
+    {
+      "name": "ui: home type filter changes",
+      "module": "// src/ui.ts",
+      "find_sha256": "d011743c872bc5ca6e18f2137e6ee32193f5dc3db66d6a4475002f59e14dfcb3",
+      "replace_sha256": "c384bd4e1be22d352b8b57f61de614fb6cb638c3c046dcaed05d6dbed854ff84"
+    },
+    {
+      "name": "ui: home follows type changes from other tabs",
+      "module": "// src/ui.ts",
+      "find_sha256": "a648fe782bc0bdce25cf4b48f768e72ec780a862407bea6da55e3f96d399dc73",
+      "replace_sha256": "b3e28b783abb039407729a062edbb3aaf5d1d4c253d132512716ea22162124c5"
+    },
+    {
+      "name": "ui: Home caches from before file types (rows without mime) are not shown",
+      "module": "// src/ui.ts",
+      "find_sha256": "b3fdc2734ace435700385d94f25c4735797bc36a90cafb77c7921983a412fccf",
+      "replace_sha256": "3760bde3a7b19c6dc7361b30fac7d75e56167cf3065f889e7b95f07e8cff92cf"
+    },
+    {
+      "name": "ui: home toolbar type filter",
+      "module": "// src/ui.ts",
+      "find_sha256": "331b667d42dad059504c69817f1c30d3aeb3053437458ae8479f0a28e01e21a0",
+      "replace_sha256": "30d5131fa705e837481ac4bad359f1a596e294203f8ad04c8b35ee55486f9c6f"
+    },
+    {
+      "name": "ui: project list asks for MIME types",
+      "module": "// src/ui.ts",
+      "find_sha256": "9c5b2ba9d2823a3272d2b774f57c5e7e86ceed4f9f7303c594f1d85ca5adba3e",
+      "replace_sha256": "68542081f54b8cd8d88b038550a84013c310b77fc4290bb601aa6320ab456f09"
+    },
+    {
+      "name": "ui: project list row thumbnail",
+      "module": "// src/ui.ts",
+      "find_sha256": "0326fd959662ac4324641a2424c58317143e9f07d3fe8f5330216c059f76acb2",
+      "replace_sha256": "d65982f1327ddc48682143b83f6b832fb8630f41a0f8504e932b507c7eff7517"
+    },
+    {
+      "name": "ui: search result thumbnail",
+      "module": "// src/ui.ts",
+      "find_sha256": "14e06a84714408c03809174e7dca03ce602e206e97b1160de4474aa2faaf5dc4",
+      "replace_sha256": "326534b9836ba1f3962f560d33bd4f24a3a172a8495c665bfb7b0d65af005e08"
+    },
+    {
+      "name": "ui: offline list thumbnail",
+      "module": "// src/ui.ts",
+      "find_sha256": "5c0bdd2aa1f913dc6af31cd871752247f05f666004e017d357f98a8c07b50456",
+      "replace_sha256": "19775650e70fc8f9ea22faf2fabc47a671a2361c7e91862384ede59b0439a404"
+    },
+    {
+      "name": "ui: another principal drops thumbnails",
+      "module": "// src/ui.ts",
+      "find_sha256": "15e02d50593c6c243437117095b0a859ba9ec0bd1988376cb42bcc4df254a618",
+      "replace_sha256": "06b8726dfd7d8db971ab3e8835f156bdec530fe37ff32edfa0c3c3dbe60ae1ef"
+    },
+    {
+      "name": "ui: session end drops thumbnails",
+      "module": "// src/ui.ts",
+      "find_sha256": "19da007795367d298ad8157e10fa163988a5b0210927aab92a95b893caccd214",
+      "replace_sha256": "7192268374f1c68bf9af182687e69203a84ce3cbbd8ff0fcc92fbae8c450f236"
+    },
+    {
+      "name": "ui: sign-out drops thumbnails",
+      "module": "// src/ui.ts",
+      "find_sha256": "98601703d5c88993366f1b35cceef700b6b8ee53d9c8094676c6ed18bd1d2ba8",
+      "replace_sha256": "0b25f7ee8ce731f1a072b01bd29d9437aef94c573510dc19a10d4f33f83c5d30"
+    }
+  ]
+}

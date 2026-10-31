@@ -1,0 +1,8 @@
+/* File type thumbnails: the media covers the type icon once it has loaded. */
+.ficon-sm{position:relative;overflow:hidden}
+.ficon-sm > .thumb{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:0;pointer-events:none;background:var(--sunk)}
+.ficon-sm.has-thumb > .thumb{opacity:1}
+.ficon-sm.has-thumb > svg{visibility:hidden}
+.search-hit{display:grid;grid-template-columns:auto minmax(0,1fr);column-gap:12px;align-items:start}
+.search-hit > *{grid-column:2}
+.search-hit > .ficon-sm{grid-column:1;grid-row:1 / span 4}
