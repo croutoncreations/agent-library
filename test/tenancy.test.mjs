@@ -57,7 +57,7 @@ test("shared workspace: invite by email, accept needs the matching signed-in ema
   WS = ok(await alice.req("POST", "/api/workspaces", { name: "Synthetic Team" }), 201).id;
   ok(await alice.req("POST", "/api/projects", { id: "team-proj", title: "Team project", workspace_id: WS }), 201);
   const inv = ok(await alice.req("POST", `/api/workspaces/${WS}/invites`, { email: "bob@example.test", role: "member" }), 201);
-  const token = new URL(inv.accept_url).hash.slice(1);
+  const token = new URL(inv.accept_url).hash.split("/").pop();
   // A forwarded link is useless to someone else.
   const wrong = await carol.req("POST", "/api/invites/accept", { token });
   assert.equal(wrong.status, 403); assert.equal(wrong.body.error.code, "email_mismatch");
@@ -67,7 +67,7 @@ test("shared workspace: invite by email, accept needs the matching signed-in ema
   assert.equal((await bob.req("POST", "/api/invites/accept", { token })).status, 410, "single use");
   // Viewer invite for Carol; Dave stays outside.
   const inv2 = ok(await alice.req("POST", `/api/workspaces/${WS}/invites`, { email: "carol@example.test", role: "viewer" }), 201);
-  ok(await carol.req("POST", "/api/invites/accept", { token: new URL(inv2.accept_url).hash.slice(1) }));
+  ok(await carol.req("POST", "/api/invites/accept", { token: new URL(inv2.accept_url).hash.split("/").pop() }));
   // Members can't invite; only owners invite admins; the token is never stored in clear.
   assert.equal((await bob.req("POST", `/api/workspaces/${WS}/invites`, { email: "x@example.test", role: "viewer" })).status, 403);
   assert.equal(sql(`SELECT COUNT(*) AS n FROM workspace_invites WHERE token_hash = '${token}'`)[0].n, 0);

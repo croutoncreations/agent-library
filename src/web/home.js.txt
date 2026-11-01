@@ -30,7 +30,7 @@ var HOME = (function () {
     write(uid, v); return has(v, pid, aid);
   }
   function prefs(uid, tab, sort, type) { var v = read(uid); v.tab = tab; v.sort = sort; if (type !== undefined) v.type = type; write(uid, v); }
-  // File types (src/file-types). One group per list item, in the order the Type sort uses.
+  // File types (file types). One group per list item, in the order the Type sort uses.
   var TYPES = ["doc", "page", "image", "video", "pdf", "csv", "json", "file"];
   function typeOf(a) {
     if (!a) return "file";

@@ -128,6 +128,7 @@ var ICONS = {
   doc: ["M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z", "M14 3v5h5", "M9 13h6", "M9 17h4"],
   image: ["M5 3h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z", "M8.5 10a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3z", "M21 15l-5-5L5 21"],
   user: ["M20 21a8 8 0 0 0-16 0", "M12 13a5 5 0 1 0 0-10 5 5 0 0 0 0 10z"],
+  users: ["M16 21a6 6 0 0 0-12 0", "M10 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8z", "M22 21a5 5 0 0 0-5-5", "M16 4.5a4 4 0 0 1 0 7"],
   table: ["M5 3h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z", "M3 9h18", "M3 15h18", "M9 9v12"],
   video: ["M3 6a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z", "M17 10l4-2.5v9L17 14"],
   braces: ["M8 3H7a2 2 0 0 0-2 2v5a2 2 0 0 1-2 2 2 2 0 0 1 2 2v5a2 2 0 0 0 2 2h1", "M16 21h1a2 2 0 0 0 2-2v-5a2 2 0 0 1 2-2 2 2 0 0 1-2-2V5a2 2 0 0 0-2-2h-1"],
@@ -286,10 +287,11 @@ function setCrumbs(items) {
   });
 }
 // ---------- primary navigation (sidebar on desktop, bottom tab bar on mobile) ----------
-var NAV = [["home", "Home", "#/", "home"], ["projects", "Projects", "#/projects", "folder"], ["connections", "Connections", "#/settings/apps", "plug", "Apps"], ["settings", "Settings", "#/settings/device", "settings"]];
+var NAV = [["home", "Home", "#/", "home"], ["projects", "Projects", "#/projects", "folder"], ["workspaces", "Workspaces", "#/workspaces", "users", "Teams"], ["connections", "Connections", "#/settings/apps", "plug", "Apps"], ["settings", "Settings", "#/settings/device", "settings"]];
 function navSection() {
   var p = location.hash.replace(/^#\/?/, "").split("/").filter(Boolean);
   if (p[0] === "projects" || p[0] === "p") return "projects";
+  if (p[0] === "workspaces" || p[0] === "invite") return "workspaces";
   if (p[0] === "apps" || (p[0] === "settings" && ["apps", "publishing", "api-keys", "tokens"].indexOf(p[1]) >= 0)) return "connections";
   if (p[0] === "settings") return "settings";
   return "home";
@@ -405,6 +407,9 @@ function route() {
   }
   if (p[0] === "search") return viewSearch();
   if (p[0] === "projects") return viewProjects();
+  if (p[0] === "workspaces" && p[1]) return viewWorkspace(p[1]);
+  if (p[0] === "workspaces") return viewWorkspaces();
+  if (p[0] === "invite") return viewInvite(p[1] || "");
   return viewHome();
 }
 
@@ -458,6 +463,155 @@ function searchEntry() {
   return link;
 }
 // ---------- global ranked search ----------
+// ---------- workspaces, members, invitations (docs/workspaces.md) ----------
+var ROLE_LABEL = { owner: "Owner", admin: "Admin", member: "Member", viewer: "Viewer" };
+var ROLE_HELP = { owner: "Full control, including deleting the workspace", admin: "Manage members, projects and connections", member: "Read and edit documents", viewer: "Read only" };
+function wsLabel(w) { return w.personal ? "Personal" : w.name; }
+async function viewWorkspaces() {
+  var msg = h("p", { class: "msg", role: "status", "aria-live": "polite" });
+  var list = h("ul", { class: "list", "aria-label": "Workspaces" });
+  var name = h("input", { type: "text", placeholder: "Team name", required: true, maxLength: 80, "aria-label": "New workspace name" });
+  var createBtn = h("button", { type: "submit" }, "Create workspace");
+  var form = h("form", { class: "card row", hidden: true, "aria-label": "New workspace", onsubmit: async function (e) {
+    e.preventDefault(); createBtn.disabled = true; showMsg(msg, "");
+    try { var r = await api("POST", "/api/workspaces", { name: name.value.trim() }); location.hash = "#/workspaces/" + enc(r.id); }
+    catch (err) { showErr(msg, err); createBtn.disabled = false; }
+  } }, name, createBtn, h("button", { type: "button", class: "secondary", onclick: function () { form.hidden = true; newBtn.hidden = false; newBtn.focus(); } }, "Cancel"));
+  var newBtn = h("button", { type: "button", onclick: function () { form.hidden = false; newBtn.hidden = true; name.focus(); } }, icon("plus"), "New workspace");
+  shell([{ t: "Home", href: "#/" }, { t: "Workspaces" }], pageHead("Workspaces", { sub: "Your personal workspace is private to you. Create a shared workspace to work on projects with other people.", actions: newBtn }), form, msg, list);
+  skeletonRows(list, 2);
+  try {
+    var r = await api("GET", "/api/workspaces");
+    doneLoading(list); list.replaceChildren();
+    r.workspaces.forEach(function (w) {
+      list.append(h("li", { class: "link" }, h("span", { class: "ficon-sm", "aria-hidden": "true" }, icon(w.personal ? "user" : "users")),
+        h("div", { class: "grow" }, rowLink("#/workspaces/" + enc(w.id), wsLabel(w)),
+          h("small", { class: "muted", text: ROLE_LABEL[w.role] + (w.personal ? " · only you" : " · " + w.member_count + (w.member_count === 1 ? " member" : " members")) + (w.status !== "active" ? " · " + w.status : "") })),
+        h("span", { class: "chev", "aria-hidden": "true" }, icon("chevron"))));
+    });
+  } catch (err) { doneLoading(list); if (err.status !== 401) showErr(msg, err); }
+}
+async function viewWorkspace(id) {
+  var msg = h("p", { class: "msg", role: "status", "aria-live": "polite" });
+  var body = h("div");
+  shell([{ t: "Workspaces", href: "#/workspaces" }, { t: "…" }], body);
+  async function load() {
+    var d;
+    try { d = await api("GET", "/api/workspaces/" + enc(id) + "/members"); }
+    catch (err) {
+      if (err.status === 401) return;
+      body.replaceChildren(stateBox("error", "alert", err.status === 404 ? "Workspace not found" : "Workspace couldn't load",
+        err.status === 404 ? "It doesn't exist or you're not a member." : err.message, h("a", { class: "btn secondary", href: "#/workspaces" }, "All workspaces")));
+      return;
+    }
+    var ws = d.workspace, admin = ws.role === "owner" || ws.role === "admin", owner = ws.role === "owner";
+    setCrumbs([{ t: "Workspaces", href: "#/workspaces" }, { t: wsLabel(ws) }]);
+    var members = h("ul", { class: "list", "aria-label": "Members" });
+    var owners = d.members.filter(function (m) { return m.role === "owner"; }).length;
+    d.members.forEach(function (m) {
+      var who = h("div", { class: "grow" }, h("strong", { text: m.label + (m.me ? " (you)" : "") }), m.email ? h("small", { class: "muted", text: m.email }) : null);
+      var li = h("li", null, h("span", { class: "avatar sm", "aria-hidden": "true", text: initials(m.label) }), who);
+      // Owners manage every role; admins manage members and viewers. Never the last owner (the server enforces it too).
+      var lastOwner = m.role === "owner" && owners < 2;
+      var canEdit = !ws.personal && !lastOwner && (owner || (admin && m.role !== "owner" && m.role !== "admin"));
+      if (canEdit) {
+        var sel = h("select", { "aria-label": "Role for " + m.label });
+        (owner ? ["owner", "admin", "member", "viewer"] : ["member", "viewer"]).forEach(function (r) { sel.append(h("option", { value: r, text: ROLE_LABEL[r], selected: r === m.role })); });
+        sel.addEventListener("change", async function () {
+          var next = sel.value;
+          if (m.me && next !== "owner" && !confirm("Change your own role to " + ROLE_LABEL[next] + "? You may lose access to settings here.")) { sel.value = m.role; return; }
+          sel.disabled = true;
+          try { await api("PATCH", "/api/workspaces/" + enc(id) + "/members/" + enc(m.principal_id), { role: next }); toast(m.label + " is now " + ROLE_LABEL[next]); load(); }
+          catch (err) { showErr(msg, err); sel.value = m.role; sel.disabled = false; }
+        });
+        li.append(sel);
+      } else li.append(h("span", { class: "badge" + (m.role === "owner" ? " accent" : ""), text: ROLE_LABEL[m.role], title: lastOwner && !ws.personal ? "A workspace needs at least one owner. Make someone else an owner first." : null }));
+      // The last owner can't leave, be removed or be demoted (the server refuses too): show the role, no controls.
+      if (!ws.personal && !lastOwner && (m.me || canEdit)) li.append(h("button", { type: "button", class: "danger secondary", onclick: async function (e) {
+        var q = m.me ? "Leave " + ws.name + "? You and the apps you connected lose access to its projects right away." : "Remove " + m.label + " from " + ws.name + "? They and the apps they connected lose access right away.";
+        if (!confirm(q)) return;
+        e.target.disabled = true;
+        try { await api("DELETE", "/api/workspaces/" + enc(id) + "/members/" + enc(m.principal_id)); if (m.me) { location.hash = "#/workspaces"; return; } toast("Removed " + m.label); load(); }
+        catch (err) { showErr(msg, err); e.target.disabled = false; }
+      } }, m.me ? "Leave" : "Remove"));
+      members.append(li);
+    });
+    var parts = [pageHead(wsLabel(ws), { eyebrow: ws.personal ? "Personal workspace" : "Shared workspace", sub: ws.personal ? "Only you can see projects here. Create a shared workspace to invite people." : "Your role: " + ROLE_LABEL[ws.role] + ". " + ROLE_HELP[ws.role] + "." }), msg,
+      h("h2", { text: "Members" }), members];
+    if (admin && !ws.personal) {
+      var email = h("input", { type: "email", required: true, maxLength: 254, placeholder: "name@example.com", "aria-label": "Email address", autocomplete: "off" });
+      var role = h("select", { "aria-label": "Role" });
+      (owner ? ["member", "viewer", "admin"] : ["member", "viewer"]).forEach(function (r) { role.append(h("option", { value: r, text: ROLE_LABEL[r] + " — " + ROLE_HELP[r] })); });
+      var linkBox = h("div", { class: "card", hidden: true });
+      var inviteBtn = h("button", { type: "submit" }, "Create invitation");
+      var inviteForm = h("form", { class: "card invite-form", "aria-label": "Invite someone", onsubmit: async function (e) {
+        e.preventDefault(); inviteBtn.disabled = true; showMsg(msg, "");
+        try {
+          var r = await api("POST", "/api/workspaces/" + enc(id) + "/invites", { email: email.value.trim(), role: role.value });
+          var link = h("input", { class: "token", type: "text", readOnly: true, value: r.accept_url, "aria-label": "Invitation link" });
+          linkBox.replaceChildren(h("p", null, h("strong", { text: "Invitation for " + r.email }), h("br"),
+            h("span", { class: "muted small", text: "Send this link to them. It works once, only for someone signed in as " + r.email + ", until " + fmtDate(r.expires_at) + ". It isn't shown again." })), link,
+            h("div", { class: "row" }, h("button", { type: "button", onclick: function () { link.select(); if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(link.value).then(function () { toast("Link copied"); }); } }, icon("copy"), "Copy link"),
+              h("button", { type: "button", class: "secondary", onclick: function () { linkBox.hidden = true; linkBox.replaceChildren(); load(); } }, "Done")));
+          linkBox.hidden = false; email.value = ""; inviteBtn.disabled = false; link.focus(); link.select();
+        } catch (err) { showErr(msg, err); inviteBtn.disabled = false; }
+      } }, h("label", { class: "field" }, h("span", { text: "Email" }), email), h("label", { class: "field" }, h("span", { text: "Role" }), role), inviteBtn);
+      var pending = h("ul", { class: "list", "aria-label": "Pending invitations" });
+      if (!d.invites.length) pending.append(h("li", { class: "empty", text: "No pending invitations." }));
+      d.invites.forEach(function (i) {
+        pending.append(h("li", null, h("div", { class: "grow" }, h("strong", { text: i.email }), h("small", { class: "muted", text: ROLE_LABEL[i.role] + " · expires " + fmtDate(i.expires_at) })),
+          h("button", { type: "button", class: "danger secondary", onclick: async function (e) {
+            e.target.disabled = true;
+            try { await api("POST", "/api/workspaces/" + enc(id) + "/invites/" + enc(i.id) + "/revoke", {}); toast("Invitation cancelled"); load(); }
+            catch (err) { showErr(msg, err); e.target.disabled = false; }
+          } }, "Cancel invitation")));
+      });
+      parts.push(h("h2", { text: "Invite someone" }), inviteForm, linkBox, h("h2", { text: "Pending invitations" }), pending);
+    }
+    if (owner && !ws.personal) {
+      var rename = h("input", { type: "text", value: ws.name, maxLength: 80, required: true, "aria-label": "Workspace name" });
+      parts.push(h("h2", { text: "Workspace settings" }),
+        h("form", { class: "card row", "aria-label": "Rename workspace", onsubmit: async function (e) {
+          e.preventDefault();
+          try { await api("PATCH", "/api/workspaces/" + enc(id), { name: rename.value.trim() }); toast("Renamed"); load(); } catch (err) { showErr(msg, err); }
+        } }, rename, h("button", { type: "submit", class: "secondary" }, "Rename")),
+        h("div", { class: "card danger-zone" }, h("p", null, h("strong", { text: "Delete workspace" }), h("br"), h("span", { class: "muted small", text: "Closes it for everyone right away: members, connected apps and API keys lose access to its projects." })),
+          h("button", { type: "button", class: "danger", onclick: async function (e) {
+            var typed = prompt("Type the workspace name to delete it: " + ws.name);
+            if (typed === null) return;
+            if (typed.trim() !== ws.name) { showMsg(msg, "The name didn't match. Nothing was deleted.", false, true); return; }
+            e.target.disabled = true;
+            try { await api("DELETE", "/api/workspaces/" + enc(id)); location.hash = "#/workspaces"; } catch (err) { showErr(msg, err); e.target.disabled = false; }
+          } }, "Delete workspace")));
+    }
+    body.replaceChildren.apply(body, parts);
+  }
+  load();
+}
+async function viewInvite(token) {
+  // The token stays in the URL fragment (never sent to the server except in the accept/preview request body).
+  var msg = h("p", { class: "msg", role: "status", "aria-live": "polite" });
+  var box = h("div");
+  shell([{ t: "Invitation" }], box);
+  if (!token) { box.replaceChildren(stateBox("error", "alert", "Invitation link incomplete", "Open the full link from the invitation.", null)); return; }
+  var pv;
+  try { pv = await api("POST", "/api/invites/preview", { token: token }); }
+  catch (err) {
+    if (err.status === 401) return;
+    box.replaceChildren(stateBox("error", "alert", err.status === 410 ? "This invitation can't be used" : "Invitation not found",
+      err.status === 410 ? "It was already used, cancelled or has expired. Ask for a new one." : "Check that you opened the whole link.", h("a", { class: "btn secondary", href: "#/" }, "Go to Home")));
+    return;
+  }
+  var accept = h("button", { type: "button", disabled: !pv.email_matches, onclick: async function () {
+    accept.disabled = true; showMsg(msg, "");
+    try { var r = await api("POST", "/api/invites/accept", { token: token }); history.replaceState(null, "", "/#/workspaces/" + enc(r.workspace_id)); toast("Joined " + pv.workspace_name); route(); }
+    catch (err) { showErr(msg, err); accept.disabled = false; }
+  } }, "Join " + pv.workspace_name);
+  add(box.replaceChildren() || box, [pageHead("Join " + pv.workspace_name, { eyebrow: "Invitation", sub: "You're invited as " + ROLE_LABEL[pv.role] + ": " + ROLE_HELP[pv.role].toLowerCase() + "." }),
+    pv.email_matches ? null : h("div", { class: "callout warn", role: "alert" }, icon("alert"), h("div", null, "This invitation was sent to a different email address than the one you're signed in with" + (pv.signed_in_email ? " (" + pv.signed_in_email + ")" : "") + ". Sign in with the invited address to join.")),
+    msg, h("div", { class: "row" }, accept, h("a", { class: "btn secondary", href: "#/" }, "Not now"))]);
+}
+
 async function viewSearch() {
   var alive = true, seq = 0, cursor = null, active = null;
   S.cleanups.push(function () { alive = false; seq++; });
@@ -524,7 +678,7 @@ async function viewSearch() {
   } catch (e) { if (alive) status.textContent = "Project filters couldn't load. Search all projects or refresh to retry."; }
   if (alive) query.focus();
 }
-// ---------- file types: specific labels, Home type filter and list thumbnails (src/file-types) ----------
+// ---------- file types: specific labels, Home type filter and list thumbnails (file types) ----------
 // Labels come from the head revision's stored MIME type. Thumbnails are made from the revision-pinned content itself, only
 // for the image and video types the server serves inline (never SVG, HTML or PDF). Each one is a single request, made only
 // while its row is on screen, a few at a time and within a per-minute budget well under the owner's read limit; a 429
@@ -824,25 +978,36 @@ async function viewProjects() {
   var list = h("ul", { class: "list", "aria-label": "Projects" }), empty = h("div", { hidden: true });
   var title = h("input", { type: "text", placeholder: "Project name", required: true, maxLength: 200, "aria-label": "New project name" });
   var createBtn = h("button", { type: "submit" }, "Create project");
+  // Where the new project goes: only workspaces where I can create projects (admin or owner). Hidden with one choice.
+  var wsPick = h("select", { "aria-label": "Workspace" }), wsField = h("label", { class: "inline-field", hidden: true }, h("span", { class: "muted small", text: "in" }), wsPick);
   var form = h("form", { class: "card row", hidden: true, "aria-label": "New project", onsubmit: async function (e) {
     e.preventDefault(); createBtn.disabled = true; showMsg(msg, "");
     // On failure the typed name stays in the field so the owner can retry.
-    try { var r = await api("POST", "/api/projects", { title: title.value.trim() }); projectTitles[r.id] = r.title; location.hash = "#/p/" + enc(r.id); }
+    try { var r = await api("POST", "/api/projects", { title: title.value.trim(), workspace_id: wsPick.value || undefined }); projectTitles[r.id] = r.title; location.hash = "#/p/" + enc(r.id); }
     catch (err) { showErr(msg, err); createBtn.disabled = false; }
-  } }, title, createBtn, h("button", { type: "button", class: "secondary", onclick: function () { form.hidden = true; newBtn.hidden = false; newBtn.focus(); } }, "Cancel"));
+  } }, title, wsField, createBtn, h("button", { type: "button", class: "secondary", onclick: function () { form.hidden = true; newBtn.hidden = false; newBtn.focus(); } }, "Cancel"));
   var newBtn = h("button", { type: "button", onclick: function () { form.hidden = false; newBtn.hidden = true; title.focus(); } }, icon("plus"), "New project");
   shell([{ t: "Home", href: "#/" }, { t: "Projects" }], pageHead("Projects", { sub: "Each project keeps its own documents, files and access. Apps only see the projects you share with them.", actions: newBtn }), form, msg, list, empty);
   skeletonRows(list, 3);
   async function load() {
     try {
-      var r = await api("GET", "/api/projects");
+      var both = await Promise.all([api("GET", "/api/projects"), api("GET", "/api/workspaces").catch(function () { return { workspaces: [] }; })]);
+      var r = both[0], wss = both[1].workspaces;
+      var canCreate = wss.filter(function (w) { return w.role === "owner" || w.role === "admin"; });
+      wsPick.replaceChildren(); canCreate.forEach(function (w) { wsPick.append(h("option", { value: w.id, text: w.personal ? "Personal" : w.name })); });
+      wsField.hidden = canCreate.length < 2; newBtn.hidden = !canCreate.length || !form.hidden;
       doneLoading(list); list.replaceChildren(); list.hidden = !r.projects.length; empty.hidden = !!r.projects.length;
+      // Group under a workspace heading only when projects come from more than one workspace.
+      var wsName = {}; wss.forEach(function (w) { wsName[w.id] = w.personal ? "Personal" : w.name; });
+      var grouped = r.projects.some(function (p) { return p.workspace_id !== r.projects[0].workspace_id; });
+      var lastWs = null;
       if (!r.projects.length) empty.replaceChildren(stateBox("", "folder", "No projects yet", "Create a project to start writing, or let a connected app create one when you approve it.", h("button", { type: "button", onclick: function () { newBtn.click(); } }, icon("plus"), "New project")));
       r.projects.forEach(function (p) {
         projectTitles[p.id] = p.title;
+        if (grouped && p.workspace_id !== lastWs) { lastWs = p.workspace_id; list.append(h("li", { class: "group-head", role: "presentation" }, h("span", { text: wsName[p.workspace_id] || "Workspace" }))); }
         var href = "#/p/" + enc(p.id);
         list.append(h("li", { class: "link" }, h("span", { class: "ficon-sm", "aria-hidden": "true" }, icon("folder")),
-          h("div", { class: "grow" }, rowLink(href, p.title)), h("span", { class: "chev", "aria-hidden": "true" }, icon("chevron"))));
+          h("div", { class: "grow" }, rowLink(href, p.title), p.role === "viewer" ? h("small", { class: "muted", text: "View only" }) : null), h("span", { class: "chev", "aria-hidden": "true" }, icon("chevron"))));
       });
       resumeApply("projects");
     } catch (err) {

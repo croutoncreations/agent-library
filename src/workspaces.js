@@ -162,8 +162,9 @@ export async function createInvite(ctx, id, input, origin) {
     wsAudit(ctx.env, ctx, id, "invite.create", inviteId, `ok:${r}`, "changes() = 1")
   ]);
   if (!ins.meta.changes) throw new HttpError(403, "forbidden", "Needs the admin role in this workspace");
-  // The link is returned once. Hosted delivery emails it; self-host shows it to copy.
-  return { id: inviteId, email, role: r, expires_at: new Date(expires).toISOString(), accept_url: `${origin}/invite#${token}` };
+  // The link is returned once. The token is in the URL fragment, so it never reaches servers or logs. Hosted delivery
+  // emails it; self-host shows it to copy.
+  return { id: inviteId, email, role: r, expires_at: new Date(expires).toISOString(), accept_url: `${origin}/#/invite/${token}` };
 }
 
 export async function revokeInvite(ctx, id, inviteId) {

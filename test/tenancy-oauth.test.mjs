@@ -23,7 +23,7 @@ before(async () => {
   // Bob invites the owner (owner@example.invalid is their verified sign-in email at Access login; dev login uses
   // owner@example.test).
   const inv = ok(await bob.req("POST", `/api/workspaces/${WS}/invites`, { email: "owner@example.test", role: "member" }), 201);
-  ok(await owner.req("POST", "/api/invites/accept", { token: new URL(inv.accept_url).hash.slice(1) }));
+  ok(await owner.req("POST", "/api/invites/accept", { token: new URL(inv.accept_url).hash.split("/").pop() }));
 });
 after(async () => { await h?.stop(); });
 
@@ -68,7 +68,7 @@ test("App Connect publisher follows its creator's role", async () => {
   if (members.some((m) => m.principal_id === ownerId)) ok(await bob.req("PATCH", `/api/workspaces/${WS}/members/${ownerId}`, { role: "member" }));
   else {
     const inv = ok(await bob.req("POST", `/api/workspaces/${WS}/invites`, { email: "owner@example.test", role: "member" }), 201);
-    ok(await owner.req("POST", "/api/invites/accept", { token: new URL(inv.accept_url).hash.slice(1) }));
+    ok(await owner.req("POST", "/api/invites/accept", { token: new URL(inv.accept_url).hash.split("/").pop() }));
   }
   pubApp = await h.registerApp({ display_name: "Synthetic Publisher", redirect_uris: ["http://127.0.0.1:5997/cb"] });
   pub = await h.connectPublisher(pubApp, { project_id: "bob-proj", destination: "root" });

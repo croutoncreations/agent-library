@@ -445,3 +445,14 @@ main > .tabs,main > nav.tabs{margin:16px 0 12px}
 .template-preview{max-height:320px;overflow:auto;overflow-wrap:anywhere;border:1px solid var(--line);border-radius:8px;padding:16px}
 .template-note{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 @media(max-width:600px){.template-form .row>label{flex:1 1 100%}.template-preview{max-height:240px;padding:12px}}
+
+/* workspaces */
+.list li.group-head{padding:14px 16px 6px;min-height:0;border-top:0;background:none;font-size:12px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:var(--muted)}
+.inline-field{display:inline-flex;align-items:center;gap:6px}
+.avatar.sm{width:32px;height:32px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;background:var(--accent-soft);color:var(--accent);font-weight:700;font-size:13px;flex:none}
+.invite-form{display:grid;grid-template-columns:minmax(12rem,1fr) minmax(12rem,1fr) auto;gap:12px;align-items:end}
+.invite-form .field{display:flex;flex-direction:column;align-items:stretch;text-align:left;gap:6px;margin:0;font-size:14px;font-weight:600}
+.invite-form .field input,.invite-form .field select{width:100%}
+@media (max-width:640px){.invite-form{grid-template-columns:1fr}}
+.danger-zone{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;border-color:color-mix(in srgb,var(--bad,#b42318) 35%,var(--line))}
+.list li.group-head + li{border-top:1px solid var(--line)}
