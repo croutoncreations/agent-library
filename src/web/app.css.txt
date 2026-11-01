@@ -471,3 +471,4 @@ main > .tabs,main > nav.tabs{margin:16px 0 12px}
 .unsaved-draft .draft-text{width:100%;min-height:6em;max-height:16em;resize:vertical;font:13px/1.5 ui-monospace,Menlo,monospace;padding:10px 12px;border:1px solid var(--line);border-radius:var(--r2,8px);background:var(--sunk,transparent);color:inherit}
 .unsaved-draft .row{display:flex;gap:8px;flex-wrap:wrap}
 .titlebar + .view-only-note{margin-top:12px}
+.read-only [data-write]{display:none!important}

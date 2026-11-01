@@ -271,7 +271,7 @@ function cxGrantPage(d, email, projects, prev, consent, values = null, error = "
   const was = new Map((prev?.projects ?? []).map((p) => [p.id, p.can_write && !viewOnly.has(p.id) ? "write" : "read"]));
   const pick = (name, fallback) => values ? String(values.get(name) ?? fallback) : fallback;
   const dupe = cxDupes(projects);
-  const row = (p) => `<li class="proj"><span class="pname">${esc(p.title)}${dupe(p) ? ` <small>${esc(p.id)}</small>` : ""}${p.can_write === false ? ` <span class="chip">View only</span>` : ""}</span>${cxSeg(`access:${p.id}`, `Access to ${p.title}`, pick(`access:${p.id}`, values ? "none" : was.get(p.id) ?? "none"), true, p.can_write === false)}</li>`;
+  const row = (p) => `<li class="proj"><span class="pname">${esc(p.title)}${dupe(p) ? ` <small>${esc(p.id)}</small>` : ""}${p.can_write === false ? ` <span class="ro-badge">View only</span>` : ""}</span>${cxSeg(`access:${p.id}`, `Access to ${p.title}`, pick(`access:${p.id}`, values ? "none" : was.get(p.id) ?? "none"), true, p.can_write === false)}</li>`;
   // Projects grouped by workspace (one connection covers one workspace; the server enforces it). A single
   // workspace renders exactly as before.
   const groups = [];
@@ -284,7 +284,7 @@ function cxGrantPage(d, email, projects, prev, consent, values = null, error = "
   // New projects: by default they go in the workspace of the picked projects (else Personal); any other active
   // workspace where the signer is an admin can be chosen, including ones without projects yet.
   const admin = projects.adminWorkspaces ?? [];
-  const wsPick = admin.length > 1 ? `<label class="field"><span>New projects go in</span><select name="new_workspace"><option value="">Same workspace as the projects I picked (else Personal)</option>${admin.map((w) => `<option value="${esc(w.id)}"${pick("new_workspace", "") === w.id ? " selected" : ""}>${esc(w.name ?? "Personal")}</option>`).join("")}</select></label>` : "";
+  const wsPick = admin.length > 1 ? `<label class="field"><span>New projects go in</span><select name="new_workspace"><option value="">Same as picked projects (else Personal)</option>${admin.map((w) => `<option value="${esc(w.id)}"${pick("new_workspace", "") === w.id ? " selected" : ""}>${esc(w.name ?? "Personal")}</option>`).join("")}</select></label>` : "";
   // Rows reveal one at a time: every filled row stays visible, plus exactly one empty row (CSS).
   const fresh = Array.from({ length: NEW_PROJECT_SLOTS }, (_, k) => {
     const sfx = k === 0 ? "" : `_${k + 1}`;
@@ -440,7 +440,8 @@ async function authorizePost(req, env, as, origin) {
     // writes no "replaced" rows (no audits scan needed).
     const auditReplaced = (pid) => env.DB.prepare(`INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id, workspace_id)
       SELECT ?, ?, ?, 'oauth.revoke', ?, 'ok:replaced', ?, (SELECT COALESCE(workspace_id, 'wsp_' || owner_id) FROM projects WHERE id = ?) WHERE changes() = 1`).bind(at, sess.principal_id, pid, replaced.id, rid, pid);
-    const res = await env.DB.batch([
+    let res;
+    try { res = await env.DB.batch([
       ...claim ? [claim, ...(replaced.projects.length ? replaced.projects : [replaced.project_id]).map(auditReplaced)] : [],
       ...chosen.filter((c) => c.isNew).flatMap((c) => [
         // Gated in-statement: if the signer lost admin or the workspace closed since the check, no row is written and
@@ -456,7 +457,11 @@ async function authorizePost(req, env, as, origin) {
         env.DB.prepare("INSERT INTO oauth_connection_projects (connection_id, project_id, can_write) VALUES (?, ?, ?)").bind(connectionId, c.id, c.write ? 1 : 0),
         audit2(c.id, "oauth.connect", connectionId, c.write ? "ok:read+write" : "ok:read")
       ])
-    ]);
+    ]); } catch (e) {
+      // The in-statement admin check lost a race (demoted, or the workspace closed): nothing was written.
+      if (/FOREIGN KEY/i.test(String(e?.message ?? e))) return errorPage("Your access to that workspace changed. Start connecting again from the app.", 403);
+      throw e;
+    }
     // Lost a race with another tab replacing the same connection: withdraw this one before any code is issued, so
     // exactly one live successor remains. (New projects made here stay; they are the owner's and empty.)
     if (claim && !res[0].meta.changes) {
@@ -914,10 +919,8 @@ form{margin:0}
 .proj{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:8px 8px 8px 14px;border-top:1px solid var(--line);transition:background .15s}
 .proj:first-child{border-top:0}
 .wsg+.wsg{margin-top:14px}.wsh{margin:0 0 6px;font-size:13px;font-weight:650;letter-spacing:.02em;text-transform:uppercase;color:var(--muted);overflow-wrap:anywhere}
-.chip{display:inline-block;margin-left:6px;padding:1px 7px;border-radius:999px;font-size:11.5px;font-weight:600;color:var(--muted);background:var(--sunk);vertical-align:1px}
-.grant:has(.wsg:nth-of-type(1) .proj input:is([value=read],[value=write]):checked) .wsg:not(:nth-of-type(1)) .seg,
-.grant:has(.wsg:nth-of-type(2) .proj input:is([value=read],[value=write]):checked) .wsg:not(:nth-of-type(2)) .seg,
-.grant:has(.wsg:nth-of-type(3) .proj input:is([value=read],[value=write]):checked) .wsg:not(:nth-of-type(3)) .seg{opacity:.45}
+.ro-badge{display:inline-block;margin-left:6px;padding:1px 7px;border-radius:999px;font-size:11.5px;font-weight:600;color:var(--muted);background:var(--sunk);vertical-align:1px}
+.grant:has(.wsg .proj input:is([value=read],[value=write]):checked) .wsg:not(:has(.proj input:is([value=read],[value=write]):checked)) .seg{opacity:.6}
 .one-ws{transition:color .15s}.grant:has(.wsg .proj input:is([value=read],[value=write]):checked) .one-ws{color:var(--fg);font-weight:600}
 .sec .field{display:flex;flex-direction:column;gap:6px;margin:10px 0;font-size:14px;font-weight:600}
 .proj:has(input:is([value=read],[value=write]):checked){background:var(--accent-soft)}

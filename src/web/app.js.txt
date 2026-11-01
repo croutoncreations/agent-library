@@ -398,7 +398,7 @@ async function ensureProjectAccess(pid) {
 function unsavedDraftBox(text, onDiscard) {
   var msg = h("p", { class: "msg", role: "status" });
   var area = h("textarea", { class: "draft-text", readOnly: true, rows: 6, "aria-label": "Your unsaved text (not saved)" }); area.value = text;
-  var box = h("div", { class: "card unsaved-draft" }, h("strong", { text: "Your unsaved changes weren't saved" }),
+  var box = h("div", { class: "card unsaved-draft", role: "alert" }, h("strong", { text: "Your unsaved changes weren't saved" }),
     h("p", { class: "muted small", text: "You now have view-only access. Copy your text to keep it." }), area,
     h("div", { class: "row" },
       h("button", { type: "button", onclick: function () { copyText(text, msg); } }, "Copy text"),
@@ -1909,7 +1909,6 @@ async function viewArtifact(pid, aid, initialTab) {
     return;
   }
   if (!S.me || location.hash.indexOf(enc(aid)) < 0) return;
-  // Access from the cached project list if known; otherwise it's applied when /api/projects arrives (applyReadOnly).
   // The server says what this person may do with the document; otherwise fall back to the cached project list.
   if (data.access) projectAccess[pid] = Object.assign({}, projectAccess[pid] || {}, data.access);
   var known = projectAccess[pid];
@@ -2117,7 +2116,7 @@ async function viewArtifact(pid, aid, initialTab) {
             h("span", { class: "grow" }, whoLine(m),
               h("span", { class: "meta", text: "“" + m.title + "”" + (m.folder ? " · " + m.folder : "") + (m.tags.length ? " · " + m.tags.join(", ") : "") + (m.trashed ? " · in trash" : "") + " · " + ago(m.created_at) }),
               note(m)),
-            cur ? h("span", { class: "badge accent", text: "current" }) : h("button", { type: "button", class: "secondary", "data-write": "", onclick: function (e) { restoreMeta(m, e.currentTarget); } }, "Restore", h("span", { class: "sr", text: " title and tags from details version " + m.version }))));
+            cur ? h("span", { class: "badge accent", text: "current" }) : A.readOnly ? null : h("button", { type: "button", class: "secondary", "data-write": "", onclick: function (e) { restoreMeta(m, e.currentTarget); } }, "Restore", h("span", { class: "sr", text: " title and tags from details version " + m.version }))));
         });
         // Details history pages separately from content versions (its own cursor).
         if (metaCursor) list.append(h("li", { class: "vh-more-meta" }, moreMeta));
@@ -2309,7 +2308,7 @@ async function viewArtifact(pid, aid, initialTab) {
         var li = h("li", null, h("strong", { text: "rev " + v.rev }),
           h("span", { class: "grow muted small", text: fmtDate(v.created_at) + " - " + fmtBytes(v.size) + " - " + (v.author_id || "") + (v.restored_from ? " - restored from rev " + v.restored_from : "") }),
           h("button", { type: "button", class: "secondary", onclick: function () { viewRev(v); } }, "View"));
-        if (v.rev !== A.rev) li.append(h("button", { type: "button", "data-write": "", onclick: function () { restoreRev(v.rev); } }, "Restore as new revision"));
+        if (v.rev !== A.rev && !A.readOnly) li.append(h("button", { type: "button", "data-write": "", onclick: function () { restoreRev(v.rev); } }, "Restore as new revision"));
         else li.append(h("span", { class: "badge", text: "current" }));
         histList.append(li);
       });
@@ -2377,6 +2376,7 @@ async function viewArtifact(pid, aid, initialTab) {
   function applyReadOnly() {
     if (!A.alive) return;
     var onEdit = A.tab === "edit";
+    app.classList.add("read-only"); // hides [data-write] controls drawn later too (history rows, restore buttons)
     // Stop autosave first; unsaved text stays readable and copyable (A.stopEditing returns it, or null).
     var unsaved = A.stopEditing ? A.stopEditing() : null;
     if (tabBtns.edit) { tabBtns.edit.remove(); panels.edit.remove(); delete tabBtns.edit; }
@@ -2384,7 +2384,8 @@ async function viewArtifact(pid, aid, initialTab) {
     app.querySelectorAll(".footbar, [data-write]").forEach(function (el) { el.remove(); });
     var tb = app.querySelector(".titlebar"); if (tb && !app.querySelector(".view-only-note")) tb.after(viewOnlyNote());
     var note = app.querySelector(".view-only-note");
-    if (unsaved !== null && note) note.after(unsavedDraftBox(unsaved, function () { clearDraft(pid, aid); }));
+    var metaLine = app.querySelector(".doc-meta");
+    if (unsaved !== null && (metaLine || note)) (metaLine || note).after(unsavedDraftBox(unsaved, function () { clearDraft(pid, aid); }));
     if (onEdit) { showTab("preview"); if (tabBtns.preview) tabBtns.preview.focus(); }
   }
   A.applyReadOnly = function () { if (!A.readOnly) { A.readOnly = true; applyReadOnly(); } };
@@ -2920,7 +2921,7 @@ function renderMarkdownEditor(A, data, ui) {
   function persistDraft(body) { writeDraft(pid, aid, A.rev, body); }
   A.isBusy = function () { return isDirty() || D.saving || !!D.conflict; };
 
-  function schedule(ms) { clearTimeout(D.timer); D.timer = setTimeout(saveNow, ms); }
+  function schedule(ms) { if (D.stopped) return; clearTimeout(D.timer); D.timer = setTimeout(saveNow, ms); }
   function onInput() {
     if (D.conflict) return;
     persistDraft(ta.value);
@@ -2951,7 +2952,7 @@ function renderMarkdownEditor(A, data, ui) {
   // Serialized autosave: one PUT in flight; the same Idempotency-Key is reused when retrying the same body+base.
   async function saveNow() {
     clearTimeout(D.timer); clearTimeout(D.retryTimer);
-    if (D.conflict) return;
+    if (D.conflict || D.stopped) return;
     if (D.saving) { D.again = true; return; }
     if (!isDirty()) { clearDraft(pid, aid); setSaved(); return; }
     var body = ta.value, baseRev = A.rev;
@@ -2985,7 +2986,8 @@ function renderMarkdownEditor(A, data, ui) {
   A.flush = function () { if (isDirty() && !D.conflict) return saveNow(); };
   // View-only (now or later): no more saves. Returns unsaved text so the person can copy it, else null.
   A.stopEditing = function () {
-    clearTimeout(D.timer); clearTimeout(D.retryTimer); D.conflict = D.conflict || { stopped: true }; ta.readOnly = true;
+    clearTimeout(D.timer); clearTimeout(D.retryTimer); D.stopped = true; ta.readOnly = true;
+    conflictBox.hidden = true; // the unsaved-text box holds the text from here on
     var dr = readDraft(pid, aid);
     var text = isDirty() ? ta.value : dr && typeof dr.body === "string" && dr.body !== D.savedBody ? dr.body : null;
     if (text === null) clearDraft(pid, aid);

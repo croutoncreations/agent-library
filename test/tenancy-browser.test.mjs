@@ -120,6 +120,10 @@ test("a demoted viewer's unsaved draft is never saved; it stays readable with Co
     const me = await (await fetch("/api/me")).json();
     const p = (await (await fetch("/api/projects")).json()).projects.find((x) => x.title === "Lab notes");
     const d = await (await fetch(`/api/projects/${p.id}/artifacts`, { method: "POST", headers: { "content-type": "application/json", "x-csrf-token": me.csrf, "idempotency-key": "doc-draft-1" }, body: JSON.stringify({ title: "Draft target", body: "synthetic saved text" }) })).json();
+    // A second content version and a rename, so History has restorable versions and details versions.
+    await fetch(`/api/projects/${p.id}/artifacts/${d.artifact_id}`, { method: "PUT", headers: { "content-type": "application/json", "x-csrf-token": me.csrf, "idempotency-key": "doc-draft-2" }, body: JSON.stringify({ expected_revision: 1, body: "synthetic saved text v2" }) });
+    const cur = await (await fetch(`/api/projects/${p.id}/artifacts/${d.artifact_id}`)).json();
+    await fetch(`/api/projects/${p.id}/artifacts/${d.artifact_id}`, { method: "PATCH", headers: { "content-type": "application/json", "x-csrf-token": me.csrf, "idempotency-key": "doc-draft-3" }, body: JSON.stringify({ expected_meta_version: cur.artifact.meta_version, title: "Draft target" + " renamed" }) });
     return { pid: p.id, aid: d.artifact_id };
   });
   // Bob left a local draft from when he could edit (same key format as the app: al:draft:<me>:<pid>:<aid>).
@@ -127,7 +131,7 @@ test("a demoted viewer's unsaved draft is never saved; it stays readable with Co
   bob.on("request", (r) => { if (r.method() === "PUT" && r.url().includes(ids.aid)) puts.push(r.url()); });
   await bob.evaluate(async (ids) => {
     const me = await (await fetch("/api/me")).json();
-    localStorage.setItem(`al:draft:${me.principal.id}:${ids.pid}:${ids.aid}`, JSON.stringify({ base: 1, body: "synthetic unsaved words", at: Date.now() }));
+    localStorage.setItem(`al:draft:${me.principal.id}:${ids.pid}:${ids.aid}`, JSON.stringify({ base: 2, body: "synthetic unsaved words", at: Date.now() }));
   }, ids);
   // Fresh load straight into the editor link: no cached project list, so access comes with the document.
   await bob.goto(`${APP}/#/p/${ids.pid}/a/${ids.aid}/edit`); await bob.reload();
@@ -139,6 +143,16 @@ test("a demoted viewer's unsaved draft is never saved; it stays readable with Co
   assert.deepEqual(kept, { value: "synthetic unsaved words", ro: true });
   assert.ok(await bob.$("xpath/.//button[normalize-space()='Copy text']"));
   await bob.screenshot({ path: "tmp/test-evidence/tenancy-viewer-unsaved-draft.png", fullPage: true });
+  // History (drawn after view-only applied) offers no restore controls to a viewer.
+  await bob.evaluate(() => [...document.querySelectorAll("[role=tab]")].find((x) => x.textContent.trim() === "History").click());
+  await bob.waitForSelector(".vh-list .vh-row");
+  await new Promise((r) => setTimeout(r, 500));
+  // Sanity: the history really has older versions and details versions (so Restore would be offered to an editor).
+  assert.ok(await bob.evaluate(() => document.querySelectorAll(".vh-list .vh-row").length >= 2), "history has 2+ versions");
+  assert.match(await text(bob), /renamed/);
+  const restoreVisible = await bob.evaluate(() => [...document.querySelectorAll("button")].filter((b) => /restore/i.test(b.textContent) && b.offsetParent !== null).map((b) => b.textContent));
+  assert.deepEqual(restoreVisible, [], "no visible Restore buttons for a viewer");
+  await bob.evaluate(() => [...document.querySelectorAll("[role=tab]")].find((x) => x.textContent.trim() === "Preview").click());
   // Discard clears the local draft.
   bob.once("dialog", (d) => d.accept());
   await (await bob.$("xpath/.//button[normalize-space()='Discard']")).click();
