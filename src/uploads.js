@@ -1,3 +1,4 @@
+import { deleteBlob, getBlob, headBlob, putBlob } from "./content-store.js";
 import { authenticate, authorizeProject, authzSql, enforceRate, limitsFor, requireCsrf } from "./auth.js";
 import { reconcileUploads } from "./cleanup.js";
 import { CONTENT_TYPE, spreadsheetSafeCsv } from "./formats.js";
@@ -15,7 +16,7 @@ var quotaUsedSql = (now) => `(SELECT COALESCE(SUM(size),0) FROM revisions WHERE 
        AND state IN ('failed','conflict'))`;
 async function purgeStaging(env, u) {
   try {
-    await env.BLOBS.delete(u.staging_key);
+    await deleteBlob(env, u.staging_key);
     await env.DB.prepare("UPDATE uploads SET staging_purged_at = ? WHERE id = ? AND staging_purged_at IS NULL").bind(nowMs(), u.id).run();
   } catch {
   }
@@ -126,7 +127,7 @@ async function uploadPut(req, env, requestId, uploadId, linkCtx) {
       off += c.byteLength;
     }
     const sha2 = await sha256Hex(bytes);
-    await env.BLOBS.put(u.staging_key, bytes, { httpMetadata: { contentType: "application/octet-stream" } });
+    await putBlob(env, u.staging_key, bytes, { httpMetadata: { contentType: "application/octet-stream" } });
     const rec = await env.DB.prepare("UPDATE uploads SET state = 'received', received_size = ?, received_sha256 = ? WHERE id = ? AND state = 'receiving'").bind(n, sha2, uploadId).run();
     if (!rec.meta.changes) {
       await purgeStaging(env, u);
@@ -235,7 +236,7 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
     const dropUnpublished = async () => {
       const idle = await db2(ctx).prepare("SELECT 1 AS x FROM uploads u WHERE id = ? AND state IN ('failed','conflict') AND final_writes = 0 AND final_purged_at IS NULL AND NOT EXISTS (SELECT 1 FROM revisions r WHERE r.blob_key = u.final_key)").bind(uploadId).first("x");
       if (!idle) return;
-      await ctx.env.BLOBS.delete(finalKey);
+      await deleteBlob(ctx.env, finalKey);
       await db2(ctx).prepare("UPDATE uploads SET final_purged_at = ? WHERE id = ? AND final_purged_at IS NULL").bind(nowMs(), uploadId).run();
     };
     // Lost the lease after writing the final object: if cleanup ended the upload, its delete may have run before this
@@ -245,7 +246,7 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
       if (row && (row.state === "failed" || row.state === "conflict")) await dropUnpublished();
       return lost();
     };
-    const staged = await ctx.env.BLOBS.get(u.staging_key);
+    const staged = await getBlob(ctx.env, u.staging_key);
     if (!staged) return fail(409, "missing_bytes", "Staged bytes missing", "failed");
     const bytes = new Uint8Array(await staged.arrayBuffer());
     const sha2 = await sha256Hex(bytes);
@@ -256,7 +257,7 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
     const begin = await db2(ctx).prepare("UPDATE uploads SET final_writes = final_writes + 1 WHERE id = ? AND state = 'sealed' AND finalize_token = ?").bind(uploadId, token).run();
     if (!begin.meta.changes) return lost();
     try {
-      await ctx.env.BLOBS.put(finalKey, bytes, { httpMetadata: { contentType: u.mime }, sha256: sha2 });
+      await putBlob(ctx.env, finalKey, bytes, { httpMetadata: { contentType: u.mime }, sha256: sha2 });
     } finally {
       // A release failure leaves accounting raised (fail closed). Log it without replacing the PUT's own error;
       // reconciliation also reports retained terminal uploads for operator recovery. Never log blob keys or errors.
@@ -264,7 +265,7 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
         console.warn(JSON.stringify({ event: "upload_final_write_release_failed" }));
       });
     }
-    const check = await ctx.env.BLOBS.head(finalKey);
+    const check = await headBlob(ctx.env, finalKey);
     if (!check || check.size !== bytes.length) return fail(500, "publish_failed", "Final object verification failed", "failed");
     // Still the finisher after the write? Renew the lease for the publication.
     const renew = await db2(ctx).prepare("UPDATE uploads SET finalize_until = ? WHERE id = ? AND state = 'sealed' AND finalize_token = ?").bind(nowMs() + FINALIZE_LEASE_MS, uploadId, token).run();
@@ -380,7 +381,7 @@ async function serveContent(ctx, req, projectId, artifactId, revParam) {
     const b = new TextEncoder().encode(r.body).slice(start, end + 1);
     return new Response(b, { status, headers });
   }
-  const obj2 = await ctx.env.BLOBS.get(r.blob_key, partial ? { range: { offset: start, length: end - start + 1 } } : void 0);
+  const obj2 = await getBlob(ctx.env, r.blob_key, partial ? { offset: start, length: end - start + 1 } : void 0);
   if (!obj2) throw new HttpError(500, "blob_missing", "Stored bytes missing");
   return new Response(obj2.body, { status, headers });
 }

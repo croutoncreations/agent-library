@@ -1,3 +1,4 @@
+import { deleteBlob } from "./content-store.js";
 import { limitsFor } from "./auth.js";
 import { nowMs } from "./util.js";
 
@@ -19,14 +20,14 @@ async function reconcileUploads(env, opts = {}) {
   let purgedStaging = 0, purgedFinal = 0;
   const st = await DB.prepare(`SELECT id, staging_key FROM uploads WHERE staging_purged_at IS NULL AND state IN ('failed','conflict','published')${pf} LIMIT ?`).bind(...pp, limit).all();
   for (const u of st.results) {
-    await env.BLOBS.delete(u.staging_key);
+    await deleteBlob(env, u.staging_key);
     const r = await DB.prepare("UPDATE uploads SET staging_purged_at = ? WHERE id = ? AND staging_purged_at IS NULL AND state IN ('failed','conflict','published')").bind(now, u.id).run();
     purgedStaging += r.meta.changes ? 1 : 0;
   }
   const fi = await DB.prepare(`SELECT id, final_key FROM uploads u WHERE final_key IS NOT NULL AND final_purged_at IS NULL AND state IN ('failed','conflict') AND final_writes = 0
       AND NOT EXISTS (SELECT 1 FROM revisions r WHERE r.blob_key = u.final_key)${pf.replace("project_id", "u.project_id")} LIMIT ?`).bind(...pp, limit).all();
   for (const u of fi.results) {
-    await env.BLOBS.delete(u.final_key);
+    await deleteBlob(env, u.final_key);
     const r = await DB.prepare("UPDATE uploads SET final_purged_at = ? WHERE id = ? AND final_purged_at IS NULL").bind(now, u.id).run();
     purgedFinal += r.meta.changes ? 1 : 0;
   }

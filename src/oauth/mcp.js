@@ -1,3 +1,4 @@
+import { getBlob } from "../content-store.js";
 import { insufficientScope } from "@cloudflare/workers-oauth-provider";
 import { limitsFor, rateLimit } from "../auth.js";
 import { byteLength } from "../formats.js";
@@ -416,7 +417,7 @@ async function ftReadFile(c, p, a) {
   const blocks = [];
   if (wantInline) {
     const row = await db(c).prepare("SELECT blob_key FROM revisions WHERE id = ? AND project_id = ?").bind(rev.id, p).first();
-    const obj2 = row?.blob_key ? await c.env.BLOBS.get(row.blob_key) : null;
+    const obj2 = row?.blob_key ? await getBlob(c.env, row.blob_key) : null;
     if (!obj2) throw new HttpError(500, "blob_missing", "Stored bytes missing");
     blocks.push({ type: "image", data: ftBase64(new Uint8Array(await obj2.arrayBuffer())), mimeType: rev.mime });
   }

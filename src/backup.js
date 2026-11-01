@@ -1,3 +1,4 @@
+import { getBlob, putBlob } from "./content-store.js";
 import { requireHuman } from "./auth.js";
 import { tplDate } from "./service.js";
 import { HttpError, int, nowIso, sha256Hex, str } from "./util.js";
@@ -26,7 +27,7 @@ async function exportBackup(ctx, projectId) {
   const blobs = {};
   for (const r of revs.results) {
     if (!r.blob_key || blobs[r.blob_key]) continue;
-    const o = await ctx.env.BLOBS.get(r.blob_key);
+    const o = await getBlob(ctx.env, r.blob_key);
     if (!o) throw new HttpError(500, "blob_missing", "Referenced blob missing during export");
     const bytes = new Uint8Array(await o.arrayBuffer());
     const sha2 = await sha256Hex(bytes);
@@ -80,7 +81,7 @@ async function restoreBackup(ctx, backup) {
     if (await sha256Hex(bytes) !== r.sha256 || bytes.length !== r.size) throw new HttpError(400, "bad_backup", `Blob for ${r.id} hash/size mismatch`);
     decoded.set(r.blob_key, bytes);
   }
-  for (const [k, bytes] of decoded) await ctx.env.BLOBS.put(k, bytes);
+  for (const [k, bytes] of decoded) await putBlob(ctx.env, k, bytes);
   if (backup.meta_versions !== void 0 && !Array.isArray(backup.meta_versions)) throw new HttpError(400, "bad_backup", "meta_versions must be a list");
   const authors = new Set([...backup.revisions, ...backup.comments, ...backup.meta_versions ?? []].map((x) => x.author_id));
   const stmts = [];
