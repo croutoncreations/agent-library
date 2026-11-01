@@ -17,7 +17,8 @@ tmp/
 # Generated DevX worktree files and local DevX/agent setup
 .envrc
 .tmuxp.yaml
-.devx/
+.devx/*
+!.devx/session.yaml.tmpl
 
 # Operator-specific configuration (never commit; see wrangler.example.toml,
 # deploy/production.example.json and scripts/self-host/example.json)
