@@ -1,4 +1,5 @@
 # DevX session template for this repo. The editor window starts Pi as the default agent harness.
+# This is the only tracked .devx/ file; scripts/release/export-public.mjs allows it and still blocks the rest.
 session_name: {{.Name}}
 start_directory: {{.Path}}
 suppress_history: false
@@ -9,7 +10,9 @@ windows:
   - window_name: editor
     layout: tiled
     shell_command_before:
-      - cd {{.Path}}
+      - cd {{.Path}}{{range $name, $port := .Ports}}
+      - export {{$name}}={{$port}}{{end}}{{if .Routes}}{{range $service, $hostname := .Routes}}
+      - export {{toHostVar $service}}=http://{{$hostname}}{{end}}{{end}}
       - export SESSION_NAME={{.Name}}
     panes:
       - 'pi -c'

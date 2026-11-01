@@ -52,7 +52,7 @@ const allowedRanges = (rel, line) => {
   for (const a of allow) if (a.path === rel) for (const m of line.matchAll(a.re)) r.push([m.index, m.index + m[0].length]);
   return r;
 };
-const forbiddenFiles = [/^wrangler\.toml$/, /^deploy\/production\.json$/, /^AGENTS\.local\.md$/, /^\.self-host.*\.json$/, /^private\//, /^\.devx\//, /^\.pi\//, /^\.env/, /^\.release-(deny|allow)list$/];
+const forbiddenFiles = [/^wrangler\.toml$/, /^deploy\/production\.json$/, /^AGENTS\.local\.md$/, /^\.self-host.*\.json$/, /^private\//, /^\.devx\/(?!session\.yaml\.tmpl$)/, /^\.pi\//, /^\.env/, /^\.release-(deny|allow)list$/];
 
 // Rules are compiled above (an invalid one exits before anything is written); only now extract.
 mkdirSync(out, { recursive: true });
