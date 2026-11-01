@@ -20,8 +20,12 @@ function load() {
   };
   const authorizeProject = async (ctx, pid) => { if (ctx.principal.kind === "agent" && ctx.grant.project_id !== pid) throw new HttpError(404, "not_found", "Project not found"); };
   const db = (ctx) => ctx.env.DB;
-  return new Function("HttpError", "nowMs", "int", "authorizeProject", "db",
-    src + "\nreturn { readTextChunk, rtQuery, rtIdBytes, rtChunkLimit, rtFit, RT_ID_TOO_LONG, RT_KINDS_ALL, RT_KINDS_DOCS };")(HttpError, () => clock, int, authorizeProject, db);
+  // The real per-statement access gate (src/auth.js credentialGate over src/tenancy.js), with this test's clock.
+  const T = new Function("HttpError", moduleScript("src/tenancy.js") + "\nreturn { humanGate, memberRoleSql, requireProjectRole };")(HttpError);
+  const credentialGate = new Function("HttpError", "nowMs", "humanGate", "memberRoleSql", "requireProjectRole", "accessEnabled", "verifyAccess", "sha256Hex",
+    moduleScript("src/auth.js") + "\nreturn credentialGate;")(HttpError, () => clock, T.humanGate, T.memberRoleSql, T.requireProjectRole, () => false, null, null);
+  return new Function("HttpError", "nowMs", "int", "authorizeProject", "credentialGate", "db",
+    src + "\nreturn { readTextChunk, rtQuery, rtIdBytes, rtChunkLimit, rtFit, RT_ID_TOO_LONG, RT_KINDS_ALL, RT_KINDS_DOCS };")(HttpError, () => clock, int, authorizeProject, credentialGate, db);
 }
 const M = load();
 const sha = (s) => createHash("sha256").update(s).digest("hex");
@@ -189,7 +193,11 @@ test("every chunk re-checks current access in its own statement (grant, API key,
     ["OAuth connection revoked", "oauth", (s) => s.exec("UPDATE oauth_connections SET revoked_at = 1")],
     ["OAuth project removed", "oauth", (s) => s.exec("DELETE FROM oauth_connection_projects")],
     ["OAuth connection expired", "oauth", () => { clock += 2 * 864e5; }],
-    ["owner no longer owns the project", "owner", (s) => s.exec("UPDATE projects SET owner_id = 'ag'")],
+    ["owner removed from the project's workspace", "owner", (s) => s.exec("DELETE FROM workspace_members WHERE principal_id = 'own'")],
+    ["key creator removed from the workspace", "apiKey", (s) => s.exec("DELETE FROM workspace_members WHERE principal_id = 'own'")],
+    ["OAuth connection creator removed from the workspace", "oauth", (s) => s.exec("DELETE FROM workspace_members WHERE principal_id = 'own'")],
+    ["grant creator removed from the workspace", "grant", (s) => s.exec("DELETE FROM workspace_members WHERE principal_id = 'own'")],
+    ["workspace suspended", "grant", (s) => s.exec("UPDATE workspaces SET status = 'suspended'")],
   ];
   for (const [name, who, revoke] of cases) {
     clock = Date.now();

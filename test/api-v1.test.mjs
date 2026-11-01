@@ -139,11 +139,12 @@ test("Muse round trip: list, create, read, update, stale 409, idempotent replay,
   const big = await new Promise((res, rej) => {
     const rq = httpRequest({ host: "127.0.0.1", port: PORT, method: "POST", path: `/v1/projects/${PA}/files`,
       headers: { authorization: `Bearer ${t}`, "idempotency-key": key(), "content-type": "application/json", "content-length": "6600000" } },
-      (r) => { r.resume(); res(r.statusCode); rq.destroy(); });
+      (r) => { let b = ""; r.setEncoding("utf8"); r.on("data", (c) => { b += c; }); r.on("end", () => { res({ status: r.statusCode, body: b }); rq.destroy(); }); });
     rq.on("error", (e) => { if (e.code !== "ECONNRESET" && e.code !== "EPIPE") rej(e); });
     rq.write("x".repeat(65536));
   });
-  assert.equal(big, 413);
+  assert.equal(big.status, 413);
+  assert.equal(JSON.parse(big.body).error.code, "too_large", "the Worker's own 413, not a proxy's");
   // Cookies are refused (no ambient browser auth on the API).
   assert.equal((await call("GET", "/v1/projects", { token: t, headers: { cookie: "al_session=x" } })).status, 400);
 });

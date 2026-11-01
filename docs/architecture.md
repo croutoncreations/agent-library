@@ -48,7 +48,7 @@ Every artifact has a stable owner URL: `https://APP_HOST/p/<project>/a/<artifact
 
 ## How the Worker is built
 
-The Worker is ordinary ES modules under `src/` (entry `src/index.js`). `npm run build` bundles them with the pinned esbuild into one module, `dist/worker/index.js`, which the deploy pipeline and the self-host setup upload unchanged (`no_bundle`). `wrangler dev` runs `src/index.js` directly. Nothing generated is committed.
+The Worker is ordinary ES modules under `src/` (entry `src/index.js`). `npm run build` bundles them with the pinned esbuild into one module, `dist/worker/index.js`, which the deploy pipeline and the self-host setup upload unchanged (`no_bundle`). `npm run dev` and the test servers build first and run that same file under `wrangler dev` (`wrangler.local.toml` sets `no_bundle`). Nothing generated is committed.
 
 - `src/web/*.txt` are the browser assets (UI shell, styles, app script, Home loader, prebuilt CodeMirror editor). They are imported as text and served verbatim; `app.js.txt` has three build-free placeholders filled in `src/ui.js`.
 - `src/service.js` is the shared service layer used by the browser API, `/v1`, MCP and App Connect. Focused modules split from it: `search/`, `changes/`, `reads/`, `history/`, `templates/`.

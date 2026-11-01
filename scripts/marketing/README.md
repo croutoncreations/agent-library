@@ -1,6 +1,6 @@
 # Marketing screenshots and clips
 
-`node scripts/marketing/capture.mjs --out tmp/marketing` starts the real Worker (`src/index.js`) under local
+`node scripts/marketing/capture.mjs --out tmp/marketing` starts the real Worker (built `dist/worker/index.js`) under local
 `wrangler dev` on loopback, seeds a fictional demo library (`seed.mjs`) and captures screenshots with headless Chrome.
 `node scripts/marketing/clips.mjs` (default `--out tmp/marketing/clips`, where `marketing/video` looks for them) does the same, then records short UI clips for the launch video
 (`marketing/video/`); see the header of `clips.mjs` for the clip list and `--only`/`--scheme`.

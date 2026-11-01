@@ -317,8 +317,8 @@ HDR = { "content-type": "application/json", "cache-control": "no-store" };
 toolError = (err2) => ({ content: [{ type: "text", text: JSON.stringify({ error: err2 }) }], structuredContent: { error: err2 }, isError: true });
 
 // Files for OAuth (MCP) connections: list, read (inline image + short-lived download link) and upload new files or
-// versions (begin -> HTTP PUT to a single-upload link -> finish). Spliced in by build-file-tools-fixes.mjs right
-// before // src/api/publisher.ts; docs/agent-setup.md#files. Needs migration 0013_oauth_file_access.sql.
+// versions (begin -> HTTP PUT to a single-upload link -> finish). See docs/agent-setup.md#files. Needs migration
+// 0013_oauth_file_access.sql.
 //  - Only connections approved on a consent page that offered files (oauth_connections.file_access = 1) get these
 //    tools. Older connections keep exactly what they were shown (documents and history) until the owner reconnects.
 //  - Uploads reuse uploadBegin/uploadPut/uploadFinish (quota, BINARY_TYPES, LIMITS.binaryBytes, finalize lease).

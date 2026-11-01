@@ -1,4 +1,4 @@
-// Marketing STILLS of Agent Library against the REAL local runtime (src/index.js under wrangler dev, loopback).
+// Marketing STILLS of Agent Library against the REAL local runtime (the built dist/worker/index.js under wrangler dev, loopback).
 // Seeds the synthetic demo library (seed.mjs), then captures app screens and per-artifact "collage tiles".
 // Usage: node scripts/marketing/capture.mjs [--out tmp/marketing] [--only home,reader,...]
 import { createRequire } from "node:module";

@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // Build the deployable Worker from src/ into dist/worker/index.js (one ES module, no network, no secrets).
 // The output is deterministic for a given source tree, lockfile and pinned esbuild; scripts/check-build.mjs
-// rebuilds it in a temp dir and compares hashes. `wrangler dev/deploy` can also bundle src/index.js directly;
-// the deploy pipeline uploads this file with no_bundle so what was tested is what ships.
+// rebuilds it in a temp dir and compares hashes. Local dev, the test servers and the deploy pipeline all run this
+// file with no_bundle, so what was tested is what ships.
 import { build } from 'esbuild';
 import { createHash } from 'node:crypto';
 import { mkdirSync, writeFileSync } from 'node:fs';

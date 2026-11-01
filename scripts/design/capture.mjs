@@ -1,4 +1,4 @@
-// Design screenshots against the REAL local runtime (src/index.js under wrangler dev, loopback only).
+// Design screenshots against the REAL local runtime (the built dist/worker/index.js under wrangler dev, loopback only).
 // Synthetic fixtures only: per-run random dev passphrase, stand-in OIDC owner, synthetic projects/documents,
 // a synthetic reader (DCR) connection and a synthetic publisher. Nothing is read from ~/.pi, .dev.vars or
 // Cloudflare; no tokens are written to disk or printed.

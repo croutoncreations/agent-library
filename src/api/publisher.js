@@ -416,13 +416,14 @@ async function commit(env, p, id, req, requestId) {
   q.push(env.DB.prepare(`INSERT INTO artifacts (id, project_id, kind, title, folder, folder_id, schema_id, publisher_id, export_name, generation_id, head_rev, head_revision_id, created_at, updated_at)
   SELECT json_extract(j.value, '$.a'), ?, 'json', t.name, '', ?, NULL, ?, t.name, ?, 1, json_extract(j.value, '$.r'), ?, ?
   FROM json_each(?) j JOIN publisher_generation_parts t ON t.publisher_id = ? AND t.generation_id = ? AND t.name = j.key WHERE ${gate}`).bind(p.project_id, p.folder_id ?? null, p.id, id, now, now, idsJson, p.id, id, ...gp));
+  // content-store: sql-side copy of staged part bodies (docs/encryption.md); needs its own change for encryption.
   q.push(env.DB.prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, size, sha256, mime, created_at, via_kind, via_id, via_label)
   SELECT json_extract(j.value, '$.r'), json_extract(j.value, '$.a'), ?, 1, ?, t.body, t.bytes, t.sha256, 'application/json', ?, 'publisher', ?, ?
   FROM json_each(?) j JOIN publisher_generation_parts t ON t.publisher_id = ? AND t.generation_id = ? AND t.name = j.key WHERE ${gate}`).bind(p.project_id, p.principal_id, now, p.id, String(p.display_name ?? "").slice(0, 120) || null, idsJson, p.id, id, ...gp));
   q.push(env.DB.prepare(`INSERT INTO artifacts (id, project_id, kind, title, folder, folder_id, schema_id, publisher_id, export_name, generation_id, head_rev, head_revision_id, created_at, updated_at)
   SELECT ?, ?, 'json', ?, '', ?, NULL, ?, ?, ?, 1, ?, ?, ? WHERE ${gate}`).bind(mArt, p.project_id, mName, p.folder_id ?? null, p.id, mName, id, mRev, now, now, ...gp));
   q.push(env.DB.prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, size, sha256, mime, created_at, via_kind, via_id, via_label)
-  SELECT ?, ?, ?, 1, ?, ?, ?, ?, 'application/json', ?, 'publisher', ?, ? WHERE ${gate}`).bind(mRev, mArt, p.project_id, p.principal_id, manifestText, mSize, mSha, now, p.id, String(p.display_name ?? "").slice(0, 120) || null, ...gp));
+  SELECT ?, ?, ?, 1, ?, ?, ?, ?, 'application/json', ?, 'publisher', ?, ? WHERE ${gate}`).bind(mRev, mArt, p.project_id, p.principal_id, storeText(manifestText), mSize, mSha, now, p.id, String(p.display_name ?? "").slice(0, 120) || null, ...gp));
   q.push(env.DB.prepare(`UPDATE publisher_generation_parts AS t SET body = NULL, artifact_id = json_extract(j.value, '$.a'), revision_id = json_extract(j.value, '$.r')
   FROM json_each(?) j WHERE t.publisher_id = ? AND t.generation_id = ? AND t.name = j.key AND ${gate}`).bind(idsJson, p.id, id, ...gp));
   q.push(env.DB.prepare(`INSERT INTO snapshots (id, publisher_id, source_revision, committed_at, exported_at, coverage, manifest_file_id, manifest_revision, manifest_sha256, files)
@@ -531,7 +532,7 @@ async function routeGeneration(req, env, p, requestId) {
   throw new HttpError(405, "method_not_allowed", "Method not allowed");
 }
 
-// src/api/publisher.ts
+// App Connect publisher API (/v1/publisher)
 var MAX_BODY = 65e5;
 var NAME_RE = /^[A-Za-z0-9._-]{1,64}$/;
 var MANIFEST = "manifest.json";
