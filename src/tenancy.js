@@ -6,6 +6,16 @@
 import { HttpError } from "./util.js";
 
 export const ROLES = ["viewer", "member", "admin", "owner"];
+/**
+ * Can more than one person sign in? A self-hosted installation behind Cloudflare Access admits only OWNER_EMAIL
+ * (src/access.js), so shared workspaces would never work there. Hosted sets MULTI_USER=1; local dev (no Access) is
+ * multi-user so the flows can be tested. MULTI_USER=0 forces single-user.
+ */
+export function multiUserInstall(env) {
+  if (env?.MULTI_USER === "1") return true;
+  if (env?.MULTI_USER === "0") return false;
+  return !(env?.ACCESS_TEAM_DOMAIN || env?.ACCESS_AUD);
+}
 export const ROLE_RANK = { none: 0, viewer: 1, member: 2, admin: 3, owner: 4 };
 /** Minimum role for an operation class. */
 export const NEED = { read: "viewer", write: "member", manage: "admin", own: "owner" };
@@ -90,17 +100,23 @@ export async function requireProjectRole(ctx, projectId, need) {
   return r;
 }
 
-/** Projects a human can see, with their effective role (excludes 'none' and inactive workspaces). */
+/**
+ * Projects a human can see, with their effective role (excludes 'none' and inactive workspaces).
+ * Driven from the person's memberships: projects_workspace serves current rows, projects_owner_legacy (0018) the
+ * rows a rolled-back Worker wrote without workspace_id (they belong to the owner's personal workspace).
+ */
 export async function visibleProjects(env, principalId) {
-  const r = await env.DB.prepare(
-    `SELECT t_p.id, t_p.title, t_p.created_at, t_w.id AS workspace_id, t_w.name AS workspace_name, t_w.personal,
+  const cols = `t_p.id, t_p.title, t_p.created_at, t_w.id AS workspace_id, t_w.name AS workspace_name, t_w.personal, t_w.created_at AS ws_created, t_m.role AS ws_role,
        CASE MIN(${rankCase("t_m.role")}, CASE WHEN t_pm.role IS NULL THEN 4 ELSE ${rankCase("t_pm.role")} END)
-         WHEN 4 THEN 'owner' WHEN 3 THEN 'admin' WHEN 2 THEN 'member' WHEN 1 THEN 'viewer' ELSE NULL END AS role
-     FROM projects t_p JOIN workspaces t_w ON t_w.id = ${projectWorkspaceSql("t_p")}
-     JOIN workspace_members t_m ON t_m.workspace_id = t_w.id AND t_m.principal_id = ?
+         WHEN 4 THEN 'owner' WHEN 3 THEN 'admin' WHEN 2 THEN 'member' WHEN 1 THEN 'viewer' ELSE NULL END AS role`;
+  const from = (join) => `FROM workspace_members t_m JOIN workspaces t_w ON t_w.id = t_m.workspace_id AND t_w.status = 'active'
+     JOIN projects t_p ON ${join}
      LEFT JOIN project_members t_pm ON t_pm.project_id = t_p.id AND t_pm.principal_id = t_m.principal_id
-     WHERE t_w.status = 'active'
-     ORDER BY t_w.personal DESC, t_w.created_at, t_p.created_at LIMIT 1000`
-  ).bind(principalId).all();
+     WHERE t_m.principal_id = ?`;
+  const r = await env.DB.prepare(
+    `SELECT * FROM (SELECT ${cols} ${from("t_p.workspace_id = t_w.id")}
+     UNION ALL SELECT ${cols} ${from("t_p.workspace_id IS NULL AND t_w.personal = 1 AND t_p.owner_id = substr(t_w.id, 5)")})
+     ORDER BY personal DESC, ws_created, created_at LIMIT 1000`
+  ).bind(principalId, principalId).all();
   return r.results.filter((p) => p.role);
 }

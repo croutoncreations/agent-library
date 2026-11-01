@@ -40,12 +40,18 @@ function servers(origin, appConnect = false) {
   try {
     if (props?.publisher_id) {
       const publisher = await livePublisher(env, props);
+      if (!publisher && await publisherWorkspaceInactive(env, props)) throw new OAuthError("temporarily_unavailable", { description: "This workspace is not active", statusCode: 503, headers: { "retry-after": "3600" } });
       if (!publisher || publisher.revoked) throw new OAuthError("invalid_grant", { description: "Publisher revoked or token superseded" });
       if (env.__oauthRefreshClaimBusy) throw retry();
       return;
     }
     const connection = await liveConnection(env, props?.connection_id);
-    if (!connection) throw new OAuthError("invalid_grant", { description: "Connection revoked or expired" });
+    if (!connection) {
+      // A suspended workspace (e.g. billing) closes access but must not destroy connections: the provider revokes
+      // the grant on invalid_grant, so answer retryably instead. Revoked/expired/creator-removed stay invalid_grant.
+      if (await connectionWorkspaceInactive(env, props?.connection_id)) throw new OAuthError("temporarily_unavailable", { description: "This workspace is not active", statusCode: 503, headers: { "retry-after": "3600" } });
+      throw new OAuthError("invalid_grant", { description: "Connection revoked or expired" });
+    }
     if (env.__oauthRefreshClaimBusy) throw retry();
     // Preserve only currently valid connections. Never revive an expired/revoked grant or widen its projects.
     const renewed = await env.DB.prepare("UPDATE oauth_connections SET expires_at = ? WHERE id = ? AND revoked_at IS NULL AND expires_at > ? RETURNING id")
@@ -88,6 +94,18 @@ function servers(origin, appConnect = false) {
   }
   cache.set(cacheKey, s);
   return s;
+}
+// True when the credential is otherwise live but its project's workspace is suspended or being deleted.
+async function connectionWorkspaceInactive(env, id) {
+  if (typeof id !== "string" || !/^oac_[A-Za-z0-9_-]{10,64}$/.test(id)) return false;
+  return !!await env.DB.prepare(`SELECT 1 FROM oauth_connections oc JOIN oauth_connection_projects cp ON cp.connection_id = oc.id JOIN projects p ON p.id = cp.project_id
+    JOIN workspaces w ON w.id = COALESCE(p.workspace_id, 'wsp_' || p.owner_id)
+    WHERE oc.id = ? AND oc.revoked_at IS NULL AND oc.expires_at > ? AND w.status <> 'active' LIMIT 1`).bind(id, nowMs()).first();
+}
+async function publisherWorkspaceInactive(env, p) {
+  if (!p || typeof p.publisher_id !== "string") return false;
+  return !!await env.DB.prepare(`SELECT 1 FROM publishers pb JOIN projects pj ON pj.id = pb.project_id JOIN workspaces w ON w.id = COALESCE(pj.workspace_id, 'wsp_' || pj.owner_id)
+    WHERE pb.id = ? AND pb.revoked_at IS NULL AND pb.token_epoch = ? AND w.status <> 'active'`).bind(p.publisher_id, p.epoch).first();
 }
 async function livePublisher(env, p) {
   if (!p || typeof p.publisher_id !== "string" || !/^pub_[A-Za-z0-9_-]{10,64}$/.test(p.publisher_id)) return null;
@@ -147,7 +165,7 @@ function logRegistration(outcome, m) {
 // Projects a person can connect an agent to: every visible project, with whether they may grant edit access.
 async function consentProjects(env, principalId) {
   return (await visibleProjects(env, principalId)).slice(0, 500).map((p) => ({ id: p.id, title: p.title, workspace_id: p.workspace_id,
-    workspace_name: p.personal ? null : p.workspace_name, can_write: ROLE_RANK[p.role] >= ROLE_RANK.member }));
+    workspace_name: p.personal ? null : p.workspace_name, can_write: ROLE_RANK[p.role] >= ROLE_RANK.member, ws_admin: ROLE_RANK[p.ws_role] >= ROLE_RANK.admin }));
 }
 async function liveConnection(env, id) {
   if (typeof id !== "string" || !/^oac_[A-Za-z0-9_-]{10,64}$/.test(id)) return null;
@@ -234,8 +252,8 @@ async function cxPreviousConnection(env, principalId, request) {
   ).bind(principalId, request.clientId, nowMs()).first();
   return row ? await liveConnection(env, row.id) : null;
 }
-function cxSeg(name, label, value, withNone) {
-  const opts = (withNone ? [["none", "Off"]] : []).concat([["read", "Read"], ["write", "Edit"]]);
+function cxSeg(name, label, value, withNone, readOnly = false) {
+  const opts = (withNone ? [["none", "Off"]] : []).concat(readOnly ? [["read", "Read"]] : [["read", "Read"], ["write", "Edit"]]);
   return `<span class="seg" role="radiogroup" aria-label="${esc(label)}">${opts.map(([v, t]) => `<label><input type="radio" name="${esc(name)}" value="${v}"${v === value ? " checked" : ""}><span>${t}</span></label>`).join("")}</span>`;
 }
 // values: the submitted form when re-rendering after a fixable mistake (choices kept), else null.
@@ -243,7 +261,18 @@ function cxGrantPage(d, email, projects, prev, consent, values = null, error = "
   const was = new Map((prev?.projects ?? []).map((p) => [p.id, p.can_write ? "write" : "read"]));
   const pick = (name, fallback) => values ? String(values.get(name) ?? fallback) : fallback;
   const dupe = cxDupes(projects);
-  const rows = projects.map((p) => `<li class="proj"><span class="pname">${esc(p.title)}${dupe(p) ? ` <small>${esc(p.id)}</small>` : ""}</span>${cxSeg(`access:${p.id}`, `Access to ${p.title}`, pick(`access:${p.id}`, values ? "none" : was.get(p.id) ?? "none"), true)}</li>`).join("");
+  const row = (p) => `<li class="proj"><span class="pname">${esc(p.title)}${dupe(p) ? ` <small>${esc(p.id)}</small>` : ""}${p.can_write === false ? ` <small>view only</small>` : ""}</span>${cxSeg(`access:${p.id}`, `Access to ${p.title}`, pick(`access:${p.id}`, values ? "none" : was.get(p.id) ?? "none"), true, p.can_write === false)}</li>`;
+  // Projects grouped by workspace (one connection covers one workspace; the server enforces it). A single
+  // workspace renders exactly as before.
+  const groups = [];
+  for (const p of projects) { const g = groups.find((x) => x.id === (p.workspace_id ?? "")); if (g) g.items.push(p); else groups.push({ id: p.workspace_id ?? "", name: p.workspace_name, items: [p], creatable: !!p.ws_admin }); }
+  const multi = groups.length > 1;
+  const rows = multi
+    ? groups.map((g) => `<li class="wsh" role="presentation"><h3 class="sub">${esc(g.name ?? "Personal")}</h3><ul class="list">${g.items.map(row).join("")}</ul></li>`).join("")
+    : projects.map(row).join("");
+  // New projects go into the chosen workspace (only workspaces where the signer can create projects are offered).
+  const creatable = groups.filter((g) => g.creatable);
+  const wsPick = multi && creatable.length > 1 ? `<label class="field"><span>New projects go in</span><select name="new_workspace">${creatable.map((g) => `<option value="${esc(g.id)}"${pick("new_workspace", "") === g.id ? " selected" : ""}>${esc(g.name ?? "Personal")}</option>`).join("")}</select></label>` : "";
   // Rows reveal one at a time: every filled row stays visible, plus exactly one empty row (CSS).
   const fresh = Array.from({ length: NEW_PROJECT_SLOTS }, (_, k) => {
     const sfx = k === 0 ? "" : `_${k + 1}`;
@@ -256,8 +285,8 @@ function cxGrantPage(d, email, projects, prev, consent, values = null, error = "
 <h1>Choose what ${esc(d.clientName)} can use</h1><p class="lede">Signed in as ${esc(email)}</p>
 ${clientFacts(d)}${welcome}${cxErr(error)}
 <form method="post" action="/authorize" class="grant"><input type="hidden" name="handle" value="${esc(consent.handle)}"><input type="hidden" name="step" value="grant">${CX_ENTER}
-<section class="sec"><h2>Projects</h2>${rows ? `<ul class="list">${rows}</ul>` : ""}
-<h3 class="sub">${cxIcon("plus")}${rows ? "Or create a project" : "Create a project to share"}</h3>${fresh}</section>
+<section class="sec"><h2>Projects</h2>${multi ? `<p class="fine">Pick projects from one workspace. To share another workspace, connect again.</p>` : ""}${rows ? `<ul class="list${multi ? " grouped" : ""}">${rows}</ul>` : ""}
+<h3 class="sub">${cxIcon("plus")}${rows ? "Or create a project" : "Create a project to share"}</h3>${wsPick}${fresh}</section>
 ${replace}
 <p class="fine"><strong>Read</strong>: view documents and files (images, PDFs, videos) and their history, and download files. <strong>Edit</strong>: also create and change documents, and upload new files and new versions of files. Comments, trash and settings are never shared.</p>
 ${cxBar('<span class="count"><span class="some"><b class="n"></b> selected</span><span class="none">Pick at least one project</span></span>')}</form>`), consent.headers, status);
@@ -346,7 +375,10 @@ async function authorizePost(req, env, as, origin) {
     // One connection covers one workspace. New projects go into that workspace (personal if none was picked).
     const wsIds = [...new Set(chosen.map((c) => c.workspace_id))];
     if (wsIds.length > 1) return retry("Pick projects from one workspace. Connect again for another workspace.");
-    const connWs = wsIds[0] ?? personalWorkspaceId(sess.principal_id);
+    const pickedWs = String(form.get("new_workspace") ?? "");
+    if (wsIds.length && pickedWs && pickedWs !== wsIds[0] && [...Array(NEW_PROJECT_SLOTS).keys()].some((i) => String(form.get(`new_title${i ? `_${i + 1}` : ""}`) ?? "").trim()))
+      return retry("New projects must go in the same workspace as the projects you picked.");
+    const connWs = wsIds[0] ?? (pickedWs || personalWorkspaceId(sess.principal_id));
     const seenTitles = /* @__PURE__ */ new Set();
     for (let i = 1; i <= NEW_PROJECT_SLOTS; i++) {
       const sfx = i === 1 ? "" : `_${i}`;
@@ -866,6 +898,8 @@ form{margin:0}
 .list{list-style:none;margin:0;padding:0;border:1px solid var(--line);border-radius:var(--r3);overflow:hidden}
 .proj{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:8px 8px 8px 14px;border-top:1px solid var(--line);transition:background .15s}
 .proj:first-child{border-top:0}
+.list.grouped{border:0;border-radius:0;overflow:visible}.list.grouped>.wsh{list-style:none}.list.grouped>.wsh+.wsh{margin-top:6px}.list.grouped .sub{margin:10px 0 6px}
+.sec .field{display:flex;flex-direction:column;gap:6px;margin:10px 0;font-size:14px;font-weight:600}
 .proj:has(input:is([value=read],[value=write]):checked){background:var(--accent-soft)}
 .pname{min-width:0;font-weight:550;overflow-wrap:anywhere}
 .pname small{display:inline;font:11.5px ui-monospace,Menlo,monospace;color:var(--faint)}

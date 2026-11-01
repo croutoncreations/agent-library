@@ -166,7 +166,7 @@ export async function startAppConnectServer({ port, oidcPort = port + OIDC_OFFSE
       };
       const list = async () => (await fetch(`${issuer}/mcp`, { method: "POST", headers: { authorization: `Bearer ${at}`, "content-type": "application/json", accept: "application/json" },
         body: JSON.stringify({ jsonrpc: "2.0", id: ++id, method: "tools/list" }) }).then((x) => x.json())).result.tools;
-      return { access_token: at, call, list };
+      return { access_token: at, refresh_token: t.body.refresh_token, client_id: reg.client_id, call, list };
     },
     async token(params, headers = {}) {
       const r = await fetch(`${issuer}/oauth/token`, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded", ...headers }, body: new URLSearchParams(params).toString() });

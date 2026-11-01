@@ -1,3 +1,4 @@
+import { personalWorkspaceId } from "./tenancy.js";
 import { getBlob, putBlob, readText, storeText } from "./content-store.js";
 import { requireHuman } from "./auth.js";
 import { tplDate } from "./service.js";
@@ -56,6 +57,10 @@ async function restoreBackup(ctx, backup) {
   if (backup?.schema !== SCHEMA && backup?.schema !== "agent-library-backup/2") throw new HttpError(400, "bad_backup", "Unsupported backup schema");
   // Restore is for moving a whole single-owner store: it needs an installation with no projects at all. On a shared
   // (hosted) installation that is never true, so restore is unavailable there by construction.
+  // Shared installations (MULTI_USER=1, or several people) refuse restore outright: a restored project id is global
+  // and would squat on, or reveal, another workspace's id. Proposed decision D8.
+  if (ctx.env.MULTI_USER === "1") throw new HttpError(403, "restore_unavailable", "Restore is only available on a single-owner installation");
+  if (await DB.prepare("SELECT COUNT(*) AS n FROM principals WHERE kind = 'human'").first("n") > 1) throw new HttpError(403, "restore_unavailable", "Restore is only available on a single-owner installation");
   const existing = await DB.prepare("SELECT COUNT(*) AS n FROM projects").first("n");
   if (existing) throw new HttpError(409, "store_not_empty", "Restore targets an empty isolated store only");
   const pid = String(backup.project?.id ?? "");
@@ -92,7 +97,7 @@ async function restoreBackup(ctx, backup) {
   const stmts = [];
   for (const a of authors) if (a !== ctx.principal.id)
     stmts.push(DB.prepare("INSERT OR IGNORE INTO principals (id, kind, issuer, subject, label, created_at) VALUES (?, 'agent', 'restored', ?, ?, ?)").bind(a, a, "restored " + a, nowIso()));
-  stmts.push(DB.prepare("INSERT INTO projects (id, owner_id, title, created_at) VALUES (?, ?, ?, ?)").bind(pid, ctx.principal.id, backup.project.title, backup.project.created_at));
+  stmts.push(DB.prepare("INSERT INTO projects (id, owner_id, title, created_at, workspace_id) VALUES (?, ?, ?, ?, ?)").bind(pid, ctx.principal.id, backup.project.title, backup.project.created_at, personalWorkspaceId(ctx.principal.id)));
   for (const a of backup.artifacts)
     stmts.push(DB.prepare(`INSERT INTO artifacts (id, project_id, kind, title, folder, tags, head_rev, head_revision_id, meta_version, trashed_at, created_at, updated_at, is_template, template_description, source_artifact_id, source_revision, source_role, template_date)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(a.id, pid, a.kind, a.title, a.folder, a.tags, a.head_rev, a.head_revision_id, a.meta_version, a.trashed_at, a.created_at, a.updated_at, a.is_template ?? 0, a.template_description ?? "", a.source_artifact_id ?? null, a.source_revision ?? null, a.source_role ?? null, a.template_date ?? null));

@@ -159,6 +159,8 @@ async function verifyApiKey(env, authz) {
     `SELECT p.id, p.title, acp.can_write AND ${memberRoleSql("p.id", "member")} AS can_write FROM api_credential_projects acp JOIN projects p ON p.id = acp.project_id
      WHERE acp.credential_id = ? AND ${memberRoleSql("p.id", "viewer")} ORDER BY p.created_at LIMIT ${MAX_PROJECTS_PER_KEY}`
   ).bind(row.created_by ?? row.owner_principal_id, row.id, row.created_by ?? row.owner_principal_id).all();
+  // The key's creator no longer reaches any of its projects (removed, or workspace closed): the key is inactive.
+  if (!ps.results.length) throw new HttpError(401, "credential_inactive", "Credential has no active projects", { reason: "no_active_projects", key_id: row.id });
   if (!row.last_used_at || nowMs() - row.last_used_at > 6e4)
     await env.DB.prepare("UPDATE api_credentials SET last_used_at = ? WHERE id = ?").bind(nowMs(), row.id).run().catch(() => {
     });

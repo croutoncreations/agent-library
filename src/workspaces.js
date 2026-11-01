@@ -1,20 +1,11 @@
 // Workspace administration (docs/workspaces.md): human-only. Every mutation re-checks the actor's role inside the
 // same statement, and the "at least one owner" rule is enforced in SQL so two concurrent demotions can't both win.
 import { requireHuman } from "./auth.js";
-import { ROLES, ROLE_RANK, requireWorkspaceRole, workspaceRoleSql } from "./tenancy.js";
+import { ROLES, ROLE_RANK, multiUserInstall, requireWorkspaceRole, workspaceRoleSql } from "./tenancy.js";
 import { HttpError, nowIso, nowMs, randomId, sha256Hex, str } from "./util.js";
 
 export const INVITE_DAYS = 14;
-/**
- * Can more than one person sign in? A self-hosted installation behind Cloudflare Access admits only OWNER_EMAIL
- * (src/access.js), so shared workspaces and invitations would never work there: the UI hides them and the API
- * refuses to create them. Hosted sets MULTI_USER=1 (with its own identity provider); local dev is multi-user.
- */
-export function multiUser(env) {
-  if (env.MULTI_USER === "1") return true;
-  if (env.MULTI_USER === "0") return false;
-  return !(env.ACCESS_TEAM_DOMAIN || env.ACCESS_AUD);
-}
+export const multiUser = multiUserInstall;
 const EMAIL = /^[^\s@<>"',;]{1,64}@[A-Za-z0-9.-]{1,190}\.[A-Za-z]{2,24}$/;
 
 function wsAudit(env, ctx, workspaceId, action, objectId, result, gate = "", gateParams = []) {
@@ -72,10 +63,14 @@ export async function updateWorkspace(ctx, id, input) {
 /** Marks a shared workspace 'deleting': closed to everyone immediately. Data removal is an operator job (hosted). */
 export async function deleteWorkspace(ctx, id) {
   requireHuman(ctx);
-  const ws = await requireWorkspaceRole(ctx, id, "owner");
+  // Owners can delete a suspended workspace too (e.g. after a billing suspension).
+  const ws = await ctx.env.DB.prepare("SELECT w.id, w.personal, w.status, m.role FROM workspaces w JOIN workspace_members m ON m.workspace_id = w.id AND m.principal_id = ? WHERE w.id = ?").bind(ctx.principal.id, id).first();
+  if (!ws || ws.status === "deleting") throw new HttpError(404, "not_found", "Workspace not found");
+  if (ws.role !== "owner") throw new HttpError(403, "forbidden", "Needs the owner role in this workspace");
   if (ws.personal) throw new HttpError(409, "personal_workspace", "Your personal workspace can't be deleted");
   const [r] = await ctx.env.DB.batch([
-    ctx.env.DB.prepare(`UPDATE workspaces AS w SET status = 'deleting' WHERE w.id = ? AND w.personal = 0 AND ${workspaceRoleSql("w.id", "owner")}`).bind(id, ctx.principal.id),
+    ctx.env.DB.prepare(`UPDATE workspaces AS w SET status = 'deleting' WHERE w.id = ? AND w.personal = 0 AND w.status <> 'deleting'
+        AND EXISTS (SELECT 1 FROM workspace_members m WHERE m.workspace_id = w.id AND m.principal_id = ? AND m.role = 'owner')`).bind(id, ctx.principal.id),
     wsAudit(ctx.env, ctx, id, "workspace.delete", id, "ok", "changes() = 1")
   ]);
   if (!r.meta.changes) throw new HttpError(403, "forbidden", "Needs the owner role in this workspace");
@@ -214,7 +209,8 @@ export async function acceptInvite(ctx, input) {
   if (!email || email !== inv.email) throw new HttpError(403, "email_mismatch", "This invitation was sent to a different email address. Sign in with that address.");
   const at = nowIso(), ms = nowMs();
   const [claim, add] = await ctx.env.DB.batch([
-    ctx.env.DB.prepare("UPDATE workspace_invites SET accepted_at = ?, accepted_by = ? WHERE id = ? AND accepted_at IS NULL AND revoked_at IS NULL AND expires_at > ?").bind(ms, ctx.principal.id, inv.id, ms),
+    ctx.env.DB.prepare(`UPDATE workspace_invites AS wi SET accepted_at = ?, accepted_by = ? WHERE wi.id = ? AND wi.accepted_at IS NULL AND wi.revoked_at IS NULL AND wi.expires_at > ?
+        AND EXISTS (SELECT 1 FROM workspaces w WHERE w.id = wi.workspace_id AND w.status = 'active')`).bind(ms, ctx.principal.id, inv.id, ms),
     // Never lowers an existing role: an owner accepting a viewer invite stays owner.
     ctx.env.DB.prepare(`INSERT INTO workspace_members (workspace_id, principal_id, role, added_by, created_at) SELECT ?, ?, ?, ?, ? WHERE changes() = 1
         ON CONFLICT (workspace_id, principal_id) DO NOTHING`).bind(inv.workspace_id, ctx.principal.id, inv.role, inv.invited_by, at),

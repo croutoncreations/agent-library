@@ -1,5 +1,5 @@
 import { readText, storeText } from "./content-store.js";
-import { authorizeProject, authzSql, contentWriteSql, protectSql, requireHuman } from "./auth.js";
+import { authorizeProject, authzSql, contentWriteSql, credentialGate, protectSql, requireHuman } from "./auth.js";
 import { chQuery, cleanupChanges, listChanges } from "./changes/service.js";
 import { MEASUREMENTS, MIME, checkFile, isCalendarDate } from "./formats.js";
 import { diffRevisions, historyPage, lineDiff, metaBaselineInsert, metaHistory, metaVersionInsert, provenance, restoreMetadata } from "./history/service.js";
@@ -7,7 +7,7 @@ import { RT_ID_TOO_LONG, RT_KINDS_ALL, RT_KINDS_DOCS, readTextChunk, rtChunkLimi
 import { __name } from "./runtime.js";
 import { RS_SCHEMA, rsQuery, rsReady, rsToolReady, searchArtifacts } from "./search/service.js";
 import { createFromTemplate, listTemplates, previewTemplate, saveAsTemplate, tplAssertMaintenance, tplDate, tplProvenance, tplTools } from "./templates/service.js";
-import { ROLE_RANK, personalWorkspaceId, workspaceRoleSql, requireProjectRole, requireWorkspaceRole, visibleProjects } from "./tenancy.js";
+import { ROLE_RANK, multiUserInstall, personalWorkspaceId, workspaceRoleSql, requireProjectRole, requireWorkspaceRole, visibleProjects } from "./tenancy.js";
 import { HttpError, int, nowIso, nowMs, randomId, sha256Hex, str } from "./util.js";
 
 function requireAppConnect(ctx) {
@@ -22,8 +22,9 @@ function assertWritable(ctx, a, what) {
 function audit(ctx, projectId, action, objectId, rev, result, gate, gateParams = []) {
   const where = gate ? ` WHERE ${gate}` : "";
   return db(ctx).prepare(
-    `INSERT INTO audits (at, actor_id, project_id, action, object_id, rev_no, result, request_id) SELECT ?, ?, ?, ?, ?, ?, ?, ?${where}`
-  ).bind(nowIso(), ctx.principal.id, projectId, action, objectId, rev, result, ctx.requestId, ...gateParams);
+    `INSERT INTO audits (at, actor_id, project_id, action, object_id, rev_no, result, request_id, workspace_id)
+     SELECT ?, ?, ?, ?, ?, ?, ?, ?, (SELECT COALESCE(workspace_id, 'wsp_' || owner_id) FROM projects WHERE id = ?)${where}`
+  ).bind(nowIso(), ctx.principal.id, projectId, action, objectId, rev, result, ctx.requestId, projectId, ...gateParams);
 }
 async function auditDenied(ctx, projectId, action, code) {
   await audit(ctx, projectId, action, null, null, "denied:" + code).run();
@@ -77,8 +78,11 @@ async function legacyConnectionInfo(ctx) {
 }
 async function listProjects(ctx) {
   if (ctx.principal.kind === "agent") {
-    const p = await db(ctx).prepare("SELECT id, title FROM projects WHERE id = ?").bind(ctx.grant.project_id).first();
-    return { projects: p ? [{ ...p, can_write: !!ctx.grant.can_write }] : [] };
+    // Same live gate as every operation: a credential whose creator lost access (or whose workspace is closed)
+    // sees no project here either.
+    const r = credentialGate(ctx, ctx.grant.project_id, "read"), w = credentialGate(ctx, ctx.grant.project_id, "write");
+    const p = await db(ctx).prepare(`SELECT id, title, ${w.sql} AS can_write FROM projects WHERE id = ? AND ${r.sql}`).bind(...w.params, ctx.grant.project_id, ...r.params).first();
+    return { projects: p ? [{ id: p.id, title: p.title, can_write: !!p.can_write && !!ctx.grant.can_write }] : [] };
   }
   // Every project in every active workspace I belong to (minus per-project 'none'), with my effective role.
   const ps = await visibleProjects(ctx.env, ctx.principal.id);
@@ -86,6 +90,10 @@ async function listProjects(ctx) {
 }
 async function createProject(ctx, input) {
   requireHuman(ctx);
+  // A chosen id (slug) is allowed only where one person owns the installation: on a shared installation a
+  // "Project already exists" answer would reveal another workspace's project id.
+  if (input.id && (ctx.env.MULTI_USER === "1" || (multiUserInstall(ctx.env) && await db(ctx).prepare("SELECT COUNT(*) AS n FROM principals WHERE kind = 'human' AND issuer <> 'restored'").first("n") > 1)))
+    throw new HttpError(400, "invalid_input", "Project ids are assigned by the server on this installation");
   const id = input.id ? str(input.id, "id", 64) : randomId("prj");
   if (!/^[a-z0-9][a-z0-9-]{2,63}$|^prj_[A-Za-z0-9_-]+$/.test(id)) throw new HttpError(400, "invalid_input", "Bad project id");
   const title = str(input.title, "title", 200, { min: 1 });

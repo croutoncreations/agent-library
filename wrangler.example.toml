@@ -71,6 +71,9 @@ APP_CONNECT_ENABLED = "1"
 # Optional: extra exact https OAuth callbacks to trust besides the built-in ChatGPT, Claude and
 # Cursor callbacks, e.g. your own MCP gateway. Space- or comma-separated; exact match only.
 # OAUTH_EXTRA_REDIRECT_URIS = "https://gateway.example.com/oauth/callback"
+# Optional: "1" turns on shared workspaces and invitations (several people). Leave unset on a
+# single-owner installation behind Access: only OWNER_EMAIL can sign in there (docs/workspaces.md).
+# MULTI_USER = "1"
 #
 # Worker secret (never in this file):
 #   ACCESS_OIDC_CLIENT_SECRET  (wrangler secret put ACCESS_OIDC_CLIENT_SECRET --env hosted)
