@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 // Offline only. No credentials, subprocesses, network, resource creation or deployment.
-import { readFileSync, writeFileSync, mkdirSync, cpSync } from 'node:fs';
+// Stages the built Worker (dist/worker/index.js from `npm run build`; built here if missing).
+import { readFileSync, writeFileSync, mkdirSync, cpSync, existsSync } from 'node:fs';
+import { buildWorker } from '../build.mjs';
 import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
@@ -43,12 +45,13 @@ export function makeConfig(v) {
     kv_namespaces: [{ binding: 'OAUTH_KV', id: v.kvNamespaceId }],
   };
 }
-// The committed bundle is installation-neutral (hostnames, owner and extra callbacks all come from config),
+// The built Worker is installation-neutral (hostnames, owner and extra callbacks all come from config),
 // so self-hosting stages it byte-for-byte.
 export function selfHostBundle(bundle) {
   return bundle;
 }
-function main() {
+export const BUILT = join(root, 'dist/worker/index.js');
+async function main() {
   const args = process.argv.slice(2);
   if (!args.length || args.includes('--help')) { console.log('Usage: node scripts/self-host/setup.mjs --input operator.json [--out dist/self-host] [--dry-run]\nOffline: validates existing IDs and stages config/bundle/migrations; never provisions or deploys.'); return; }
   const opts = {};
@@ -60,7 +63,8 @@ function main() {
   if (!opts.input) throw Error('--input is required');
   const v = validate(JSON.parse(readFileSync(resolve(opts.input), 'utf8')));
   const config = makeConfig(v);
-  const bundle = selfHostBundle(readFileSync(join(root, 'src/index.js'), 'utf8'));
+  if (!existsSync(BUILT)) await buildWorker({ outfile: BUILT });
+  const bundle = selfHostBundle(readFileSync(BUILT, 'utf8'));
   const digest = createHash('sha256').update(bundle).digest('hex');
   if (opts.dryRun) { console.log(`Validated offline: DB/R2/KV bindings, two hosts, Access/OIDC; bucket privacy requires operator verification; bundle SHA-256 ${digest}. No files written.`); return; }
   const out = resolve(opts.out || join(root, 'dist/self-host'));
@@ -73,9 +77,9 @@ function main() {
   writeFileSync(join(out, 'wrangler.json'), JSON.stringify(config, null, 2) + '\n', { mode: 0o600 });
   for (const file of ['LICENSE', 'THIRD_PARTY_NOTICES.md']) cpSync(join(root, file), join(out, file));
   const release = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
-  writeFileSync(join(out, 'manifest.json'), JSON.stringify({ version: release.version, license: release.license, bundleSha256: digest, sourceSha256: createHash('sha256').update(readFileSync(join(root, 'src/index.js'))).digest('hex') }, null, 2) + '\n');
+  writeFileSync(join(out, 'manifest.json'), JSON.stringify({ version: release.version, license: release.license, bundleSha256: digest, sourceSha256: digest }, null, 2) + '\n');
   console.log(`Staged offline in ${out}. See docs/self-hosting.md for explicit migration, secret and deployment commands. Nothing was provisioned or deployed.`);
 }
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  try { main(); } catch (e) { console.error(e instanceof SyntaxError ? 'Invalid JSON input' : e.message); process.exitCode = 1; }
+  main().catch((e) => { console.error(e instanceof SyntaxError ? 'Invalid JSON input' : e.message); process.exitCode = 1; });
 }

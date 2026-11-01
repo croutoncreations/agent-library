@@ -1,9 +1,6 @@
 # Upload finalization and recovery
 
-`build-upload-fixes.mjs` runs after `build-session-fixes.mjs` in `npm run build:design`.
-It patches the production bundle from `src/upload-fixes/finish.js`; the older TypeScript
-snapshot is not the deployed implementation. Commit `src/index.js` and
-`upload-fixes-preservation.json` after rebuilding. `npm run check:bundle` verifies both.
+Upload finalization lives in `src/uploads.js` (`uploadFinish`) with the cron reconciler in `src/cleanup.js`.
 
 Migration `0011_upload_finalize_lease.sql` must precede the new Worker. It adds:
 

@@ -1,3 +1,7 @@
+import { authorizeProject } from "../auth.js";
+import { db } from "../service.js";
+import { HttpError, int, nowMs } from "../util.js";
+
 // ---------- revision-pinned chunked text reads (docs/chunked-reads.md) ----------
 // One shared implementation for every transport (OAuth MCP, legacy /mcp, /v1, browser API). A read returns at most
 // one bounded chunk of one immutable version: the cursor pins the version (rev_no + sha256) and the byte offset, so
@@ -24,6 +28,8 @@ function rtIdBytes(id) {
 // RT_MAX_ID_BYTES is refused before any reply echoes that id, and rtFit bounds every reply the handler then sends.
 const RT_MAX_ID_BYTES = 1024;
 function rtChunkLimit(msg) {
+  if (msg?.method === "tools/call" && msg.params?.name === "search_artifacts") return { maxBytes: 65536, idTooLong: rtIdBytes(msg.id) > RT_MAX_ID_BYTES };
+  if (msg?.method === "tools/call" && msg.params?.name === "list_changes") return { maxBytes: 65536, idTooLong: rtIdBytes(msg.id) > RT_MAX_ID_BYTES };
   const a = msg?.method === "tools/call" && msg.params?.name === "read_artifact" ? msg.params.arguments : void 0;
   if (!a || typeof a !== "object" || Array.isArray(a) || a.cursor == null && a.max_bytes == null) return null;
   const m = a.max_bytes;
@@ -163,3 +169,5 @@ async function readTextChunk(ctx, projectId, artifactId, opts = {}) {
   if (rtEncodedSize(out, mcp, idBytes) > maxBytes) throw tooSmall();
   return out;
 }
+
+export { RT_ID_TOO_LONG, RT_KINDS_ALL, RT_KINDS_DOCS, readTextChunk, rtChunkLimit, rtFit, rtIdBytes, rtQuery, rtReadAuthzSql };

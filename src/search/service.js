@@ -1,3 +1,7 @@
+import { appOrigin, artifactWebUrl, previewWebUrl } from "../links.js";
+import { appConnectEnabled, db, rtReadAuthzSql } from "../service.js";
+import { HttpError, nowMs, sha256Hex } from "../util.js";
+
 // Ranked lexical search. See docs/ranked-search.md for semantics, rollout and live pagination.
 const RS_SCHEMA = { type: "object", additionalProperties: false, required: ["query"], properties: {
   query: { type: "string", minLength: 1, maxLength: 200 },
@@ -97,7 +101,7 @@ async function searchArtifacts(ctx, args, transport = "api") {
   for (const [k, op] of [["updated_after", ">"], ["updated_before", "<"]]) if (a[k]) { where.push(`a.updated_at ${op} ?`); values.push(a[k]); }
   // No corpus-wide rank statistic: hidden documents cannot affect the order of authorized hits.
   const sql = `WITH hits AS (
-    SELECT a.id, a.project_id, p.title AS project_title, a.title, a.kind, a.updated_at, r.rev_no, r.sha256,
+    SELECT a.id, a.project_id, p.title AS project_title, a.title, a.kind, a.updated_at, r.rev_no, r.sha256, r.mime,
       (CASE WHEN lower(a.title)=lower(?) THEN 1000 ELSE 0 END + (${titleScore})) AS score,
       CASE WHEN (${titleScore})>0 THEN 'title' ELSE 'body' END AS matched_field,
       CASE WHEN a.kind='binary' THEN a.title ELSE substr(snippet(artifact_search,4,'','',' … ',40),1,500) END AS snippet
@@ -112,7 +116,7 @@ async function searchArtifacts(ctx, args, transport = "api") {
   const results = rows.slice(0, a.limit).map(r => ({
     project_id: r.project_id, project_title: r.project_title, artifact_id: r.id, title: r.title, kind: r.kind,
     matched_field: r.matched_field, snippet: (r.snippet || r.title).slice(0,500), indexed_body: r.kind !== "binary",
-    revision: r.rev_no, sha256: r.sha256, updated_at: r.updated_at,
+    revision: r.rev_no, sha256: r.sha256, updated_at: r.updated_at, ...(ctx.principal?.kind === "human" && !ctx.oauthConnection && !ctx.apiCredential ? { mime: r.mime } : {}),
     web_url: origin ? artifactWebUrl(origin,r.project_id,r.id) + "?v=" + r.rev_no : null,
     preview_url: origin ? previewWebUrl(origin,r.project_id,r.id) + "?v=" + r.rev_no : null
   }));
@@ -127,3 +131,5 @@ async function searchArtifacts(ctx, args, transport = "api") {
   }
   return out;
 }
+
+export { RS_SCHEMA, rsQuery, rsReady, rsToolReady, searchArtifacts };

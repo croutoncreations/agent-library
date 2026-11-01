@@ -30,7 +30,7 @@ The full suite starts real local Wrangler services and uses the official MCP SDK
 
 ## Changing what ships
 
-The Worker is the committed `src/index.js`. Edit the maintained source or the build patch (see AGENTS.md), run `npm run build:design`, and commit `src/index.js` with every changed `*-preservation.json`. `npm run check:bundle` must pass. An edit to an older `.ts` snapshot on its own changes nothing.
+The Worker is built from the ES modules under `src/` (entry `src/index.js`) by `npm run build` into `dist/worker/index.js`; nothing generated is committed. Browser assets live in `src/web/*.txt` and are imported as text. `npm run check:bundle` checks the build is reproducible and installation-neutral.
 
 ## Pull requests
 

@@ -4,7 +4,7 @@ Agent Library is MIT licensed; the following components retain their own copyrig
 
 ## Cloudflare Workers OAuth Provider
 
-`src/index.js` and `baseline/index.js` contain a module marked `node_modules/@cloudflare/workers-oauth-provider/dist/oauth-provider.js`. The lockfile selects `@cloudflare/workers-oauth-provider` 1.2.1. The notice below is retained verbatim from that installed package's `LICENSE.txt`. Confirm the embedded baseline revision as part of provenance review before distributing a release.
+The built Worker (`dist/worker/index.js`) bundles `@cloudflare/workers-oauth-provider` from `node_modules` at the version the lockfile selects (1.2.1). The notice below is retained verbatim from that package's `LICENSE.txt`.
 
 Source: https://github.com/cloudflare/workers-oauth-provider
 

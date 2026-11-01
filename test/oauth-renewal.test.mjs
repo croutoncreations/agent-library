@@ -5,11 +5,11 @@ import {readFileSync,writeFileSync,mkdtempSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {createHash} from 'node:crypto';
+import {loadWorker} from './load-worker.mjs';
 const dir=mkdtempSync(join(tmpdir(),'library-oauth-renewal-'));
 after(()=>rmSync(dir,{recursive:true,force:true}));
-const source=readFileSync(new URL('../src/index.js',import.meta.url),'utf8');
-writeFileSync(join(dir,'bundle.mjs'),source.replace('import { WorkerEntrypoint } from "cloudflare:workers";','class WorkerEntrypoint {}')+'\nexport {servers,handleOAuthHost};\n');
-const {servers,handleOAuthHost}=await import(join(dir,'bundle.mjs'));
+// The real Worker source, bundled for Node with cloudflare:workers replaced by an inert class.
+const {servers,handleOAuthHost}=await loadWorker({'oauth/server.js':['servers','handleOAuthHost']});
 class KV {
  rows=new Map();
  async get(k,options){const r=this.rows.get(k);if(!r||r.expiry&&r.expiry<=Date.now())return null;return options==='json'||options?.type==='json'?JSON.parse(r.value):r.value;}

@@ -4,7 +4,9 @@ import { readFileSync, mkdtempSync, writeFileSync, rmSync, existsSync } from 'no
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { validate, makeConfig, selfHostBundle } from '../scripts/self-host/setup.mjs';
+import { validate, makeConfig, selfHostBundle, BUILT } from '../scripts/self-host/setup.mjs';
+import { buildWorker } from '../scripts/build.mjs';
+await buildWorker({ outfile: BUILT });
 const input = { workerName:'test-library', accountId:'abcd'.repeat(8), databaseName:'test-library-db', databaseId:'abcdef12-1234-4234-8234-123456789abc', bucketName:'test-library-blobs', kvNamespaceId:'bcde'.repeat(8), appHost:'library.example.test', mcpHost:'mcp.example.test', accessTeamDomain:'test-team.cloudflareaccess.com', accessAudience:'audience-for-synthetic-fixture', ownerEmail:'owner@example.test', oidcClientId:'syntheticClient', oidcIssuer:'https://test-team.cloudflareaccess.com/cdn-cgi/access/sso/oidc/syntheticClient' };
 const script = resolve('scripts/self-host/setup.mjs');
 test('requires explicit non-secret fields and a consistent, separated auth configuration', () => {
@@ -31,8 +33,8 @@ test('requires explicit non-secret fields and a consistent, separated auth confi
   for (const bad of [['http://gateway.example.test/cb'],['https://gateway.example.test/cb?x=1'],['https://*.example.test/cb'],['https://gateway.example.test/cb#f'],'https://gateway.example.test/cb',Array(11).fill('https://a.example.test/cb')])
     assert.throws(()=>validate({...input,extraRedirectUris:bad}),/extraRedirectUris/);
 });
-test('the committed bundle is installation-neutral and is staged unchanged',()=>{
-  const source=readFileSync('src/index.js','utf8');
+test('the built Worker is installation-neutral and is staged unchanged',()=>{
+  const source=readFileSync(BUILT,'utf8');
   assert.equal(selfHostBundle(source),source);
   // No operator hostnames, gateways or owner identities are compiled in; they all come from config.
   assert.doesNotMatch(source,/cc-hosted-mcp-gateway|workers\.dev\/upstream|cloudflareaccess\.com\/cdn-cgi|@gmail\.com/);
@@ -50,7 +52,7 @@ test('CLI dry-run writes nothing, stages all migrations and refuses overwrite wi
     execFileSync(process.execPath,[script,'--input',file,'--out',out]);
     const c=JSON.parse(readFileSync(join(out,'wrangler.json')));
     assert.deepEqual(c,makeConfig(input));
-    assert.equal(readFileSync(join(out,'worker/index.js'),'utf8'),selfHostBundle(readFileSync('src/index.js','utf8')));
+    assert.equal(readFileSync(join(out,'worker/index.js'),'utf8'),selfHostBundle(readFileSync(BUILT,'utf8')));
     assert.ok(existsSync(join(out,'migrations/0011_upload_finalize_lease.sql')));
     assert.ok(existsSync(join(out,'manifest.json')));
     assert.equal(JSON.parse(readFileSync(join(out,'manifest.json'))).version,'0.1.0');

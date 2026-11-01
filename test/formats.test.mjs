@@ -1,21 +1,13 @@
-// Pure-format checks for src/formats.ts (no server). Strips the TS module's types with the repo's esbuild.
+// Pure-format checks for src/formats.js (no server), loaded from the shipped source.
 import { test, before } from "node:test";
 import assert from "node:assert/strict";
-import { transformSync } from "esbuild";
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
-import { ROOT } from "./helpers.mjs";
+
+
+
+import { loadWorker } from "./load-worker.mjs";
 
 let F;
-before(async () => {
-  const dir = join(ROOT, "tmp", "fmt-test");
-  mkdirSync(dir, { recursive: true });
-  for (const f of ["util", "formats"]) {
-    const out = transformSync(readFileSync(join(ROOT, "src", `${f}.ts`), "utf8"), { loader: "ts", format: "esm", target: "es2022" }).code;
-    writeFileSync(join(dir, `${f}.mjs`), out.replace(/from "\.\/util"/g, 'from "./util.mjs"'));
-  }
-  F = await import(join(dir, "formats.mjs") + "?t=" + Date.now());
-});
+before(async () => { F = await loadWorker({ "formats.js": ["checkFile", "parseCsv", "spreadsheetSafeCsv", "MEASUREMENTS", "MIME", "byteLength", "isCalendarDate"] }); });
 const M = "agentlib.measurements/1";
 const rec = (o = {}) => ({ id: "r1", recorded_at: "2026-02-28T23:59:00+14:00", metric: "weight_kg", value: 80, unit: "kg", ...o });
 const json = (records) => JSON.stringify({ schema: M, records });

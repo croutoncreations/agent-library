@@ -10,11 +10,7 @@ and `listProjects`; publishers use `livePublisher` and their sole destination. T
 Only IDs, labels, permitted project metadata, capabilities and timestamps are
 serialized; credential records, owner identity and secrets never enter results.
 
-The maintained serializer is `src/diagnostics/service.js`. The last build step,
-`build-diagnostics-fixes.mjs` (after ranked search and the project-changes feed), applies exact once-matching patches within named
-modules and emits `diagnostics-preservation.json`. Bundle reproducibility
-includes this step. The UI comes from `src/web/app.js`; earlier whole-bundle
-pins were re-reviewed and updated for that UI change, without weakening checks.
+The serializer lives in the service layer (`src/service.js`, `connectionInfo` and `legacyConnectionInfo`); the UI is in `src/web/app.js.txt`.
 
 Owner summaries describe saved access, status and safe IDs. They neither probe
 clients nor promise a successful read/write. Existing disconnect, replacement

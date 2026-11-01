@@ -1,0 +1,143 @@
+var HOME = (function () {
+  function key(uid) { return "al:home:" + encodeURIComponent(uid); }
+  function empty() { return { favorites: [], tab: "recent", sort: "newest", type: "all" }; }
+  function read(uid) {
+    var out = empty();
+    if (!uid) return out;
+    try {
+      var v = JSON.parse(localStorage.getItem(key(uid)) || "null");
+      if (!v || !Array.isArray(v.favorites)) return out;
+      var seen = new Set();
+      out.favorites = v.favorites.filter(function (x) {
+        if (!x || typeof x.pid !== "string" || typeof x.aid !== "string" || !x.pid || !x.aid) return false;
+        var k = JSON.stringify([x.pid, x.aid]); if (seen.has(k)) return false; seen.add(k); return true;
+      }).map(function (x) { return { pid: x.pid, aid: x.aid }; });
+      if (v.tab === "favorites") out.tab = v.tab;
+      if (["newest", "oldest", "title", "type"].indexOf(v.sort) >= 0) out.sort = v.sort;
+      if (TYPES.indexOf(v.type) >= 0) out.type = v.type;
+    } catch (e) {}
+    return out;
+  }
+  function write(uid, v) {
+    if (!uid) throw new Error("Sign in to save favorites.");
+    localStorage.setItem(key(uid), JSON.stringify({ favorites: v.favorites, tab: v.tab, sort: v.sort, type: v.type }));
+  }
+  function has(v, pid, aid) { return v.favorites.some(function (x) { return x.pid === pid && x.aid === aid; }); }
+  function toggle(uid, pid, aid) {
+    var v = read(uid);
+    if (has(v, pid, aid)) v.favorites = v.favorites.filter(function (x) { return x.pid !== pid || x.aid !== aid; });
+    else v.favorites.push({ pid: pid, aid: aid });
+    write(uid, v); return has(v, pid, aid);
+  }
+  function prefs(uid, tab, sort, type) { var v = read(uid); v.tab = tab; v.sort = sort; if (type !== undefined) v.type = type; write(uid, v); }
+  // File types (src/file-types). One group per list item, in the order the Type sort uses.
+  var TYPES = ["doc", "page", "image", "video", "pdf", "csv", "json", "file"];
+  function typeOf(a) {
+    if (!a) return "file";
+    if (a.kind === "markdown") return "doc";
+    if (a.kind === "html") return "page";
+    if (a.kind === "csv" || a.kind === "json") return a.kind;
+    var m = typeof a.mime === "string" ? a.mime.toLowerCase() : "";
+    if (m.indexOf("image/") === 0) return "image";
+    if (m.indexOf("video/") === 0) return "video";
+    if (m === "application/pdf") return "pdf";
+    return "file";
+  }
+  function order(rows, mode) {
+    return rows.slice().sort(function (a, b) {
+      var at = Date.parse(a.updated_at), bt = Date.parse(b.updated_at), av = Number.isFinite(at), bv = Number.isFinite(bt);
+      if (mode === "type") { var d = TYPES.indexOf(typeOf(a)) - TYPES.indexOf(typeOf(b)); if (d) return d; }
+      if (mode !== "title" && mode !== "type") {
+        if (av !== bv) return av ? -1 : 1;
+        if (av && at !== bt) return mode === "oldest" ? at - bt : bt - at;
+      }
+      return a.title.localeCompare(b.title, undefined, { sensitivity: "base" }) || a.pid.localeCompare(b.pid) || a.id.localeCompare(b.id);
+    });
+  }
+  var CACHE = "al:homecache:";
+  function cacheKey(uid) { return CACHE + encodeURIComponent(uid); }
+  function cacheRead(uid) {
+    if (!uid) return null;
+    try {
+      var v = JSON.parse(sessionStorage.getItem(cacheKey(uid)) || "null");
+      return v && v.uid === uid && Array.isArray(v.rows) && Array.isArray(v.projects) && Number.isFinite(v.at) ? v : null;
+    } catch (e) { return null; }
+  }
+  function cacheWrite(uid, result) {
+    if (!uid) return;
+    try { sessionStorage.setItem(cacheKey(uid), JSON.stringify({ uid: uid, rows: result.rows, projects: result.projects, at: Date.now() })); } catch (e) {}
+  }
+  // keepUid null clears every user's cached list (sign-out, session end).
+  function cacheClear(keepUid) {
+    var keep = keepUid ? cacheKey(keepUid) : null;
+    try { for (var i = sessionStorage.length - 1; i >= 0; i--) { var k = sessionStorage.key(i); if (k && k.indexOf(CACHE) === 0 && k !== keep) sessionStorage.removeItem(k); } } catch (e) {}
+  }
+  // Home shows this many rows before "Show more"; the early result is exact for exactly these.
+  var EARLY = 50;
+  async function load(call, current, early) {
+    function check() { if (!current()) { var e = new Error("Home navigation changed"); e.cancelled = true; throw e; } }
+    check(); var first = await call("GET", "/api/projects"); check();
+    var projects = first.projects;
+    var states = projects.map(function (p) { return { p: p, rows: [], cursor: null, seen: new Set(), done: false, failed: false }; });
+    // Fetches one page (firstOnly) or the remaining pages. No hard-coded project whitelist or silent page truncation.
+    async function scan(s, firstOnly) {
+      try {
+        do {
+          check(); var path = "/api/projects/" + encodeURIComponent(s.p.id) + "/artifacts?include=mime";
+          if (s.cursor !== null) path += "&cursor=" + encodeURIComponent(s.cursor);
+          var result = await call("GET", path); check();
+          result.artifacts.forEach(function (a) {
+            if (a.project_id === s.p.id && !a.trashed && typeof a.id === "string" && typeof a.title === "string")
+              s.rows.push({ pid: s.p.id, id: a.id, title: a.title, kind: a.kind, mime: typeof a.mime === "string" ? a.mime : null, updated_at: a.updated_at, revision: a.revision });
+          });
+          s.cursor = result.next_cursor == null ? null : String(result.next_cursor);
+          if (s.cursor !== null) {
+            if (s.seen.has(s.cursor) || s.seen.size >= 1000) throw new Error("Home pagination incomplete");
+            s.seen.add(s.cursor);
+          }
+        } while (s.cursor !== null && !firstOnly);
+        if (s.cursor === null) s.done = true;
+      } catch (e) {
+        if (e.cancelled || e.status === 401) throw e;
+        s.rows = []; s.done = true; s.failed = e.status !== 403 && e.status !== 404;
+      }
+    }
+    // Bounded concurrency.
+    async function pool(items, firstOnly) {
+      var next = 0;
+      async function worker() { while (next < items.length) await scan(items[next++], firstOnly); }
+      await Promise.all(Array.from({ length: Math.min(6, items.length) }, worker)); check();
+    }
+    function collect(list) {
+      var allowed = new Map(list.map(function (p) { return [p.id, p.title]; })), all = [], dedup = new Set();
+      states.forEach(function (s) {
+        if (!allowed.has(s.p.id)) return;
+        s.rows.forEach(function (a) {
+          var k = JSON.stringify([a.pid, a.id]); if (dedup.has(k)) return; dedup.add(k);
+          all.push(Object.assign({}, a, { project_title: allowed.get(a.pid) }));
+        });
+      });
+      var bad = states.filter(function (s) { return s.failed && allowed.has(s.p.id); }).map(function (s) { return s.p.id; });
+      return { rows: all, projects: list, failed: bad.length, failedPids: bad };
+    }
+    function stamp(a) { return a ? Date.parse(a.updated_at) : NaN; }
+    await pool(states, true);
+    // The early list must equal the first EARLY rows of the complete "newest" order. Unfetched rows of a project
+    // are no newer than the last row fetched, so they can only enter if that row ties with or is newer than the
+    // cutoff row (the API breaks ties by id, the list by title): fetch further first. Unparseable times are not shown early.
+    while (early) {
+      var open = states.filter(function (s) { return !s.done; });
+      if (!open.length) break;
+      var top = order(collect(projects).rows, "newest"), cut = stamp(top[EARLY - 1]);
+      if (!Number.isFinite(cut) || open.some(function (s) { return !Number.isFinite(stamp(s.rows[s.rows.length - 1])); })) break;
+      var tied = open.filter(function (s) { return stamp(s.rows[s.rows.length - 1]) >= cut; });
+      if (!tied.length) { early(collect(projects)); break; }
+      await pool(tied, true);
+    }
+    await pool(states.filter(function (s) { return !s.done; }), false);
+    // Access may be revoked during a scan; drop the entire project's metadata, including earlier pages.
+    var final = await call("GET", "/api/projects"); check();
+    return collect(final.projects);
+  }
+  return { typeOf: typeOf, TYPES: TYPES, read: read, has: has, toggle: toggle, prefs: prefs, order: order, load: load, EARLY: EARLY, cacheRead: cacheRead, cacheWrite: cacheWrite, cacheClear: cacheClear };
+})();

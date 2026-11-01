@@ -10,13 +10,11 @@ import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ROOT } from "./helpers.mjs";
+import { loadWorker } from "./load-worker.mjs";
 
 const dir = mkdtempSync(join(tmpdir(), "al-upload-races-"));
 after(() => rmSync(dir, { recursive: true, force: true }));
-const src = readFileSync(join(ROOT, "src/index.js"), "utf8");
-assert.equal(src.split('import { WorkerEntrypoint } from "cloudflare:workers";').length, 2);
-writeFileSync(join(dir, "bundle.mjs"), src.replace('import { WorkerEntrypoint } from "cloudflare:workers";', "class WorkerEntrypoint {}") + "\nexport { uploadFinish, reconcileUploads };");
-const lib = await import(join(dir, "bundle.mjs"));
+const lib = await loadWorker({ "uploads.js": ["uploadFinish"], "cleanup.js": ["reconcileUploads"] });
 
 const PNG = Buffer.from("89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000b49444154789c636000020000050001a5f645400000000049454e44ae426082", "hex");
 const SHA = createHash("sha256").update(PNG).digest("hex");
@@ -50,8 +48,8 @@ function world() {
     async delete(k) { blobs.delete(k); },
   };
   const at = new Date().toISOString();
-  sql.prepare("INSERT INTO principals VALUES ('hum_synthetic','human','synthetic','owner','Synthetic owner',?)").run(at);
-  sql.prepare("INSERT INTO projects VALUES (?,'hum_synthetic','Synthetic project',?)").run(P, at);
+  sql.prepare("INSERT INTO principals (id, kind, issuer, subject, label, created_at) VALUES ('hum_synthetic','human','synthetic','owner','Synthetic owner',?)").run(at);
+  sql.prepare("INSERT INTO projects (id, owner_id, title, created_at) VALUES (?,'hum_synthetic','Synthetic project',?)").run(P, at);
   const env = { DB, BLOBS };
   const ctx = { env, principal: { id: "hum_synthetic", kind: "human", label: "Synthetic owner" }, requestId: "req_synthetic" };
   let n = 0;

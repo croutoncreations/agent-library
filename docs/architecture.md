@@ -46,21 +46,17 @@ Binary uploads go through `upload_begin`, then an authenticated PUT of the bytes
 
 Every artifact has a stable owner URL: `https://APP_HOST/p/<project>/a/<artifact>` (add `?v=N` for a specific version). MCP and API responses include it, so agents can hand links to people or to each other.
 
-## How `src/index.js` is built
+## How the Worker is built
 
-The deployable Worker is a committed, byte-pinned bundle. `npm run build:design` produces it from `baseline/index.js` through a chain of small build steps (`build-*.mjs`). Each step replaces exact, hash-pinned regions with maintained sources:
-- `src/web/*` for the UI;
-- `src/render/markdown.module.js`;
-- `src/api/publisher.ts` and `generations.ts`;
-- `src/history/*`;
-- `src/web/connect-pages.js`;
-- `src/upload-fixes/*`;
-- `src/oauth-renewal/*`;
-- `src/file-tools/*` (files for OAuth connections, `build-file-tools-fixes.mjs`, the last step).
+The Worker is ordinary ES modules under `src/` (entry `src/index.js`). `npm run build` bundles them with the pinned esbuild into one module, `dist/worker/index.js`, which the deploy pipeline and the self-host setup upload unchanged (`no_bundle`). `wrangler dev` runs `src/index.js` directly. Nothing generated is committed.
 
-Each step must leave every other byte unchanged and records hashes in a `*-preservation.json` manifest. CI's `npm run check:bundle` rebuilds in a temporary copy and fails on any difference. Because of this, every change to what ships is a reviewable source diff, and the shipped bytes are reproducible.
+- `src/web/*.txt` are the browser assets (UI shell, styles, app script, Home loader, prebuilt CodeMirror editor). They are imported as text and served verbatim; `app.js.txt` has three build-free placeholders filled in `src/ui.js`.
+- `src/service.js` is the shared service layer used by the browser API, `/v1`, MCP and App Connect. Focused modules split from it: `search/`, `changes/`, `reads/`, `history/`, `templates/`.
+- `src/oauth/` is the OAuth server, consent pages and MCP-over-OAuth; `src/api/` holds `/v1`, API keys, app clients and the publisher API.
 
-Most of `src/**/*.ts` is an older snapshot of the code `baseline/index.js` was built from. It typechecks and documents intent, but it does not rebuild the Worker. Moving to a conventional build from TypeScript is planned future work.
+`npm run check:bundle` builds twice in fresh directories and fails if the outputs differ, if the bundle imports anything but `cloudflare:workers`, or if an installation-specific value appears. The editor bundle's provenance is checked separately (`npm run check:editor`).
+
+The modules were recovered mechanically from the previous byte-pinned bundle (Phase 0 of the hosted plan) and verified by the full test suite against both builds.
 
 ## Configuration
 

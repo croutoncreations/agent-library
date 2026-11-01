@@ -35,7 +35,7 @@ binding = "BLOBS"
 bucket_name = "agent-library-blobs"
 
 # ---- Your installation (wrangler deploy --env hosted) ----
-# src/index.js is a byte-pinned bundle; it is uploaded unmodified from an isolated copy
+# The Worker is built from src/ by `npm run build` (dist/worker/index.js) and uploaded unmodified from an isolated copy
 # (`npm run stage:hosted` copies it to dist/hosted/index.js and verifies its sha256), so wrangler
 # cannot attach neighbouring sources as extra modules.
 [env.hosted]

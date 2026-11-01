@@ -87,10 +87,8 @@ test("owner search results carry the MIME type for the browser; agent search doe
 });
 
 test("HOME: type grouping, type sort and the saved type filter", () => {
-  const src = readFileSync(new URL("../src/index.js", import.meta.url), "utf8");
-  const START = "var HOME_JS = String.raw`", END = "`;\n\n// src/editor-bundle.ts\n";
   const store = new Map(), localStorage = { getItem: (k) => store.get(k) ?? null, setItem: (k, v) => store.set(k, String(v)) };
-  const HOME = vm.runInNewContext(src.slice(src.indexOf(START) + START.length, src.indexOf(END)) + "\nHOME", { localStorage, sessionStorage: localStorage });
+  const HOME = vm.runInNewContext(readFileSync(new URL("../src/web/home.js.txt", import.meta.url), "utf8") + "\nHOME", { localStorage, sessionStorage: localStorage });
   const t = (kind, mime) => HOME.typeOf({ kind, mime });
   assert.deepEqual([t("markdown"), t("html"), t("csv"), t("json"), t("binary", "image/png"), t("binary", "VIDEO/MP4"), t("binary", "application/pdf"), t("binary", null), t("binary", "application/zip")],
     ["doc", "page", "csv", "json", "image", "video", "pdf", "file", "file"]);

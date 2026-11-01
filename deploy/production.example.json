@@ -3,7 +3,7 @@
   "accountId": "replace-with-your-32-hex-cloudflare-account-id",
   "workerName": "agent-library",
   "wranglerEnv": "hosted",
-  "main": "src/index.js",
+  "main": "dist/worker/index.js",
   "uploadMain": "dist/hosted/index.js",
   "noBundle": true,
   "compatibilityDate": "2025-09-01",

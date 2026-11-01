@@ -1,3 +1,7 @@
+import { authorizeProject } from "../auth.js";
+import { db, loadArtifact, updateMetadata } from "../service.js";
+import { CHANGE_NOTE_MAX, HttpError, int, nowIso, randomId } from "../util.js";
+
 // ---------- version history (docs/version-history.md) ----------
 // Who and why, for a new content or metadata version: [via_kind, via_id, via_label, client_info, change_note].
 // via_* is derived by the server from the access path; client_info and change_note are self-reported.
@@ -166,17 +170,17 @@ async function diffRevisions(ctx, projectId, artifactId, fromQ, toQ) {
 // document, i.e. revision 1's author). INSERT OR IGNORE keeps it to exactly one row even under concurrent retries.
 function metaBaselineInsert(ctx, a, gate, gp) {
   return db(ctx).prepare(
-    `INSERT OR IGNORE INTO meta_versions (id, artifact_id, project_id, version, title, folder, tags, trashed, author_id, via_kind, via_id, via_label, client_info, change_note, restored_from, created_at)
-     SELECT ?, ?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT author_id FROM revisions WHERE artifact_id = ? AND project_id = ? AND rev_no = 1), ?), NULL, NULL, NULL, NULL, 'baseline', NULL, ?
+    `INSERT OR IGNORE INTO meta_versions (id, artifact_id, project_id, version, title, folder, tags, trashed, template_description, author_id, via_kind, via_id, via_label, client_info, change_note, restored_from, created_at)
+     SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT author_id FROM revisions WHERE artifact_id = ? AND project_id = ? AND rev_no = 1), ?), NULL, NULL, NULL, NULL, 'baseline', NULL, ?
      WHERE ${gate} AND NOT EXISTS (SELECT 1 FROM meta_versions WHERE artifact_id = ? AND project_id = ?)`
-  ).bind(randomId("mvb"), a.id, a.project_id, a.meta_version, a.title, a.folder, a.tags, a.trashed_at ? 1 : 0, a.id, a.project_id, ctx.principal.id, a.updated_at ?? nowIso(), ...gp, a.id, a.project_id);
+  ).bind(randomId("mvb"), a.id, a.project_id, a.meta_version, a.title, a.folder, a.tags, a.trashed_at ? 1 : 0, a.template_description, a.id, a.project_id, ctx.principal.id, a.updated_at ?? nowIso(), ...gp, a.id, a.project_id);
 }
 function metaVersionInsert(ctx, a, version, v, input, gate, gp) {
   const note = input?.change_note ?? (v.restoredFrom ? "Restored details from version " + v.restoredFrom : null);
   return db(ctx).prepare(
-    `INSERT INTO meta_versions (id, artifact_id, project_id, version, title, folder, tags, trashed, author_id, via_kind, via_id, via_label, client_info, change_note, restored_from, created_at)
-     SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${gate}`
-  ).bind(randomId("mv"), a.id, a.project_id, version, v.title, v.folder, v.tags, v.trashed ? 1 : 0, ctx.principal.id, ...provenance(ctx, { change_note: note }), v.restoredFrom, nowIso(), ...gp);
+    `INSERT INTO meta_versions (id, artifact_id, project_id, version, title, folder, tags, trashed, template_description, author_id, via_kind, via_id, via_label, client_info, change_note, restored_from, created_at)
+     SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${gate}`
+  ).bind(randomId("mv"), a.id, a.project_id, version, v.title, v.folder, v.tags, v.trashed ? 1 : 0, v.description, ctx.principal.id, ...provenance(ctx, { change_note: note }), v.restoredFrom, nowIso(), ...gp);
 }
 async function metaHistory(ctx, projectId, artifactId, authorized = false, cursor) {
   if (!authorized) {
@@ -184,7 +188,7 @@ async function metaHistory(ctx, projectId, artifactId, authorized = false, curso
     await loadArtifact(ctx, projectId, artifactId, { allowTrashed: ctx.principal.kind === "human" });
   }
   const before = cursor === void 0 || cursor === null || cursor === "" ? null : int(Number(cursor), "cursor", 1);
-  const cols = `SELECT m.version, m.title, m.folder, m.tags, m.trashed, m.author_id, m.via_kind, m.via_id, m.via_label, m.client_info, m.change_note, m.restored_from, m.created_at,
+  const cols = `SELECT m.version, m.title, m.folder, m.tags, m.trashed, m.template_description, m.author_id, m.via_kind, m.via_id, m.via_label, m.client_info, m.change_note, m.restored_from, m.created_at,
        p.label AS author_label
      FROM meta_versions m LEFT JOIN principals p ON p.id = m.author_id
      WHERE m.artifact_id = ? AND m.project_id = ?`;
@@ -195,7 +199,7 @@ async function metaHistory(ctx, projectId, artifactId, authorized = false, curso
   const next_cursor = r.results.length > HISTORY_PAGE ? String(rows[rows.length - 1].version) : null;
   const me = ctx.principal.kind === "human" ? ctx.principal.id : null;
   return { next_cursor, meta_versions: rows.map((m) => ({
-    version: m.version, title: m.title, folder: m.folder, tags: JSON.parse(m.tags), trashed: !!m.trashed, created_at: m.created_at,
+    version: m.version, title: m.title, template_description: m.template_description, folder: m.folder, tags: JSON.parse(m.tags), trashed: !!m.trashed, created_at: m.created_at,
     baseline: m.change_note === "baseline" && !m.via_kind,
     who: m.change_note === "baseline" && !m.via_kind ? "Before history was recorded" : whoLabel(m, me),
     via: m.via_kind ? { kind: m.via_kind, id: m.via_id, label: m.via_label } : null,
@@ -208,7 +212,7 @@ async function restoreMetadata(ctx, projectId, artifactId, input, key) {
   await authorizeProject(ctx, projectId, true);
   const expected = int(input.expected_meta_version, "expected_meta_version", 1);
   const from = int(input.from_version, "from_version", 1);
-  const row = await db(ctx).prepare("SELECT title, folder, tags, trashed FROM meta_versions WHERE artifact_id = ? AND project_id = ? AND version = ?").bind(artifactId, projectId, from).first();
+  const row = await db(ctx).prepare("SELECT title, folder, tags, trashed, template_description FROM meta_versions WHERE artifact_id = ? AND project_id = ? AND version = ?").bind(artifactId, projectId, from).first();
   if (!row) {
     // A trashed document doesn't exist for agents: answer as for any other missing document, so an agent can't
     // probe which details versions it has.
@@ -221,6 +225,9 @@ async function restoreMetadata(ctx, projectId, artifactId, input, key) {
   return updateMetadata(ctx, projectId, artifactId, {
     expected_meta_version: expected, title: row.title, folder: row.folder, tags: JSON.parse(row.tags),
     ...keepTrash ? {} : { trashed: !!row.trashed },
+    ...(await loadArtifact(ctx, projectId, artifactId, { allowTrashed: true })).is_template ? { template_description: row.template_description } : {},
     change_note: input.change_note
   }, key, { restoredFrom: from });
 }
+
+export { diffRevisions, historyPage, lineDiff, metaBaselineInsert, metaHistory, metaVersionInsert, provenance, restoreMetadata };

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Offline proof that `wrangler deploy --env hosted` would upload exactly the
-// committed, byte-pinned src/index.js with the recorded installation config.
+// built Worker (dist/worker/index.js, staged by stage.mjs) with the recorded installation config.
 // Uses --dry-run (no account, no network writes). Run before deploys (deploy.yml).
 // Needs the installation's wrangler.toml and deploy/production.json (both gitignored).
 import { execFileSync } from 'node:child_process';

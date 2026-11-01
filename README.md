@@ -79,12 +79,13 @@ Agent Library is a personal library: one owner, many agents.
 npm ci
 npm run typecheck
 npm run test:deploy        # deploy guards and migration ordering (offline)
-npm run check:bundle       # src/index.js rebuilds byte-for-byte from source
+npm run build              # dist/worker/index.js from src/
+npm run check:bundle       # the build is reproducible and installation-neutral
 npm test                   # full suite: local wrangler, real MCP client, Chrome
 npm run dev                # local server on 127.0.0.1:8787 (wrangler.local.toml)
 ```
 
-Tests use local Wrangler bindings and synthetic fixtures only. Read [CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md) before changing code. The deployable Worker is the committed `src/index.js`, built from a pinned baseline plus small reviewed source patches (`npm run build:design`), not a full compile of `src/**/*.ts`.
+Tests use local Wrangler bindings and synthetic fixtures only. Read [CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md) before changing code. The Worker is built from the ES modules in `src/` (`npm run build`).
 
 ## Status
 

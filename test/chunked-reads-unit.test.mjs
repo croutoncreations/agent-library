@@ -8,11 +8,12 @@ import { join } from "node:path";
 import { createHash, randomBytes } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { ROOT } from "./helpers.mjs";
+import { moduleScript } from "./module-source.mjs";
 
 class HttpError extends Error { constructor(status, code, message) { super(message); this.status = status; this.code = code; } }
 let clock = Date.now();
 function load() {
-  const src = readFileSync(join(ROOT, "src/reads/service.js"), "utf8");
+  const src = moduleScript("src/reads/service.js");
   const int = (v, name, min = 0, max = Number.MAX_SAFE_INTEGER) => {
     if (typeof v !== "number" || !Number.isInteger(v) || v < min || v > max) throw new HttpError(400, "invalid_input", `${name} must be an integer in [${min}, ${max}]`);
     return v;
@@ -32,8 +33,8 @@ function fixture() {
   const s = new DatabaseSync(":memory:");
   for (const f of readdirSync(join(ROOT, "migrations")).sort()) s.exec(readFileSync(join(ROOT, "migrations", f), "utf8"));
   const now = new Date().toISOString(), far = clock + 864e5;
-  s.exec(`INSERT INTO principals VALUES ('own','human','i','s1','Owner','${now}'), ('ag','agent','i','s2','Agent','${now}'), ('ak','agent','i','s3','Key','${now}');
-    INSERT INTO projects VALUES ('pa','own','A','${now}'), ('pb','own','B','${now}');
+  s.exec(`INSERT INTO principals (id, kind, issuer, subject, label, created_at) VALUES ('own','human','i','s1','Owner','${now}'), ('ag','agent','i','s2','Agent','${now}'), ('ak','agent','i','s3','Key','${now}');
+    INSERT INTO projects (id, owner_id, title, created_at) VALUES ('pa','own','A','${now}'), ('pb','own','B','${now}');
     INSERT INTO grants (id, project_id, principal_id, token_hash, can_write, expires_at, created_by, created_at) VALUES ('g1','pa','ag','h1',0,${far},'own','${now}');
     INSERT INTO api_credentials (id, owner_principal_id, principal_id, label, token_hash, created_at, expires_at) VALUES ('k1','own','ak','key','h2','${now}',${far});
     INSERT INTO api_credential_projects VALUES ('k1','pa',0);

@@ -5,6 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 import { readFileSync, readdirSync } from "node:fs";
 import vm from "node:vm";
 import { webcrypto } from "node:crypto";
+import { moduleScript } from "./module-source.mjs";
 function db() {
   const d = new DatabaseSync(":memory:");
   for (const n of readdirSync("migrations")
@@ -12,7 +13,7 @@ function db() {
     .sort())
     d.exec(readFileSync("migrations/" + n, "utf8"));
   d.exec(
-    `INSERT INTO principals VALUES('owner','human','local','owner','Owner','2000-01-01');INSERT INTO projects VALUES('p','owner','Synthetic','2000-01-01');`,
+    `INSERT INTO principals (id, kind, issuer, subject, label, created_at) VALUES ('owner','human','local','owner','Owner','2000-01-01');INSERT INTO projects (id, owner_id, title, created_at) VALUES ('p','owner','Synthetic','2000-01-01');`,
   );
   return d;
 }
@@ -102,7 +103,7 @@ test("cleanup deletes at most 1000 rows; preserves monotonic high and records fl
     d.exec(
       `INSERT INTO project_changes(project_id,artifact_id,kind,type,changed_fields,at) VALUES('p','a','markdown','artifact.created','[]','1900-01-01');`,
     );
-  const code = readFileSync("src/changes/service.js", "utf8");
+  const code = moduleScript("src/changes/service.js");
   const warnings = [];
   const cleanup = vm.runInNewContext(code + ";cleanupChanges", {
     nowMs: () => Date.now(),
@@ -150,7 +151,7 @@ test("cleanup deletes at most 1000 rows; preserves monotonic high and records fl
 
 test("OAuth kind gates independently apply App Connect and file approval", () => {
   const kinds = vm.runInNewContext(
-    readFileSync("src/changes/service.js", "utf8") + ";chKinds",
+    moduleScript("src/changes/service.js") + ";chKinds",
     {
       appConnectEnabled: (env) => env.APP_CONNECT_ENABLED === "1",
     },
@@ -207,7 +208,7 @@ test("metadata changes made entirely inside trash produce no new reconciliation 
 });
 
 test("opaque cursors hide global counters, use fresh nonces and reject ciphertext tampering", async () => {
-  const code = readFileSync("src/changes/service.js", "utf8");
+  const code = moduleScript("src/changes/service.js");
   class HttpError extends Error {
     constructor(status, code, message) {
       super(message);
@@ -260,7 +261,7 @@ test("opaque cursors hide global counters, use fresh nonces and reject ciphertex
 
 test("publisher coverage fingerprints stay ordered across scan order and query-plan changes", () => {
   const coverage = vm.runInNewContext(
-    readFileSync("src/changes/service.js", "utf8") + ";CH_COVERAGE_SQL",
+    moduleScript("src/changes/service.js") + ";CH_COVERAGE_SQL",
   );
   const d = new DatabaseSync(":memory:");
   d.exec(`CREATE TABLE publishers(id TEXT PRIMARY KEY,project_id TEXT,current_snapshot_id TEXT);

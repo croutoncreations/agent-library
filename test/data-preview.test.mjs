@@ -1,5 +1,5 @@
 // CSV and JSON inline previews in the browser app (src/web/app.js renderDataFile / dataPreview).
-//  1. Parser parity: the browser CSV parser and the server's parseCsv (src/formats.ts) accept and reject the same
+//  1. Parser parity: the browser CSV parser and the server's parseCsv (src/formats.js) accept and reject the same
 //     inputs and produce the same cells, so a preview never disagrees with validation.
 //  2. Real Chrome against the real local runtime (loopback, synthetic owner, App Connect on so the owner can
 //     create csv/json files): cells, tree, Table toggle, Raw text, mobile overflow, hostile content, large-file caps.
@@ -9,10 +9,10 @@ import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
-import { transformSync } from "esbuild";
 import { ROOT } from "./helpers.mjs";
 import { startAppConnectServer } from "./fixtures/app-connect-harness.mjs";
 import { SERVER_PORTS } from "./ports.mjs";
+import { loadWorker } from "./load-worker.mjs";
 
 const require = createRequire(import.meta.url);
 const CHROME = process.env.CHROME_PATH ?? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
@@ -23,7 +23,7 @@ const PHONE_390 = { width: 390, height: 844, deviceScaleFactor: 3, isMobile: tru
 const PHONE_320 = { width: 320, height: 658, deviceScaleFactor: 2, isMobile: true, hasTouch: true };
 
 // ---------- 1. parser parity ----------
-const appJs = readFileSync(join(ROOT, "src/web/app.js"), "utf8");
+const appJs = readFileSync(join(ROOT, "src/web/app.js.txt"), "utf8");
 const slice = (from, to) => { const a = appJs.indexOf(from), b = appJs.indexOf(to, a); assert.ok(a >= 0 && b > a, from); return appJs.slice(a, b); };
 const csvParse = new Function(slice("function csvParse(", "\n// JSON numbers keep") + "; return csvParse;")();
 // The real formatting helpers and JSON code from app.js (cut at function boundaries, not comments).
@@ -31,23 +31,9 @@ const J = new Function(slice("function fmtCount(", "\n// RFC 4180") + slice("fun
   slice("function isJsonContainer(", "\n// An array of flat objects") + slice("var NUMERIC_CELL", "\nfunction dataNote(") +
   slice("function jsonPath(", "\nfunction jsonSummary(") + slice("function jsonErrorText(", "\nfunction jsonScalar(") +
   "; return { jsonParse, jsonChanges, jsonBrief, isNumericCell, jsonErrorText, JSON_EXACT_NUMBERS };")();
-// Production's parseCsv is the one inside the deployed bundle (src/index.js); src/formats.ts is an older snapshot.
-// Both are checked so neither can drift from the browser parser unnoticed.
-const bundle = readFileSync(join(ROOT, "src/index.js"), "utf8");
-const bslice = (from, to) => { const a = bundle.indexOf(from), b = bundle.indexOf(to, a); assert.ok(a >= 0 && b > a, from); return bundle.slice(a, b); };
-const bundleParseCsv = new Function("HttpError", "MAX_FILE_BYTES", "invalid", bslice("function byteLength(", "\nfunction depthOk(") + bslice("function parseCsv(", "\nfunction strField(") + "; return parseCsv;")(
-  class HttpError extends Error { constructor(s, c, m) { super(m); this.code = c; } }, 1048576,
-  (x) => Object.assign(new Error(`Invalid ${x.format}: ${x.detail}`), { code: "invalid_content" }));
+// The server's parseCsv (src/formats.js, the shipped module), checked against the browser parser so neither drifts.
 let serverParseCsv;
-before(async () => {
-  const dir = join(ROOT, "tmp", "data-preview-test");
-  mkdirSync(dir, { recursive: true });
-  for (const f of ["util", "formats"]) {
-    const out = transformSync(readFileSync(join(ROOT, "src", `${f}.ts`), "utf8"), { loader: "ts", format: "esm", target: "es2022" }).code;
-    writeFileSync(join(dir, `${f}.mjs`), out.replace(/from "\.\/util"/g, 'from "./util.mjs"'));
-  }
-  serverParseCsv = (await import(join(dir, "formats.mjs") + "?t=" + Date.now())).parseCsv;
-});
+before(async () => { serverParseCsv = (await loadWorker({ "formats.js": ["parseCsv"] })).parseCsv; });
 
 const CORPUS = [
   "a,b\n1,2\n", "a,b\r\n1,2\r\n", "a,b\n1,2", "a\n", "a", "a,b\n\"x, y\",\"line1\nline2\"\n", "a,b\n\"he said \"\"hi\"\"\",2\n",
@@ -56,8 +42,8 @@ const CORPUS = [
   "name,note\n<img src=x onerror=alert(1)>,=HYPERLINK(\"http://example.invalid\",\"x\")\n",
   "\n", "a,b\n1,\n", "a\n\"x\ry\"\n", "\"h1\",\"h,2\"\n1,2\n", " \t,b\n1,2\n", "a,b\n1,2\r\n3,4", "a,,b\n1,2,3\n",
 ];
-test("CSV parser parity: the browser preview and server validation (deployed bundle and formats.ts) accept, reject and split identically", () => {
-  for (const [name, server] of [["bundle", bundleParseCsv], ["formats.ts", serverParseCsv]]) for (const text of CORPUS) {
+test("CSV parser parity: the browser preview and server validation (src/formats.js) accept, reject and split identically", () => {
+  for (const [name, server] of [["formats.js", serverParseCsv]]) for (const text of CORPUS) {
     let s, c;
     try { s = { ok: server(text) }; } catch (e) { s = { err: e.message }; }
     try { c = { ok: csvParse(text) }; } catch (e) { c = { err: e.message }; }
