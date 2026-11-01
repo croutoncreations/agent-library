@@ -57,7 +57,7 @@ The Worker is ordinary ES modules under `src/` (entry `src/index.js`). `npm run 
 
 `npm run check:bundle` builds twice in fresh directories and fails if the outputs differ, if the bundle imports anything but `cloudflare:workers`, or if an installation-specific value appears. The editor bundle's provenance is checked separately (`npm run check:editor`).
 
-The modules were recovered mechanically from the previous byte-pinned bundle (Phase 0 of the hosted plan) and verified by the full test suite against both builds.
+The modules were recovered mechanically from the previous byte-pinned bundle (Phase 0 of the hosted plan). The existing test suite passed on the old bundle and passes on this build; test servers run the built `dist/worker/index.js` itself (`wrangler.local.toml` uses `no_bundle`).
 
 ## Configuration
 
@@ -72,12 +72,12 @@ Rate limits and upload TTLs have defaults and optional vars. See [wrangler.examp
 
 ## Ranked search
 
-[Ranked search](ranked-search.md) adds a D1 FTS5 index over current published heads, live permission filtering, opaque query-bound pagination, a Home search view, `/api/search`, `/v1/search` and the `search_artifacts` MCP tool. Maintained sources in `src/search/` are integrated by the preservation-checked final `build-search.mjs` step. Rollout requires migration 0014 and a bounded existing-data backfill; see the guide for export/rollback considerations.
+[Ranked search](ranked-search.md) adds a D1 FTS5 index over current published heads, live permission filtering, opaque query-bound pagination, a Home search view, `/api/search`, `/v1/search` and the `search_artifacts` MCP tool. Sources: `src/search/`.
 
 ## Templates
 
-Project-scoped Markdown templates reuse artifact revisions and metadata history; identity and copy provenance are additive fields. Owner-only definition maintenance is enforced in the shared service and transaction fences. Both MCP transports, /v1 and the owner picker use the same implementation, integrated by `build-template-fixes.mjs`. See [Document templates](templates.md) for date/retry semantics, /2 backup compatibility and rollback notes.
+Project-scoped Markdown templates reuse artifact revisions and metadata history; identity and copy provenance are additive fields. Owner-only definition maintenance is enforced in the shared service and transaction fences. Both MCP transports, /v1 and the owner picker use the same implementation (`src/templates/`). See [Document templates](templates.md) for date/retry semantics, /2 backup compatibility and rollback notes.
 
 ## File types
 
-File types in the browser UI (`src/file-types/`, integrated by the final `build-file-types.mjs` step): lists label files by their stored MIME type ("PNG image", "MP4 video", "PDF"), Home can filter and sort by type, and list rows show small thumbnails for images and videos. Thumbnails are drawn in the browser from the revision-pinned `/content` URL, lazily and within a per-minute budget, kept as 96px object URLs for the session and dropped on sign-out. The owner list route adds `mime` only with `?include=mime`, and owner search adds it for human sessions only, so MCP, `/v1` and default `/api` shapes are unchanged. No migration.
+File types in the browser UI (`src/web/app.js.txt`, `src/web/home.js.txt`): lists label files by their stored MIME type ("PNG image", "MP4 video", "PDF"), Home can filter and sort by type, and list rows show small thumbnails for images and videos. Thumbnails are drawn in the browser from the revision-pinned `/content` URL, lazily and within a per-minute budget, kept as 96px object URLs for the session and dropped on sign-out. The owner list route adds `mime` only with `?include=mime`, and owner search adds it for human sessions only, so MCP, `/v1` and default `/api` shapes are unchanged. No migration.

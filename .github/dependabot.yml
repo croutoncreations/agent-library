@@ -9,8 +9,8 @@ updates:
       actions:
         patterns: ["*"]
   # npm: Dependabot security alerts still arrive for everything. Routine bumps skip packages that are
-  # pinned on purpose: Wrangler and esbuild (the bundle build checks the esbuild version), and the OAuth
-  # provider, which is compiled into the byte-pinned src/index.js and needs a deliberate rebuild.
+  # pinned on purpose: Wrangler and esbuild (the build checks the esbuild version), and the OAuth
+  # provider, which is bundled into the Worker and changes security-critical behaviour (upgrade deliberately).
   - package-ecosystem: npm
     directory: /
     schedule:

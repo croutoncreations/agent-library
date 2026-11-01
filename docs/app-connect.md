@@ -73,7 +73,7 @@ Rules that apply to every call:
 - Files are JSON or CSV. An optional schema (`agentlib.measurements/1`) validates time-series records.
 - For staged generations, the root must be an `agentlib.generation.index/1` document that references every part. Each part is an `agentlib.generation.part/1` document. The legacy names `healthconnect.readable.index/1` and `healthconnect.readable.part/1` are still accepted.
 
-The exact request and response shapes are in `src/api/publisher.ts` and `src/api/generations.ts`. Working examples are in `test/app-connect-phase2.test.mjs`, `test/app-connect-phase3.test.mjs`, `test/generations-regression.test.mjs` and the harness `test/fixtures/app-connect-harness.mjs`.
+The exact request and response shapes are in `src/api/publisher.js` (`GENERATION_CONTRACT` and the routes). Working examples are in `test/app-connect-phase2.test.mjs`, `test/app-connect-phase3.test.mjs`, `test/generations-regression.test.mjs` and the harness `test/fixtures/app-connect-harness.mjs`.
 
 ## Current limits
 

@@ -23,16 +23,21 @@ new key and updating the revision's `blob_key` in a revision-guarded statement.
 
 ## Text stored inline in D1
 
-Markdown, HTML, JSON and CSV bodies live in `revisions.body`; comments in `comments.body`. They are read directly in
-SQL in several places, so encrypting them is a larger change than swapping `content-store.js`:
+Markdown, HTML, JSON and CSV bodies live in `revisions.body`; comments in `comments.body`. Every JavaScript write
+binds `storeText(text)` and every JavaScript read of a selected body goes through `readText(stored)` (both in
+`src/content-store.js`). `test/content-store.test.mjs` builds the Worker with a marker codec in place of those two
+functions and runs real creates, saves, restores, comments and reads against the migrated schema, so a path that
+skips the seam fails.
+
+Some features also read the body **inside SQL**, which a JavaScript codec can't reach. These need their own change
+when text encryption is built:
 
 | Where | What reads the body in SQL |
 |---|---|
 | `migrations/0014_ranked_search.sql` triggers, `src/search/service.js` | FTS5 index of title and body |
 | `src/reads/service.js` | byte-range `substr` of the body for chunked reads |
 | `src/service.js` (`listArtifacts`) | owner `LIKE` filter over the head body |
-| `src/api/publisher.js` | generation commit copies part bodies into revisions; `json_extract` over staged parts |
-| `src/backup.js` | export and restore |
+| `src/api/publisher.js` | generation commit copies staged part bodies into revisions with `INSERT … SELECT`; `json_extract` over staged parts |
 
 Plan when per-workspace encryption is built: add a nullable `key_version` to `revisions` and `comments` (NULL =
 plaintext, read both), encrypt in the Worker before insert, and replace the SQL-side uses above. Search is the hard

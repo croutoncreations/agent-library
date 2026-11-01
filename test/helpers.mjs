@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { SERVER_PORTS, INSPECTOR_OFFSET } from "./ports.mjs";
+import { buildWorker } from "../scripts/build.mjs";
 
 export const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 /** Local-only wrangler config (placeholder IDs); never an installation's wrangler.toml. */
@@ -25,9 +26,13 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // Functional suites drive many requests per minute through one identity; raise rate limits there.
 // test/limits.test.mjs passes low explicit values to exercise the limiter itself.
 const FUNCTIONAL_VARS = { RATE_READS_PER_MIN: "100000", RATE_WRITES_PER_MIN: "100000", RATE_AUTHFAIL_PER_MIN: "100000" };
+// Every server runs the shipped artifact (dist/worker/index.js). Built once per test process.
+let built = null;
 export async function startServer(name, port, { fresh = true, persistDir, vars = FUNCTIONAL_VARS, readyHeaders = {}, readyBase } = {}) {
   if (!Object.values(SERVER_PORTS).includes(port)) throw new Error(`port ${port} is not in test/ports.mjs SERVER_PORTS`);
   for (const p of [port, port + INSPECTOR_OFFSET]) if (!(await portFree(p))) throw new Error(`port ${p} for server ${name} is already in use (a previous server did not exit?)`);
+  built ??= buildWorker();
+  await built;
   const dir = persistDir ?? join(ROOT, "tmp", `test-state-${name}`);
   if (fresh) rmSync(dir, { recursive: true, force: true });
   mkdirSync(dir, { recursive: true });

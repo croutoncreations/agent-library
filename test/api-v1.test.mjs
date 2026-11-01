@@ -134,7 +134,16 @@ test("Muse round trip: list, create, read, update, stale 409, idempotent replay,
   // Wrong content type and oversized bodies.
   assert.equal((await call("POST", `/v1/projects/${PA}/files`, { token: t, idem: key(), raw: "title=x", headers: { "content-type": "application/x-www-form-urlencoded" } })).status, 415);
   assert.equal((await call("POST", `/v1/projects/${PA}/files`, { token: t, idem: key(), raw: "{", headers: { "content-type": "application/json" } })).status, 400);
-  assert.equal((await call("POST", `/v1/projects/${PA}/files`, { token: t, idem: key(), raw: "x".repeat(6_600_000), headers: { "content-type": "application/json" } })).status, 413);
+  // Oversized declared body: the server answers 413 from Content-Length before reading the body. Send only a
+  // prefix and read the response; streaming all 6.6 MB races the early reply (the client then sees EPIPE).
+  const big = await new Promise((res, rej) => {
+    const rq = httpRequest({ host: "127.0.0.1", port: PORT, method: "POST", path: `/v1/projects/${PA}/files`,
+      headers: { authorization: `Bearer ${t}`, "idempotency-key": key(), "content-type": "application/json", "content-length": "6600000" } },
+      (r) => { r.resume(); res(r.statusCode); rq.destroy(); });
+    rq.on("error", (e) => { if (e.code !== "ECONNRESET" && e.code !== "EPIPE") rej(e); });
+    rq.write("x".repeat(65536));
+  });
+  assert.equal(big, 413);
   // Cookies are refused (no ambient browser auth on the API).
   assert.equal((await call("GET", "/v1/projects", { token: t, headers: { cookie: "al_session=x" } })).status, 400);
 });

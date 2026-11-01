@@ -1,3 +1,4 @@
+import { readText, storeText } from "../content-store.js";
 import { authorizeProject, authzSql, requireHuman } from "../auth.js";
 import { provenance } from "../history/service.js";
 import { appOrigin, artifactWebUrl, previewWebUrl } from "../links.js";
@@ -52,7 +53,7 @@ async function tplSource(ctx, pid, id, revision, definition) {
     AND a.trashed_at IS NULL ${definition ? "AND a.is_template = 1" : ""} AND ${az.sql}`)
     .bind(id, pid, revision, ...az.params).first();
   if (!r) throw new HttpError(404, "not_found", "Source is not available");
-  return { body: r.body };
+  return { body: readText(r.body) };
 }
 async function tplCopy(ctx, projectId, input, key, definition = false) {
   tplDenyPublisher(ctx);
@@ -99,7 +100,7 @@ async function tplCopy(ctx, projectId, input, key, definition = false) {
       .bind(id, projectId, title, folder, folderId, rid, now, now, definition ? 1 : 0, description, sourceId, revision, definition ? "document" : "template", date, ...ownParams),
     db(ctx).prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, size, sha256, mime, created_at, via_kind, via_id, via_label, client_info, change_note)
       SELECT ?, ?, ?, 1, ?, ?, ?, ?, 'text/markdown', ?, ?, ?, ?, ?, ? WHERE ${created}`)
-      .bind(rid, id, projectId, ctx.principal.id, body, new TextEncoder().encode(body).length, hash, now, ...provenance(ctx, { change_note: note }), id),
+      .bind(rid, id, projectId, ctx.principal.id, storeText(body), new TextEncoder().encode(body).length, hash, now, ...provenance(ctx, { change_note: note }), id),
     audit(ctx, projectId, definition ? "template.create" : "template.use", id, 1, "ok", created, [id])
   ], i);
   if (!Array.isArray(out)) return out;

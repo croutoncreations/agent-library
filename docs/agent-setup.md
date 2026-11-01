@@ -45,7 +45,7 @@ Routes (all under `https://YOUR_MCP_HOST`):
 | `…/files/{file}/meta-versions`, `…/meta-versions/{n}/restore` | GET, POST | title, folder and tag history |
 | `/v1/projects/{project}/folders`, `…/files/{file}/records` | GET (+POST folders) | folders and data records (with App Connect enabled) |
 
-Writes need an `Idempotency-Key` header. Request and response shapes are in `src/api/v1.ts`, and `test/api-v1.test.mjs` has working examples. Don't log request headers.
+Writes need an `Idempotency-Key` header. Request and response shapes are in `src/api/v1.js`, and `test/api-v1.test.mjs` has working examples. Don't log request headers.
 
 ## Security and conflicts
 

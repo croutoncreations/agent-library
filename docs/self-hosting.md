@@ -89,7 +89,7 @@ npm run setup:self-host -- --input .self-host.json             # writes dist/sel
 
 The generator works offline. It validates the fields (it rejects unknown keys, so a secret can't end up in the file) and writes `dist/self-host/`:
 - `wrangler.json`;
-- the Worker (`worker/index.js`, a byte-for-byte copy of the committed `src/index.js`);
+- the Worker (`worker/index.js`, a byte-for-byte copy of `dist/worker/index.js`, which the generator builds from `src/` with `npm run build`);
 - all migrations;
 - a `manifest.json` with hashes.
 

@@ -3,9 +3,8 @@
 // Today content is encrypted at rest by the storage provider (Cloudflare D1/R2), so these are pass-throughs.
 // Per-workspace envelope encryption (hosted plan, "Encryption at rest") plugs in here: a KeyProvider wraps
 // per-workspace data keys and R2 objects become chunked AES-GCM so Range reads keep working.
-// test/content-store.test.mjs fails if any other module touches env.BLOBS. Text bodies stored inline in D1
-// (revisions.body, comments.body) are read in many places, several of them inside SQL; docs/encryption.md lists
-// every one, because encrypting them changes search and chunked reads, not just this module.
+// test/content-store.test.mjs fails if any other module touches env.BLOBS. Text bodies stored inline in D1 go
+// through storeText/readText below.
 
 /** Read a stored object, optionally a byte range ({ offset, length }). Returns an R2ObjectBody or null. */
 export async function getBlob(env, key, range) {
@@ -32,3 +31,15 @@ export async function deleteBlob(env, key) {
   return env.BLOBS.delete(key);
 }
 
+
+// Text bodies stored inline in D1 (revisions.body, comments.body). Every JS write passes the plaintext through
+// storeText before binding it, and every JS read passes the column through readText. Identity until per-workspace
+// encryption lands; then storeText encrypts (and sets a key_version column) and readText decrypts. Bodies also read
+// inside SQL (search index, chunked reads, publisher batch copies, owner LIKE filter) are listed in
+// docs/encryption.md; test/content-store.test.mjs keeps the JS paths on these two functions.
+export function storeText(text) {
+  return text;
+}
+export function readText(stored) {
+  return stored;
+}

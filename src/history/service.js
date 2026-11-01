@@ -1,3 +1,4 @@
+import { readText } from "../content-store.js";
 import { authorizeProject } from "../auth.js";
 import { db, loadArtifact, updateMetadata } from "../service.js";
 import { CHANGE_NOTE_MAX, HttpError, int, nowIso, randomId } from "../util.js";
@@ -163,7 +164,7 @@ async function diffRevisions(ctx, projectId, artifactId, fromQ, toQ) {
   if (A.blob_key || B.blob_key || typeof A.body !== "string" || typeof B.body !== "string")
     return { from: side(A), to: side(B), binary: true, identical: A.sha256 === B.sha256 };
   if (A.sha256 === B.sha256) return { from: side(A), to: side(B), binary: false, identical: true, added: 0, removed: 0, hunks: [], truncated: false };
-  return { from: side(A), to: side(B), binary: false, identical: false, ...lineDiff(A.body, B.body) };
+  return { from: side(A), to: side(B), binary: false, identical: false, ...lineDiff(readText(A.body), readText(B.body)) };
 }
 // ---------- metadata versions ----------
 // The first metadata change after 0010 records the prior state as a baseline row (author: whoever created the

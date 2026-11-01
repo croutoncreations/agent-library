@@ -1,6 +1,6 @@
 # Version history
 
-Status: implemented. Build step `build-history-fixes.mjs`, migration `0010_version_history.sql`, sources in `src/history/`, tests in `test/version-history.test.mjs`.
+Status: implemented. Sources in `src/history/`, migration `0010_version_history.sql`, tests in `test/version-history.test.mjs`.
 
 ## Goal
 

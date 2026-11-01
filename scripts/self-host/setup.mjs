@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Offline only. No credentials, subprocesses, network, resource creation or deployment.
-// Stages the built Worker (dist/worker/index.js from `npm run build`; built here if missing).
-import { readFileSync, writeFileSync, mkdirSync, cpSync, existsSync } from 'node:fs';
+// Builds the Worker from src/ (dist/worker/index.js, deterministic and offline) and stages exactly that file.
+import { readFileSync, writeFileSync, mkdirSync, cpSync } from 'node:fs';
 import { buildWorker } from '../build.mjs';
 import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -63,7 +63,7 @@ async function main() {
   if (!opts.input) throw Error('--input is required');
   const v = validate(JSON.parse(readFileSync(resolve(opts.input), 'utf8')));
   const config = makeConfig(v);
-  if (!existsSync(BUILT)) await buildWorker({ outfile: BUILT });
+  await buildWorker({ outfile: BUILT });
   const bundle = selfHostBundle(readFileSync(BUILT, 'utf8'));
   const digest = createHash('sha256').update(bundle).digest('hex');
   if (opts.dryRun) { console.log(`Validated offline: DB/R2/KV bindings, two hosts, Access/OIDC; bucket privacy requires operator verification; bundle SHA-256 ${digest}. No files written.`); return; }
@@ -77,7 +77,7 @@ async function main() {
   writeFileSync(join(out, 'wrangler.json'), JSON.stringify(config, null, 2) + '\n', { mode: 0o600 });
   for (const file of ['LICENSE', 'THIRD_PARTY_NOTICES.md']) cpSync(join(root, file), join(out, file));
   const release = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
-  writeFileSync(join(out, 'manifest.json'), JSON.stringify({ version: release.version, license: release.license, bundleSha256: digest, sourceSha256: digest }, null, 2) + '\n');
+  writeFileSync(join(out, 'manifest.json'), JSON.stringify({ version: release.version, license: release.license, bundleSha256: digest }, null, 2) + '\n');
   console.log(`Staged offline in ${out}. See docs/self-hosting.md for explicit migration, secret and deployment commands. Nothing was provisioned or deployed.`);
 }
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

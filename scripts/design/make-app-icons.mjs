@@ -6,7 +6,7 @@
 //   maskable + Apple touch icon: opaque white tile (launchers/iOS crop or matte these), mark inside the safe zone
 // Usage: node scripts/design/make-app-icons.mjs <fold-mark-full.png> <out-dir>
 // fold-mark-full.png is not committed: regenerate it with extract-logo.mjs from the approved design export. The
-// committed outputs are pinned by hash (icon-fixes-preservation.json), so CI never needs to rerun this script.
+// committed outputs (src/pwa-icons.js, src/web/brand/) are checked by test/design-shell.test.mjs, so CI never reruns this script.
 import { createRequire } from "node:module";
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";

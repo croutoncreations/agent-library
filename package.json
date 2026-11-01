@@ -30,7 +30,7 @@
   },
   "scripts": {
     "build": "node scripts/build.mjs",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && node scripts/check-names.mjs",
     "fixtures": "node test/make-fixtures.mjs",
     "test": "node --test --test-concurrency=1 test/*.test.mjs",
     "test:deploy": "node --test test/deploy-guards.test.mjs test/migrations-order.test.mjs",
@@ -42,7 +42,7 @@
     "test:self-host": "node --test test/self-host.test.mjs",
     "check:editor": "npm run check --prefix editor",
     "check:self-host-upload": "node scripts/self-host/check-upload.mjs",
-    "dev": "wrangler dev --config wrangler.local.toml --local"
+    "dev": "node scripts/build.mjs && wrangler dev --config wrangler.local.toml --local"
   },
   "dependencies": {
     "@cloudflare/workers-oauth-provider": "1.2.1"

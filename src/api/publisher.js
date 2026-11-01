@@ -1,3 +1,4 @@
+import { readText, storeText } from "../content-store.js";
 import { authzSql, limitsFor, rateLimit } from "../auth.js";
 import { CONTENT_TYPE, MIME, byteLength, checkFile } from "../formats.js";
 import { appOrigin, artifactWebUrl, previewWebUrl } from "../links.js";
@@ -755,7 +756,7 @@ async function commitSnapshot(env, p, req, requestId) {
       stmts.push(env.DB.prepare(`UPDATE artifacts SET head_rev = ?, head_revision_id = ?, updated_at = ? WHERE id = ? AND head_rev = ? AND trashed_at IS NULL AND ${gate}`).bind(nextRev, revId, now, artId, ex.head_rev, ...gp));
     }
     stmts.push(env.DB.prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, size, sha256, mime, created_at, via_kind, via_id, via_label)
-      SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'publisher', ?, ? WHERE ${gate} AND EXISTS (SELECT 1 FROM artifacts WHERE id = ? AND head_revision_id = ?)`).bind(revId, artId, p.project_id, nextRev, p.principal_id, content, size, sha, MIME[kind], now, p.id, String(p.display_name ?? "").slice(0, 120) || null, ...gp, artId, revId));
+      SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'publisher', ?, ? WHERE ${gate} AND EXISTS (SELECT 1 FROM artifacts WHERE id = ? AND head_revision_id = ?)`).bind(revId, artId, p.project_id, nextRev, p.principal_id, storeText(content), size, sha, MIME[kind], now, p.id, String(p.display_name ?? "").slice(0, 120) || null, ...gp, artId, revId));
     return { artId, nextRev };
   };
   for (const c of checked) {
@@ -885,7 +886,7 @@ async function route(req, env, p, requestId) {
     const revNo = revQ !== null ? int(Number(revQ), "revision", 1) : a.head_rev;
     const r = await env.DB.prepare("SELECT body, mime, sha256 FROM revisions WHERE artifact_id = ? AND rev_no = ?").bind(a.id, revNo).first();
     if (!r) throw new HttpError(404, "not_found", "File not found");
-    const bytes = new TextEncoder().encode(r.body);
+    const bytes = new TextEncoder().encode(readText(r.body));
     return new Response(m === "HEAD" ? null : bytes, { status: 200, headers: {
       "content-type": CONTENT_TYPE[r.mime] ?? r.mime,
       "content-length": String(bytes.length),

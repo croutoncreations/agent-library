@@ -1,4 +1,4 @@
-import { getBlob, putBlob } from "./content-store.js";
+import { getBlob, putBlob, readText, storeText } from "./content-store.js";
 import { requireHuman } from "./auth.js";
 import { tplDate } from "./service.js";
 import { HttpError, int, nowIso, sha256Hex, str } from "./util.js";
@@ -41,8 +41,8 @@ async function exportBackup(ctx, projectId) {
     exported_at: nowIso(),
     project: { id: p.id, title: p.title, created_at: p.created_at },
     artifacts: arts.results,
-    revisions: revs.results,
-    comments: comments.results,
+    revisions: revs.results.map((r) => ({ ...r, body: r.body === null ? null : readText(r.body) })),
+    comments: comments.results.map((c) => ({ ...c, body: readText(c.body) })),
     meta_versions: metaVersionsExport,
     blobs
   };
@@ -93,12 +93,12 @@ async function restoreBackup(ctx, backup) {
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(a.id, pid, a.kind, a.title, a.folder, a.tags, a.head_rev, a.head_revision_id, a.meta_version, a.trashed_at, a.created_at, a.updated_at, a.is_template ?? 0, a.template_description ?? "", a.source_artifact_id ?? null, a.source_revision ?? null, a.source_role ?? null, a.template_date ?? null));
   for (const r of backup.revisions)
     stmts.push(DB.prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, blob_key, size, sha256, mime, restored_from, created_at, via_kind, via_id, via_label, client_info, change_note)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(r.id, r.artifact_id, pid, r.rev_no, r.author_id, r.body, r.blob_key, r.size, r.sha256, r.mime, r.restored_from, r.created_at, r.via_kind ?? null, r.via_id ?? null, r.via_label ?? null, r.client_info ?? null, r.change_note ?? null));
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(r.id, r.artifact_id, pid, r.rev_no, r.author_id, r.body === null ? null : storeText(r.body), r.blob_key, r.size, r.sha256, r.mime, r.restored_from, r.created_at, r.via_kind ?? null, r.via_id ?? null, r.via_label ?? null, r.client_info ?? null, r.change_note ?? null));
   for (const v of backup.meta_versions ?? [])
     stmts.push(DB.prepare(`INSERT INTO meta_versions (id, artifact_id, project_id, version, title, folder, tags, trashed, author_id, via_kind, via_id, via_label, client_info, change_note, restored_from, created_at, template_description)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(v.id, v.artifact_id, pid, v.version, v.title, v.folder, v.tags, v.trashed ? 1 : 0, v.author_id, v.via_kind ?? null, v.via_id ?? null, v.via_label ?? null, v.client_info ?? null, v.change_note ?? null, v.restored_from ?? null, v.created_at, v.template_description ?? ""));
   for (const c of backup.comments)
-    stmts.push(DB.prepare("INSERT INTO comments (id, project_id, artifact_id, rev_no, author_id, body, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(c.id, pid, c.artifact_id, c.rev_no, c.author_id, c.body, c.created_at));
+    stmts.push(DB.prepare("INSERT INTO comments (id, project_id, artifact_id, rev_no, author_id, body, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(c.id, pid, c.artifact_id, c.rev_no, c.author_id, storeText(c.body), c.created_at));
   stmts.push(DB.prepare("INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id) VALUES (?, ?, ?, 'backup.restore', ?, 'ok', ?)").bind(nowIso(), ctx.principal.id, pid, pid, ctx.requestId));
   await DB.batch(stmts);
   return { restored_project: pid, artifacts: backup.artifacts.length, revisions: backup.revisions.length, blobs: decoded.size, grants: 0 };

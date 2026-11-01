@@ -1,3 +1,4 @@
+import { readText, storeText } from "./content-store.js";
 import { authorizeProject, authzSql, contentWriteSql, protectSql, requireHuman } from "./auth.js";
 import { chQuery, cleanupChanges, listChanges } from "./changes/service.js";
 import { MEASUREMENTS, MIME, checkFile, isCalendarDate } from "./formats.js";
@@ -181,7 +182,7 @@ async function getArtifact(ctx, projectId, artifactId, revNo) {
   return {
     artifact: { ...artifactView(a, appConnectEnabled(ctx.env)), ...await tplProvenance(ctx, projectId, a) },
     revision: { rev: rev.rev_no, id: rev.id, size: rev.size, sha256: rev.sha256, mime: rev.mime, created_at: rev.created_at, author_id: rev.author_id },
-    ...a.kind === "markdown" || a.kind === "html" ? { body: rev.body } : a.kind === "json" || a.kind === "csv" ? { content: rev.body, content_url: `/api/projects/${projectId}/artifacts/${artifactId}/content?rev=${rev.rev_no}` } : { content_url: `/api/projects/${projectId}/artifacts/${artifactId}/content?rev=${rev.rev_no}` }
+    ...a.kind === "markdown" || a.kind === "html" ? { body: readText(rev.body) } : a.kind === "json" || a.kind === "csv" ? { content: readText(rev.body), content_url: `/api/projects/${projectId}/artifacts/${artifactId}/content?rev=${rev.rev_no}` } : { content_url: `/api/projects/${projectId}/artifacts/${artifactId}/content?rev=${rev.rev_no}` }
   };
 }
 async function history(ctx, projectId, artifactId, opts = {}) {
@@ -244,7 +245,7 @@ async function createMarkdown(ctx, projectId, input, key, kind = "markdown") {
       SELECT ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ? WHERE ${az.sql}
         AND (? IS NULL OR EXISTS (SELECT 1 FROM folders WHERE id = ? AND project_id = ?))`).bind(artId, projectId, kind, title, folder, folderId, schema, revId, now, now, ...az.params, folderId, folderId, projectId),
     db(ctx).prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, size, sha256, mime, created_at, via_kind, via_id, via_label, client_info, change_note)
-      SELECT ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM artifacts WHERE id = ?)`).bind(revId, artId, projectId, ctx.principal.id, body2, new TextEncoder().encode(body2).length, sha2, mime, now, ...provenance(ctx, input), artId),
+      SELECT ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM artifacts WHERE id = ?)`).bind(revId, artId, projectId, ctx.principal.id, storeText(body2), new TextEncoder().encode(body2).length, sha2, mime, now, ...provenance(ctx, input), artId),
     audit(ctx, projectId, "artifact.create", artId, 1, "ok", "EXISTS (SELECT 1 FROM artifacts WHERE id = ?)", [artId])
   ], i);
   if (!Array.isArray(out2)) return out2;
@@ -269,7 +270,7 @@ async function publishRevision(ctx, projectId, artifactId, expected, i, rev, ext
       projectId,
       next,
       ctx.principal.id,
-      rev.body ?? null,
+      rev.body === void 0 || rev.body === null ? null : storeText(rev.body),
       rev.blobKey ?? null,
       rev.size,
       rev.sha256,
@@ -366,7 +367,7 @@ async function restoreRevision(ctx, projectId, artifactId, input, key) {
     artifactId,
     expected,
     i,
-    { body: old.body ?? void 0, blobKey: old.blob_key ?? void 0, size: old.size, sha256: old.sha256, mime: old.mime, restoredFrom: from, change_note: input.change_note ?? "Restored version " + from },
+    { body: old.body === null || old.body === void 0 ? void 0 : readText(old.body), blobKey: old.blob_key ?? void 0, size: old.size, sha256: old.sha256, mime: old.mime, restoredFrom: from, change_note: input.change_note ?? "Restored version " + from },
     [],
     "artifact.restore_revision"
   );
@@ -489,7 +490,7 @@ async function readRecords(ctx, projectId, artifactId, q) {
   const metric = q.metric ?? null;
   const limit = q.limit === void 0 || q.limit === null || q.limit === "" ? 100 : int(Number(q.limit), "limit", 1, 500);
   const offset = q.cursor ? int(Number(q.cursor), "cursor", 0, 1e7) : 0;
-  const all = JSON.parse(rev.body).records;
+  const all = JSON.parse(readText(rev.body)).records;
   let undated = 0;
   const ranged = from !== null || to !== null;
   const hits = [];
@@ -530,7 +531,7 @@ async function addComment(ctx, projectId, artifactId, input, key) {
   const body2 = { comment_id: id, revision: rev };
   const out2 = await runBatch(ctx, [
     db(ctx).prepare(`INSERT INTO comments (id, project_id, artifact_id, rev_no, author_id, body, created_at)
-      SELECT ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM revisions WHERE artifact_id = ? AND project_id = ? AND rev_no = ?) AND ${az.sql}`).bind(id, projectId, artifactId, rev, ctx.principal.id, text, nowIso(), artifactId, projectId, rev, ...az.params),
+      SELECT ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM revisions WHERE artifact_id = ? AND project_id = ? AND rev_no = ?) AND ${az.sql}`).bind(id, projectId, artifactId, rev, ctx.principal.id, storeText(text), nowIso(), artifactId, projectId, rev, ...az.params),
     idemInsert(ctx, i, 201, body2, gate, [id]),
     audit(ctx, projectId, "comment.add", artifactId, rev, "ok", gate, [id])
   ], i);
@@ -545,7 +546,7 @@ async function listComments(ctx, projectId, artifactId) {
     `SELECT c.id, c.rev_no AS revision, c.body, c.created_at, p.label AS author FROM comments c JOIN principals p ON p.id = c.author_id
      WHERE c.artifact_id = ? AND c.project_id = ? ORDER BY c.created_at LIMIT 200`
   ).bind(artifactId, projectId).all();
-  return { comments: r.results };
+  return { comments: r.results.map((c) => ({ ...c, body: readText(c.body) })) };
 }
 async function listAudit(ctx, projectId) {
   requireHuman(ctx);

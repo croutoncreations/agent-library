@@ -32,7 +32,7 @@ Workflows run on GitHub's `ubuntu-24.04` unless you set the repository variable 
    They must describe the same installation. Check from an app checkout with both files copied in (both are gitignored there):
    ```sh
    npm run test:deploy           # includes "own wrangler.toml matches deploy/production.json"
-   npm run check:deploy-config   # offline wrangler --dry-run uploads exactly src/index.js with your bindings
+   npm run check:deploy-config   # builds dist/worker/index.js; offline wrangler --dry-run uploads exactly it with your bindings
    ```
    `baseline` in `deploy/production.json` is the Worker version that's live before the pipeline's first deploy (`npx wrangler deployments status --env hosted`). The pipeline only deploys over that version or over versions it deployed itself.
 3. **Cloudflare API token.** Create a custom token scoped to your account and zone with these permissions:

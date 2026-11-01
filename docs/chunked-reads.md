@@ -1,6 +1,6 @@
 # Chunked text reads
 
-Status: implemented. Build step `build-read-fixes.mjs` (after `build-app-connect-fixes.mjs`, before `build-file-tools-fixes.mjs`), sources in `src/reads/`, tests in `test/chunked-reads-unit.test.mjs`, `test/chunked-reads.test.mjs` and `test/oauth-chatgpt.test.mjs`. No migration.
+Status: implemented. Sources in `src/reads/`, tests in `test/chunked-reads-unit.test.mjs`, `test/chunked-reads.test.mjs` and `test/oauth-chatgpt.test.mjs`. No migration.
 
 ## Why
 

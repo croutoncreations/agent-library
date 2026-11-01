@@ -117,7 +117,7 @@ jobs:
         working-directory: app
         run: npm ci --no-audit --no-fund --ignore-scripts
 
-      - name: Offline config check (upload == committed bundle, bindings match)
+      - name: Offline config check (build, upload == built Worker, bindings match)
         working-directory: app
         run: npm run -s test:deploy && npm run -s check:deploy-config
 
