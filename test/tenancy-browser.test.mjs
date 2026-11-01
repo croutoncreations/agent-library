@@ -49,15 +49,28 @@ test("owner creates a workspace and invites; invitee joins through the link; rol
   await alice.select("select[aria-label='Role']", "viewer");
   await (await alice.waitForSelector("xpath/.//button[normalize-space()='Create invitation']")).click();
   const link = await (await alice.waitForSelector("input[aria-label='Invitation link']")).evaluate((el) => el.value);
-  assert.match(link, new RegExp(`^${APP}/#/invite/inv_`));
+  // A path, not a #fragment, so it survives a sign-in redirect.
+  assert.match(link, new RegExp(`^${APP}/invite/inv_`));
+  // The pending list refreshes while the link stays on screen.
+  await waitText(alice, /bob@example\.test[\s\S]*Viewer · expires/);
   await alice.screenshot({ path: "tmp/test-evidence/tenancy-owner-invite.png", fullPage: true });
 
-  const bob = await pageAs("bob");
-  await bob.goto(link); await bob.reload();
+  // Signed-out invitee: the link survives signing in (passphrase form here; Access is a server-side redirect to the
+  // same path), then shows the invitation. The token is never saved for resume.
+  const bobCtx = await browser.createBrowserContext();
+  const bob = await bobCtx.newPage();
+  await bob.setViewport({ width: 1280, height: 900 });
+  await bob.goto(link);
+  await bob.waitForSelector('input[name="passphrase"]');
+  assert.match(await bob.evaluate(() => location.hash), /^#\/invite\/inv_/);
+  await bob.evaluate(async (passphrase) => fetch("/auth/dev-login", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ passphrase, user: "bob" }) }), s.passphrase());
+  await bob.reload();
   await waitText(bob, /Join Synthetic Lab/);
+  assert.match(await text(bob), /Alice invited you as Viewer/);
   assert.doesNotMatch(await text(bob), /\bnull\b/);
   await (await bob.waitForSelector("xpath/.//button[normalize-space()='Join Synthetic Lab']")).click();
   await waitText(bob, /Your role: Viewer/);
+  assert.equal(await bob.evaluate(() => Object.keys(localStorage).some((k) => /invite/.test(localStorage.getItem(k) || ""))), false, "invite token never stored");
   const t = await text(bob);
   assert.doesNotMatch(t, /Invite someone|Delete workspace|Create invitation/i, "viewers see no admin controls");
   assert.match(t, /Leave/);
@@ -77,10 +90,24 @@ test("owner creates a workspace and invites; invitee joins through the link; rol
   });
   await alice.goto(APP + "/#/projects"); await alice.reload();
   await waitText(alice, /Lab notes/);
-  const heads = await alice.$$eval(".list li.group-head", (els) => els.map((e) => e.textContent));
+  const heads = await alice.$$eval(".ws-group h2", (els) => els.map((e) => e.textContent));
   assert.deepEqual(heads.map((x) => x.toLowerCase()), ["personal", "synthetic lab"]);
+  // Role changes are a pending choice: arrowing through the menu changes nothing until Save role (and owner/admin asks).
+  await alice.goto(APP + "/#/workspaces"); await alice.reload();
+  await (await alice.waitForSelector("xpath/.//a[normalize-space()='Synthetic Lab']")).click();
+  const sel = await alice.waitForSelector("select[aria-label='Role for Bob']");
+  await sel.focus(); await alice.keyboard.press("ArrowDown"); await alice.keyboard.press("ArrowDown");
+  await new Promise((r) => setTimeout(r, 500));
+  const roles = await alice.evaluate(async () => (await (await fetch(location.pathname.replace(/.*/, "/api/workspaces/") + location.hash.split("/")[2] + "/members")).json()).members.map((m) => m.role));
+  assert.deepEqual(roles, ["owner", "viewer"], "no role saved without Save role");
   // Bob (viewer) sees the lab project marked view-only and can't create projects anywhere but his personal workspace.
   await bob.goto(APP + "/#/projects"); await bob.reload();
   await waitText(bob, /Lab notes/);
   assert.match(await text(bob), /View only/);
+  // In the project, a viewer gets no New document / Upload and a view-only note instead.
+  await (await bob.waitForSelector("xpath/.//a[normalize-space()='Lab notes']")).click();
+  await waitText(bob, /view-only access/);
+  assert.equal(await bob.$("xpath/.//button[contains(., 'New document')]"), null);
+  assert.equal(await bob.$("xpath/.//button[contains(., 'Upload')]"), null);
+  await bob.screenshot({ path: "tmp/test-evidence/tenancy-viewer-project.png", fullPage: true });
 });

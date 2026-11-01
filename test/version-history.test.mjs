@@ -356,7 +356,7 @@ test("browser: History shows who/why, groups autosave bursts, compares, restores
     await page.setViewport({ width: 1280, height: 900 });
     await page.goto(APP + "/"); await page.waitForSelector('input[name="passphrase"]');
     await page.type('input[name="passphrase"]', s.passphrase());
-    await Promise.all([page.waitForFunction(() => document.querySelectorAll("#nav a").length === 4), page.click('button[type="submit"]')]);
+    await Promise.all([page.waitForFunction(() => document.querySelectorAll("#nav a").length === 5), page.click('button[type="submit"]')]);
     await page.goto(`${APP}/p/${P}/a/${id}`);
     await page.waitForFunction(() => [...document.querySelectorAll("[role=tab]")].some((t) => t.textContent.trim() === "History"));
     await page.evaluate(() => [...document.querySelectorAll("[role=tab]")].find((t) => t.textContent.trim() === "History").click());

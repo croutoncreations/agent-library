@@ -46,7 +46,7 @@ before(async () => {
   await page.goto(ORIGIN + "/");
   await page.waitForSelector('input[name="passphrase"]');
   await page.type('input[name="passphrase"]', s.passphrase());
-  await Promise.all([page.waitForFunction(() => document.querySelectorAll("#nav a").length === 4), page.click('button[type="submit"]')]);
+  await Promise.all([page.waitForFunction(() => document.querySelectorAll("#nav a").length === 5), page.click('button[type="submit"]')]);
 });
 after(async () => { await browser?.close(); await s?.stop(); });
 

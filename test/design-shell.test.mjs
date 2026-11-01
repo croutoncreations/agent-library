@@ -31,21 +31,21 @@ before(async () => {
   assert.equal(await page.evaluate(() => document.body.classList.contains("signed-out")), true, "no app navigation before sign-in");
   assert.equal(await page.$$eval("#nav a", (a) => a.length), 0);
   await page.type('input[name="passphrase"]', s.passphrase());
-  await Promise.all([page.waitForFunction(() => document.querySelectorAll("#nav a").length === 4), page.click('button[type="submit"]')]);
+  await Promise.all([page.waitForFunction(() => document.querySelectorAll("#nav a").length === 5), page.click('button[type="submit"]')]);
 });
 after(async () => { await browser?.close(); await s?.stop(); });
 
 const current = () => page.evaluate(() => [...document.querySelectorAll("#nav a[aria-current=page]")].map((a) => a.dataset.nav));
 
-test("primary navigation marks exactly the current section (home, projects, project, connections, settings)", { skip: !haveChrome && "Chrome not installed" }, async () => {
+test("primary navigation marks exactly the current section (home, projects, project, workspaces, connections, settings)", { skip: !haveChrome && "Chrome not installed" }, async () => {
   for (const [hash, want, wait] of [["#/", "home", "First doc"], ["#/projects", "projects", "Alpha notes"], ["#/p/alpha", "projects", "First doc"],
-    ["#/settings/apps", "connections", "Reader apps"], ["#/settings/api-keys", "connections", "API keys"], ["#/settings/device", "settings", "Storage limit"]]) {
+    ["#/settings/apps", "connections", "Reader apps"], ["#/settings/api-keys", "connections", "API keys"], ["#/workspaces", "workspaces", "Personal"], ["#/settings/device", "settings", "Storage limit"]]) {
     await page.goto(ORIGIN + "/" + hash); await page.waitForFunction((w) => document.body.innerText.includes(w), {}, wait);
     assert.deepEqual(await current(), [want], hash);
   }
   // Accessible name = visible text (WCAG 2.5.3): no aria-label overriding it.
   const names = await page.$$eval("#nav a", (a) => a.map((x) => [x.getAttribute("aria-label"), x.innerText.trim()]));
-  assert.deepEqual(names, [[null, "Home"], [null, "Projects"], [null, "Connections"], [null, "Settings"]]);
+  assert.deepEqual(names, [[null, "Home"], [null, "Projects"], [null, "Workspaces"], [null, "Connections"], [null, "Settings"]]);
 });
 
 test("brand: the approved Fold mark renders in the sidebar and mobile header (exact original crop, not the fallback tile)", { skip: !haveChrome && "Chrome not installed" }, async () => {
@@ -134,7 +134,7 @@ test("project list: whole-row link without nested controls; distinct empty, no-m
   await page.waitForFunction(() => document.body.innerText.includes("Alpha notes"));
 });
 
-test("mobile: bottom tab bar with four labelled 44px+ destinations; no horizontal overflow at 390 or 320", { skip: !haveChrome && "Chrome not installed" }, async () => {
+test("mobile: bottom tab bar with five labelled 44px+ destinations (Workspaces on multi-user installations); no horizontal overflow at 390 or 320", { skip: !haveChrome && "Chrome not installed" }, async () => {
   for (const width of [390, 320]) {
     await page.setViewport({ width, height: 760, isMobile: true, hasTouch: true });
     for (const hash of ["#/", "#/projects", "#/p/alpha", "#/settings/apps"]) {
@@ -144,7 +144,7 @@ test("mobile: bottom tab bar with four labelled 44px+ destinations; no horizonta
         tabs: [...document.querySelectorAll("#nav a")].map((a) => { const r = a.getBoundingClientRect(); return [Math.round(r.height), r.bottom <= innerHeight + 1]; }) }));
       assert.ok(m.over <= 0, `${width} ${hash} overflows by ${m.over}px`);
       assert.equal(m.pos, "fixed");
-      assert.equal(m.tabs.length, 4);
+      assert.equal(m.tabs.length, 5);
       assert.ok(m.tabs.every(([hgt, inView]) => hgt >= 44 && inView), JSON.stringify(m.tabs));
     }
   }
@@ -216,7 +216,7 @@ test("home: switching filters does not refetch; a return visit shows this tab's 
     await p.setViewport({ width: 1440, height: 900 });
     await p.goto(ORIGIN + "/"); await p.waitForSelector('input[name="passphrase"]');
     await p.type('input[name="passphrase"]', s.passphrase());
-    await Promise.all([p.waitForFunction(() => document.querySelectorAll("#nav a").length === 4), p.click('button[type="submit"]')]);
+    await Promise.all([p.waitForFunction(() => document.querySelectorAll("#nav a").length === 5), p.click('button[type="submit"]')]);
     await p.goto(ORIGIN + "/#/"); await p.waitForFunction(() => document.body.innerText.includes("First doc"));
     await p.waitForFunction(() => Object.keys(sessionStorage).some((k) => k.startsWith("al:homecache:")));
     const fetched = []; p.on("request", (r) => { if (new URL(r.url()).pathname.startsWith("/api/projects")) fetched.push(r.url()); });

@@ -102,6 +102,17 @@ test("hosted boot signs in through Access, never with the loopback passphrase fo
   assert.equal(await page.$('input[name="passphrase"]'), null);
 });
 
+test("single-owner installation behind Access: no Workspaces section, and the API refuses shared workspaces", { skip }, async () => {
+  await openHome();
+  assert.deepEqual(await page.$$eval("#nav a", (as) => as.map((a) => a.dataset.nav)), ["home", "projects", "connections", "settings"]);
+  const r = await page.evaluate(async () => {
+    const me = await (await fetch("/api/me")).json();
+    const c = await fetch("/api/workspaces", { method: "POST", headers: { "content-type": "application/json", "x-csrf-token": me.csrf }, body: JSON.stringify({ name: "Team" }) });
+    return { multi: me.multi_user, status: c.status, code: (await c.json()).error.code };
+  });
+  assert.deepEqual(r, { multi: false, status: 403, code: "single_user" });
+});
+
 test("app session ended, Access still signed in: requests renew it in place (no reload, no sign-in screen)", { skip }, async () => {
   await openHome();
   endAppSessions();

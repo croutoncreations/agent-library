@@ -5,6 +5,16 @@ import { ROLES, ROLE_RANK, requireWorkspaceRole, workspaceRoleSql } from "./tena
 import { HttpError, nowIso, nowMs, randomId, sha256Hex, str } from "./util.js";
 
 export const INVITE_DAYS = 14;
+/**
+ * Can more than one person sign in? A self-hosted installation behind Cloudflare Access admits only OWNER_EMAIL
+ * (src/access.js), so shared workspaces and invitations would never work there: the UI hides them and the API
+ * refuses to create them. Hosted sets MULTI_USER=1 (with its own identity provider); local dev is multi-user.
+ */
+export function multiUser(env) {
+  if (env.MULTI_USER === "1") return true;
+  if (env.MULTI_USER === "0") return false;
+  return !(env.ACCESS_TEAM_DOMAIN || env.ACCESS_AUD);
+}
 const EMAIL = /^[^\s@<>"',;]{1,64}@[A-Za-z0-9.-]{1,190}\.[A-Za-z]{2,24}$/;
 
 function wsAudit(env, ctx, workspaceId, action, objectId, result, gate = "", gateParams = []) {
@@ -36,7 +46,7 @@ export async function listWorkspaces(ctx) {
 
 export async function createWorkspace(ctx, input) {
   requireHuman(ctx);
-  if (ctx.env.WORKSPACE_CREATION === "off") throw new HttpError(403, "forbidden", "Creating workspaces is turned off on this installation");
+  if (!multiUser(ctx.env)) throw new HttpError(403, "single_user", "This installation has a single user; shared workspaces aren't available");
   const name = wsName(input?.name);
   const id = randomId("wsp", 12), at = nowIso();
   await ctx.env.DB.batch([
@@ -144,6 +154,7 @@ export async function removeMember(ctx, id, principalId) {
 
 export async function createInvite(ctx, id, input, origin) {
   requireHuman(ctx);
+  if (!multiUser(ctx.env)) throw new HttpError(403, "single_user", "This installation has a single user; invitations aren't available");
   const me = await requireWorkspaceRole(ctx, id, "admin");
   if (me.personal) throw new HttpError(409, "personal_workspace", "Create a shared workspace to invite people");
   const email = str(input?.email, "email", 254, { min: 3 }).trim().toLowerCase();
@@ -155,16 +166,19 @@ export async function createInvite(ctx, id, input, origin) {
   ).bind(id, email).first();
   if (already) throw new HttpError(409, "already_member", "That person is already a member");
   const token = randomId("inv", 32), inviteId = randomId("inv", 12), expires = nowMs() + INVITE_DAYS * 864e5;
-  const [ins] = await ctx.env.DB.batch([
+  const [, ins] = await ctx.env.DB.batch([
+    // A new invitation for the same address replaces any pending one (its link stops working).
+    ctx.env.DB.prepare(`UPDATE workspace_invites AS wi SET revoked_at = ? WHERE wi.workspace_id = ? AND wi.email = ? AND wi.accepted_at IS NULL AND wi.revoked_at IS NULL
+        AND ${workspaceRoleSql("wi.workspace_id", "admin")}`).bind(nowMs(), id, email, ctx.principal.id),
     ctx.env.DB.prepare(`INSERT INTO workspace_invites (id, workspace_id, email, role, token_hash, invited_by, created_at, expires_at)
         SELECT ?, ?, ?, ?, ?, ?, ?, ? WHERE ${workspaceRoleSql("?", r === "admin" ? "owner" : "admin")}`)
       .bind(inviteId, id, email, r, await sha256Hex(token), ctx.principal.id, nowIso(), expires, ctx.principal.id, id),
     wsAudit(ctx.env, ctx, id, "invite.create", inviteId, `ok:${r}`, "changes() = 1")
   ]);
   if (!ins.meta.changes) throw new HttpError(403, "forbidden", "Needs the admin role in this workspace");
-  // The link is returned once. The token is in the URL fragment, so it never reaches servers or logs. Hosted delivery
-  // emails it; self-host shows it to copy.
-  return { id: inviteId, email, role: r, expires_at: new Date(expires).toISOString(), accept_url: `${origin}/#/invite/${token}` };
+  // The link is returned once. It is a path (not a #fragment) so it survives a sign-in redirect; the token alone
+  // grants nothing (signed-in, verified matching email, single use, <= 14 days). Hosted delivery emails it.
+  return { id: inviteId, email, role: r, expires_at: new Date(expires).toISOString(), accept_url: `${origin}/invite/${token}` };
 }
 
 export async function revokeInvite(ctx, id, inviteId) {
@@ -183,9 +197,13 @@ export async function revokeInvite(ctx, id, inviteId) {
 export async function previewInvite(ctx, input) {
   requireHuman(ctx);
   const inv = await findInvite(ctx, input);
-  const ws = await ctx.env.DB.prepare("SELECT name FROM workspaces WHERE id = ?").bind(inv.workspace_id).first("name");
+  const row = await ctx.env.DB.prepare(
+    `SELECT w.name, p.label AS inviter, (SELECT role FROM workspace_members WHERE workspace_id = w.id AND principal_id = ?) AS my_role
+     FROM workspaces w LEFT JOIN principals p ON p.id = ? WHERE w.id = ?`
+  ).bind(ctx.principal.id, inv.invited_by, inv.workspace_id).first();
   const email = await myEmail(ctx);
-  return { workspace_name: ws, role: inv.role, email_matches: !!email && email === inv.email, signed_in_email: email };
+  return { workspace_id: inv.workspace_id, workspace_name: row.name, inviter: row.inviter, role: inv.role, already_role: row.my_role ?? null,
+    email_matches: !!email && email === inv.email, signed_in_email: email };
 }
 
 export async function acceptInvite(ctx, input) {
@@ -214,7 +232,8 @@ async function findInvite(ctx, input) {
   const inv = await ctx.env.DB.prepare(
     `SELECT i.*, w.status FROM workspace_invites i JOIN workspaces w ON w.id = i.workspace_id WHERE i.token_hash = ?`
   ).bind(await sha256Hex(token)).first();
-  if (!inv || inv.status !== "active") throw new HttpError(404, "not_found", "Invitation not found");
+  if (!inv) throw new HttpError(404, "not_found", "Invitation not found");
+  if (inv.status !== "active") throw new HttpError(410, "workspace_unavailable", "This workspace is no longer available");
   if (inv.revoked_at !== null || inv.accepted_at !== null || inv.expires_at <= nowMs()) throw new HttpError(410, "invite_used", "This invitation was already used, revoked or has expired");
   return inv;
 }

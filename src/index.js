@@ -14,7 +14,7 @@ import { listAccess, listConnections, revokeConnection, revokeConnectionById } f
 import { handleFileTransfer } from "./oauth/mcp.js";
 import { handleOAuthHost, originFor } from "./oauth/server.js";
 import { servePwa } from "./pwa.js";
-import { acceptInvite, createInvite, createWorkspace, deleteWorkspace, listMembers, listWorkspaces, previewInvite, removeMember, revokeInvite, setMemberRole, updateWorkspace } from "./workspaces.js";
+import { acceptInvite, createInvite, createWorkspace, deleteWorkspace, listMembers, listWorkspaces, multiUser, previewInvite, removeMember, revokeInvite, setMemberRole, updateWorkspace } from "./workspaces.js";
 import { __name } from "./runtime.js";
 import { IMAGE_TYPES, VIDEO_TYPES, addComment, appConnectEnabled, chQuery, cleanupChanges, createFile, createFolder, createFromTemplate, createGrant, createMarkdown, createProject, diffRevisions, getArtifact, history, listArtifacts, listAudit, listChanges, listComments, listFolders, listGrants, listProjects, listTemplates, metaHistory, previewTemplate, readRecords, readTextChunk, requireAppConnect, restoreMetadata, restoreRevision, rsQuery, rsReady, rtQuery, saveAsTemplate, saveFile, saveMarkdown, searchArtifacts, updateGrant, updateMetadata } from "./service.js";
 import { APP_CSS, APP_HTML, APP_JS } from "./ui.js";
@@ -110,7 +110,7 @@ async function accessLogin(req, env, url) {
 async function route3(req, env, url, requestId) {
   const path = url.pathname;
   const m = req.method;
-  if (m === "GET" && (path === "/" || path === "/index.html" || WEB_ROUTE.test(path))) return new Response(APP_HTML, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
+  if (m === "GET" && (path === "/" || path === "/index.html" || WEB_ROUTE.test(path) || /^\/invite\/inv_[A-Za-z0-9_-]{20,80}$/.test(path))) return new Response(APP_HTML, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
   if (m === "GET" && path === "/app.js") return new Response(APP_JS, { headers: { "content-type": "text/javascript; charset=utf-8", "cache-control": "no-store" } });
   if (m === "GET" && (path === "/manifest.webmanifest" || path === "/sw.js" || path.startsWith("/icons/"))) {
     const r = servePwa(path);
@@ -141,7 +141,7 @@ async function route3(req, env, url, requestId) {
   const seg = path.split("/").slice(2);
   if (seg[0] === "search" && seg[1] === "status" && seg.length === 2 && m === "GET") { requireHuman(ctx); return json({ready: await rsReady(env)}); }
   if (seg[0] === "search" && seg.length === 1 && m === "GET") { requireHuman(ctx); return json(await searchArtifacts(ctx, rsQuery(url.searchParams))); }
-  if (seg[0] === "me" && m === "GET") return json({ principal: ctx.principal, csrf: ctx.csrf ?? null, api_base: ctx.env.MCP_HOST ? originFor(ctx.env.MCP_HOST) + "/v1" : null });
+  if (seg[0] === "me" && m === "GET") return json({ principal: ctx.principal, csrf: ctx.csrf ?? null, api_base: ctx.env.MCP_HOST ? originFor(ctx.env.MCP_HOST) + "/v1" : null, multi_user: multiUser(ctx.env) });
   if (seg[0] === "logout" && m === "POST") {
     requireHuman(ctx);
     await env.DB.prepare("UPDATE sessions SET revoked_at = ? WHERE principal_id = ? AND revoked_at IS NULL").bind(nowMs(), ctx.principal.id).run();
