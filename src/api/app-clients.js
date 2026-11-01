@@ -3,7 +3,9 @@ import { memberRoleSql, personalWorkspaceId, requireWorkspaceRole, workspaceRole
 
 // App registrations belong to a workspace (default: the registrant's personal workspace). The registrant or an admin
 // of that workspace manages one (columns qualified: see KEY_MANAGER in credentials.js).
-var APP_MANAGER = `(c.owner_principal_id = ? OR ${workspaceRoleSql("COALESCE(c.workspace_id, 'wsp_' || c.owner_principal_id)", "admin")})`;
+// The registrant must still be a member of the app's (active) workspace: someone removed loses the app too.
+var APP_WS = "COALESCE(c.workspace_id, 'wsp_' || c.owner_principal_id)";
+var APP_MANAGER = `((c.owner_principal_id = ? AND ${workspaceRoleSql(APP_WS, "viewer")}) OR ${workspaceRoleSql(APP_WS, "admin")})`;
 import { _servers, originFor } from "../oauth/server.js";
 import { requireAppConnect } from "../service.js";
 import { HttpError, nowIso, nowMs, randomId, str } from "../util.js";
@@ -41,9 +43,9 @@ async function updateAppClient(ctx, id, input) {
   requireHuman(ctx);
   requireAppConnect(ctx);
   const sp = suggestion(input?.suggested_project, "suggested_project"), sf = suggestion(input?.suggested_folder, "suggested_folder");
-  const r = await ctx.env.DB.prepare(`UPDATE app_clients AS c SET suggested_project = ?, suggested_folder = ? WHERE c.id = ? AND ${APP_MANAGER}`).bind(sp, sf, id, ctx.principal.id, ctx.principal.id).run();
+  const r = await ctx.env.DB.prepare(`UPDATE app_clients AS c SET suggested_project = ?, suggested_folder = ? WHERE c.id = ? AND ${APP_MANAGER}`).bind(sp, sf, id, ctx.principal.id, ctx.principal.id, ctx.principal.id).run();
   if (!r.meta.changes) throw new HttpError(404, "not_found", "App not found");
-  await ctx.env.DB.prepare("INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id) VALUES (?, ?, NULL, 'app_client.update', ?, 'ok', ?)").bind(nowIso(), ctx.principal.id, id, ctx.requestId).run();
+  await ctx.env.DB.prepare("INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id, workspace_id) VALUES (?, ?, NULL, 'app_client.update', ?, 'ok', ?, (SELECT COALESCE(workspace_id, 'wsp_' || owner_principal_id) FROM app_clients WHERE id = ?))").bind(nowIso(), ctx.principal.id, id, ctx.requestId, id).run();
   return view(await ctx.env.DB.prepare("SELECT * FROM app_clients WHERE id = ?").bind(id).first());
 }
 async function registerAppClient(ctx, input) {
@@ -68,20 +70,21 @@ async function registerAppClient(ctx, input) {
   const id = randomId("apc", 12);
   await env.DB.batch([
     env.DB.prepare("INSERT INTO app_clients (id, owner_principal_id, client_id, display_name, redirect_uris, origins, created_at, suggested_project, suggested_folder, workspace_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(id, ctx.principal.id, client.clientId, display, JSON.stringify(redirects), JSON.stringify(origins), nowIso(), suggestedProject, suggestedFolder, ws.id),
-    env.DB.prepare("INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id) VALUES (?, ?, NULL, 'app_client.register', ?, 'ok', ?)").bind(nowIso(), ctx.principal.id, id, ctx.requestId)
+    env.DB.prepare("INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id, workspace_id) VALUES (?, ?, NULL, 'app_client.register', ?, 'ok', ?, ?)").bind(nowIso(), ctx.principal.id, id, ctx.requestId, ws.id)
   ]);
   return view(await env.DB.prepare("SELECT * FROM app_clients WHERE id = ?").bind(id).first());
 }
 async function listAppClients(ctx) {
   requireHuman(ctx);
   requireAppConnect(ctx);
-  const r = await ctx.env.DB.prepare(`SELECT c.* FROM app_clients c WHERE ${APP_MANAGER} ORDER BY c.created_at DESC LIMIT 100`).bind(ctx.principal.id, ctx.principal.id).all();
+  const r = await ctx.env.DB.prepare(`SELECT c.* FROM app_clients c WHERE ${APP_MANAGER} ORDER BY c.created_at DESC LIMIT 100`).bind(ctx.principal.id, ctx.principal.id, ctx.principal.id).all();
   // Publishers of these apps, plus any publisher connected into a project where I'm an admin or connected it myself.
   const pubs = await ctx.env.DB.prepare(
     `SELECT pb.id, pb.app_client_id, pb.project_id, pb.folder_id, pb.created_at, pb.revoked_at, pb.current_source_revision, pb.current_snapshot_id
-     FROM publishers pb WHERE pb.app_client_id IN (SELECT c.id FROM app_clients c WHERE ${APP_MANAGER})
+     FROM publishers pb WHERE (pb.app_client_id IN (SELECT c.id FROM app_clients c WHERE ${APP_MANAGER})
+         AND (COALESCE(pb.created_by, pb.owner_principal_id) = ? OR ${memberRoleSql("pb.project_id", "viewer")}))
        OR COALESCE(pb.created_by, pb.owner_principal_id) = ? OR ${memberRoleSql("pb.project_id", "admin")} ORDER BY pb.created_at DESC LIMIT 500`
-  ).bind(ctx.principal.id, ctx.principal.id, ctx.principal.id, ctx.principal.id).all();
+  ).bind(ctx.principal.id, ctx.principal.id, ctx.principal.id, ctx.principal.id, ctx.principal.id, ctx.principal.id, ctx.principal.id).all();
   const pv = (p) => ({
     publisher_id: p.id,
     project_id: p.project_id,
@@ -101,9 +104,9 @@ async function listAppClients(ctx) {
 async function disableAppClient(ctx, id) {
   requireHuman(ctx);
   requireAppConnect(ctx);
-  const r = await ctx.env.DB.prepare(`UPDATE app_clients AS c SET disabled_at = ? WHERE c.id = ? AND ${APP_MANAGER} AND c.disabled_at IS NULL`).bind(nowMs(), id, ctx.principal.id, ctx.principal.id).run();
+  const r = await ctx.env.DB.prepare(`UPDATE app_clients AS c SET disabled_at = ? WHERE c.id = ? AND (c.owner_principal_id = ? OR ${workspaceRoleSql(APP_WS, "admin")}) AND c.disabled_at IS NULL`).bind(nowMs(), id, ctx.principal.id, ctx.principal.id).run();
   if (!r.meta.changes) throw new HttpError(404, "not_found", "App not found or already disabled");
-  await ctx.env.DB.prepare("INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id) VALUES (?, ?, NULL, 'app_client.disable', ?, 'ok', ?)").bind(nowIso(), ctx.principal.id, id, ctx.requestId).run();
+  await ctx.env.DB.prepare("INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id, workspace_id) VALUES (?, ?, NULL, 'app_client.disable', ?, 'ok', ?, (SELECT COALESCE(workspace_id, 'wsp_' || owner_principal_id) FROM app_clients WHERE id = ?))").bind(nowIso(), ctx.principal.id, id, ctx.requestId, id).run();
   return { ok: true };
 }
 async function revokePublisher(ctx, id) {

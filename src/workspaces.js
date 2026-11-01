@@ -126,7 +126,11 @@ export async function setMemberRole(ctx, id, principalId, input) {
 export async function removeMember(ctx, id, principalId) {
   requireHuman(ctx);
   const self = principalId === ctx.principal.id;
-  const me = await requireWorkspaceRole(ctx, id, self ? "viewer" : "admin");
+  // Leaving works in a suspended workspace too (not while it is being deleted); removing others needs it active.
+  const me = self
+    ? await ctx.env.DB.prepare("SELECT w.id, w.personal, w.status, m.role FROM workspaces w JOIN workspace_members m ON m.workspace_id = w.id AND m.principal_id = ? WHERE w.id = ? AND w.status <> 'deleting'").bind(ctx.principal.id, id).first()
+    : await requireWorkspaceRole(ctx, id, "admin");
+  if (!me) throw new HttpError(404, "not_found", "Workspace not found");
   if (me.personal && self) throw new HttpError(409, "personal_workspace", "You can't leave your personal workspace");
   const cur = await ctx.env.DB.prepare("SELECT role FROM workspace_members WHERE workspace_id = ? AND principal_id = ?").bind(id, principalId).first("role");
   if (!cur) throw new HttpError(404, "not_found", "Member not found");
@@ -134,7 +138,7 @@ export async function removeMember(ctx, id, principalId) {
   const need = self ? "viewer" : cur === "owner" || cur === "admin" ? "owner" : "admin";
   const [r] = await ctx.env.DB.batch([
     ctx.env.DB.prepare(`DELETE FROM workspace_members AS wm WHERE wm.workspace_id = ? AND wm.principal_id = ? AND wm.role = ?
-        AND ${workspaceRoleSql("?", need)} AND ${OTHER_OWNER}`).bind(id, principalId, cur, ctx.principal.id, id, id, principalId),
+        AND ${self ? "wm.principal_id = ?" : workspaceRoleSql("?", need)} AND ${OTHER_OWNER}`).bind(id, principalId, cur, ctx.principal.id, ...self ? [] : [id], id, principalId),
     // Per-project caps go with the membership.
     ctx.env.DB.prepare(`DELETE FROM project_members WHERE principal_id = ? AND changes() = 1 AND project_id IN
         (SELECT id FROM projects WHERE COALESCE(workspace_id, 'wsp_' || owner_id) = ?)`).bind(principalId, id),

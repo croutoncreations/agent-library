@@ -4,6 +4,8 @@ import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { startAppConnectServer } from "./fixtures/app-connect-harness.mjs";
 import { SERVER_PORTS } from "./ports.mjs";
+import { execFileSync } from "node:child_process";
+import { ROOT, LOCAL_CONFIG } from "./helpers.mjs";
 
 let h, owner, bob, WS, ownerId, agent, pubApp, pub, OWN, BOBP;
 const ok = (r, status = 200) => { assert.equal(r.status, status, JSON.stringify(r.body)); return r.body; };
@@ -76,4 +78,27 @@ test("App Connect publisher follows its creator's role", async () => {
   ok(await bob.req("PATCH", `/api/workspaces/${WS}/members/${ownerId}`, { role: "viewer" }));
   const me = await h.pub(pub.access_token, "GET", "/publisher/me");
   assert.ok(me.status === 401 || me.status === 403, `publisher must stop when its creator can no longer write (got ${me.status})`);
+});
+
+test("consent: a new project goes only into an active workspace where the signer is admin", async () => {
+  // Make the owner an admin of Bob's workspace, so it is offered under "New projects go in".
+  ok(await bob.req("PATCH", `/api/workspaces/${WS}/members/${ownerId}`, { role: "admin" }));
+  let page = "";
+  const made = await h.connectMcpAgent({}, { clientName: "New in team", extra: { new_workspace: WS, new_title: "Made at consent", new_access: "write" }, onConsent: (html) => { page = html; } });
+  assert.match(page, /New projects go in/);
+  assert.match(page, /<h3 class="wsh" id="wsh-\d+">Bob&#39;s team|<h3 class="wsh" id="wsh-\d+">Bob's team/);
+  const created = ok(await bob.req("GET", "/api/projects")).projects.find((p) => p.title === "Made at consent");
+  assert.ok(created && created.workspace_id === WS, "created in the chosen workspace");
+  assert.equal((await made.call("list_projects", {})).isError, false);
+  // Suspended: the same choice is refused and nothing is created.
+  const sqlRun = (q) => execFileSync("wrangler", ["d1", "--config", LOCAL_CONFIG, "execute", "DB", "--local", "--persist-to", h.dir, "--command", q], { cwd: ROOT, stdio: "ignore" });
+  sqlRun(`UPDATE workspaces SET status = 'suspended' WHERE id = '${WS}'`);
+  try {
+    await assert.rejects(h.connectMcpAgent({}, { clientName: "Into suspended", extra: { new_workspace: WS, new_title: "Should not exist", new_access: "read" } }), /no interstitial redirect/);
+  } finally { sqlRun(`UPDATE workspaces SET status = 'active' WHERE id = '${WS}'`); }
+  assert.equal(ok(await bob.req("GET", "/api/projects")).projects.some((p) => p.title === "Should not exist"), false);
+  // A plain member can't pick the workspace either.
+  ok(await bob.req("PATCH", `/api/workspaces/${WS}/members/${ownerId}`, { role: "member" }));
+  await assert.rejects(h.connectMcpAgent({}, { clientName: "Member new", extra: { new_workspace: WS, new_title: "Member made", new_access: "read" } }), /no interstitial redirect/);
+  assert.equal(ok(await bob.req("GET", "/api/projects")).projects.some((p) => p.title === "Member made"), false);
 });

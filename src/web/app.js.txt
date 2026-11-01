@@ -394,6 +394,17 @@ async function ensureProjectAccess(pid) {
   try { noteProjects((await api("GET", "/api/projects")).projects); } catch (e) {}
   return projectAccess[pid] || null;
 }
+// Unsaved text from before access became view-only: readable, copyable, discardable; never saved.
+function unsavedDraftBox(text, onDiscard) {
+  var msg = h("p", { class: "msg", role: "status" });
+  var area = h("textarea", { class: "draft-text", readOnly: true, rows: 6, "aria-label": "Your unsaved text (not saved)" }); area.value = text;
+  var box = h("div", { class: "card unsaved-draft" }, h("strong", { text: "Your unsaved changes weren't saved" }),
+    h("p", { class: "muted small", text: "You now have view-only access. Copy your text to keep it." }), area,
+    h("div", { class: "row" },
+      h("button", { type: "button", onclick: function () { copyText(text, msg); } }, "Copy text"),
+      h("button", { type: "button", class: "secondary", onclick: function () { if (confirm("Discard your unsaved text?")) { onDiscard(); box.remove(); } } }, "Discard")), msg);
+  return box;
+}
 // For people with view-only access: remove write controls (marked data-write) and say why, once per view.
 function viewOnlyNote() {
   return h("div", { class: "callout view-only-note", role: "note" }, icon("alert"), h("div", null, "You have view-only access to this project. Ask a workspace admin if you need to edit."));
@@ -1323,7 +1334,7 @@ async function viewList(pid, trash) {
     var href = "#/p/" + enc(pid) + "/a/" + enc(a.id);
     var main = h("div", { class: "grow" }, trash ? h("span", { text: a.title }) : rowLink(href, a.title), info);
     var li = h("li", trash ? null : { class: "link" }, fileThumb(a, pid, trash), main, h("span", { class: "badge", text: a.is_template ? "Template" : kindLabel(a) }));
-    if (trash && canWrite(pid)) li.append(h("button", { type: "button", class: "secondary", onclick: async function (e) {
+    if (trash && canWrite(pid)) li.append(h("button", { type: "button", class: "secondary", "data-write": "", onclick: async function (e) {
       e.target.disabled = true;
       try { await api("PATCH", "/api/projects/" + enc(pid) + "/artifacts/" + enc(a.id), { expected_meta_version: a.meta_version, trashed: false }, { key: uuid() }); li.remove(); showMsg(msg, "Restored \"" + a.title + "\".", true); }
       catch (err) { showErr(msg, err); e.target.disabled = false; if (err.status === 409) load(true); }
@@ -1475,8 +1486,9 @@ async function viewList(pid, trash) {
   // Viewers: no create/upload controls. Known from the cached project list, or applied once it arrives.
   var knownAccess = projectAccess[pid];
   if (knownAccess && !knownAccess.can_write) { actions = null; panel = viewOnlyNote(); }
-  else if (!knownAccess && !trash) ensureProjectAccess(pid).then(function (acc) {
+  else if (!knownAccess) ensureProjectAccess(pid).then(function (acc) {
     if (!acc || acc.can_write || !app.contains(titleH1)) return;
+    app.querySelectorAll("[data-write]").forEach(function (el) { el.remove(); });
     (actions || []).forEach(function (b) { b.remove(); }); (Array.isArray(panel) ? panel : []).forEach(function (el) { el.remove(); });
     var ph = app.querySelector(".page-head"); if (ph) ph.after(viewOnlyNote());
     load(true);
@@ -1898,6 +1910,8 @@ async function viewArtifact(pid, aid, initialTab) {
   }
   if (!S.me || location.hash.indexOf(enc(aid)) < 0) return;
   // Access from the cached project list if known; otherwise it's applied when /api/projects arrives (applyReadOnly).
+  // The server says what this person may do with the document; otherwise fall back to the cached project list.
+  if (data.access) projectAccess[pid] = Object.assign({}, projectAccess[pid] || {}, data.access);
   var known = projectAccess[pid];
   var A = { pid: pid, aid: aid, base: base, meta: data.artifact, rev: data.revision.rev, alive: true, readOnly: !!known && !known.can_write };
   offTouch(pid, aid);
@@ -2103,7 +2117,7 @@ async function viewArtifact(pid, aid, initialTab) {
             h("span", { class: "grow" }, whoLine(m),
               h("span", { class: "meta", text: "“" + m.title + "”" + (m.folder ? " · " + m.folder : "") + (m.tags.length ? " · " + m.tags.join(", ") : "") + (m.trashed ? " · in trash" : "") + " · " + ago(m.created_at) }),
               note(m)),
-            cur ? h("span", { class: "badge accent", text: "current" }) : h("button", { type: "button", class: "secondary", onclick: function (e) { restoreMeta(m, e.currentTarget); } }, "Restore", h("span", { class: "sr", text: " title and tags from details version " + m.version }))));
+            cur ? h("span", { class: "badge accent", text: "current" }) : h("button", { type: "button", class: "secondary", "data-write": "", onclick: function (e) { restoreMeta(m, e.currentTarget); } }, "Restore", h("span", { class: "sr", text: " title and tags from details version " + m.version }))));
         });
         // Details history pages separately from content versions (its own cursor).
         if (metaCursor) list.append(h("li", { class: "vh-more-meta" }, moreMeta));
@@ -2156,7 +2170,7 @@ async function viewArtifact(pid, aid, initialTab) {
         h("span", { class: "icons" }, copyIcon("link", "Copy link to this version", function () { return link(n); })));
       var body = h("div", { class: "vh-body" });
       var actions = h("div", { class: "row" });
-      if (n !== A.rev && !A.readOnly) actions.append(h("button", { type: "button", onclick: function (e) { restoreRev(n, e.currentTarget); } }, "Restore this version"));
+      if (n !== A.rev && !A.readOnly) actions.append(h("button", { type: "button", "data-write": "", onclick: function (e) { restoreRev(n, e.currentTarget); } }, "Restore this version"));
       if (n > 1) actions.append(h("button", { type: "button", class: "secondary", onclick: function () { showDiff(n - 1, n, body); } }, "What changed in v" + n));
       if (n !== A.rev) actions.append(h("button", { type: "button", class: "secondary", onclick: function () { showDiff(n, A.rev, body); } }, "Compare with current"));
       if (isDataKind(A.meta.kind)) actions.append(h("button", { type: "button", class: "ghost", onclick: function () { body.replaceChildren(mediaFor(v.mime, base + "/content?rev=" + n, A.meta.title, "v" + n)); } }, "Preview v" + n));
@@ -2295,7 +2309,7 @@ async function viewArtifact(pid, aid, initialTab) {
         var li = h("li", null, h("strong", { text: "rev " + v.rev }),
           h("span", { class: "grow muted small", text: fmtDate(v.created_at) + " - " + fmtBytes(v.size) + " - " + (v.author_id || "") + (v.restored_from ? " - restored from rev " + v.restored_from : "") }),
           h("button", { type: "button", class: "secondary", onclick: function () { viewRev(v); } }, "View"));
-        if (v.rev !== A.rev) li.append(h("button", { type: "button", onclick: function () { restoreRev(v.rev); } }, "Restore as new revision"));
+        if (v.rev !== A.rev) li.append(h("button", { type: "button", "data-write": "", onclick: function () { restoreRev(v.rev); } }, "Restore as new revision"));
         else li.append(h("span", { class: "badge", text: "current" }));
         histList.append(li);
       });
@@ -2363,15 +2377,20 @@ async function viewArtifact(pid, aid, initialTab) {
   function applyReadOnly() {
     if (!A.alive) return;
     var onEdit = A.tab === "edit";
+    // Stop autosave first; unsaved text stays readable and copyable (A.stopEditing returns it, or null).
+    var unsaved = A.stopEditing ? A.stopEditing() : null;
     if (tabBtns.edit) { tabBtns.edit.remove(); panels.edit.remove(); delete tabBtns.edit; }
     details.remove(); comForm.remove();
     app.querySelectorAll(".footbar, [data-write]").forEach(function (el) { el.remove(); });
     var tb = app.querySelector(".titlebar"); if (tb && !app.querySelector(".view-only-note")) tb.after(viewOnlyNote());
-    if (onEdit) showTab("preview");
+    var note = app.querySelector(".view-only-note");
+    if (unsaved !== null && note) note.after(unsavedDraftBox(unsaved, function () { clearDraft(pid, aid); }));
+    if (onEdit) { showTab("preview"); if (tabBtns.preview) tabBtns.preview.focus(); }
   }
+  A.applyReadOnly = function () { if (!A.readOnly) { A.readOnly = true; applyReadOnly(); } };
   if (A.readOnly) applyReadOnly();
   showTab(wantV ? "history" : isTextDoc(A.meta.kind) && initialTab === "edit" && !A.readOnly ? "edit" : "preview");
-  if (!known) ensureProjectAccess(pid).then(function (acc) { if (acc && !acc.can_write && !A.readOnly) { A.readOnly = true; applyReadOnly(); } });
+  if (!known) ensureProjectAccess(pid).then(function (acc) { if (acc && !acc.can_write) A.applyReadOnly(); });
   resumeApply("artifact");
 }
 
@@ -2947,6 +2966,8 @@ function renderMarkdownEditor(A, data, ui) {
       D.saving = false;
       if (err.status === 409 && err.code === "revision_conflict") { D.attempt = null; enterConflict((err.data.error || {}).current_revision); return; }
       if (err.status === 401) return; // draft already persisted per keystroke under this principal's key
+      // Access changed (e.g. demoted to viewer): switch to view-only and keep the text copyable.
+      if (err.status === 403 && A.applyReadOnly) { persistDraft(att.body); A.applyReadOnly(); return; }
       if (err.status === 422) D.attempt = null;
       D.errCount++;
       var retry = err.status === 0 || err.status >= 500 || err.status === 429;
@@ -2962,6 +2983,15 @@ function renderMarkdownEditor(A, data, ui) {
     if (A.tab === "preview") loadPreview();
   }
   A.flush = function () { if (isDirty() && !D.conflict) return saveNow(); };
+  // View-only (now or later): no more saves. Returns unsaved text so the person can copy it, else null.
+  A.stopEditing = function () {
+    clearTimeout(D.timer); clearTimeout(D.retryTimer); D.conflict = D.conflict || { stopped: true }; ta.readOnly = true;
+    var dr = readDraft(pid, aid);
+    var text = isDirty() ? ta.value : dr && typeof dr.body === "string" && dr.body !== D.savedBody ? dr.body : null;
+    if (text === null) clearDraft(pid, aid);
+    A.isBusy = function () { return false; }; A.flush = function () {};
+    return text;
+  };
 
   // Conflict view: keeps local text, never auto-merges.
   async function enterConflict(currentRev, note) {
@@ -3089,6 +3119,7 @@ function renderMarkdownEditor(A, data, ui) {
 
   // Recover a local draft for this principal/project/artifact.
   var dr = readDraft(pid, aid);
+  if (A.readOnly) return; // view-only: the draft (if any) is offered for copying by applyReadOnly, never saved
   if (dr && typeof dr.body === "string" && dr.body !== data.body) {
     ta.value = dr.body;
     if (dr.base === A.rev) { setStatus("dirty", "Unsaved changes"); showBanner("Restored your unsaved local draft from " + fmtDate(dr.at) + "."); schedule(800); }

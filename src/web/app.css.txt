@@ -464,3 +464,10 @@ main > .tabs,main > nav.tabs{margin:16px 0 12px}
 .danger-zone .field{display:flex;flex-direction:column;align-items:stretch;gap:6px;font-size:14px;font-weight:600;width:100%;max-width:28rem}
 .field.grow{display:flex;flex-direction:column;align-items:stretch;gap:6px;flex:1 1 14rem;font-size:14px;font-weight:600}
 .card.row:has(> .field.grow){align-items:flex-end}
+
+/* Unsaved text kept for copying after access became view-only */
+.unsaved-draft{display:flex;flex-direction:column;gap:8px;margin:12px 0}
+.unsaved-draft p{margin:0}
+.unsaved-draft .draft-text{width:100%;min-height:6em;max-height:16em;resize:vertical;font:13px/1.5 ui-monospace,Menlo,monospace;padding:10px 12px;border:1px solid var(--line);border-radius:var(--r2,8px);background:var(--sunk,transparent);color:inherit}
+.unsaved-draft .row{display:flex;gap:8px;flex-wrap:wrap}
+.titlebar + .view-only-note{margin-top:12px}

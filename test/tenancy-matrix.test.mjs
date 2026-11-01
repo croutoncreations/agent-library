@@ -79,8 +79,11 @@ function readOps(kind, X, agent = cred.oauth) {
   ];
   throw new Error(kind);
 }
-const mcpCall = async (m, name, args) => { try { const r = await m.call(name, args); return { status: r.isError ? 404 : 200, text: JSON.stringify(r.data ?? {}) }; } catch (e) { return { status: e.code ?? 500, text: String(e.message) }; } };
-const oc = async (agent, name, args) => { const r = await agent.call(name, args); return { status: r.isError ? (r.status >= 400 ? r.status : 404) : 200, text: JSON.stringify(r.data ?? {}) }; };
+// MCP results map to the tool error's own HTTP status (error.status), never a blanket 404, so a validation error
+// can't pass for isolation. Transport-level refusals (401) keep their status.
+const toolStatus = (r) => !r.isError ? 200 : (r.data?.error?.status ?? r.data?.status ?? (r.status >= 400 ? r.status : 500));
+const mcpCall = async (m, name, args) => { try { const r = await m.call(name, args); return { status: toolStatus(r), text: JSON.stringify(r.data ?? {}) }; } catch (e) { return { status: e.code ?? 500, text: String(e.message) }; } };
+const oc = async (agent, name, args) => { const r = await agent.call(name, args); return { status: toolStatus(r), text: JSON.stringify(r.data ?? {}) }; };
 
 before(async () => {
   h = await startAppConnectServer({ port: SERVER_PORTS["tenancy-matrix"] });
@@ -140,25 +143,39 @@ test("other workspace: every read surface is 404 for every credential type, and 
     assert.equal(r.status, 404, `oauth ${label} on another workspace: ${r.text.slice(0, 200)}`);
     assert.doesNotMatch(r.text, /zebraAlpha/, `oauth ${label} leaked A`);
   }
-  // Search: across everything visible, and naming the other workspace's project explicitly.
-  for (const r of [
-    await session(bob, "GET", "/api/search?query=zebraBravo"),
-    await v1(cred.key, "GET", "/v1/search?query=zebraBravo"),
-    await v1(cred.key, "GET", `/v1/search?query=zebraBravo&project_ids=${B.project}`),
-    await oc(cred.oauth, "search_artifacts", { query: "zebraAlpha" }),
-    await oc(cred.oauth, "search_artifacts", { query: "zebraAlpha", project_ids: [A.project] }),
-  ]) assert.doesNotMatch(r.text, /zebraBravo|zebraAlpha.*(doc|one|two)/, `search leaked: ${r.text.slice(0, 200)}`);
-  // Project lists and connection info name only the credential's own workspace.
-  for (const r of [await v1(cred.key, "GET", "/v1/projects"), await v1(cred.key, "GET", "/v1/connection-info"), await api(cred.grant, "GET", "/api/projects"),
-    await mcpCall(cred.grantMcp, "list_projects", {}), await oc(cred.oauth, "list_projects", {}), await oc(cred.oauth, "connection_info", {})]) {
-    assert.ok(!r.text.includes(B.project) || !r.text.includes(A.project), `a project list spans workspaces: ${r.text.slice(0, 300)}`);
+  // Search: the own marker is found (search works), the other workspace's never appears, even when named.
+  const searches = [
+    ["session", (q) => session(bob, "GET", `/api/search?query=${q}`), "zebraAlpha", "zebraBravo", B.project],
+    ["key", (q, ids) => v1(cred.key, "GET", `/v1/search?query=${q}${ids ? `&project_ids=${ids}` : ""}`), "zebraAlpha", "zebraBravo", B.project],
+    ["oauth", (q, ids) => oc(cred.oauth, "search_artifacts", { query: q, ...ids ? { project_ids: [ids] } : {} }), "zebraBravo", "zebraAlpha", A.project],
+  ];
+  for (const [label, search, own, other, otherProject] of searches) {
+    const mine = await search(own);
+    assert.equal(mine.status, 200, `${label} search: ${mine.text.slice(0, 200)}`);
+    assert.match(mine.text, new RegExp(own), `${label} search must find its own workspace's document`);
+    const theirs = await search(other);
+    assert.equal(theirs.status, 200);
+    assert.doesNotMatch(theirs.text, new RegExp(other), `${label} search leaked the other workspace`);
+    if (label !== "session") { const named = await search(other, otherProject); assert.doesNotMatch(named.text, new RegExp(other), `${label} search naming the other project leaked`); }
   }
-  assert.doesNotMatch((await v1(cred.key, "GET", "/v1/projects")).text, new RegExp(B.project));
-  assert.doesNotMatch((await oc(cred.oauth, "list_projects", {})).text, new RegExp(A.project));
+  // Project lists and connection info: each names its own workspace's project and never the other's.
+  for (const [label, r, own, other] of [
+    ["key /v1/projects", await v1(cred.key, "GET", "/v1/projects"), A.project, B.project],
+    ["key connection-info", await v1(cred.key, "GET", "/v1/connection-info"), A.project, B.project],
+    ["grant /api/projects", await api(cred.grant, "GET", "/api/projects"), A.project, B.project],
+    ["grant list_projects", await mcpCall(cred.grantMcp, "list_projects", {}), A.project, B.project],
+    ["oauth list_projects", await oc(cred.oauth, "list_projects", {}), B.project, A.project],
+    ["oauth connection_info", await oc(cred.oauth, "connection_info", {}), B.project, A.project],
+  ]) {
+    assert.equal(r.status, 200, `${label}: ${r.text.slice(0, 200)}`);
+    assert.ok(r.text.includes(own), `${label} must list its own project`);
+    assert.ok(!r.text.includes(other), `${label} lists the other workspace's project`);
+  }
 });
 
 test("other workspace: every write surface is refused for every credential type and changes nothing", async () => {
   const before = ok(await owner.req("GET", `/api/projects/${B.project}/artifacts/${B.doc}`)).revision.rev;
+  const aBefore = ok(await bob.req("GET", `/api/projects/${A.project}/artifacts/${A.doc}`)).revision.rev;
   const writes = [
     ["session save", () => session(bob, "PUT", `/api/projects/${B.project}/artifacts/${B.doc}`, { expected_revision: before, body: "pwn" })],
     ["session create", () => session(bob, "POST", `/api/projects/${B.project}/artifacts`, { title: "x", body: "pwn" })],
@@ -171,19 +188,27 @@ test("other workspace: every write surface is refused for every credential type 
     ["grant save", () => api(cred.grant, "PUT", `/api/projects/${B.project}/artifacts/${B.doc}`, { body: { expected_revision: before, body: "pwn" } })],
     ["grant upload", () => api(cred.grant, "POST", `/api/projects/${B.project}/uploads`, { body: { title: "x", mime: "image/png", size: png.length, sha256: sha256(png) } })],
     ["grant mcp save", () => mcpCall(cred.grantMcp, "save_markdown", { project_id: B.project, artifact_id: B.doc, expected_revision: before, body: "pwn", idempotency_key: key("g") })],
-    ["oauth save", () => oc(cred.oauth, "save_markdown", { project_id: A.project, artifact_id: A.doc, expected_revision: 2, body: "pwn", idempotency_key: key("o") })],
+    ["oauth save", () => oc(cred.oauth, "save_markdown", { project_id: A.project, artifact_id: A.doc, expected_revision: aBefore, body: "pwn", idempotency_key: key("o") })],
     ["oauth upload", () => oc(cred.oauth, "upload_file", { project_id: A.project, title: "x", mime: "image/png", content_base64: png.toString("base64"), change_note: "x", idempotency_key: key("o") })],
-    ["oauth upload_begin", () => oc(cred.oauth, "upload_begin", { project_id: A.project, title: "x", mime: "image/png", size: png.length, sha256: sha256(png), idempotency_key: key("o") })],
+    ["oauth upload_begin", () => oc(cred.oauth, "upload_begin", { project_id: A.project, title: "x", mime: "image/png", size: png.length, sha256: sha256(png), change_note: "x", idempotency_key: key("o") })],
   ];
   for (const [label, op] of writes) {
     const r = await op();
     assert.equal(r.status, 404, `${label} on another workspace must be 404 (got ${r.status} ${r.text.slice(0, 200)})`);
   }
   assert.equal(ok(await owner.req("GET", `/api/projects/${B.project}/artifacts/${B.doc}`)).revision.rev, before);
-  assert.equal(ok(await bob.req("GET", `/api/projects/${A.project}/artifacts/${A.doc}`)).revision.rev, 2);
+  assert.equal(ok(await bob.req("GET", `/api/projects/${A.project}/artifacts/${A.doc}`)).revision.rev, aBefore);
+  // Positive controls: the same MCP calls succeed on the credential's own project, so the 404s above were isolation.
+  const aRev = ok(await bob.req("GET", `/api/projects/${A.project}/artifacts/${A.doc}`)).revision.rev;
+  assert.equal((await mcpCall(cred.grantMcp, "save_markdown", { project_id: A.project, artifact_id: A.doc, expected_revision: aRev, body: "synthetic zebraAlpha three", idempotency_key: key("g") })).status, 200);
+  const bRev = ok(await owner.req("GET", `/api/projects/${B.project}/artifacts/${B.doc}`)).revision.rev;
+  assert.equal((await oc(cred.oauth, "save_markdown", { project_id: B.project, artifact_id: B.doc, expected_revision: bRev, body: "synthetic zebraBravo three", idempotency_key: key("o") })).status, 200);
+  assert.equal((await oc(cred.oauth, "upload_begin", { project_id: B.project, title: "x", mime: "image/png", size: png.length, sha256: sha256(png), change_note: "x", idempotency_key: key("o") })).status, 200);
   // A publisher can't be connected into a project of a workspace its signer doesn't belong to.
   const pa = await h.authorize(cred.app, { project_id: A.project, destination: "root" });
   assert.ok(!pa.code, "publisher consent into another workspace's project must fail");
+  assert.equal(pa.error, 400, `publisher consent refusal: ${pa.error}`);
+  assert.doesNotMatch(pa.html ?? "", /A project|zebraAlpha/, "the refusal names nothing from the other workspace");
 });
 
 test("idempotency replay does not outlive a demotion (API key and OAuth)", async () => {
@@ -245,7 +270,7 @@ test("suspension closes every credential into the workspace; OAuth refresh stays
 test("removal: every credential the person created becomes inactive; refresh is invalid_grant", async () => {
   ok(await bob.req("DELETE", `/api/workspaces/${WSA}/members/${ownerId}`));
   const r = await cred.oauthA.call("read_artifact", { project_id: A.project, artifact_id: A.doc });
-  assert.ok(r.isError);
+  assert.equal(r.status, 401, `removed creator's OAuth token: ${r.status} ${JSON.stringify(r.data)}`);
   const rt = await h.token({ grant_type: "refresh_token", refresh_token: cred.oauthA.refresh_token, client_id: cred.oauthA.client_id, resource: `${h.issuer}/mcp` });
   assert.equal(rt.status, 400, JSON.stringify(rt.body)); assert.equal(rt.body.error, "invalid_grant");
   // Bob's own credentials are unaffected by the owner's removal.
@@ -274,9 +299,22 @@ test("management: members get 403, outsiders 404; a chosen project id is refused
   const free = await dave.req("POST", "/api/projects", { id: "never-used-id", title: "x" });
   assert.equal(taken.status, 400); assert.equal(free.status, 400);
   assert.equal(JSON.stringify(taken.body.error.code), JSON.stringify(free.body.error.code));
-  // Admins see and can revoke the publisher a member connected into their workspace's project.
-  const apps = ok(await bob.req("GET", "/api/app-clients"));
-  assert.ok(Array.isArray(apps.other_publishers));
+  // Admins see and can revoke a publisher a member connected into their workspace's project (the member's own app).
+  // Re-invite the owner (removed above) as member, connect their publisher app into A, then bob revokes it.
+  const inv2 = ok(await bob.req("POST", `/api/workspaces/${WSA}/invites`, { email: "owner@example.test", role: "member" }), 201);
+  ok(await owner.req("POST", "/api/invites/accept", { token: inv2.accept_url.split("/").pop() }));
+  const pubA = await h.connectPublisher(cred.app, { project_id: A.project, destination: "root" });
+  const listed = ok(await bob.req("GET", "/api/app-clients")).other_publishers.find((p) => p.publisher_id === pubA.publisher_id);
+  assert.ok(listed && listed.project_id === A.project, "the admin sees the member's publisher in other_publishers");
+  // An outsider sees nothing of it and can't revoke it; the admin can.
+  assert.equal((await dave.req("GET", "/api/app-clients")).body.other_publishers.some((p) => p.publisher_id === pubA.publisher_id), false);
+  assert.equal((await dave.req("POST", `/api/publishers/${pubA.publisher_id}/revoke`)).status, 404);
+  ok(await bob.req("POST", `/api/publishers/${pubA.publisher_id}/revoke`));
+  assert.equal((await h.pub(pubA.access_token, "GET", "/publisher/me")).status, 401);
+  // The owner's own app listing shows only publishers whose project they can see (the B one, and A while member).
+  ok(await bob.req("DELETE", `/api/workspaces/${WSA}/members/${ownerId}`));
+  const mineAfter = ok(await owner.req("GET", "/api/app-clients")).app_clients.flatMap((c) => c.publishers);
+  assert.ok(mineAfter.some((p) => p.project_id === B.project));
 });
 
 test("last owner: two concurrent demotions of the only two owners leave exactly one owner", async () => {

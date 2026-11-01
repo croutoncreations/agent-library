@@ -39,7 +39,8 @@ A workspace always has at least one owner. A `project_members` row can narrow on
    (`credential_inactive`, or the OAuth error), like a revoked credential. A key that still reaches another active
    project keeps working there. OAuth refresh for a *suspended* workspace answers `temporarily_unavailable` (503),
    so the provider keeps the connection and it works again when the workspace is reactivated; refresh for a revoked
-   connection or removed creator is `invalid_grant`. Owners can still delete a suspended workspace.
+   connection, a removed creator or a workspace being deleted is `invalid_grant`. Owners can still delete a suspended
+   workspace.
 
 ## Data model (migration 0017, additive)
 
@@ -49,7 +50,8 @@ A workspace always has at least one owner. A `project_members` row can narrow on
   accepted_by, revoked_at)`; only the token's SHA-256 is stored.
 - `project_members(project_id, principal_id, role)`
 - `principals.email` (verified email from sign-in, used to match invitations)
-- `workspace_id` on `projects`, `oauth_connections`, `api_credentials`, `app_clients`, `publishers`, `audits`;
+- `workspace_id` on `projects`, `oauth_connections`, `api_credentials`, `app_clients`, `publishers`, `audits`
+  (migration 0019 fills it for every project-scoped audit row; app audits write it explicitly);
   `created_by` on `oauth_connections`, `api_credentials`, `publishers` (`grants.created_by` already exists).
 
 **Existing data needs no rewrite.** A human's personal workspace has the deterministic id `wsp_<principal id>`. The
@@ -80,8 +82,11 @@ shared workspace exists, or accept this for the rollback window.
   takes `workspace_id` (default: my personal workspace).
 - Settings lists (`/api/access`, `/api/api-keys`, `/api/app-clients`) show credentials across my workspaces:
   the ones I created, plus, in workspaces where I'm an admin, everyone's. `/api/app-clients` lists the apps I
-  registered or administer (each with `workspace_id`) and, in `other_publishers`, publishers of other apps that I
-  connected or can revoke as a project admin. `POST /api/app-clients` takes `workspace_id` (default personal; admin).
+  registered (while I'm still a member of the app's workspace) or administer, each with `workspace_id`; each app's
+  publishers are listed only where I connected them or can see their project. `other_publishers` lists publishers of
+  other apps that I connected or can revoke as a project admin. `POST /api/app-clients` takes `workspace_id` (default
+  personal; admin). A member may connect an app they registered into a project where they can write (like an API key
+  it never exceeds their role); that project's admins see and can revoke it.
 - `POST /api/backup/restore` works only on a single-owner installation with no projects (`MULTI_USER` unset and at
   most one person); shared installations answer 403 `restore_unavailable`.
 
@@ -90,8 +95,9 @@ shared workspace exists, or accept this for the rollback window.
 The consent page lists projects from every workspace where the signer can grant access, grouped under workspace
 headings when there is more than one. A connection covers projects from one workspace only (its `workspace_id`;
 the server refuses a mix). A new project created on the consent page goes in the workspace of the picked projects,
-or the one chosen in "New projects go in" (offered for workspaces where the signer is an admin). Projects where the
-signer is a viewer offer Read only.
+or the one chosen in "New projects go in" (offered for every active workspace where the signer is an admin, even one
+without projects; checked again inside the insert). Projects where the signer is a viewer offer Read only. Lists
+show at most 500 projects on the consent page and 1000 in the app.
 
 ## Isolation tests
 

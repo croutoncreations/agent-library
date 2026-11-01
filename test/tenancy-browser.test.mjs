@@ -111,3 +111,38 @@ test("owner creates a workspace and invites; invitee joins through the link; rol
   assert.equal(await bob.$("xpath/.//button[contains(., 'Upload')]"), null);
   await bob.screenshot({ path: "tmp/test-evidence/tenancy-viewer-project.png", fullPage: true });
 });
+
+test("a demoted viewer's unsaved draft is never saved; it stays readable with Copy and Discard", { skip: !available && "Chrome/puppeteer not installed" }, async () => {
+  const alice = await pageAs("alice");
+  const bob = await pageAs("bob");
+  // Alice writes a document in Lab notes (Bob is a viewer there after the test above).
+  const ids = await alice.evaluate(async () => {
+    const me = await (await fetch("/api/me")).json();
+    const p = (await (await fetch("/api/projects")).json()).projects.find((x) => x.title === "Lab notes");
+    const d = await (await fetch(`/api/projects/${p.id}/artifacts`, { method: "POST", headers: { "content-type": "application/json", "x-csrf-token": me.csrf, "idempotency-key": "doc-draft-1" }, body: JSON.stringify({ title: "Draft target", body: "synthetic saved text" }) })).json();
+    return { pid: p.id, aid: d.artifact_id };
+  });
+  // Bob left a local draft from when he could edit (same key format as the app: al:draft:<me>:<pid>:<aid>).
+  const puts = [];
+  bob.on("request", (r) => { if (r.method() === "PUT" && r.url().includes(ids.aid)) puts.push(r.url()); });
+  await bob.evaluate(async (ids) => {
+    const me = await (await fetch("/api/me")).json();
+    localStorage.setItem(`al:draft:${me.principal.id}:${ids.pid}:${ids.aid}`, JSON.stringify({ base: 1, body: "synthetic unsaved words", at: Date.now() }));
+  }, ids);
+  // Fresh load straight into the editor link: no cached project list, so access comes with the document.
+  await bob.goto(`${APP}/#/p/${ids.pid}/a/${ids.aid}/edit`); await bob.reload();
+  await waitText(bob, /weren't saved/);
+  await new Promise((r) => setTimeout(r, 2000)); // longer than the 800 ms draft autosave
+  assert.deepEqual(puts, [], "no save attempted for a viewer");
+  assert.equal(await bob.$("[role=tab][aria-controls*=edit], .ed-host"), null, "no editor for a viewer");
+  const kept = await bob.$eval(".unsaved-draft textarea", (t) => ({ value: t.value, ro: t.readOnly }));
+  assert.deepEqual(kept, { value: "synthetic unsaved words", ro: true });
+  assert.ok(await bob.$("xpath/.//button[normalize-space()='Copy text']"));
+  await bob.screenshot({ path: "tmp/test-evidence/tenancy-viewer-unsaved-draft.png", fullPage: true });
+  // Discard clears the local draft.
+  bob.once("dialog", (d) => d.accept());
+  await (await bob.$("xpath/.//button[normalize-space()='Discard']")).click();
+  const left = await bob.evaluate((ids) => Object.keys(localStorage).filter((k) => k.endsWith(`${ids.pid}:${ids.aid}`)).length, ids);
+  assert.equal(left, 0);
+  await alice.browserContext().close(); await bob.browserContext().close();
+});

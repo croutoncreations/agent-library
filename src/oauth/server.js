@@ -5,7 +5,7 @@ import { handleOAuthMcp } from "./mcp.js";
 import { authorizationUrl, exchangeAndVerify, newUpstreamSecrets, oidcConfig } from "./oidc.js";
 import { __name } from "../runtime.js";
 import { folderName } from "../service.js";
-import { ROLE_RANK, memberRoleSql, personalWorkspaceId, visibleProjects, workspaceRole } from "../tenancy.js";
+import { ROLE_RANK, memberRoleSql, personalWorkspaceId, visibleProjects, workspaceRoleSql } from "../tenancy.js";
 import { nowIso, nowMs, randomId } from "../util.js";
 
 function originFor(host) {
@@ -95,17 +95,20 @@ function servers(origin, appConnect = false) {
   cache.set(cacheKey, s);
   return s;
 }
-// True when the credential is otherwise live but its project's workspace is suspended or being deleted.
+// True when the credential is otherwise live, its creator is still a member, and only the workspace is suspended
+// (recoverable). Deleting workspaces and removed creators are terminal (invalid_grant).
 async function connectionWorkspaceInactive(env, id) {
   if (typeof id !== "string" || !/^oac_[A-Za-z0-9_-]{10,64}$/.test(id)) return false;
   return !!await env.DB.prepare(`SELECT 1 FROM oauth_connections oc JOIN oauth_connection_projects cp ON cp.connection_id = oc.id JOIN projects p ON p.id = cp.project_id
     JOIN workspaces w ON w.id = COALESCE(p.workspace_id, 'wsp_' || p.owner_id)
-    WHERE oc.id = ? AND oc.revoked_at IS NULL AND oc.expires_at > ? AND w.status <> 'active' LIMIT 1`).bind(id, nowMs()).first();
+    WHERE oc.id = ? AND oc.revoked_at IS NULL AND oc.expires_at > ? AND w.status = 'suspended'
+      AND EXISTS (SELECT 1 FROM workspace_members m WHERE m.workspace_id = w.id AND m.principal_id = COALESCE(oc.created_by, oc.owner_principal_id)) LIMIT 1`).bind(id, nowMs()).first();
 }
 async function publisherWorkspaceInactive(env, p) {
   if (!p || typeof p.publisher_id !== "string") return false;
   return !!await env.DB.prepare(`SELECT 1 FROM publishers pb JOIN projects pj ON pj.id = pb.project_id JOIN workspaces w ON w.id = COALESCE(pj.workspace_id, 'wsp_' || pj.owner_id)
-    WHERE pb.id = ? AND pb.revoked_at IS NULL AND pb.token_epoch = ? AND w.status <> 'active'`).bind(p.publisher_id, p.epoch).first();
+    WHERE pb.id = ? AND pb.revoked_at IS NULL AND pb.token_epoch = ? AND w.status = 'suspended'
+      AND EXISTS (SELECT 1 FROM workspace_members m WHERE m.workspace_id = w.id AND m.principal_id = COALESCE(pb.created_by, pb.owner_principal_id))`).bind(p.publisher_id, p.epoch).first();
 }
 async function livePublisher(env, p) {
   if (!p || typeof p.publisher_id !== "string" || !/^pub_[A-Za-z0-9_-]{10,64}$/.test(p.publisher_id)) return null;
@@ -164,8 +167,13 @@ function logRegistration(outcome, m) {
 }
 // Projects a person can connect an agent to: every visible project, with whether they may grant edit access.
 async function consentProjects(env, principalId) {
-  return (await visibleProjects(env, principalId)).slice(0, 500).map((p) => ({ id: p.id, title: p.title, workspace_id: p.workspace_id,
-    workspace_name: p.personal ? null : p.workspace_name, can_write: ROLE_RANK[p.role] >= ROLE_RANK.member, ws_admin: ROLE_RANK[p.ws_role] >= ROLE_RANK.admin }));
+  const list = (await visibleProjects(env, principalId)).slice(0, 500).map((p) => ({ id: p.id, title: p.title, workspace_id: p.workspace_id,
+    workspace_name: p.personal ? null : p.workspace_name, can_write: ROLE_RANK[p.role] >= ROLE_RANK.member }));
+  // Active workspaces where the signer may create projects (admin+), including ones with no projects yet.
+  list.adminWorkspaces = (await env.DB.prepare(`SELECT w.id, w.name, w.personal FROM workspace_members m JOIN workspaces w ON w.id = m.workspace_id
+    WHERE m.principal_id = ? AND w.status = 'active' AND m.role IN ('owner','admin') ORDER BY w.personal DESC, w.created_at LIMIT 50`).bind(principalId).all()).results
+    .map((w) => ({ id: w.id, name: w.personal ? null : w.name }));
+  return list;
 }
 async function liveConnection(env, id) {
   if (typeof id !== "string" || !/^oac_[A-Za-z0-9_-]{10,64}$/.test(id)) return null;
@@ -258,21 +266,25 @@ function cxSeg(name, label, value, withNone, readOnly = false) {
 }
 // values: the submitted form when re-rendering after a fixable mistake (choices kept), else null.
 function cxGrantPage(d, email, projects, prev, consent, values = null, error = "", status = 200) {
-  const was = new Map((prev?.projects ?? []).map((p) => [p.id, p.can_write ? "write" : "read"]));
+  // An earlier Edit grant on a project that is now view-only pre-selects Read (there is no Edit option to select).
+  const viewOnly = new Set(projects.filter((p) => p.can_write === false).map((p) => p.id));
+  const was = new Map((prev?.projects ?? []).map((p) => [p.id, p.can_write && !viewOnly.has(p.id) ? "write" : "read"]));
   const pick = (name, fallback) => values ? String(values.get(name) ?? fallback) : fallback;
   const dupe = cxDupes(projects);
-  const row = (p) => `<li class="proj"><span class="pname">${esc(p.title)}${dupe(p) ? ` <small>${esc(p.id)}</small>` : ""}${p.can_write === false ? ` <small>view only</small>` : ""}</span>${cxSeg(`access:${p.id}`, `Access to ${p.title}`, pick(`access:${p.id}`, values ? "none" : was.get(p.id) ?? "none"), true, p.can_write === false)}</li>`;
+  const row = (p) => `<li class="proj"><span class="pname">${esc(p.title)}${dupe(p) ? ` <small>${esc(p.id)}</small>` : ""}${p.can_write === false ? ` <span class="chip">View only</span>` : ""}</span>${cxSeg(`access:${p.id}`, `Access to ${p.title}`, pick(`access:${p.id}`, values ? "none" : was.get(p.id) ?? "none"), true, p.can_write === false)}</li>`;
   // Projects grouped by workspace (one connection covers one workspace; the server enforces it). A single
   // workspace renders exactly as before.
   const groups = [];
-  for (const p of projects) { const g = groups.find((x) => x.id === (p.workspace_id ?? "")); if (g) g.items.push(p); else groups.push({ id: p.workspace_id ?? "", name: p.workspace_name, items: [p], creatable: !!p.ws_admin }); }
-  const multi = groups.length > 1;
-  const rows = multi
-    ? groups.map((g) => `<li class="wsh" role="presentation"><h3 class="sub">${esc(g.name ?? "Personal")}</h3><ul class="list">${g.items.map(row).join("")}</ul></li>`).join("")
-    : projects.map(row).join("");
-  // New projects go into the chosen workspace (only workspaces where the signer can create projects are offered).
-  const creatable = groups.filter((g) => g.creatable);
-  const wsPick = multi && creatable.length > 1 ? `<label class="field"><span>New projects go in</span><select name="new_workspace">${creatable.map((g) => `<option value="${esc(g.id)}"${pick("new_workspace", "") === g.id ? " selected" : ""}>${esc(g.name ?? "Personal")}</option>`).join("")}</select></label>` : "";
+  for (const p of projects) { const g = groups.find((x) => x.id === (p.workspace_id ?? "")); if (g) g.items.push(p); else groups.push({ id: p.workspace_id ?? "", name: p.workspace_name, items: [p] }); }
+  // One group per workspace, each with its own heading, whenever any shared workspace is involved.
+  const named = groups.length > 1 || groups.some((g) => g.name);
+  const rows = projects.length ? (named
+    ? groups.map((g, i) => `<div class="wsg" role="group" aria-labelledby="wsh-${i}"><h3 class="wsh" id="wsh-${i}">${esc(g.name ?? "Personal")}</h3><ul class="list">${g.items.map(row).join("")}</ul></div>`).join("")
+    : `<ul class="list">${projects.map(row).join("")}</ul>`) : "";
+  // New projects: by default they go in the workspace of the picked projects (else Personal); any other active
+  // workspace where the signer is an admin can be chosen, including ones without projects yet.
+  const admin = projects.adminWorkspaces ?? [];
+  const wsPick = admin.length > 1 ? `<label class="field"><span>New projects go in</span><select name="new_workspace"><option value="">Same workspace as the projects I picked (else Personal)</option>${admin.map((w) => `<option value="${esc(w.id)}"${pick("new_workspace", "") === w.id ? " selected" : ""}>${esc(w.name ?? "Personal")}</option>`).join("")}</select></label>` : "";
   // Rows reveal one at a time: every filled row stays visible, plus exactly one empty row (CSS).
   const fresh = Array.from({ length: NEW_PROJECT_SLOTS }, (_, k) => {
     const sfx = k === 0 ? "" : `_${k + 1}`;
@@ -285,7 +297,7 @@ function cxGrantPage(d, email, projects, prev, consent, values = null, error = "
 <h1>Choose what ${esc(d.clientName)} can use</h1><p class="lede">Signed in as ${esc(email)}</p>
 ${clientFacts(d)}${welcome}${cxErr(error)}
 <form method="post" action="/authorize" class="grant"><input type="hidden" name="handle" value="${esc(consent.handle)}"><input type="hidden" name="step" value="grant">${CX_ENTER}
-<section class="sec"><h2>Projects</h2>${multi ? `<p class="fine">Pick projects from one workspace. To share another workspace, connect again.</p>` : ""}${rows ? `<ul class="list${multi ? " grouped" : ""}">${rows}</ul>` : ""}
+<section class="sec"><h2>Projects</h2>${groups.length > 1 ? `<p class="fine one-ws">Pick projects from one workspace. To share another workspace, connect again.</p>` : ""}${rows}
 <h3 class="sub">${cxIcon("plus")}${rows ? "Or create a project" : "Create a project to share"}</h3>${wsPick}${fresh}</section>
 ${replace}
 <p class="fine"><strong>Read</strong>: view documents and files (images, PDFs, videos) and their history, and download files. <strong>Edit</strong>: also create and change documents, and upload new files and new versions of files. Comments, trash and settings are never shared.</p>
@@ -393,8 +405,9 @@ async function authorizePost(req, env, as, origin) {
     }
     if (!chosen.length) return retry("Pick at least one project, or create one.");
     if (chosen.some((c) => c.isNew)) {
-      const role = await workspaceRole(env, connWs, sess.principal_id);
-      if (ROLE_RANK[role ?? "none"] < ROLE_RANK.admin) return retry("Only workspace admins can create projects here. Pick existing projects.");
+      // Admin of an ACTIVE workspace (checked again inside the INSERT below).
+      const ok = await env.DB.prepare(`SELECT ${workspaceRoleSql("?", "admin")} AS ok`).bind(sess.principal_id, connWs).first("ok");
+      if (!ok) return retry("Only workspace admins can create projects here. Pick existing projects.");
     }
     const wsOwner = await env.DB.prepare("SELECT created_by FROM workspaces WHERE id = ?").bind(connWs).first("created_by");
     if (chosen.length > MAX_CONN_PROJECTS) return retry(`Pick at most ${MAX_CONN_PROJECTS} projects.`);
@@ -417,7 +430,7 @@ async function authorizePost(req, env, as, origin) {
     const client = await oauth.lookupClient(ar.clientId);
     const connectionId = randomId("oac", 18);
     const at = nowIso(), rid = randomId("req", 9);
-    const audit2 = /* @__PURE__ */ __name((projectId, action, object, result) => env.DB.prepare("INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(at, sess.principal_id, projectId, action, object, result, rid), "audit");
+    const audit2 = /* @__PURE__ */ __name((projectId, action, object, result) => env.DB.prepare("INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id, workspace_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").bind(at, sess.principal_id, projectId, action, object, result, rid, connWs), "audit");
     // Replacing claims the predecessor first, in the same transaction as the new rows. Revoking before the app
     // redeems its code is deliberate (fails closed): if the app never finishes, the new connection still exists, so
     // connecting again from the same app prefills it and offers to replace it.
@@ -425,12 +438,14 @@ async function authorizePost(req, env, as, origin) {
     // Audited only if this request's claim won. The batch runs in order in one transaction, so changes() is 1 right
     // after a winning claim and stays 1 through each audit insert; a losing tab's claim changes 0 rows, so it
     // writes no "replaced" rows (no audits scan needed).
-    const auditReplaced = (pid) => env.DB.prepare(`INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id)
-      SELECT ?, ?, ?, 'oauth.revoke', ?, 'ok:replaced', ? WHERE changes() = 1`).bind(at, sess.principal_id, pid, replaced.id, rid);
+    const auditReplaced = (pid) => env.DB.prepare(`INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id, workspace_id)
+      SELECT ?, ?, ?, 'oauth.revoke', ?, 'ok:replaced', ?, (SELECT COALESCE(workspace_id, 'wsp_' || owner_id) FROM projects WHERE id = ?) WHERE changes() = 1`).bind(at, sess.principal_id, pid, replaced.id, rid, pid);
     const res = await env.DB.batch([
       ...claim ? [claim, ...(replaced.projects.length ? replaced.projects : [replaced.project_id]).map(auditReplaced)] : [],
       ...chosen.filter((c) => c.isNew).flatMap((c) => [
-        env.DB.prepare("INSERT INTO projects (id, owner_id, title, created_at, workspace_id) VALUES (?, ?, ?, ?, ?)").bind(c.id, wsOwner ?? sess.principal_id, c.isNew, at, connWs),
+        // Gated in-statement: if the signer lost admin or the workspace closed since the check, no row is written and
+        // the connection rows below fail their project foreign key, so the whole batch rolls back.
+        env.DB.prepare(`INSERT INTO projects (id, owner_id, title, created_at, workspace_id) SELECT ?, ?, ?, ?, ? WHERE ${workspaceRoleSql("?", "admin")}`).bind(c.id, wsOwner ?? sess.principal_id, c.isNew, at, connWs, sess.principal_id, connWs),
         audit2(c.id, "project.create", c.id, "ok:oauth-consent")
       ]),
       // file_access = 1 only when the page the owner saw offered files (offered: "files", set when it was shown). A page
@@ -898,7 +913,12 @@ form{margin:0}
 .list{list-style:none;margin:0;padding:0;border:1px solid var(--line);border-radius:var(--r3);overflow:hidden}
 .proj{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:8px 8px 8px 14px;border-top:1px solid var(--line);transition:background .15s}
 .proj:first-child{border-top:0}
-.list.grouped{border:0;border-radius:0;overflow:visible}.list.grouped>.wsh{list-style:none}.list.grouped>.wsh+.wsh{margin-top:6px}.list.grouped .sub{margin:10px 0 6px}
+.wsg+.wsg{margin-top:14px}.wsh{margin:0 0 6px;font-size:13px;font-weight:650;letter-spacing:.02em;text-transform:uppercase;color:var(--muted);overflow-wrap:anywhere}
+.chip{display:inline-block;margin-left:6px;padding:1px 7px;border-radius:999px;font-size:11.5px;font-weight:600;color:var(--muted);background:var(--sunk);vertical-align:1px}
+.grant:has(.wsg:nth-of-type(1) .proj input:is([value=read],[value=write]):checked) .wsg:not(:nth-of-type(1)) .seg,
+.grant:has(.wsg:nth-of-type(2) .proj input:is([value=read],[value=write]):checked) .wsg:not(:nth-of-type(2)) .seg,
+.grant:has(.wsg:nth-of-type(3) .proj input:is([value=read],[value=write]):checked) .wsg:not(:nth-of-type(3)) .seg{opacity:.45}
+.one-ws{transition:color .15s}.grant:has(.wsg .proj input:is([value=read],[value=write]):checked) .one-ws{color:var(--fg);font-weight:600}
 .sec .field{display:flex;flex-direction:column;gap:6px;margin:10px 0;font-size:14px;font-weight:600}
 .proj:has(input:is([value=read],[value=write]):checked){background:var(--accent-soft)}
 .pname{min-width:0;font-weight:550;overflow-wrap:anywhere}

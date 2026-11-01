@@ -138,7 +138,7 @@ export async function startAppConnectServer({ port, oidcPort = port + OIDC_OFFSE
      * Connect an ordinary MCP agent (like ChatGPT/Claude) through DCR + owner consent, for reader/protection tests.
      * grants: { [projectId]: "read" | "write" }. Returns { access_token, call(name, args) } (token in memory only).
      */
-    async connectMcpAgent(grants, { clientName = "synthetic agent", onConsent, redirect = "http://127.0.0.1:5998/cb" } = {}) {
+    async connectMcpAgent(grants, { clientName = "synthetic agent", onConsent, redirect = "http://127.0.0.1:5998/cb", extra = {} } = {}) {
       // redirect is never contacted: the code is read from the consent interstitial.
       const reg = await fetch(`${issuer}/oauth/register`, { method: "POST", headers: { "content-type": "application/json" },
         body: JSON.stringify({ client_name: clientName, redirect_uris: [redirect], token_endpoint_auth_method: "none" }) }).then((r) => r.json());
@@ -151,7 +151,7 @@ export async function startAppConnectServer({ port, oidcPort = port + OIDC_OFFSE
       const per = Object.fromEntries(Object.entries(grants).map(([p, a]) => [`access:${p}`, a]));
       const consentHtml = await r.text();
       await onConsent?.(consentHtml);
-      r = await b.go(`${issuer}/authorize`, form({ handle: hidden(consentHtml, "handle"), step: "grant", ...per, decision: "approve" }));
+      r = await b.go(`${issuer}/authorize`, form({ handle: hidden(consentHtml, "handle"), step: "grant", ...per, ...extra, decision: "approve" }));
       const code = interstitialTarget(await r.text()).searchParams.get("code");
       const t = await h.token({ grant_type: "authorization_code", code, redirect_uri: redirect, client_id: reg.client_id, code_verifier: verifier, resource: `${issuer}/mcp` });
       const at = t.body.access_token;

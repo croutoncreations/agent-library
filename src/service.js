@@ -7,7 +7,7 @@ import { RT_ID_TOO_LONG, RT_KINDS_ALL, RT_KINDS_DOCS, readTextChunk, rtChunkLimi
 import { __name } from "./runtime.js";
 import { RS_SCHEMA, rsQuery, rsReady, rsToolReady, searchArtifacts } from "./search/service.js";
 import { createFromTemplate, listTemplates, previewTemplate, saveAsTemplate, tplAssertMaintenance, tplDate, tplProvenance, tplTools } from "./templates/service.js";
-import { ROLE_RANK, multiUserInstall, personalWorkspaceId, workspaceRoleSql, requireProjectRole, requireWorkspaceRole, visibleProjects } from "./tenancy.js";
+import { ROLE_RANK, personalWorkspaceId, projectRole, workspaceRoleSql, requireProjectRole, requireWorkspaceRole, visibleProjects } from "./tenancy.js";
 import { HttpError, int, nowIso, nowMs, randomId, sha256Hex, str } from "./util.js";
 
 function requireAppConnect(ctx) {
@@ -92,7 +92,7 @@ async function createProject(ctx, input) {
   requireHuman(ctx);
   // A chosen id (slug) is allowed only where one person owns the installation: on a shared installation a
   // "Project already exists" answer would reveal another workspace's project id.
-  if (input.id && (ctx.env.MULTI_USER === "1" || (multiUserInstall(ctx.env) && await db(ctx).prepare("SELECT COUNT(*) AS n FROM principals WHERE kind = 'human' AND issuer <> 'restored'").first("n") > 1)))
+  if (input.id && (ctx.env.MULTI_USER === "1" || (await db(ctx).prepare("SELECT COUNT(*) AS n FROM principals WHERE kind = 'human' AND issuer <> 'restored'").first("n") > 1)))
     throw new HttpError(400, "invalid_input", "Project ids are assigned by the server on this installation");
   const id = input.id ? str(input.id, "id", 64) : randomId("prj");
   if (!/^[a-z0-9][a-z0-9-]{2,63}$|^prj_[A-Za-z0-9_-]+$/.test(id)) throw new HttpError(400, "invalid_input", "Bad project id");
@@ -193,12 +193,15 @@ async function listArtifacts(ctx, projectId, q) {
 }
 async function getArtifact(ctx, projectId, artifactId, revNo) {
   await authorizeProject(ctx, projectId, false);
+  // People get their effective access with the document, so the UI never renders write controls it must take back.
+  const access = ctx.principal.kind === "human" ? await projectRole(ctx.env, ctx.principal.id, projectId) : null;
   const a = await loadArtifact(ctx, projectId, artifactId);
   const rev = await db(ctx).prepare("SELECT * FROM revisions WHERE artifact_id = ? AND project_id = ? AND rev_no = ?").bind(artifactId, projectId, revNo ?? a.head_rev).first();
   if (!rev) throw new HttpError(404, "not_found", "Revision not found");
   return {
     artifact: { ...artifactView(a, appConnectEnabled(ctx.env)), ...await tplProvenance(ctx, projectId, a) },
     revision: { rev: rev.rev_no, id: rev.id, size: rev.size, sha256: rev.sha256, mime: rev.mime, created_at: rev.created_at, author_id: rev.author_id },
+    ...access ? { access: { role: access.role, can_write: ROLE_RANK[access.role] >= ROLE_RANK.member } } : {},
     ...a.kind === "markdown" || a.kind === "html" ? { body: readText(rev.body) } : a.kind === "json" || a.kind === "csv" ? { content: readText(rev.body), content_url: `/api/projects/${projectId}/artifacts/${artifactId}/content?rev=${rev.rev_no}` } : { content_url: `/api/projects/${projectId}/artifacts/${artifactId}/content?rev=${rev.rev_no}` }
   };
 }
