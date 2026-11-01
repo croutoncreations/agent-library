@@ -158,5 +158,44 @@ test("a demoted viewer's unsaved draft is never saved; it stays readable with Co
   await (await bob.$("xpath/.//button[normalize-space()='Discard']")).click();
   const left = await bob.evaluate((ids) => Object.keys(localStorage).filter((k) => k.endsWith(`${ids.pid}:${ids.aid}`)).length, ids);
   assert.equal(left, 0);
+  // Discard sticks: leaving the document and coming back shows no draft box.
+  await bob.goto(`${APP}/#/projects`); await waitText(bob, /Lab notes/);
+  await bob.goto(`${APP}/#/p/${ids.pid}/a/${ids.aid}`); await waitText(bob, /view-only access/);
+  assert.equal(await bob.$(".unsaved-draft"), null, "discarded draft does not come back");
+  await alice.browserContext().close(); await bob.browserContext().close();
+});
+
+test("demoted while typing: the refused save switches to view-only, keeps the text, and Discard sticks", { skip: !available && "Chrome/puppeteer not installed" }, async () => {
+  const alice = await pageAs("alice");
+  const bob = await pageAs("bob");
+  const ids = await alice.evaluate(async () => {
+    const me = await (await fetch("/api/me")).json();
+    const ws = (await (await fetch("/api/workspaces")).json()).workspaces.find((w) => !w.personal);
+    const p = (await (await fetch("/api/projects")).json()).projects.find((x) => x.title === "Lab notes");
+    const members = (await (await fetch(`/api/workspaces/${ws.id}/members`)).json()).members;
+    const bobId = members.find((m) => m.role !== "owner").principal_id;
+    const hdr = (k) => ({ "content-type": "application/json", "x-csrf-token": me.csrf, "idempotency-key": k });
+    await fetch(`/api/workspaces/${ws.id}/members/${bobId}`, { method: "PATCH", headers: hdr("promote-bob"), body: JSON.stringify({ role: "member" }) });
+    const d = await (await fetch(`/api/projects/${p.id}/artifacts`, { method: "POST", headers: hdr("doc-typing-1"), body: JSON.stringify({ title: "Typing target", body: "synthetic start" }) })).json();
+    return { ws: ws.id, bobId, pid: p.id, aid: d.artifact_id };
+  });
+  await bob.goto(`${APP}/#/p/${ids.pid}/a/${ids.aid}/edit`); await bob.reload();
+  await bob.waitForSelector(".ed-host");
+  // Alice demotes Bob while his editor is open; then he types.
+  await alice.evaluate(async (ids) => {
+    const me = await (await fetch("/api/me")).json();
+    await fetch(`/api/workspaces/${ids.ws}/members/${ids.bobId}`, { method: "PATCH", headers: { "content-type": "application/json", "x-csrf-token": me.csrf, "idempotency-key": "demote-bob-2" }, body: JSON.stringify({ role: "viewer" }) });
+  }, ids);
+  await bob.click(".ed-host"); await bob.keyboard.press("End"); await bob.keyboard.type(" plus typed words");
+  await waitText(bob, /weren't saved/);
+  assert.match(await bob.$eval(".unsaved-draft textarea", (t) => t.value), /plus typed words/);
+  assert.equal(await bob.$(".ed-host"), null, "the editor is gone");
+  bob.once("dialog", (d) => d.accept());
+  await (await bob.$("xpath/.//button[normalize-space()='Discard']")).click();
+  // Leaving and coming back: the discarded text doesn't return.
+  await bob.goto(`${APP}/#/projects`); await waitText(bob, /Lab notes/);
+  await bob.goto(`${APP}/#/p/${ids.pid}/a/${ids.aid}`); await waitText(bob, /view-only access/);
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal(await bob.$(".unsaved-draft"), null, "discarded text does not come back");
   await alice.browserContext().close(); await bob.browserContext().close();
 });

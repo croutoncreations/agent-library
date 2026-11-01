@@ -2991,6 +2991,9 @@ function renderMarkdownEditor(A, data, ui) {
     var dr = readDraft(pid, aid);
     var text = isDirty() ? ta.value : dr && typeof dr.body === "string" && dr.body !== D.savedBody ? dr.body : null;
     if (text === null) clearDraft(pid, aid);
+    // The text now lives in the draft box (and localStorage until Discard); the old editor is no longer "dirty",
+    // so navigation never re-persists it and there is no leave-page prompt or edit-conflict banner.
+    D.savedBody = ta.value;
     A.isBusy = function () { return false; }; A.flush = function () {};
     return text;
   };
