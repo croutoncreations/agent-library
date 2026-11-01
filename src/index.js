@@ -14,6 +14,7 @@ import { listAccess, listConnections, revokeConnection, revokeConnectionById } f
 import { handleFileTransfer } from "./oauth/mcp.js";
 import { handleOAuthHost, originFor } from "./oauth/server.js";
 import { servePwa } from "./pwa.js";
+import { acceptInvite, createInvite, createWorkspace, deleteWorkspace, listMembers, listWorkspaces, previewInvite, removeMember, revokeInvite, setMemberRole, updateWorkspace } from "./workspaces.js";
 import { __name } from "./runtime.js";
 import { IMAGE_TYPES, VIDEO_TYPES, addComment, appConnectEnabled, chQuery, cleanupChanges, createFile, createFolder, createFromTemplate, createGrant, createMarkdown, createProject, diffRevisions, getArtifact, history, listArtifacts, listAudit, listChanges, listComments, listFolders, listGrants, listProjects, listTemplates, metaHistory, previewTemplate, readRecords, readTextChunk, requireAppConnect, restoreMetadata, restoreRevision, rsQuery, rsReady, rtQuery, saveAsTemplate, saveFile, saveMarkdown, searchArtifacts, updateGrant, updateMetadata } from "./service.js";
 import { APP_CSS, APP_HTML, APP_JS } from "./ui.js";
@@ -61,10 +62,15 @@ async function devLogin(req, env, url) {
   const b = await body(req);
   const supplied = await sha256Hex(String(b.passphrase ?? ""));
   if (supplied !== await sha256Hex(env.LOCAL_DEV_LOGIN)) throw new HttpError(401, "unauthenticated", "Bad passphrase");
-  let p = await env.DB.prepare("SELECT id FROM principals WHERE issuer = 'local-dev' AND subject = 'owner'").first("id");
+  // Local development only: `user` picks a synthetic person (default "owner"), so multi-user flows can be tested.
+  // Each gets the email <user>@example.test (used to match invitations) and a personal workspace (migration trigger).
+  const user = b.user === void 0 ? "owner" : str(b.user, "user", 32);
+  if (!/^[a-z][a-z0-9-]{0,31}$/.test(user)) throw new HttpError(400, "invalid_input", "user must be lower-case letters, digits or -");
+  let p = await env.DB.prepare("SELECT id FROM principals WHERE issuer = 'local-dev' AND subject = ?").bind(user).first("id");
   if (!p) {
     p = randomId("hum");
-    await env.DB.prepare("INSERT INTO principals (id, kind, issuer, subject, label, created_at) VALUES (?, 'human', 'local-dev', 'owner', 'Owner', ?)").bind(p, nowIso()).run();
+    const label = user === "owner" ? "Owner" : user.charAt(0).toUpperCase() + user.slice(1);
+    await env.DB.prepare("INSERT INTO principals (id, kind, issuer, subject, label, created_at, email) VALUES (?, 'human', 'local-dev', ?, ?, ?, ?)").bind(p, user, label, nowIso(), `${user}@example.test`).run();
   }
   const sid = randomId("ses", 32);
   const csrf = randomId("csrf", 18);
@@ -92,6 +98,8 @@ async function accessLogin(req, env, url) {
     p = { id: randomId("hum") };
     await env.DB.prepare("INSERT INTO principals (id, kind, issuer, subject, label, created_at) VALUES (?, 'human', ?, ?, 'Owner', ?)").bind(p.id, id.issuer, id.subject, nowIso()).run();
   }
+  // Keep the verified sign-in email current (matches workspace invitations). Never used for authorization.
+  if (id.email) await env.DB.prepare("UPDATE principals SET email = ? WHERE id = ? AND email IS NOT ?").bind(String(id.email).toLowerCase(), p.id, String(id.email).toLowerCase()).run();
   const sid = randomId("ses", 32);
   const csrf = randomId("csrf", 18);
   await env.DB.prepare("INSERT INTO sessions (id_hash, principal_id, csrf, expires_at) VALUES (?, ?, ?, ?)").bind(await sha256Hex(sid), p.id, csrf, nowMs() + 30 * 864e5).run();
@@ -139,6 +147,21 @@ async function route3(req, env, url, requestId) {
     await env.DB.prepare("UPDATE sessions SET revoked_at = ? WHERE principal_id = ? AND revoked_at IS NULL").bind(nowMs(), ctx.principal.id).run();
     return json({ ok: true }, 200, { "set-cookie": `${SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0` });
   }
+  if (seg[0] === "workspaces") {
+    if (seg.length === 1 && m === "GET") return json(await listWorkspaces(ctx));
+    if (seg.length === 1 && m === "POST") return json(await createWorkspace(ctx, await body(req)), 201);
+    const wid = str(seg[1], "workspace", 80);
+    if (seg.length === 2 && m === "PATCH") return json(await updateWorkspace(ctx, wid, await body(req)));
+    if (seg.length === 2 && m === "DELETE") return json(await deleteWorkspace(ctx, wid));
+    if (seg[2] === "members" && seg.length === 3 && m === "GET") return json(await listMembers(ctx, wid));
+    if (seg[2] === "members" && seg.length === 4 && m === "PATCH") return json(await setMemberRole(ctx, wid, str(seg[3], "member", 80), await body(req)));
+    if (seg[2] === "members" && seg.length === 4 && m === "DELETE") return json(await removeMember(ctx, wid, str(seg[3], "member", 80)));
+    if (seg[2] === "invites" && seg.length === 3 && m === "POST") return json(await createInvite(ctx, wid, await body(req), url.origin), 201);
+    if (seg[2] === "invites" && seg.length === 5 && seg[4] === "revoke" && m === "POST") return json(await revokeInvite(ctx, wid, str(seg[3], "invite", 80)));
+    throw new HttpError(404, "not_found", "Not found");
+  }
+  if (seg[0] === "invites" && seg.length === 2 && seg[1] === "preview" && m === "POST") return json(await previewInvite(ctx, await body(req)));
+  if (seg[0] === "invites" && seg.length === 2 && seg[1] === "accept" && m === "POST") return json(await acceptInvite(ctx, await body(req)));
   if (seg[0] === "restore" && m === "POST") return json(await restoreBackup(ctx, await body(req)), 201);
   if (seg[0] === "access" && seg.length === 1 && m === "GET") return json(await listAccess(ctx));
   if (seg[0] === "connections" && seg.length === 3 && seg[2] === "revoke" && m === "POST") return json(await revokeConnectionById(ctx, str(seg[1], "connection", 80)));

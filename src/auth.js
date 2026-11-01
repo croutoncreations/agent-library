@@ -1,4 +1,5 @@
 import { accessEnabled, verifyAccess } from "./access.js";
+import { humanGate, memberRoleSql, requireProjectRole } from "./tenancy.js";
 import { HttpError, nowMs, sha256Hex } from "./util.js";
 
 function limitsFor(env) {
@@ -95,10 +96,13 @@ async function authorizeProject(ctx, projectId, write) {
   if (ctx.principal.kind === "agent") {
     if (!ctx.grant || ctx.grant.project_id !== projectId) throw new HttpError(404, "not_found", "Project not found");
     if (write && !ctx.grant.can_write) throw new HttpError(403, "forbidden", "Grant is read-only");
+    // The credential's creator must still be a member with enough role (checked again inside every mutation).
+    const g = credentialGate(ctx, projectId, write ? "write" : "read");
+    const ok = await ctx.env.DB.prepare(`SELECT ${g.sql} AS ok`).bind(...g.params).first("ok");
+    if (!ok) throw new HttpError(write ? 403 : 404, write ? "forbidden" : "not_found", write ? "No write access to this project" : "Project not found");
     return;
   }
-  const p = await ctx.env.DB.prepare("SELECT owner_id FROM projects WHERE id = ?").bind(projectId).first();
-  if (!p || p.owner_id !== ctx.principal.id) throw new HttpError(404, "not_found", "Project not found");
+  await requireProjectRole(ctx, projectId, write ? "member" : "viewer");
 }
 function protectSql(ctx, artifactId) {
   if (ctx.principal.kind !== "agent" || ctx.publisher || artifactId === void 0) return { sql: "1", params: [] };
@@ -109,11 +113,19 @@ function contentWriteSql(ctx, artifactId) {
   if (ctx.publisher || artifactId === void 0) return { sql: "1", params: [] };
   return { sql: "NOT EXISTS (SELECT 1 FROM artifacts WHERE id = ? AND publisher_id IS NOT NULL)", params: [artifactId] };
 }
-function authzSql(ctx, projectId) {
+/**
+ * SQL gate for one credential on one project, evaluated inside each statement. need: "read" | "write".
+ * Every agent credential works only while its creator (COALESCE(created_by, owner)) still has at least
+ * viewer (read) or member (write) in the project's active workspace.
+ */
+function credentialGate(ctx, projectId, need) {
+  const now = nowMs();
+  const roleNeed = need === "write" ? "member" : "viewer";
   if (ctx.principal.kind === "agent" && ctx.publisher)
     return {
       sql: `EXISTS (SELECT 1 FROM publishers pb JOIN projects pj ON pj.id = pb.project_id
-              WHERE pb.id = ? AND pb.project_id = ? AND pb.revoked_at IS NULL AND pj.owner_id = pb.owner_principal_id)`,
+              WHERE pb.id = ? AND pb.project_id = ? AND pb.revoked_at IS NULL
+                AND ${memberRoleSql("pj.id", roleNeed, "COALESCE(pb.created_by, pb.owner_principal_id)")})`,
       params: [ctx.grant.id, projectId]
     };
   if (ctx.principal.kind === "agent" && ctx.apiCredential)
@@ -121,27 +133,32 @@ function authzSql(ctx, projectId) {
       sql: `EXISTS (SELECT 1 FROM api_credentials ac
               JOIN api_credential_projects acp ON acp.credential_id = ac.id
               JOIN projects pj ON pj.id = acp.project_id
-              WHERE ac.id = ? AND acp.project_id = ? AND ac.revoked_at IS NULL AND ac.expires_at > ? AND acp.can_write = 1
-                AND pj.owner_id = ac.owner_principal_id)`,
-      params: [ctx.grant.id, projectId, nowMs()]
+              WHERE ac.id = ? AND acp.project_id = ? AND ac.revoked_at IS NULL AND ac.expires_at > ?${need === "write" ? " AND acp.can_write = 1" : ""}
+                AND ${memberRoleSql("pj.id", roleNeed, "COALESCE(ac.created_by, ac.owner_principal_id)")})`,
+      params: [ctx.grant.id, projectId, now]
     };
   if (ctx.principal.kind === "agent" && ctx.oauthConnection)
     return {
       sql: `EXISTS (SELECT 1 FROM oauth_connections oc
               JOIN oauth_connection_projects cp ON cp.connection_id = oc.id
               JOIN projects pj ON pj.id = cp.project_id
-              WHERE oc.id = ? AND cp.project_id = ? AND oc.revoked_at IS NULL AND oc.expires_at > ? AND cp.can_write = 1
-                AND pj.owner_id = oc.owner_principal_id)`,
-      params: [ctx.grant.id, projectId, nowMs()]
+              WHERE oc.id = ? AND cp.project_id = ? AND oc.revoked_at IS NULL AND oc.expires_at > ?${need === "write" ? " AND cp.can_write = 1" : " AND oc.can_read = 1"}
+                AND ${memberRoleSql("pj.id", roleNeed, "COALESCE(oc.created_by, oc.owner_principal_id)")})`,
+      params: [ctx.grant.id, projectId, now]
     };
   if (ctx.principal.kind === "agent")
     return {
-      sql: "EXISTS (SELECT 1 FROM grants WHERE id = ? AND project_id = ? AND revoked_at IS NULL AND expires_at > ? AND can_write = 1)",
-      params: [ctx.grant.id, projectId, nowMs()]
+      sql: `EXISTS (SELECT 1 FROM grants gr WHERE gr.id = ? AND gr.project_id = ? AND gr.revoked_at IS NULL AND gr.expires_at > ?${need === "write" ? " AND gr.can_write = 1" : ""}
+              AND ${memberRoleSql("gr.project_id", roleNeed, "gr.created_by")})`,
+      params: [ctx.grant.id, projectId, now]
     };
-  return { sql: "EXISTS (SELECT 1 FROM projects WHERE id = ? AND owner_id = ?)", params: [projectId, ctx.principal.id] };
+  const h = humanGate(ctx.principal.id, projectId, roleNeed);
+  return { sql: h.sql, params: h.params };
+}
+function authzSql(ctx, projectId) {
+  return credentialGate(ctx, projectId, "write");
 }
 var SESSION_COOKIE;
 SESSION_COOKIE = "al_session";
 
-export { SESSION_COOKIE, authenticate, authorizeProject, authzSql, contentWriteSql, enforceRate, limitsFor, protectSql, rateLimit, requireCsrf, requireHuman };
+export { SESSION_COOKIE, authenticate, authorizeProject, authzSql, credentialGate, contentWriteSql, enforceRate, limitsFor, protectSql, rateLimit, requireCsrf, requireHuman };

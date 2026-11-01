@@ -4,6 +4,7 @@ import { CONTENT_TYPE, MIME, byteLength, checkFile } from "../formats.js";
 import { appOrigin, artifactWebUrl, previewWebUrl } from "../links.js";
 import { SCOPES, livePublisher } from "../oauth/server.js";
 import { LIMITS, connectionInfo, idemLookup } from "../service.js";
+import { memberRoleSql } from "../tenancy.js";
 import { HttpError, errorBody, idemKey, int, json, nowIso, randomId, sha256Hex, str } from "../util.js";
 
 // src/api/generations.ts
@@ -166,10 +167,10 @@ var beginView = (g) => ({
 });
 async function assertStillAuthorized(env, p) {
   const row = await env.DB.prepare(`SELECT pb.token_epoch,pb.revoked_at,pb.project_id,pb.folder_id,ac.disabled_at AS client_disabled,
-    pj.owner_id,pb.owner_principal_id,CASE WHEN pb.folder_id IS NULL THEN 1 ELSE EXISTS(SELECT 1 FROM folders f WHERE f.id=pb.folder_id AND f.project_id=pb.project_id) END AS folder_valid
+    ${memberRoleSql("pj.id", "member", "COALESCE(pb.created_by, pb.owner_principal_id)")} AS creator_ok,CASE WHEN pb.folder_id IS NULL THEN 1 ELSE EXISTS(SELECT 1 FROM folders f WHERE f.id=pb.folder_id AND f.project_id=pb.project_id) END AS folder_valid
     FROM publishers pb JOIN app_clients ac ON ac.id=pb.app_client_id JOIN projects pj ON pj.id=pb.project_id WHERE pb.id=?`).bind(p.id).first();
   if (!row || row.revoked_at !== null || row.client_disabled !== null || row.token_epoch !== p.token_epoch) throw new HttpError(401, "unauthenticated", "Publisher/client revoked or token superseded; reconnect required");
-  if (row.project_id !== p.project_id || (row.folder_id ?? null) !== (p.folder_id ?? null) || row.owner_id !== row.owner_principal_id || !row.folder_valid) throw new HttpError(403, "scope_mismatch", "Publisher destination unavailable or changed");
+  if (row.project_id !== p.project_id || (row.folder_id ?? null) !== (p.folder_id ?? null) || !row.creator_ok || !row.folder_valid) throw new HttpError(403, "scope_mismatch", "Publisher destination unavailable or changed");
 }
 async function begin(env, p, req) {
   idemKey(req.headers.get("idempotency-key"));

@@ -56,8 +56,8 @@ export async function startServer(name, port, { fresh = true, persistDir, vars =
   }
   return {
     base, dir, port,
-    login: () => humanLogin(base, passphrase),
-    loginAt: (b) => humanLogin(b, passphrase),
+    login: (user) => humanLogin(base, passphrase, user),
+    loginAt: (b, user) => humanLogin(b, passphrase, user),
     passphrase: () => passphrase, // for real-browser login forms in tests only
     stop: async () => { stopProc(child); await waitExit(child); await waitPortsFree([port, port + INSPECTOR_OFFSET]); },
   };
@@ -92,8 +92,8 @@ async function parse(r) {
 }
 
 /** Human cookie session. req() adds cookie + csrf for non-GET unless opts.noCsrf. */
-export async function humanLogin(base, passphrase) {
-  const r = await fetch(base + "/auth/dev-login", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ passphrase }) });
+export async function humanLogin(base, passphrase, user) {
+  const r = await fetch(base + "/auth/dev-login", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ passphrase, ...(user ? { user } : {}) }) });
   if (r.status !== 200) throw new Error("dev-login failed " + r.status);
   const { csrf } = await r.json();
   const cookie = r.headers.get("set-cookie").split(";")[0];

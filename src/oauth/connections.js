@@ -1,6 +1,10 @@
 import { authorizeProject, requireHuman } from "../auth.js";
 import { _servers, originFor } from "./server.js";
+import { memberRoleSql, workspaceRoleSql } from "../tenancy.js";
 import { HttpError, nowIso, nowMs } from "../util.js";
+
+// A connection is managed by the person who created it, or an admin of its workspace.
+const MANAGE = `(COALESCE(c.created_by, c.owner_principal_id) = ? OR ${workspaceRoleSql("COALESCE(c.workspace_id, 'wsp_' || c.owner_principal_id)", "admin")})`;
 
 async function listConnections(ctx, projectId) {
   requireHuman(ctx);
@@ -9,8 +13,8 @@ async function listConnections(ctx, projectId) {
     `SELECT c.id, c.client_name, c.client_id, c.redirect_uri, cp.can_write, c.created_at, c.expires_at, c.revoked_at, c.last_used_at,
             (SELECT COUNT(*) FROM oauth_connection_projects x WHERE x.connection_id = c.id) AS project_count
      FROM oauth_connections c JOIN oauth_connection_projects cp ON cp.connection_id = c.id AND cp.project_id = ?
-     WHERE c.owner_principal_id = ? ORDER BY c.created_at DESC LIMIT 100`
-  ).bind(projectId, ctx.principal.id).all();
+     WHERE ${MANAGE} ORDER BY c.created_at DESC LIMIT 100`
+  ).bind(projectId, ctx.principal.id, ctx.principal.id).all();
   return { connections: r.results.map((c) => ({
     id: c.id,
     client_name: c.client_name,
@@ -35,13 +39,13 @@ async function listAccess(ctx) {
   requireHuman(ctx);
   const me2 = ctx.principal.id;
   const conns = await ctx.env.DB.prepare(
-    `SELECT id, client_name, client_id, redirect_uri, created_at, expires_at, revoked_at, last_used_at, file_access
-     FROM oauth_connections WHERE owner_principal_id = ? ORDER BY created_at DESC LIMIT 200`
-  ).bind(me2).all();
+    `SELECT id, client_name, client_id, redirect_uri, created_at, expires_at, revoked_at, last_used_at, file_access, workspace_id, created_by, owner_principal_id
+     FROM oauth_connections c WHERE ${MANAGE} ORDER BY created_at DESC LIMIT 200`
+  ).bind(me2, me2).all();
   const cps = await ctx.env.DB.prepare(
     `SELECT cp.connection_id, cp.project_id, cp.can_write, p.title FROM oauth_connection_projects cp
      JOIN oauth_connections c ON c.id = cp.connection_id JOIN projects p ON p.id = cp.project_id
-     WHERE c.owner_principal_id = ? AND p.owner_id = ?`
+     WHERE ${MANAGE}`
   ).bind(me2, me2).all();
   const byConn = /* @__PURE__ */ new Map();
   for (const r of cps.results) {
@@ -52,8 +56,8 @@ async function listAccess(ctx) {
   const grants = await ctx.env.DB.prepare(
     `SELECT g.id, g.project_id, pr.title, pl.label, g.can_write, g.expires_at, g.revoked_at, g.created_at
      FROM grants g JOIN projects pr ON pr.id = g.project_id JOIN principals pl ON pl.id = g.principal_id
-     WHERE pr.owner_id = ? ORDER BY g.created_at DESC LIMIT 200`
-  ).bind(me2).all();
+     WHERE (g.created_by = ? OR ${memberRoleSql("pr.id", "admin")}) ORDER BY g.created_at DESC LIMIT 200`
+  ).bind(me2, me2).all();
   const now = nowMs();
   return {
     connections: conns.results.map((c) => ({
@@ -61,6 +65,8 @@ async function listAccess(ctx) {
       client_name: c.client_name,
       client_id: c.client_id,
       redirect_host: safeHost(c.redirect_uri),
+      workspace_id: c.workspace_id ?? `wsp_${c.owner_principal_id}`,
+      created_by: c.created_by ?? c.owner_principal_id,
       projects: byConn.get(c.id) ?? [],
       files: c.file_access === 1,
       status: c.revoked_at !== null ? "revoked" : c.expires_at <= now ? "expired" : "active",
@@ -85,16 +91,16 @@ async function revokeConnectionById(ctx, connectionId) {
   requireHuman(ctx);
   const row = await ctx.env.DB.prepare(
     `SELECT cp.project_id FROM oauth_connections c JOIN oauth_connection_projects cp ON cp.connection_id = c.id
-     WHERE c.id = ? AND c.owner_principal_id = ? LIMIT 1`
-  ).bind(connectionId, ctx.principal.id).first("project_id");
+     WHERE c.id = ? AND ${MANAGE} LIMIT 1`
+  ).bind(connectionId, ctx.principal.id, ctx.principal.id).first("project_id");
   if (!row) throw new HttpError(404, "not_found", "Connection not found");
   return revokeConnection(ctx, row, connectionId);
 }
 async function revokeConnection(ctx, projectId, connectionId) {
   requireHuman(ctx);
-  await authorizeProject(ctx, projectId, true);
-  const r = await ctx.env.DB.prepare(`UPDATE oauth_connections SET revoked_at = ? WHERE id = ? AND owner_principal_id = ? AND revoked_at IS NULL
-      AND EXISTS (SELECT 1 FROM oauth_connection_projects cp WHERE cp.connection_id = oauth_connections.id AND cp.project_id = ?)`).bind(nowMs(), connectionId, ctx.principal.id, projectId).run();
+  await authorizeProject(ctx, projectId, false);
+  const r = await ctx.env.DB.prepare(`UPDATE oauth_connections AS c SET revoked_at = ? WHERE id = ? AND ${MANAGE} AND revoked_at IS NULL
+      AND EXISTS (SELECT 1 FROM oauth_connection_projects cp WHERE cp.connection_id = c.id AND cp.project_id = ?)`).bind(nowMs(), connectionId, ctx.principal.id, ctx.principal.id, projectId).run();
   if (!r.meta.changes) throw new HttpError(404, "not_found", "Active connection not found");
   await ctx.env.DB.prepare("INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id) VALUES (?, ?, ?, 'oauth.revoke', ?, 'ok', ?)").bind(nowIso(), ctx.principal.id, projectId, connectionId, ctx.requestId).run();
   const env = ctx.env;

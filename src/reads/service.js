@@ -1,4 +1,4 @@
-import { authorizeProject } from "../auth.js";
+import { authorizeProject, credentialGate } from "../auth.js";
 import { db } from "../service.js";
 import { HttpError, int, nowMs } from "../util.js";
 
@@ -50,21 +50,7 @@ function rtFit(body, lim) {
 }
 const RT_ID_TOO_LONG = { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Request id is too long for a chunked read (at most 1024 bytes as JSON)" } };
 function rtReadAuthzSql(ctx, projectId) {
-  const now = nowMs();
-  if (ctx.principal.kind === "agent" && ctx.publisher)
-    return { sql: `EXISTS (SELECT 1 FROM publishers pb JOIN projects pj ON pj.id = pb.project_id
-      WHERE pb.id = ? AND pb.project_id = ? AND pb.revoked_at IS NULL AND pj.owner_id = pb.owner_principal_id)`, params: [ctx.grant.id, projectId] };
-  if (ctx.principal.kind === "agent" && ctx.apiCredential)
-    return { sql: `EXISTS (SELECT 1 FROM api_credentials ac JOIN api_credential_projects acp ON acp.credential_id = ac.id
-      JOIN projects pj ON pj.id = acp.project_id
-      WHERE ac.id = ? AND acp.project_id = ? AND ac.revoked_at IS NULL AND ac.expires_at > ? AND pj.owner_id = ac.owner_principal_id)`, params: [ctx.grant.id, projectId, now] };
-  if (ctx.principal.kind === "agent" && ctx.oauthConnection)
-    return { sql: `EXISTS (SELECT 1 FROM oauth_connections oc JOIN oauth_connection_projects cp ON cp.connection_id = oc.id
-      JOIN projects pj ON pj.id = cp.project_id
-      WHERE oc.id = ? AND cp.project_id = ? AND oc.revoked_at IS NULL AND oc.expires_at > ? AND oc.can_read = 1 AND pj.owner_id = oc.owner_principal_id)`, params: [ctx.grant.id, projectId, now] };
-  if (ctx.principal.kind === "agent")
-    return { sql: "EXISTS (SELECT 1 FROM grants WHERE id = ? AND project_id = ? AND revoked_at IS NULL AND expires_at > ?)", params: [ctx.grant.id, projectId, now] };
-  return { sql: "EXISTS (SELECT 1 FROM projects WHERE id = ? AND owner_id = ?)", params: [projectId, ctx.principal.id] };
+  return credentialGate(ctx, projectId, "read");
 }
 function rtCursorEncode(p, a, r, h, o) {
   return "rc1." + btoa(JSON.stringify([p, a, r, h, o])).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");

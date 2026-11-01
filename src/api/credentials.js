@@ -1,10 +1,14 @@
 import { requireHuman } from "../auth.js";
+import { ROLE_RANK, memberRoleSql, projectRole, workspaceRoleSql } from "../tenancy.js";
 import { HttpError, nowIso, nowMs, randomId, sha256Hex, str } from "../util.js";
 
 var KEY_LIFETIMES_DAYS = [1, 7, 30, 90];
 var DEFAULT_LIFETIME_DAYS = 90;
 var MAX_PROJECTS_PER_KEY = 50;
 var KEY_RE = /^alk_[A-Za-z0-9_-]{43}$/;
+// A key is managed by the person who created it, or an admin of its workspace. Columns are qualified: inside
+// workspaceRoleSql a bare workspace_id would bind to workspace_members.workspace_id (any admin anywhere).
+var KEY_MANAGER = `(COALESCE(k.created_by, k.owner_principal_id) = ? OR ${workspaceRoleSql("COALESCE(k.workspace_id, 'wsp_' || k.owner_principal_id)", "admin")})`;
 async function validateScope(env, ownerId, raw) {
   if (!Array.isArray(raw) || raw.length < 1 || raw.length > MAX_PROJECTS_PER_KEY)
     throw new HttpError(400, "invalid_input", `projects must list 1-${MAX_PROJECTS_PER_KEY} projects`);
@@ -17,8 +21,12 @@ async function validateScope(env, ownerId, raw) {
     if (r.access !== "read" && r.access !== "read_write") throw new HttpError(400, "invalid_input", "access must be read or read_write");
     out2.push({ project_id: pid, can_write: r.access === "read_write" });
   }
-  const owned = await env.DB.prepare(`SELECT id FROM projects WHERE owner_id = ? AND id IN (${out2.map(() => "?").join(",")})`).bind(ownerId, ...out2.map((s) => s.project_id)).all();
-  if (owned.results.length !== out2.length) throw new HttpError(404, "not_found", "Project not found");
+  // Every project must be visible to the creator, all in one workspace, and read_write needs member or above.
+  const roles = await Promise.all(out2.map((s) => projectRole(env, ownerId, s.project_id)));
+  if (roles.some((r) => !r || !r.role || r.status !== "active")) throw new HttpError(404, "not_found", "Project not found");
+  if (new Set(roles.map((r) => r.workspace_id)).size !== 1) throw new HttpError(400, "invalid_input", "A key covers projects from one workspace");
+  if (out2.some((s, i) => s.can_write && ROLE_RANK[roles[i].role] < ROLE_RANK.member)) throw new HttpError(403, "forbidden", "Your role in this workspace is read-only");
+  out2.workspaceId = roles[0].workspace_id;
   return out2;
 }
 function lifetime(raw) {
@@ -37,8 +45,8 @@ async function insertKey(ctx, label, days, scope, replacesId) {
   const expires = nowMs() + days * 864e5;
   await env.DB.batch([
     env.DB.prepare("INSERT INTO principals (id, kind, issuer, subject, label, created_at) VALUES (?, 'agent', 'agent-library-api', ?, ?, ?)").bind(principalId, principalId, label, nowIso()),
-    env.DB.prepare(`INSERT INTO api_credentials (id, owner_principal_id, principal_id, label, token_hash, created_at, expires_at, replaces_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).bind(id, ctx.principal.id, principalId, label, await sha256Hex(secret), nowIso(), expires, replacesId),
+    env.DB.prepare(`INSERT INTO api_credentials (id, owner_principal_id, principal_id, label, token_hash, created_at, expires_at, replaces_id, workspace_id, created_by)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(id, ctx.principal.id, principalId, label, await sha256Hex(secret), nowIso(), expires, replacesId, scope.workspaceId, ctx.principal.id),
     ...scope.map((s) => env.DB.prepare("INSERT INTO api_credential_projects (credential_id, project_id, can_write) VALUES (?, ?, ?)").bind(id, s.project_id, s.can_write ? 1 : 0)),
     ...scope.map((s) => auditStmt(env, ctx, s.project_id, replacesId ? "apikey.replace" : "apikey.create", id, s.can_write ? "ok:read_write" : "ok:read"))
   ]);
@@ -52,18 +60,21 @@ async function createApiKey(ctx, input) {
   return insertKey(ctx, label, days, scope, null);
 }
 async function ownKey(ctx, id) {
-  const k = await ctx.env.DB.prepare("SELECT * FROM api_credentials WHERE id = ? AND owner_principal_id = ?").bind(id, ctx.principal.id).first();
+  // The creator, or an admin of the key's workspace, manages a key. Anyone else gets 404.
+  const k = await ctx.env.DB.prepare(`SELECT k.* FROM api_credentials k WHERE k.id = ? AND ${KEY_MANAGER}`).bind(id, ctx.principal.id, ctx.principal.id).first();
   if (!k) throw new HttpError(404, "not_found", "API key not found");
   return k;
 }
 async function listApiKeys(ctx) {
   requireHuman(ctx);
-  const keys = await ctx.env.DB.prepare("SELECT * FROM api_credentials WHERE owner_principal_id = ? ORDER BY created_at DESC LIMIT 200").bind(ctx.principal.id).all();
+  // Keys I created, plus every key in workspaces where I'm an admin.
+  const mine = `SELECT k.id FROM api_credentials k WHERE ${KEY_MANAGER} ORDER BY k.created_at DESC LIMIT 200`;
+  const keys = await ctx.env.DB.prepare(`SELECT * FROM api_credentials WHERE id IN (${mine}) ORDER BY created_at DESC`).bind(ctx.principal.id, ctx.principal.id).all();
   const scopes = await ctx.env.DB.prepare(
     `SELECT acp.credential_id, acp.project_id, acp.can_write, p.title FROM api_credential_projects acp
      JOIN projects p ON p.id = acp.project_id
-     WHERE acp.credential_id IN (SELECT id FROM api_credentials WHERE owner_principal_id = ? ORDER BY created_at DESC LIMIT 200)`
-  ).bind(ctx.principal.id).all();
+     WHERE acp.credential_id IN (${mine})`
+  ).bind(ctx.principal.id, ctx.principal.id).all();
   const now = nowMs();
   return { keys: keys.results.map((k) => ({
     id: k.id,
@@ -73,6 +84,8 @@ async function listApiKeys(ctx) {
     last_used_at: k.last_used_at ? new Date(k.last_used_at).toISOString() : null,
     replaces_id: k.replaces_id,
     status: k.revoked_at !== null ? "revoked" : k.expires_at <= now ? "expired" : "active",
+    workspace_id: k.workspace_id ?? `wsp_${k.owner_principal_id}`,
+    created_by: k.created_by ?? k.owner_principal_id,
     projects: scopes.results.filter((s) => s.credential_id === k.id).map((s) => ({ project_id: s.project_id, title: s.title, access: s.can_write ? "read_write" : "read" }))
   })) };
 }
@@ -80,17 +93,21 @@ async function replaceApiKey(ctx, id, input) {
   requireHuman(ctx);
   const old = await ownKey(ctx, id);
   if (old.revoked_at !== null) throw new HttpError(409, "revoked", "Revoked keys cannot be replaced; create a new key");
-  const scope = await ctx.env.DB.prepare(
-    "SELECT acp.project_id, acp.can_write FROM api_credential_projects acp JOIN projects p ON p.id = acp.project_id WHERE acp.credential_id = ? AND p.owner_id = ?"
-  ).bind(id, ctx.principal.id).all();
-  if (!scope.results.length) throw new HttpError(409, "empty_scope", "Key has no projects left");
-  return insertKey(ctx, old.label, lifetime(input?.lifetime_days), scope.results.map((r) => ({ project_id: r.project_id, can_write: !!r.can_write })), id);
+  const cur = await ctx.env.DB.prepare("SELECT project_id, can_write FROM api_credential_projects WHERE credential_id = ?").bind(id).all();
+  if (!cur.results.length) throw new HttpError(409, "empty_scope", "Key has no projects left");
+  // The new key belongs to whoever replaces it, so its scope is re-validated against their own role.
+  const scope = await validateScope(ctx.env, ctx.principal.id, cur.results.map((r) => ({ project_id: r.project_id, access: r.can_write ? "read_write" : "read" })));
+  return insertKey(ctx, old.label, lifetime(input?.lifetime_days), scope, id);
 }
 async function setApiKeyScope(ctx, id, input) {
   requireHuman(ctx);
   const k = await ownKey(ctx, id);
   if (k.revoked_at !== null || k.expires_at <= nowMs()) throw new HttpError(409, "inactive", "Key is revoked or expired");
-  const scope = await validateScope(ctx.env, ctx.principal.id, input?.projects);
+  // The scope can never exceed the key's creator (who it acts for), nor the acting person.
+  const creator = k.created_by ?? k.owner_principal_id;
+  const scope = await validateScope(ctx.env, creator, input?.projects);
+  if (creator !== ctx.principal.id) await validateScope(ctx.env, ctx.principal.id, input?.projects);
+  if (scope.workspaceId !== (k.workspace_id ?? `wsp_${k.owner_principal_id}`)) throw new HttpError(400, "invalid_input", "A key covers projects from one workspace");
   const env = ctx.env;
   const cur = await env.DB.prepare("SELECT project_id, can_write FROM api_credential_projects WHERE credential_id = ?").bind(id).all();
   const added = scope.filter((s) => {
@@ -117,7 +134,7 @@ async function revokeApiKey(ctx, id) {
   const at = nowMs();
   const env = ctx.env;
   const [r] = await env.DB.batch([
-    env.DB.prepare("UPDATE api_credentials SET revoked_at = ? WHERE id = ? AND owner_principal_id = ? AND revoked_at IS NULL").bind(at, id, ctx.principal.id),
+    env.DB.prepare("UPDATE api_credentials SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL").bind(at, id),
     env.DB.prepare(`INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id)
       SELECT ?, ?, NULL, 'apikey.revoke', ?, 'ok', ? WHERE EXISTS (SELECT 1 FROM api_credentials WHERE id = ? AND revoked_at = ?)`).bind(nowIso(), ctx.principal.id, id, ctx.requestId, id, at)
   ]);
@@ -139,9 +156,9 @@ async function verifyApiKey(env, authz) {
   if (row.revoked_at !== null) throw new HttpError(401, "credential_revoked", "Credential revoked", { reason: "revoked", key_id: row.id });
   if (row.expires_at <= nowMs()) throw new HttpError(401, "credential_expired", "Credential expired", { reason: "expired", key_id: row.id });
   const ps = await env.DB.prepare(
-    `SELECT p.id, p.title, acp.can_write FROM api_credential_projects acp JOIN projects p ON p.id = acp.project_id
-     WHERE acp.credential_id = ? AND p.owner_id = ? ORDER BY p.created_at LIMIT ${MAX_PROJECTS_PER_KEY}`
-  ).bind(row.id, row.owner_principal_id).all();
+    `SELECT p.id, p.title, acp.can_write AND ${memberRoleSql("p.id", "member")} AS can_write FROM api_credential_projects acp JOIN projects p ON p.id = acp.project_id
+     WHERE acp.credential_id = ? AND ${memberRoleSql("p.id", "viewer")} ORDER BY p.created_at LIMIT ${MAX_PROJECTS_PER_KEY}`
+  ).bind(row.created_by ?? row.owner_principal_id, row.id, row.created_by ?? row.owner_principal_id).all();
   if (!row.last_used_at || nowMs() - row.last_used_at > 6e4)
     await env.DB.prepare("UPDATE api_credentials SET last_used_at = ? WHERE id = ?").bind(nowMs(), row.id).run().catch(() => {
     });

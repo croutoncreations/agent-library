@@ -7,6 +7,7 @@ import { RT_ID_TOO_LONG, RT_KINDS_ALL, RT_KINDS_DOCS, readTextChunk, rtChunkLimi
 import { __name } from "./runtime.js";
 import { RS_SCHEMA, rsQuery, rsReady, rsToolReady, searchArtifacts } from "./search/service.js";
 import { createFromTemplate, listTemplates, previewTemplate, saveAsTemplate, tplAssertMaintenance, tplDate, tplProvenance, tplTools } from "./templates/service.js";
+import { ROLE_RANK, personalWorkspaceId, workspaceRoleSql, requireProjectRole, requireWorkspaceRole, visibleProjects } from "./tenancy.js";
 import { HttpError, int, nowIso, nowMs, randomId, sha256Hex, str } from "./util.js";
 
 function requireAppConnect(ctx) {
@@ -79,26 +80,34 @@ async function listProjects(ctx) {
     const p = await db(ctx).prepare("SELECT id, title FROM projects WHERE id = ?").bind(ctx.grant.project_id).first();
     return { projects: p ? [{ ...p, can_write: !!ctx.grant.can_write }] : [] };
   }
-  const r = await db(ctx).prepare("SELECT id, title FROM projects WHERE owner_id = ? ORDER BY created_at").bind(ctx.principal.id).all();
-  return { projects: r.results.map((p) => ({ ...p, can_write: true })) };
+  // Every project in every active workspace I belong to (minus per-project 'none'), with my effective role.
+  const ps = await visibleProjects(ctx.env, ctx.principal.id);
+  return { projects: ps.map((p) => ({ id: p.id, title: p.title, workspace_id: p.workspace_id, role: p.role, can_write: ROLE_RANK[p.role] >= ROLE_RANK.member })) };
 }
 async function createProject(ctx, input) {
   requireHuman(ctx);
   const id = input.id ? str(input.id, "id", 64) : randomId("prj");
   if (!/^[a-z0-9][a-z0-9-]{2,63}$|^prj_[A-Za-z0-9_-]+$/.test(id)) throw new HttpError(400, "invalid_input", "Bad project id");
   const title = str(input.title, "title", 200, { min: 1 });
-  await db(ctx).batch([
-    db(ctx).prepare("INSERT INTO projects (id, owner_id, title, created_at) VALUES (?, ?, ?, ?)").bind(id, ctx.principal.id, title, nowIso()),
-    audit(ctx, id, "project.create", id, null, "ok")
+  const wsId = input.workspace_id === void 0 ? personalWorkspaceId(ctx.principal.id) : str(input.workspace_id, "workspace_id", 80);
+  const ws = await requireWorkspaceRole(ctx, wsId, "admin");
+  // owner_id stays the workspace's creator so a rolled-back Worker (owner-only model) still finds it.
+  const ownerId = await db(ctx).prepare("SELECT created_by FROM workspaces WHERE id = ?").bind(ws.id).first("created_by");
+  const [ins] = await db(ctx).batch([
+    db(ctx).prepare(`INSERT INTO projects (id, owner_id, title, created_at, workspace_id) SELECT ?, ?, ?, ?, ?
+      WHERE ${workspaceRoleSql("?", "admin")}`).bind(id, ownerId, title, nowIso(), ws.id, ctx.principal.id, ws.id),
+    db(ctx).prepare("INSERT INTO audits (at, actor_id, project_id, action, object_id, rev_no, result, request_id, workspace_id) SELECT ?, ?, ?, 'project.create', ?, NULL, 'ok', ?, ? WHERE EXISTS (SELECT 1 FROM projects WHERE id = ? AND workspace_id = ?)")
+      .bind(nowIso(), ctx.principal.id, id, id, ctx.requestId, ws.id, id, ws.id)
   ]).catch((e) => {
     if (/UNIQUE|constraint/i.test(String(e))) throw new HttpError(409, "exists", "Project already exists");
     throw e;
   });
-  return { id, title };
+  if (!ins.meta.changes) throw new HttpError(403, "forbidden", "Needs the admin role in this workspace");
+  return { id, title, workspace_id: ws.id };
 }
 async function createGrant(ctx, projectId, input) {
   requireHuman(ctx);
-  await authorizeProject(ctx, projectId, true);
+  await requireProjectRole(ctx, projectId, "admin");
   const label = str(input.label, "label", 80, { min: 1 });
   const canWrite = input.can_write === true ? 1 : 0;
   const ttlHours = input.ttl_hours === void 0 ? 24 : int(input.ttl_hours, "ttl_hours", 1, 24 * 30);
@@ -117,7 +126,7 @@ async function createGrant(ctx, projectId, input) {
 }
 async function listGrants(ctx, projectId) {
   requireHuman(ctx);
-  await authorizeProject(ctx, projectId, false);
+  await requireProjectRole(ctx, projectId, "admin");
   const r = await db(ctx).prepare(
     `SELECT g.id, p.label, g.can_write, g.expires_at, g.revoked_at FROM grants g JOIN principals p ON p.id = g.principal_id
      WHERE g.project_id = ? ORDER BY g.created_at`
@@ -134,7 +143,7 @@ async function listGrants(ctx, projectId) {
 }
 async function updateGrant(ctx, projectId, grantId, input) {
   requireHuman(ctx);
-  await authorizeProject(ctx, projectId, true);
+  await requireProjectRole(ctx, projectId, "admin");
   let res;
   if (input.revoke === true) {
     res = await db(ctx).prepare("UPDATE grants SET revoked_at = ? WHERE id = ? AND project_id = ? AND revoked_at IS NULL").bind(nowMs(), grantId, projectId).run();
@@ -550,7 +559,7 @@ async function listComments(ctx, projectId, artifactId) {
 }
 async function listAudit(ctx, projectId) {
   requireHuman(ctx);
-  await authorizeProject(ctx, projectId, false);
+  await requireProjectRole(ctx, projectId, "admin");
   const r = await db(ctx).prepare(
     "SELECT seq, at, actor_id, action, object_id, rev_no, result, request_id FROM audits WHERE project_id = ? ORDER BY seq DESC LIMIT 200"
   ).bind(projectId).all();

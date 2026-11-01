@@ -5,6 +5,7 @@ import { handleOAuthMcp } from "./mcp.js";
 import { authorizationUrl, exchangeAndVerify, newUpstreamSecrets, oidcConfig } from "./oidc.js";
 import { __name } from "../runtime.js";
 import { folderName } from "../service.js";
+import { ROLE_RANK, memberRoleSql, personalWorkspaceId, visibleProjects, workspaceRole } from "../tenancy.js";
 import { nowIso, nowMs, randomId } from "../util.js";
 
 function originFor(host) {
@@ -92,7 +93,8 @@ async function livePublisher(env, p) {
   if (!p || typeof p.publisher_id !== "string" || !/^pub_[A-Za-z0-9_-]{10,64}$/.test(p.publisher_id)) return null;
   const row = await env.DB.prepare(
     `SELECT pb.*, ac.client_id, ac.disabled_at AS client_disabled, ac.id AS apc_id FROM publishers pb JOIN app_clients ac ON ac.id = pb.app_client_id
-     JOIN projects pj ON pj.id = pb.project_id WHERE pb.id = ? AND pj.owner_id = pb.owner_principal_id`
+     JOIN projects pj ON pj.id = pb.project_id WHERE pb.id = ?
+       AND ${memberRoleSql("pj.id", "member", "COALESCE(pb.created_by, pb.owner_principal_id)")}`
   ).bind(p.publisher_id).first();
   if (!row) return null;
   if (row.revoked_at !== null) return { ...row, revoked: true };
@@ -142,14 +144,19 @@ function logRegistration(outcome, m) {
     software_version: s(m.software_version, 40)
   }));
 }
+// Projects a person can connect an agent to: every visible project, with whether they may grant edit access.
+async function consentProjects(env, principalId) {
+  return (await visibleProjects(env, principalId)).slice(0, 500).map((p) => ({ id: p.id, title: p.title, workspace_id: p.workspace_id,
+    workspace_name: p.personal ? null : p.workspace_name, can_write: ROLE_RANK[p.role] >= ROLE_RANK.member }));
+}
 async function liveConnection(env, id) {
   if (typeof id !== "string" || !/^oac_[A-Za-z0-9_-]{10,64}$/.test(id)) return null;
   const row = await env.DB.prepare("SELECT * FROM oauth_connections WHERE id = ?").bind(id).first();
   if (!row || row.revoked_at !== null || row.expires_at <= nowMs()) return null;
   const ps = await env.DB.prepare(
-    `SELECT p.id, p.title, cp.can_write FROM oauth_connection_projects cp JOIN projects p ON p.id = cp.project_id
-     WHERE cp.connection_id = ? AND p.owner_id = ? ORDER BY p.created_at LIMIT ${MAX_CONN_PROJECTS}`
-  ).bind(id, row.owner_principal_id).all();
+    `SELECT p.id, p.title, cp.can_write AND ${memberRoleSql("p.id", "member")} AS can_write FROM oauth_connection_projects cp JOIN projects p ON p.id = cp.project_id
+     WHERE cp.connection_id = ? AND ${memberRoleSql("p.id", "viewer")} ORDER BY p.created_at LIMIT ${MAX_CONN_PROJECTS}`
+  ).bind(row.created_by ?? row.owner_principal_id, id, row.created_by ?? row.owner_principal_id).all();
   if (!ps.results.length) return null;
   return { ...row, projects: ps.results };
 }
@@ -325,16 +332,21 @@ async function authorizePost(req, env, as, origin) {
     const sess = await env.OAUTH_KV.get(`consentctx:${await sha(handle)}`, "json");
     if (!sess) return errorPage("This consent page expired. Start connecting again from the app.");
     if (sess.app_client_id) return errorPage("This app connects as a publisher. Start connecting again from the app.");
-    const owned = await env.DB.prepare("SELECT id, title FROM projects WHERE owner_id = ? ORDER BY created_at LIMIT 500").bind(sess.principal_id).all();
+    const owned = { results: await consentProjects(env, sess.principal_id) };
     // A fixable mistake re-renders the page with the owner's choices kept: the consent handle is still unused, and
     // the browser's Back button can't help (the sign-in callback that rendered the page is single-use).
     const retry = (msg) => sess.view ? cxGrantPage(sess.view.d, sess.view.email, owned.results, sess.view.prev, { handle, headers: new Headers() }, form, msg, 400) : errorPage(msg);
     const chosen = [];
     for (const p of owned.results) {
       const a = String(form.get(`access:${p.id}`) ?? "none");
-      if (a === "read" || a === "write") chosen.push({ id: p.id, write: a === "write" });
+      if (a === "read" || a === "write") chosen.push({ id: p.id, write: a === "write", workspace_id: p.workspace_id });
       else if (a !== "none") return retry("Unexpected access choice. Pick Off, Read or Edit for each project.");
+      if (a === "write" && !p.can_write) return retry(`Your role in \u201C${p.title.slice(0, 60)}\u201D is read-only. Choose Read or Off.`);
     }
+    // One connection covers one workspace. New projects go into that workspace (personal if none was picked).
+    const wsIds = [...new Set(chosen.map((c) => c.workspace_id))];
+    if (wsIds.length > 1) return retry("Pick projects from one workspace. Connect again for another workspace.");
+    const connWs = wsIds[0] ?? personalWorkspaceId(sess.principal_id);
     const seenTitles = /* @__PURE__ */ new Set();
     for (let i = 1; i <= NEW_PROJECT_SLOTS; i++) {
       const sfx = i === 1 ? "" : `_${i}`;
@@ -345,9 +357,14 @@ async function authorizePost(req, env, as, origin) {
       if (newAccess !== "read" && newAccess !== "write") return retry(`Choose Read or Edit for new project \u201C${newTitle.slice(0, 60)}\u201D.`);
       if (seenTitles.has(newTitle.toLowerCase())) return retry(`\u201C${newTitle.slice(0, 60)}\u201D is listed twice. Remove the duplicate.`);
       seenTitles.add(newTitle.toLowerCase());
-      chosen.push({ id: randomId("prj"), write: newAccess === "write", isNew: newTitle });
+      chosen.push({ id: randomId("prj"), write: newAccess === "write", isNew: newTitle, workspace_id: connWs });
     }
     if (!chosen.length) return retry("Pick at least one project, or create one.");
+    if (chosen.some((c) => c.isNew)) {
+      const role = await workspaceRole(env, connWs, sess.principal_id);
+      if (ROLE_RANK[role ?? "none"] < ROLE_RANK.admin) return retry("Only workspace admins can create projects here. Pick existing projects.");
+    }
+    const wsOwner = await env.DB.prepare("SELECT created_by FROM workspaces WHERE id = ?").bind(connWs).first("created_by");
     if (chosen.length > MAX_CONN_PROJECTS) return retry(`Pick at most ${MAX_CONN_PROJECTS} projects.`);
     const anyWrite = chosen.some((c) => c.write);
     const scope = anyWrite ? [SCOPES.read, SCOPES.write, SCOPES.offline] : [SCOPES.read, SCOPES.offline];
@@ -381,13 +398,13 @@ async function authorizePost(req, env, as, origin) {
     const res = await env.DB.batch([
       ...claim ? [claim, ...(replaced.projects.length ? replaced.projects : [replaced.project_id]).map(auditReplaced)] : [],
       ...chosen.filter((c) => c.isNew).flatMap((c) => [
-        env.DB.prepare("INSERT INTO projects (id, owner_id, title, created_at) VALUES (?, ?, ?, ?)").bind(c.id, sess.principal_id, c.isNew, at),
+        env.DB.prepare("INSERT INTO projects (id, owner_id, title, created_at, workspace_id) VALUES (?, ?, ?, ?, ?)").bind(c.id, wsOwner ?? sess.principal_id, c.isNew, at, connWs),
         audit2(c.id, "project.create", c.id, "ok:oauth-consent")
       ]),
       // file_access = 1 only when the page the owner saw offered files (offered: "files", set when it was shown). A page
       // opened before files were offered keeps documents only (migration 0013; build-file-tools-fixes.mjs).
-      env.DB.prepare(`INSERT INTO oauth_connections (id, owner_principal_id, project_id, client_id, client_name, redirect_uri, resource, can_read, can_write, file_access, created_at, expires_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)`).bind(connectionId, sess.principal_id, chosen[0].id, ar.clientId, (client?.clientName ?? ar.clientId).slice(0, 200), ar.redirectUri, `${origin}/mcp`, anyWrite ? 1 : 0, sess.offered === "files" ? 1 : 0, at, CONNECTION_EXPIRES_AT),
+      env.DB.prepare(`INSERT INTO oauth_connections (id, owner_principal_id, project_id, client_id, client_name, redirect_uri, resource, can_read, can_write, file_access, created_at, expires_at, workspace_id, created_by)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)`).bind(connectionId, sess.principal_id, chosen[0].id, ar.clientId, (client?.clientName ?? ar.clientId).slice(0, 200), ar.redirectUri, `${origin}/mcp`, anyWrite ? 1 : 0, sess.offered === "files" ? 1 : 0, at, CONNECTION_EXPIRES_AT, connWs, sess.principal_id),
       ...chosen.flatMap((c) => [
         env.DB.prepare("INSERT INTO oauth_connection_projects (connection_id, project_id, can_write) VALUES (?, ?, ?)").bind(connectionId, c.id, c.write ? 1 : 0),
         audit2(c.id, "oauth.connect", connectionId, c.write ? "ok:read+write" : "ok:read")
@@ -503,11 +520,11 @@ async function callback(req, env, as, origin) {
     principalId = humans.results[0].id;
     await env.DB.prepare("INSERT INTO upstream_identities (issuer, subject, principal_id, email, created_at) VALUES (?, ?, ?, ?, ?)").bind(ident.issuer, ident.subject, principalId, ident.email, nowIso()).run();
   }
-  const projects = await env.DB.prepare("SELECT id, title FROM projects WHERE owner_id = ? ORDER BY created_at LIMIT 500").bind(principalId).all();
+  const projects = { results: await consentProjects(env, principalId) };
   const pubApp = await appClientFor(env, resumed.request.clientId);
   if (pubApp && resumed.request.resource === `${origin}/v1`) {
     if (pubApp.owner_principal_id !== principalId) return errorPage("This app is registered to a different owner.", 403);
-    return publishConsentPage(env, oauth, resumed, pubApp, principalId, ident.email, projects.results);
+    return publishConsentPage(env, oauth, resumed, pubApp, principalId, ident.email, projects.results.filter((p) => p.can_write));
   }
   const details = await oauth.describeConsent(resumed.request);
   const consent = await oauth.beginConsent(resumed.request);
@@ -522,11 +539,11 @@ async function callback(req, env, as, origin) {
 async function readerAudience(env, ownerId, projectId) {
   const conns = await env.DB.prepare(
     `SELECT oc.client_name AS name, cp.can_write FROM oauth_connections oc JOIN oauth_connection_projects cp ON cp.connection_id = oc.id
-     WHERE cp.project_id = ? AND oc.owner_principal_id = ? AND oc.revoked_at IS NULL AND oc.expires_at > ? ORDER BY oc.created_at`
+     WHERE cp.project_id = ? AND ? IS NOT NULL AND oc.revoked_at IS NULL AND oc.expires_at > ? ORDER BY oc.created_at`
   ).bind(projectId, ownerId, nowMs()).all();
   const keys = await env.DB.prepare(
     `SELECT ac.label AS name, acp.can_write FROM api_credentials ac JOIN api_credential_projects acp ON acp.credential_id = ac.id
-     WHERE acp.project_id = ? AND ac.owner_principal_id = ? AND ac.revoked_at IS NULL AND ac.expires_at > ? ORDER BY ac.created_at`
+     WHERE acp.project_id = ? AND ? IS NOT NULL AND ac.revoked_at IS NULL AND ac.expires_at > ? ORDER BY ac.created_at`
   ).bind(projectId, ownerId, nowMs()).all();
   return [...conns.results.map((c) => ({ kind: "Connected app", ...c })), ...keys.results.map((k) => ({ kind: "API key", ...k }))];
 }
@@ -566,7 +583,7 @@ async function cxPublishPage(env, app, principalId, email, projects, consent, va
   const chosenProject = pick("project_id", (cxSuggestedProject(projects, suggest?.project) ?? projects[0]).id);
   const dupe = cxDupes(projects);
   const projOpts = projects.map((p) => `<option value="${esc(p.id)}"${p.id === chosenProject ? " selected" : ""}>${esc(p.title)}${dupe(p) ? ` (${esc(p.id)})` : ""}</option>`).join("");
-  const folders = await env.DB.prepare(`SELECT f.id, f.name, f.project_id FROM folders f JOIN projects p ON p.id = f.project_id WHERE p.owner_id = ? ORDER BY f.name_key LIMIT 500`).bind(principalId).all();
+  const folders = await env.DB.prepare(`SELECT f.id, f.name, f.project_id FROM folders f JOIN projects p ON p.id = f.project_id WHERE ${memberRoleSql("p.id", "member")} ORDER BY f.name_key LIMIT 500`).bind(principalId).all();
   const byProject = /* @__PURE__ */ new Map();
   for (const f of folders.results) byProject.set(f.project_id, [...byProject.get(f.project_id) ?? [], f]);
   // One folder field for all projects (a hidden control still submits, and /authorize caps bodies at 16 KiB), with
@@ -613,8 +630,8 @@ async function publishConsentPost(req, env, oauth, form, handle, origin) {
   // A fixable mistake re-renders the page with the owner's choices kept (the consent handle is still unused).
   const retry = async (msg) => {
     if (!sess.email) return errorPage(msg);
-    const owned = await env.DB.prepare("SELECT id, title FROM projects WHERE owner_id = ? ORDER BY created_at LIMIT 500").bind(sess.principal_id).all();
-    return cxPublishPage(env, app, sess.principal_id, sess.email, owned.results, { handle, headers: new Headers() }, form, msg, 400, sess.suggest ?? null);
+    const owned = { results: await consentProjects(env, sess.principal_id) };
+    return cxPublishPage(env, app, sess.principal_id, sess.email, owned.results.filter((p) => p.can_write), { handle, headers: new Headers() }, form, msg, 400, sess.suggest ?? null);
   };
   const resume = String(form.get("resume") ?? "new");
   const at = nowIso(), rid = randomId("req", 9);
@@ -632,7 +649,7 @@ async function publishConsentPost(req, env, oauth, form, handle, origin) {
     );
   } else {
     const projectId = String(form.get("project_id") ?? "");
-    const proj = await env.DB.prepare("SELECT id FROM projects WHERE id = ? AND owner_id = ?").bind(projectId, sess.principal_id).first();
+    const proj = await env.DB.prepare(`SELECT p.id, COALESCE(p.workspace_id, 'wsp_' || p.owner_id) AS workspace_id FROM projects p WHERE p.id = ? AND ${memberRoleSql("p.id", "member")}`).bind(projectId, sess.principal_id).first();
     if (!proj) return retry("Choose one of your projects.");
     const dest = String(form.get("destination") ?? "");
     let folderId = null;
@@ -658,8 +675,8 @@ async function publishConsentPost(req, env, oauth, form, handle, origin) {
     } else return retry("Choose a folder option.");
     stmts.push(
       env.DB.prepare("INSERT INTO principals (id, kind, issuer, subject, label, created_at) VALUES (?, 'agent', 'agent-library-publisher', ?, ?, ?)").bind(principalId, publisherId, `publisher:${app.display_name}`.slice(0, 200), at),
-      env.DB.prepare(`INSERT INTO publishers (id, owner_principal_id, principal_id, app_client_id, display_name, project_id, folder_id, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).bind(publisherId, sess.principal_id, principalId, app.id, app.display_name, projectId, folderId, at),
+      env.DB.prepare(`INSERT INTO publishers (id, owner_principal_id, principal_id, app_client_id, display_name, project_id, folder_id, created_at, workspace_id, created_by)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(publisherId, sess.principal_id, principalId, app.id, app.display_name, projectId, folderId, at, proj.workspace_id, sess.principal_id),
       audit2(projectId, "publisher.connect", publisherId, folderId ? "ok:folder" : "ok:root")
     );
   }

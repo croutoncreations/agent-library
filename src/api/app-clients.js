@@ -1,4 +1,5 @@
 import { requireHuman } from "../auth.js";
+import { memberRoleSql } from "../tenancy.js";
 import { _servers, originFor } from "../oauth/server.js";
 import { requireAppConnect } from "../service.js";
 import { HttpError, nowIso, nowMs, randomId, str } from "../util.js";
@@ -71,7 +72,7 @@ async function listAppClients(ctx) {
   const r = await ctx.env.DB.prepare("SELECT * FROM app_clients WHERE owner_principal_id = ? ORDER BY created_at DESC LIMIT 100").bind(ctx.principal.id).all();
   const pubs = await ctx.env.DB.prepare(
     `SELECT pb.id, pb.app_client_id, pb.project_id, pb.folder_id, pb.created_at, pb.revoked_at, pb.current_source_revision, pb.current_snapshot_id
-     FROM publishers pb WHERE pb.owner_principal_id = ? ORDER BY pb.created_at DESC LIMIT 500`
+     FROM publishers pb WHERE pb.app_client_id IN (SELECT id FROM app_clients WHERE owner_principal_id = ?) ORDER BY pb.created_at DESC LIMIT 500`
   ).bind(ctx.principal.id).all();
   return { app_clients: r.results.map((c) => ({ ...view(c), publishers: pubs.results.filter((p) => p.app_client_id === c.id).map((p) => ({
     publisher_id: p.id,
@@ -94,7 +95,9 @@ async function disableAppClient(ctx, id) {
 async function revokePublisher(ctx, id) {
   requireHuman(ctx);
   requireAppConnect(ctx);
-  const r = await ctx.env.DB.prepare("UPDATE publishers SET revoked_at = ? WHERE id = ? AND owner_principal_id = ? AND revoked_at IS NULL").bind(nowMs(), id, ctx.principal.id).run();
+  // The person who connected the publisher, or an admin of the project's workspace.
+  const r = await ctx.env.DB.prepare(`UPDATE publishers AS pb SET revoked_at = ? WHERE pb.id = ? AND pb.revoked_at IS NULL
+      AND (COALESCE(pb.created_by, pb.owner_principal_id) = ? OR ${memberRoleSql("pb.project_id", "admin")})`).bind(nowMs(), id, ctx.principal.id, ctx.principal.id).run();
   if (!r.meta.changes) throw new HttpError(404, "not_found", "Publisher not found or already revoked");
   const p = await ctx.env.DB.prepare("SELECT project_id FROM publishers WHERE id = ?").bind(id).first("project_id");
   await ctx.env.DB.prepare("INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id) VALUES (?, ?, ?, 'publisher.revoke', ?, 'ok', ?)").bind(nowIso(), ctx.principal.id, p, id, ctx.requestId).run();

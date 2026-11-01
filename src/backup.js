@@ -1,6 +1,7 @@
 import { getBlob, putBlob, readText, storeText } from "./content-store.js";
 import { requireHuman } from "./auth.js";
 import { tplDate } from "./service.js";
+import { requireProjectRole } from "./tenancy.js";
 import { HttpError, int, nowIso, sha256Hex, str } from "./util.js";
 
 var SCHEMA = "agent-library-backup/1";
@@ -14,7 +15,9 @@ async function exportBackup(ctx, projectId) {
   requireHuman(ctx);
   let metaVersionsExport = [];
   const DB = ctx.env.DB;
-  const p = await DB.prepare("SELECT * FROM projects WHERE id = ? AND owner_id = ?").bind(projectId, ctx.principal.id).first();
+  // Exporting a whole project is an admin action in its workspace.
+  await requireProjectRole(ctx, projectId, "admin");
+  const p = await DB.prepare("SELECT * FROM projects WHERE id = ?").bind(projectId).first();
   if (!p) throw new HttpError(404, "not_found", "Project not found");
   const pubFiles = await DB.prepare("SELECT COUNT(*) AS n FROM artifacts WHERE project_id = ? AND publisher_id IS NOT NULL").bind(projectId).first("n").catch(() => 0);
   if (pubFiles) throw new HttpError(409, "backup_unsupported", "This project contains app exports; backup of App Connect projects is not supported yet");
@@ -51,6 +54,8 @@ async function restoreBackup(ctx, backup) {
   requireHuman(ctx);
   const DB = ctx.env.DB;
   if (backup?.schema !== SCHEMA && backup?.schema !== "agent-library-backup/2") throw new HttpError(400, "bad_backup", "Unsupported backup schema");
+  // Restore is for moving a whole single-owner store: it needs an installation with no projects at all. On a shared
+  // (hosted) installation that is never true, so restore is unavailable there by construction.
   const existing = await DB.prepare("SELECT COUNT(*) AS n FROM projects").first("n");
   if (existing) throw new HttpError(409, "store_not_empty", "Restore targets an empty isolated store only");
   const pid = String(backup.project?.id ?? "");
