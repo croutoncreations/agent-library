@@ -1444,12 +1444,12 @@ function dataKindOf(file) {
 // Problems found in the browser before anything is sent: shown as-is, with no "retry" hint.
 function localUploadError(text) { var e = new Error(text); e.local = true; return e; }
 async function readDataText(file) {
-  if (file.size > DATA_MAX_BYTES + 3) throw localUploadError(file.name + " is " + fmtBytes(file.size) + "; CSV and JSON files can be up to 1 MiB");
+  if (file.size > DATA_MAX_BYTES + 3) throw localUploadError(file.name + " is " + fmtBytes(file.size) + "; CSV and JSON files can be up to 1 MB");
   var text;
   try { text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(await file.arrayBuffer()); }
   catch (e) { throw localUploadError(file.name + " isn't UTF-8 text. Save it as UTF-8 (e.g. \u201CCSV UTF-8\u201D) and try again"); }
   if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
-  if (utf8Len(text) > DATA_MAX_BYTES) throw localUploadError(file.name + " is " + fmtBytes(utf8Len(text)) + "; CSV and JSON files can be up to 1 MiB");
+  if (utf8Len(text) > DATA_MAX_BYTES) throw localUploadError(file.name + " is " + fmtBytes(utf8Len(text)) + "; CSV and JSON files can be up to 1 MB");
   return text;
 }
 async function uploadDataFile(pid, file, kind, target, keys, status) {
