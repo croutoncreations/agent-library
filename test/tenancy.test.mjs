@@ -251,6 +251,8 @@ test("import a backup into a workspace (D8 B): new ids, importer as author, admi
   const viaGrant = structuredClone(bk); viaGrant.revisions[0].via_kind = "grant";
   const okGrant = await alice.req("POST", `/api/workspaces/${WS}/import`, { backup: viaGrant, title: "Via grant" });
   assert.equal(okGrant.status, 201, JSON.stringify(okGrant.body));
+  const wrongSize = structuredClone(bk); wrongSize.revisions.find((r) => r.blob_key === null).size += 1;
+  assert.equal((await alice.req("POST", `/api/workspaces/${WS}/import`, { backup: wrongSize })).status, 400);
   const wrongHead = structuredClone(bk); wrongHead.artifacts[0].head_rev = 99;
   assert.equal((await alice.req("POST", `/api/workspaces/${WS}/import`, { backup: wrongHead })).status, 400);
   // Retried import with the same Idempotency-Key returns the first project instead of creating a duplicate.

@@ -158,9 +158,8 @@ async function route3(req, env, url, requestId) {
     if (seg[2] === "members" && seg.length === 4 && m === "DELETE") return json(await removeMember(ctx, wid, str(seg[3], "member", 80)));
     if (seg[2] === "import" && seg.length === 3 && m === "POST") {
       // Backups embed files as base64; the request cap is 2 MiB (about 1.5 MB of files). Larger projects need a
-      // streamed import (later); say so clearly instead of a generic 413. Refuse by Content-Length before reading.
-      const tooBig = () => new HttpError(413, "backup_too_large", "This backup is larger than 2 MB, the import limit for now. Split the project or remove large files first.");
-      if (Number(req.headers.get("content-length") ?? 0) > 2 * 1024 * 1024) throw tooBig();
+      // streamed import (later); say so clearly instead of a generic 413. The body is read before refusing (measured in
+      // bytes) so HTTP/1 clients receive the error rather than a reset; Cloudflare's own request limit bounds the read.
       const raw = await req.text();
       if (new TextEncoder().encode(raw).length > 2 * 1024 * 1024) throw new HttpError(413, "backup_too_large", "This backup is larger than 2 MB, the import limit for now. Split the project or remove large files first.");
       let parsed; try { parsed = raw ? JSON.parse(raw) : {}; } catch { throw new HttpError(400, "invalid_json", "Malformed JSON"); }

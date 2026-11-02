@@ -153,7 +153,9 @@ function checkImportRows(backup, decoded) {
     revKeys.add(k);
     if (r.via_kind != null && !VIA_KINDS.has(r.via_kind)) bad("Bad version provenance");
     str(r.via_label ?? "", "via_label", 200); str(r.change_note ?? "", "change_note", 280); str(r.client_info ?? "", "client_info", 500);
-    if (typeof r.created_at !== "string" || typeof r.mime !== "string") bad("Bad version fields");
+    if (typeof r.created_at !== "string" || typeof r.mime !== "string" || /[\u0000-\u001f\u007f]/.test(r.mime) || r.mime.length > 100) bad("Bad version fields");
+    if (!Number.isInteger(r.size) || r.size < 0) bad("Bad version size");
+    if (r.blob_key === null && r.size !== new TextEncoder().encode(r.body).length) bad("A version's size doesn't match its text");
     if (r.blob_key !== null) {
       const art = backup.artifacts.find((a) => a.id === r.artifact_id);
       if (!art || art.kind !== "binary") bad("A file version belongs to a document that isn't a file");
