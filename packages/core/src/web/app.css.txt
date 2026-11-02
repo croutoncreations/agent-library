@@ -476,4 +476,4 @@ main > .tabs,main > nav.tabs{margin:16px 0 12px}
 .import-form p{margin:0}
 .import-form .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .import-form input[type=file]{min-width:0;max-width:100%}
-.card.signin{display:flex;flex-direction:column;gap:10px;max-width:26rem}.card.signin .signin-choice{justify-content:center}.card.signin .signin-email input[type=email]{flex:1;min-width:0}
+.card.signin{display:flex;flex-direction:column;gap:10px;max-width:26rem}.card.signin .signin-choice{justify-content:center}.card.signin .signin-email{flex-direction:column;align-items:stretch;gap:8px}.card.signin .signin-email input[type=email]{width:100%;min-width:0}.card.signin .signin-or{display:flex;align-items:center;gap:10px;color:var(--muted);font-size:13px;margin:4px 0}.card.signin .signin-or::before,.card.signin .signin-or::after{content:"";flex:1;border-top:1px solid var(--line)}

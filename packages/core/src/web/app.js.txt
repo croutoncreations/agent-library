@@ -480,6 +480,7 @@ function viewLogin(note) {
       if (c.email) {
         var em = h("input", { type: "email", name: "email", required: true, autocomplete: "email", placeholder: "you@example.com", "aria-label": "Email address" });
         // A plain form POST (same origin): the server answers with a redirect, like the provider buttons.
+        if (parts.length) parts.push(h("div", { class: "signin-or", "aria-hidden": "true" }, "or"));
         parts.push(h("form", { method: "post", action: "/auth/signin", class: "row signin-email" },
           h("input", { type: "hidden", name: "choice", value: c.id }), h("input", { type: "hidden", name: "next", value: nextHash }), em,
           h("button", { type: "submit" }, c.label)));
