@@ -258,6 +258,29 @@ test("new documents in a required project are hidden until approved; the author 
   }
 });
 
+test("approving a new document re-checks the project document limit; reject still works", async () => {
+  assert.equal((await owner.req("PUT", base + "/review-settings", { default: "required", kinds: ["markdown"] })).status, 200);
+  try {
+    const c = ok(await writer.call("create_markdown", { project_id: P, title: "Over the limit", body: "x", idempotency_key: key() }));
+    assert.equal(c.status, "pending_review");
+    const n = sql(`SELECT COUNT(*) AS n FROM artifacts WHERE project_id = '${P}' AND publisher_id IS NULL AND pending_review = 0`)[0].n;
+    sql(`WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < ${100 - n})
+      INSERT INTO artifacts (id, project_id, kind, title, created_at, updated_at) SELECT 'fill_' || i, '${P}', 'markdown', 'Filler', '2000-01-01T00:00:00Z', '2000-01-01T00:00:00Z' FROM s`);
+    try {
+      const e = err(await reviewer.call("review_proposal", { project_id: P, proposal_id: c.proposal_id, decision: "approve", idempotency_key: key() }));
+      assert.equal(e.code, "quota_exceeded");
+      assert.equal(sql(`SELECT status FROM proposals WHERE id = '${c.proposal_id}'`)[0].status, "pending");
+      assert.equal(sql(`SELECT pending_review FROM artifacts WHERE id = '${c.artifact_id}'`)[0].pending_review, 1);
+      ok(await reviewer.call("review_proposal", { project_id: P, proposal_id: c.proposal_id, decision: "reject", idempotency_key: key() }));
+      assert.equal(sql(`SELECT status FROM proposals WHERE id = '${c.proposal_id}'`)[0].status, "rejected");
+    } finally {
+      sql(`DELETE FROM artifacts WHERE project_id = '${P}' AND title = 'Filler' AND id LIKE 'fill_%'`);
+    }
+  } finally {
+    assert.equal((await owner.req("PUT", base + "/review-settings", { default: "off" })).status, 200);
+  }
+});
+
 test("files: gated uploads are proposals, approve/reject only, reviewer download, quota counted once, purge after 30 days", async () => {
   const png1 = makePng(8, 8), png2 = makePng(12, 12);
   const b = await owner.req("POST", base + "/uploads", { title: "Chart.png", mime: "image/png", size: png1.length, sha256: sha256(png1) });
