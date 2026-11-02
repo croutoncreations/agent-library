@@ -6,6 +6,7 @@ import { adapters } from "../adapters.js";
 import { mayCreateAccount, principalForIdentity } from "../identity/accounts.js";
 import { randomToken } from "../identity/jwt.js";
 import { EMAIL_RE, checkEmailPage, limitSigninStart, startFailure } from "../identity/browser.js";
+import { TURNSTILE_ORIGIN, requireHuman, turnstileSiteKey } from "../identity/turnstile.js";
 import { HttpError } from "../util.js";
 import { __name } from "../runtime.js";
 import { folderName } from "../service.js";
@@ -227,18 +228,23 @@ var CX_ENTER = '<button name="decision" value="approve" class="enter" tabindex="
 function cxBar(lead) {
   return `<div class="bar">${lead}<button name="decision" value="deny">Cancel</button><button name="decision" value="approve" class="primary">Connect</button></div>`;
 }
-function cxStart(handle, choices = []) {
+function cxStart(handle, choices = [], siteKey = null) {
   const head = `<form method="post" action="/authorize"><input type="hidden" name="handle" value="${esc(handle)}"><input type="hidden" name="step" value="signin"><input type="hidden" name="decision" value="approve">`;
   if (!choices.length) return `<form method="post" action="/authorize"><input type="hidden" name="handle" value="${esc(handle)}"><input type="hidden" name="step" value="signin">
 <div class="bar"><button name="decision" value="deny">Cancel</button><button name="decision" value="approve" class="primary">Continue${cxIcon("next")}</button></div></form>`;
   // Several ways to sign in (hosted): provider buttons (secondary), then "or" and the email link (primary), plus Cancel.
   // Same hierarchy as the app's sign-in card.
   const opts = choices.map((c, i) => c.email
-    ? `${i ? '<div class="or" aria-hidden="true">or</div>' : ""}${head}<input type="hidden" name="choice" value="${esc(c.id)}"><label class="fine" for="cx-email">Email</label><input id="cx-email" name="email" type="email" required autocomplete="email" placeholder="you@example.com" pattern="[^\\s@]+@[^\\s@]+\\.[^\\s@]{2,}" title="Enter an address like you@example.com" style="width:100%;min-height:44px;margin:4px 0 8px"><button class="primary" style="width:100%">${esc(c.label)}</button></form>`
+    ? `${i ? '<div class="or" aria-hidden="true">or</div>' : ""}${head}<input type="hidden" name="choice" value="${esc(c.id)}"><label class="fine" for="cx-email">Email</label>${siteKey ? `<div class="cf-turnstile" data-sitekey="${esc(siteKey)}" data-size="flexible" style="margin:4px 0 8px"></div>` : ""}<input id="cx-email" name="email" type="email" required autocomplete="email" placeholder="you@example.com" pattern="[^\\s@]+@[^\\s@]+\\.[^\\s@]{2,}" title="Enter an address like you@example.com" style="width:100%;min-height:44px;margin:4px 0 8px"><button class="primary" style="width:100%">${esc(c.label)}</button></form>`
     : `${head}<input type="hidden" name="choice" value="${esc(c.id)}"><button style="width:100%;margin-bottom:8px">${esc(c.label)}</button></form>`).join("\n");
   return `${opts}
 <form method="post" action="/authorize"><input type="hidden" name="handle" value="${esc(handle)}"><input type="hidden" name="step" value="signin"><div class="bar"><button name="decision" value="deny">Cancel</button></div></form>`;
 }
+/** Turnstile site key for the consent page's email-link form (only when an email choice is offered). */
+function cxTurnstile(env) {
+  return cxChoices(env).some((c) => c.email) ? turnstileSiteKey(env) : null;
+}
+const cxTurnstileScript = (env) => cxTurnstile(env) ? `<script src="${TURNSTILE_ORIGIN}/turnstile/v0/api.js" async defer></script>` : "";
 /** Sign-in options of the consent sign-in ([] = one Continue button). */
 function cxChoices(env) {
   return (upstreamFor(env).choices?.() ?? []).filter((x) => typeof x?.id === "string" && /^[a-z0-9_-]{1,32}$/.test(x.id) && typeof x.label === "string").map((x) => ({ id: x.id, label: x.label.slice(0, 60), email: !!x.email }));
@@ -336,7 +342,7 @@ async function authorizeGet(req, env, as, origin) {
     return page("Connect an app to Agent Library", cxShell(`${cxPair(app.display_name)}
 <h1>Connect ${esc(app.display_name)}</h1><p class="lede">It wants to publish its own files to your library. Sign in to choose where they go. Nothing is shared yet.</p>
 <div class="chips">${cxChip("ok", "check", "Registered by you")}${cxChip("", "back", `Returns to ${esc(new URL(parsed.redirectUri).host)}`)}</div>
-${cxStart(consent2.handle, cxChoices(env))}`), consent2.headers, 200, targets2);
+${cxStart(consent2.handle, cxChoices(env), cxTurnstile(env))}${cxTurnstileScript(env)}`), consent2.headers, 200, targets2, { turnstile: !!cxTurnstile(env) });
   }
   if (!allowedRedirect(parsed.redirectUri)) return errorPage("This app's callback address is not allowed to connect.");
   const details = await oauth.describeConsent(parsed);
@@ -345,7 +351,7 @@ ${cxStart(consent2.handle, cxChoices(env))}`), consent2.headers, 200, targets2);
   return page("Connect an app to Agent Library", cxShell(`${cxPair(details.clientName)}
 <h1>Connect ${esc(details.clientName)}</h1><p class="lede">It wants to use documents in your library. Sign in to pick which projects. Nothing is shared yet.</p>
 ${clientFacts(details)}
-${cxStart(consent.handle, cxChoices(env))}`), consent.headers, 200, targets);
+${cxStart(consent.handle, cxChoices(env), cxTurnstile(env))}${cxTurnstileScript(env)}`), consent.headers, 200, targets, { turnstile: !!cxTurnstile(env) });
 }
 async function authorizePost(req, env, as, origin) {
   const oauth = as.getOAuthApi(env);
@@ -370,7 +376,10 @@ async function authorizePost(req, env, as, origin) {
       email = String(form.get("email") ?? "").trim().toLowerCase();
       if (!EMAIL_RE.test(email) || email.length > 254) return errorPage("That doesn't look like an email address. Go back and check it.");
     }
-    try { await limitSigninStart(env, req, email); }
+    try {
+      if (email) await requireHuman(env, String(form.get("cf-turnstile-response") ?? ""), req.headers.get("cf-connecting-ip"));
+      await limitSigninStart(env, req, email);
+    }
     catch (e) { const f = startFailure(e); return errorPage(`${f.title}. ${f.msg}`, f.status); }
     const approved = await oauth.approveConsent(req, handle, { scope: [SCOPES.read] });
     const secrets = { verifier: randomToken(64), nonce: randomToken(32) };
@@ -881,11 +890,13 @@ isLoopbackRedirect = (u) => /^http:\/\/(127\.0\.0\.1|localhost)(:\d{1,5})?\/[A-Z
 MAX_CONN_PROJECTS = 50;
 NEW_PROJECT_SLOTS = 5;
 esc = (v) => String(v).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
-page = (title, body2, headers, status = 200, formTargets = []) => {
+page = (title, body2, headers, status = 200, formTargets = [], opts = {}) => {
   const h = headers ?? new Headers();
   h.set("content-type", "text/html; charset=utf-8");
   const targets = ["'self'", ...formTargets.filter((o) => /^https:\/\/[a-z0-9.-]+$|^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/.test(o))].join(" ");
-  h.set("content-security-policy", `default-src 'none'; style-src 'unsafe-inline'; form-action ${targets}; frame-ancestors 'none'; base-uri 'none'`);
+  // Pages with the Turnstile widget may load Cloudflare's script and frame, nothing else.
+  const ts = opts.turnstile ? `; script-src ${TURNSTILE_ORIGIN}; frame-src ${TURNSTILE_ORIGIN}` : "";
+  h.set("content-security-policy", `default-src 'none'; style-src 'unsafe-inline'; form-action ${targets}; frame-ancestors 'none'; base-uri 'none'${ts}`);
   h.set("x-frame-options", "DENY");
   h.set("cache-control", "no-store");
   h.set("referrer-policy", "no-referrer");

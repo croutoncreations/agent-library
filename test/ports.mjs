@@ -31,6 +31,7 @@ export const SERVER_PORTS = range({
 export const AUX_PORTS = range({
   hostedJwks: 23100, oauthBrowserOidc: 23101, oauthBrowserCallback: 23102, oauthBrowserHop: 23103,
   chatgptOidc: 23104, chatgptCallback: 23105, hostedSessionJwks: 23106, hostedSessionAccess: 23107,
+  hostedTurnstile: 23108,
 });
 
 /** Every port bound during a run, for the uniqueness check. */

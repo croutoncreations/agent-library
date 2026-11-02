@@ -12,6 +12,7 @@ import { statusPage } from "../oauth/server.js";
 import { HttpError, nowMs, randomId, sha256Hex } from "../util.js";
 import { mayCreateAccount, principalForIdentity } from "./accounts.js";
 import { randomToken } from "./jwt.js";
+import { requireHuman } from "./turnstile.js";
 
 const TX_COOKIE = "al_signin";
 const TX_TTL = 600;
@@ -68,6 +69,7 @@ export async function limitSigninStart(env, req, email) {
 /** Errors from the adapter's start(): a page the person can act on (never raw JSON). */
 export function startFailure(e) {
   if (e instanceof HttpError && e.status === 429) return { status: 429, title: "Too many sign-in attempts", msg: "Wait a minute, then try again." };
+  if (e instanceof HttpError && /^human_check|^turnstile/.test(e.code ?? "")) return { status: e.status, title: "Human check", msg: e.message };
   if (e instanceof HttpError && e.status < 500) return { status: e.status, title: "Can't start sign-in", msg: e.message };
   console.error("signin_start_failed", e?.code ?? e?.name ?? "error");
   return { status: 502, title: "Sign-in is unavailable", msg: "We couldn't reach the sign-in service. Try again in a minute." };
@@ -79,7 +81,11 @@ export async function signinStart(req, env, url) {
   const up = adapters(env).identity.upstream(env);
   let params = url.searchParams;
   if (req.method === "POST") {
-    if (req.headers.get("origin") !== url.origin) throw new HttpError(403, "bad_origin", "Cross-origin requests are not allowed");
+    // A same-origin form post. With Referrer-Policy: no-referrer, browsers send "Origin: null" on form posts, so
+    // Sec-Fetch-Site (set by the browser, not settable by pages) is the signal; a matching Origin also counts.
+    const o = req.headers.get("origin"), sfs = req.headers.get("sec-fetch-site");
+    if (!(o === url.origin || (sfs === "same-origin" && (o === null || o === "null" || o === url.origin))))
+      throw new HttpError(403, "bad_origin", "Cross-origin requests are not allowed");
     if (Number(req.headers.get("content-length") ?? 0) > 4096) throw new HttpError(413, "too_large", "Request body too large");
     params = new URLSearchParams(await req.text());
   }
@@ -97,6 +103,8 @@ export async function signinStart(req, env, url) {
   let target;
   const state = randomToken(32), bind = randomToken(32), verifier = randomToken(64), nonce = randomToken(32);
   try {
+    // Email links only: the human check runs before anything is counted, stored or sent.
+    if (email) await requireHuman(env, params.get("cf-turnstile-response"), req.headers.get("cf-connecting-ip"));
     await limitSigninStart(env, req, email);
     await env.OAUTH_KV.put(`signin:${await sha256Hex(state)}`, JSON.stringify({ bind: await sha256Hex(bind), verifier, nonce, next }), { expirationTtl: TX_TTL });
     target = await up.start({ redirectUri: `${url.origin}/auth/callback`, state, verifier, nonce, choice: picked?.id ?? null, email, mayCreateAccount: (e) => mayCreateAccount(env, e) });

@@ -85,6 +85,8 @@ APP_CONNECT_ENABLED = "1"
 # OIDC_JWKS_URL = "https://login.example.com/.well-known/jwks.json"
 # SIGNUP_ALLOWLIST = "@example.com"
 # OIDC_TRUST_EMAIL = "1"   # only for providers that never send email_verified and only issue verified emails
+# Optional human check (Cloudflare Turnstile, free) on email sign-in links; also needs the secret TURNSTILE_SECRET_KEY.
+# TURNSTILE_SITE_KEY = "0x4AAAAAAA..."
 #
 # Worker secret (never in this file):
 #   ACCESS_OIDC_CLIENT_SECRET  (wrangler secret put ACCESS_OIDC_CLIENT_SECRET --env hosted)

@@ -228,6 +228,26 @@ async function authMethods() {
   return AUTH;
 }
 function redirectSignIn() { return !!(AUTH && AUTH.redirect); }
+// Loads Cloudflare's Turnstile script once (allowed by the shell's CSP only when the installation enables it) and
+// renders the widget into el. The submit button stays disabled until the check passes.
+var turnstileLoading = null;
+function renderTurnstile(el, siteKey, submit) {
+  submit.disabled = true;
+  var note = h("p", { class: "small muted", role: "status", text: "Checking that you're human\u2026" });
+  el.appendChild(note);
+  turnstileLoading = turnstileLoading || new Promise(function (resolve, reject) {
+    var s = document.createElement("script");
+    s.src = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit"; s.async = true;
+    s.onload = resolve; s.onerror = reject; document.head.appendChild(s);
+  });
+  turnstileLoading.then(function () {
+    note.remove();
+    window.turnstile.render(el, { sitekey: siteKey, size: "flexible",
+      callback: function () { submit.disabled = false; },
+      "expired-callback": function () { submit.disabled = true; },
+      "error-callback": function () { submit.disabled = true; el.appendChild(h("p", { class: "small msg", role: "alert", text: "The human check couldn't load. Use a sign-in button above, or reload the page." })); } });
+  }).catch(function () { note.textContent = "The human check couldn't load. Use a sign-in button above, or reload the page."; note.setAttribute("role", "alert"); });
+}
 function signInHref() { var n = location.hash && location.hash !== "#/" ? location.hash : ""; return "/auth/signin" + (n ? "?next=" + encodeURIComponent(n) : ""); }
 var renewing = null, signingOut = false;
 // The app session ended but Access may still be signed in: get a new app session for the same user.
@@ -481,11 +501,14 @@ function viewLogin(note) {
         var em = h("input", { type: "email", id: "signin-email", name: "email", required: true, autocomplete: "email", placeholder: "you@example.com",
           pattern: "[^\\s@]+@[^\\s@]+\\.[^\\s@]{2,}", title: "Enter an address like you@example.com" });
         var send = h("button", { type: "submit" }, c.label);
+        // Human check (Cloudflare Turnstile) when the installation turns it on; the widget adds cf-turnstile-response.
+        var human = AUTH && AUTH.turnstile_site_key ? h("div", { class: "signin-human" }) : null;
+        if (human) renderTurnstile(human, AUTH.turnstile_site_key, send);
         // A plain form POST (same origin): the server answers with a redirect, like the provider buttons. One submit only.
         if (parts.length) parts.push(h("div", { class: "signin-or", "aria-hidden": "true" }, "or"));
         parts.push(h("form", { method: "post", action: "/auth/signin", class: "row signin-email", onsubmit: function () { send.disabled = true; send.textContent = "Sending\u2026"; } },
           h("input", { type: "hidden", name: "choice", value: c.id }), h("input", { type: "hidden", name: "next", value: nextHash }),
-          h("label", { for: "signin-email", class: "small muted", text: "Email" }), em, send));
+          h("label", { for: "signin-email", class: "small muted", text: "Email" }), em, human, send));
       } else {
         var b = h("a", { class: "btn secondary signin-choice", href: "/auth/signin?choice=" + encodeURIComponent(c.id) + (nextHash ? "&next=" + encodeURIComponent(nextHash) : "") }, c.label);
         parts.push(b); if (!first) first = b;
