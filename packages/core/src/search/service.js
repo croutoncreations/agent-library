@@ -81,7 +81,7 @@ async function rsCursorDecode(secret,binding,cursor) {
 async function searchArtifacts(ctx, args, transport = "api") {
   if (ctx.publisher) throw new HttpError(403, "forbidden", "Search is unavailable to publishers");
   // Project paths (<handle>/<slug>) become ids first; one that names nothing fails like an unknown id below.
-  if (args && Array.isArray(args.project_ids) && args.project_ids.some((x) => typeof x === "string" && x.includes("/")))
+  if (args && Array.isArray(args.project_ids) && args.project_ids.length <= 20 && args.project_ids.some((x) => typeof x === "string" && x.includes("/")))
     args = { ...args, project_ids: await Promise.all(args.project_ids.map((x) => typeof x === "string" && x.length <= 110 ? resolveProjectRef(ctx.env, x) : x)) };
   const a = rsNormalize(args), scope = rsScope(ctx);
   const searchState = await rsSearchState(ctx.env);
@@ -124,7 +124,8 @@ async function searchArtifacts(ctx, args, transport = "api") {
     web_url: origin ? artifactWebUrl(origin,r.project_id,r.id) + "?v=" + r.rev_no : null,
     preview_url: origin ? previewWebUrl(origin,r.project_id,r.id) + "?v=" + r.rev_no : null
   }));
-  await addressLinks(ctx.env, results); // browser links use project paths; before the size budget below
+  // Browser links use project paths (results are already limited to readable projects); before the size budget below.
+  await addressLinks(ctx.env, { results }, new Set(results.map((r) => r.project_id)));
   const token = "x".repeat(512); // Conservative reservation for the signed cursor in both encoded copies.
   const out = { results, has_more: rows.length > a.limit, next_cursor: null };
   // Budget the complete duplicated JSON MCP envelope (including JSON escaping and the echoed ID), not just snippets.

@@ -37,7 +37,7 @@ const expectDocUrl = async (u, pid, aid) => assert.equal(u, `${ORIGIN}/${await p
 test("create, list, read, history and save the same document: every web_url identifies it", async () => {
   const lp = await m.call("list_projects", {});
   assert.equal(lp.data.projects[0].web_url, `${ORIGIN}/${await pathOf(PID)}`);
-  assert.match(await pathOf(PID), /^owner-[a-z2-9]{4}\/links-project$/, "slug from the title; personal handle with a random suffix");
+  assert.match(await pathOf(PID), /^u-[a-z2-9]{8}\/links-project$/, "slug from the title; random personal handle");
   const c = await m.call("create_markdown", { project_id: PID, title: "Linked doc", body: "# v1", idempotency_key: key("c") });
   assert.equal(c.isError, false);
   docId = c.data.artifact_id;

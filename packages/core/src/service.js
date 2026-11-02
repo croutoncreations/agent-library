@@ -124,7 +124,7 @@ async function createProject(ctx, input) {
     throw e;
   });
   if (!ins.meta.changes) throw new HttpError(403, "forbidden", "Needs the admin role in this workspace");
-  const handle = await ensureHandle(ctx.env, { ...ws, label: ctx.principal.label });
+  const handle = await ensureHandle(ctx.env, ws);
   return { id, title, slug, path: `${handle}/${slug}`, workspace_id: ws.id };
 }
 /** Rename a project and/or change its address (slug). Workspace admins only; old address links stop working. */

@@ -112,10 +112,11 @@ async function handleOAuthMcp(req, env, ctx) {
       }
       // A project may be named by its address (<handle>/<slug>) as well as its id.
       if (typeof args.project_id === "string" && args.project_id.includes("/")) args.project_id = await resolveProjectRef(env, args.project_id);
-      if (Array.isArray(args.project_ids)) args.project_ids = await Promise.all(args.project_ids.map((x) => resolveProjectRef(env, x)));
+      if (Array.isArray(args.project_ids) && args.project_ids.length <= 20) args.project_ids = await Promise.all(args.project_ids.map((x) => resolveProjectRef(env, x)));
+      const connIds = conn.projects.map((p) => p.id);
       if (tool.name === "list_projects") {
         const paths = await projectPaths(env, conn.projects.map((p) => p.id));
-        const result = await addressLinks(env, withWebUrls("list_projects", args, void 0, { projects: conn.projects.map((p) => ({ id: p.id, title: p.title, ...paths.has(p.id) ? { path: paths.get(p.id) } : {}, can_write: projectWrite(p) })) }, appOrigin(env.APP_HOST)));
+        const result = await addressLinks(env, withWebUrls("list_projects", args, void 0, { projects: conn.projects.map((p) => ({ id: p.id, title: p.title, ...paths.has(p.id) ? { path: paths.get(p.id) } : {}, can_write: projectWrite(p) })) }, appOrigin(env.APP_HOST)), connIds);
         return reply(rpc(msg.id, { content: [{ type: "text", text: JSON.stringify(result) }], structuredContent: result, isError: false }));
       }
       if (tool.name === "search_artifacts") {
@@ -152,7 +153,7 @@ async function handleOAuthMcp(req, env, ctx) {
         rpcIdBytes: rtIdBytes(msg.id)
       };
       try {
-        const result = await addressLinks(env, withWebUrls(tool.name, toolArgs, proj.id, await tool.run(sctx, proj.id, toolArgs), appOrigin(env.APP_HOST)));
+        const result = await addressLinks(env, withWebUrls(tool.name, toolArgs, proj.id, await tool.run(sctx, proj.id, toolArgs), appOrigin(env.APP_HOST)), connIds);
         await env.DB.prepare("UPDATE oauth_connections SET last_used_at = ? WHERE id = ?").bind(nowMs(), conn.id).run().catch(() => {
         });
         return reply(rpc(msg.id, { content: ftContent(result, pv), structuredContent: result, isError: false }));
@@ -182,7 +183,7 @@ RW = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openW
 TOOLS = [
   { name: "connection_info", title: "Check connection access", description: "Identify this authenticated connection and its current effective project access. No document reads or writes. Compare the safe ID in Connections.", inputSchema: S({}, []), annotations: RO, write: false },
   ...tplTools(true),
-  { name: "list_changes", title: "List project changes", description: "Poll published changes in one explicit project. WITHOUT cursor establishes a current checkpoint and returns NO history (initialized=true). Store next_cursor; follow has_more, then poll again. At-least-once: deduplicate by event_id. Cursors expire after 30 days; checkpoint BEFORE reconciling current content. Publishers excluded. No bodies or push notifications.", inputSchema: S({ project_id: { type: "string", maxLength: 64 }, cursor: { type: "string", maxLength: 2048 }, limit: { type: "integer", minimum: 1, maximum: 50 } }, ["project_id"]), annotations: RO, write: false, run: (c,p,a) => listChanges(c,p,a) },
+  { name: "list_changes", title: "List project changes", description: "Poll published changes in one explicit project. WITHOUT cursor establishes a current checkpoint and returns NO history (initialized=true). Store next_cursor; follow has_more, then poll again. At-least-once: deduplicate by event_id. Cursors expire after 30 days; checkpoint BEFORE reconciling current content. Publishers excluded. No bodies or push notifications.", inputSchema: S({ project_id: { type: "string", maxLength: 110, description: "Project ID or path (workspace/project)" }, cursor: { type: "string", maxLength: 2048 }, limit: { type: "integer", minimum: 1, maximum: 50 } }, ["project_id"]), annotations: RO, write: false, run: (c,p,a) => listChanges(c,p,a) },
   { name: "search_artifacts", title: "Search library", description: "Ranked lexical search across currently readable projects. All words must match stored title/text; punctuation separates words. Returns bounded plain-text excerpts and revision-pinned links. Live pagination expires after 15 minutes.", inputSchema: RS_SCHEMA, annotations: RO, write: false, run: (c, p, a) => searchArtifacts(c,a,"mcp") },
   {
     name: "list_projects",

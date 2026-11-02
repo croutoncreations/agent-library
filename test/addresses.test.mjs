@@ -36,7 +36,7 @@ after(async () => { await s?.stop(); });
 test("workspaces get handles (chosen or derived; unique; reserved names refused); projects get slugs", async () => {
   // Personal workspaces get a derived handle with a random suffix (a handle never confirms a person exists).
   const mine = ok(await alice.req("GET", "/api/workspaces")).workspaces[0];
-  assert.match(mine.handle, /^alice-[a-z2-9]{4}$/);
+  assert.match(mine.handle, /^u-[a-z2-9]{8}$/, "personal handles are random, never from the name or email");
   W.alicePersonal = mine;
   const acme = ok(await alice.req("POST", "/api/workspaces", { name: "Acme Research", handle: "acme" }), 201);
   assert.equal(acme.handle, "acme");
@@ -178,4 +178,32 @@ test("projects and workspaces that predate addresses get them on first use (and 
   ok(await alice.req("GET", `/api/projects/${enc(a.path)}/artifacts`));
   // The previous Worker keeps working on these rows: owner_id unchanged, workspace_id now the personal workspace.
   assert.deepEqual(sql("SELECT owner_id, workspace_id FROM projects WHERE id = 'prj_legacy_addr_1'")[0], { owner_id: me, workspace_id: `wsp_${me}` });
+});
+
+test("links never reveal another workspace's address, and stored content is never rewritten", async () => {
+  // Eve saves a JSON file that names Bob's project in a link field, then reads it back every way she can.
+  const evePersonal = ok(await eve.req("POST", "/api/projects", { title: "Eve stuff" }), 201).id;
+  const trap = JSON.stringify({ web_url: `${APP}/p/${P.bobNotes}`, nested: { web_url: `${APP}/p/${P.bobNotes}/a/x` } });
+  const f = await eve.req("POST", `/api/projects/${evePersonal}/artifacts`, { kind: "json", title: "trap.json", body: trap });
+  if (f.status === 201) {
+    const c = await fetch(`${APP}/api/projects/${evePersonal}/artifacts/${f.body.artifact_id}/content`, { headers: { cookie: eve.cookie } });
+    const txt = await c.text();
+    assert.equal(txt, trap, "file bytes unchanged");
+    assert.equal(txt.includes(W.bobAcme.handle), false);
+  }
+  // Generated links for a project the caller can't open keep the /p/<id> form (here: a markdown body with the link).
+  const r = ok(await eve.req("GET", "/api/projects"));
+  assert.equal(JSON.stringify(r).includes(W.bobAcme.handle), false);
+});
+
+test("first use after the migration assigns at most a bounded number of addresses per request", async () => {
+  const me = ok(await bob.req("GET", "/api/me")).principal.id;
+  const values = Array.from({ length: 45 }, (_, i) => `('prj_bulk_${String(i).padStart(2, "0")}', '${me}', 'Bulk ${i}', '2026-01-01T00:00:${String(i).padStart(2, "0")}Z')`).join(",");
+  sql(`INSERT INTO projects (id, owner_id, title, created_at) VALUES ${values}`);
+  const first = ok(await bob.req("GET", "/api/projects")).projects.filter((p) => p.id.startsWith("prj_bulk_"));
+  assert.equal(first.length, 45);
+  const withPath = first.filter((p) => p.path).length;
+  assert.ok(withPath > 0 && withPath <= 20, `assigned ${withPath} in one request`);
+  for (let i = 0; i < 3; i++) await bob.req("GET", "/api/projects");
+  assert.equal(ok(await bob.req("GET", "/api/projects")).projects.filter((p) => p.id.startsWith("prj_bulk_") && !p.path).length, 0, "the rest on later requests");
 });

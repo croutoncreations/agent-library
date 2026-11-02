@@ -95,7 +95,7 @@ test("entitlements can refuse an operation before anything is written", async ()
 test("lifecycle hooks run after the change and never break it", async () => {
   const got = [];
   const A = W.resolveAdapters({ lifecycle: { async workspaceCreated(_env, ws) { got.push(ws.name); throw new Error("mail down"); } } });
-  const DB = { prepare() { return { bind() { return this; } }; }, async batch(s) { return s.map(() => ({ meta: { changes: 1 } })); } };
+  const DB = { prepare() { return { bind() { return this; }, async run() { return { meta: { changes: 1 } }; }, async first() { return null; } }; }, async batch(s) { return s.map(() => ({ meta: { changes: 1 } })); } };
   const ctx = { env: W.withAdapters({ MULTI_USER: "1", DB }, A), principal: { id: "hum_synthetic", kind: "human" }, requestId: "req_t" };
   const ws = await W.createWorkspace(ctx, { name: "Team" });
   assert.equal(ws.name, "Team"); assert.deepEqual(got, ["Team"]);

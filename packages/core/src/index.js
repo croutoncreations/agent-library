@@ -10,6 +10,7 @@ import { reconcileUploads } from "./cleanup.js";
 import { EDITOR_JS, EDITOR_JS_SHA256 } from "./editor-bundle.js";
 import { RENDER_CSP, htmlRefs, renderHtmlDocument } from "./html.js";
 import { WEB_ROUTE } from "./links.js";
+import { visibleProjects } from "./tenancy.js";
 import { RESERVED_HANDLES, addressLinksResponse, resolveProjectRef } from "./paths.js";
 import { imageRefs, renderMarkdown } from "./markdown.js";
 import { handleMcp } from "./mcp.js";
@@ -125,7 +126,12 @@ async function accessLogin(req, env, url) {
   await env.DB.prepare("INSERT INTO sessions (id_hash, principal_id, csrf, expires_at) VALUES (?, ?, ?, ?)").bind(await sha256Hex(sid), p.id, csrf, nowMs() + 30 * 864e5).run();
   return withCookies(json({ ok: true, csrf }), sessionCookie(url, sid, 2592000));
 }
-async function route3(req, env, url, requestId) {
+/** Project ids the authenticated caller can open (people: every visible project; agents: their grant's project). */
+async function openableProjects(ctx) {
+  if (ctx.principal.kind !== "human") return ctx.grant?.project_id ? [ctx.grant.project_id] : [];
+  return (await visibleProjects(ctx.env, ctx.principal.id)).map((p) => p.id);
+}
+async function route3(req, env, url, requestId, seen = {}) {
   const path = url.pathname;
   const m = req.method;
   if (m === "GET" && (path === "/" || path === "/index.html" || WEB_ROUTE.test(path) || /^\/invite\/inv_[A-Za-z0-9_-]{20,80}$/.test(path))) return new Response(APP_HTML, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", ...appShellCsp(env) } });
@@ -164,6 +170,7 @@ async function route3(req, env, url, requestId) {
     throw e;
   });
   const ctx = await authenticate(req, env, requestId);
+  seen.ctx = ctx;
   if (m !== "GET" && m !== "HEAD") requireCsrf(ctx, req);
   await enforceRate(ctx, m !== "GET" && m !== "HEAD");
   const key = () => idemKey(req.headers.get("idempotency-key"));
@@ -368,14 +375,16 @@ var coreWorker = {
     if (e2.MCP_HOST && host === e2.MCP_HOST.toLowerCase()) {
       const publisherRoute = env.APP_CONNECT_ENABLED === "1" && /^\/v1\/publisher(\/|$)/.test(url.pathname);
       if (url.pathname.startsWith("/files/")) return withSec(await handleFileTransfer(req, env, url));
-      if (isV1Path(url.pathname) && !publisherRoute) return withSec(await addressLinksResponse(env, await handleV1(req, env)));
+      if (isV1Path(url.pathname) && !publisherRoute) return withSec(await handleV1(req, env));
       return withSec(await handleOAuthHost(req, e2, ctx, host));
     }
     if (e2.APP_HOST && host !== e2.APP_HOST.toLowerCase())
       return new Response(JSON.stringify({ error: "not_found" }), { status: 404, headers: { "content-type": "application/json" } });
     try {
-      let res = await route3(req, env, url, requestId);
-      if (url.pathname.startsWith("/api/")) res = await addressLinksResponse(env, res);
+      const seen = {};
+      let res = await route3(req, env, url, requestId, seen);
+      // Links in API results use project addresses, only for projects this caller can open.
+      if (url.pathname.startsWith("/api/") && seen.ctx) res = await addressLinksResponse(env, res, url.pathname, () => openableProjects(seen.ctx));
       res.headers.set?.("x-request-id", requestId);
       return withSec(res);
     } catch (e) {

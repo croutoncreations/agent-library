@@ -37,7 +37,7 @@ export async function listWorkspaces(ctx) {
      WHERE w.status <> 'deleting' ORDER BY w.personal DESC, w.created_at LIMIT 200`
   ).bind(ctx.principal.id).all();
   const out = [];
-  for (const w of r.results) out.push({ ...w, personal: !!w.personal, handle: await ensureHandle(ctx.env, { ...w, label: ctx.principal.label }) });
+  for (const w of r.results) out.push({ ...w, personal: !!w.personal, handle: await ensureHandle(ctx.env, w) });
   return { workspaces: out };
 }
 
@@ -110,7 +110,7 @@ export async function listMembers(ctx, id) {
      ORDER BY created_at DESC LIMIT 200`
   ).bind(id, nowMs()).all() : { results: [] };
   return {
-    workspace: { id: ws.id, name: ws.name, handle: await ensureHandle(ctx.env, { ...ws, label: ctx.principal.label }), personal: !!ws.personal, role: ws.role, status: ws.status },
+    workspace: { id: ws.id, name: ws.name, handle: await ensureHandle(ctx.env, ws), personal: !!ws.personal, role: ws.role, status: ws.status },
     // Emails are shown to admins only; everyone sees names and roles.
     members: m.results.map((x) => ({ principal_id: x.principal_id, label: x.label, email: admin ? x.email : null, role: x.role, created_at: x.created_at, me: x.principal_id === ctx.principal.id })),
     invites: inv.results.map((i) => ({ ...i, expires_at: new Date(i.expires_at).toISOString() }))

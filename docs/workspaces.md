@@ -113,13 +113,14 @@ is `https://<app>/acme/notes` (documents: `…/acme/notes/a/<id>`, with `/previe
 - **Accepted wherever a project id is**: browser API (`/api/projects/acme%2Fnotes/…`), `/v1` (`/v1/projects/acme%2Fnotes/…`),
   MCP `project_id` (`"acme/notes"`), and search `project_ids`. `list_projects`, `GET /v1/projects` and
   `GET /api/projects` return each project's `path`.
-- **Links** (`web_url`, `preview_url`, `version_url`) use the path. Only those generated fields are rewritten; document
-  text is never changed. Old `/p/<id>` links keep working.
+- **Links** (`web_url`, `preview_url`, `version_url`) use the path, only for projects the caller can open, and only in
+  the fields this code generates (top level, `artifact`/`file`/`template`, and items of its result lists). Stored
+  content (files, records, text, backups, renders) is never rewritten. Old `/p/<id>` links keep working.
 - **Handles**: 1–39 of `a-z 0-9 -`, not starting or ending with `-`, and not a reserved word (app and API routes such
   as `api`, `p`, `settings`, `auth`, `billing`; see `RESERVED_HANDLES` in `packages/core/src/paths.js`). A shared
   workspace's handle is chosen at creation (`{handle}`) or derived from its name (`-2`… then a random suffix when
-  taken). A personal workspace's handle is derived from the person's name **with a random suffix** (`alice-k3x9`), so a
-  handle never confirms that someone has an account.
+  taken). A personal workspace's handle is **random** (`u-k3x9m2p7`): never derived from a name or email, and never
+  confirming that someone has an account. Its owner can change it.
 - **Slugs**: 1–64 of `a-z 0-9 -`; derived from the title (`Q3 Notes!` → `q3-notes`, then `-2`, `-3` … in that
   workspace) unless one is chosen.
 - **Changing** a handle (workspace owner) or slug (project admin) changes every link that used the old one; those
@@ -127,7 +128,8 @@ is `https://<app>/acme/notes` (documents: `…/acme/notes/a/<id>`, with `/previe
   another workspace, which is one reason a path never grants anything by itself. Changes are audited
   (`workspace.handle`, `project.address`).
 - **Migration 0020** adds `workspaces.handle` (unique) and `projects.slug` (unique per `workspace_id`), both nullable.
-  Rows without them, including rows a rolled-back Worker writes, get them on first use; a project given a slug also
+  Rows without them, including rows a rolled-back Worker writes, get them on first use (at most 20 per request, to stay
+  within D1's per-request query limit; the rest on later requests); a project given a slug also
   gets its `workspace_id` filled in (the personal workspace, as resolved today), so the previous Worker keeps working.
 - **Later**: subdomains (`acme.<domain>`) as an optional alias (D14).
 

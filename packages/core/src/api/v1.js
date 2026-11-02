@@ -2,7 +2,7 @@ import { readOnlyError } from "../tenancy.js";
 import { verifyApiKey } from "./credentials.js";
 import { limitsFor, rateLimit } from "../auth.js";
 import { appOrigin, artifactWebUrl, previewWebUrl, projectWebUrl } from "../links.js";
-import { projectPaths, resolveProjectRef } from "../paths.js";
+import { addressLinksResponse, projectPaths, resolveProjectRef } from "../paths.js";
 import { __name } from "../runtime.js";
 import { RT_KINDS_ALL, RT_KINDS_DOCS, appConnectEnabled, chQuery, connectionInfo, createFile, createFolder, createFromTemplate, createMarkdown, diffRevisions, getArtifact, history, listArtifacts, listChanges, listFolders, listTemplates, metaHistory, readRecords, readTextChunk, requireAppConnect, restoreMetadata, restoreRevision, rsQuery, rtQuery, saveFile, saveMarkdown, searchArtifacts } from "../service.js";
 import { serveContent } from "../uploads.js";
@@ -92,7 +92,7 @@ function withLinks(origin, pid, r) {
   if (!origin || !r.body?.artifact_id) return r;
   return { ...r, body: { ...r.body, web_url: artifactWebUrl(origin, pid, r.body.artifact_id), preview_url: previewWebUrl(origin, pid, r.body.artifact_id) } };
 }
-async function route2(req, env, url, requestId) {
+async function route2(req, env, url, requestId, seen = {}) {
   const m = req.method;
   let path = url.pathname.replace(/\/$/, "");
   // /v1/projects/<handle>%2F<slug>/… names a project by its address; it's mapped to the id before matching (no
@@ -115,6 +115,7 @@ async function route2(req, env, url, requestId) {
     if (e instanceof HttpError && e.status === 401) await rateLimit(env, "authfail:" + (req.headers.get("cf-connecting-ip") ?? "local"), limitsFor(env).authFailPerMin);
     throw e;
   }
+  seen.k = k;
   const write = m !== "GET" && m !== "HEAD";
   const lim2 = limitsFor(env);
   await rateLimit(env, `${write ? "w" : "r"}:${k.principalId}`, write ? lim2.writesPerMin : lim2.readsPerMin);
@@ -279,7 +280,8 @@ async function handleV1(req, env) {
   const requestId = randomId("req", 9);
   const url = new URL(req.url);
   try {
-    const res = await route2(req, env, url, requestId);
+    const seen = {};
+    const res = await addressLinksResponse(env, await route2(req, env, url, requestId, seen), url.pathname, seen.k ? seen.k.projects.map((p) => p.id) : []);
     const r = new Response(res.body, res);
     r.headers.set("x-request-id", requestId);
     return r;

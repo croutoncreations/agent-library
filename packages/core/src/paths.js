@@ -46,13 +46,15 @@ function* candidates(base, max, randomOnly) {
 
 /**
  * Gives a workspace a handle if it has none (first use of a workspace created before handles, or by the sign-up
- * trigger). Personal handles always get a random suffix, so a handle never confirms that a person exists.
+ * trigger).
  */
 export async function ensureHandle(env, ws) {
   if (ws.handle) return ws.handle;
-  let base = slugify(ws.personal ? ws.label : ws.name, 30);
-  if (!base || base.length < 2 || RESERVED_HANDLES.has(base)) base = ws.personal ? (base || "me") : `${base || "team"}-ws`;
-  for (const h of candidates(base, 39, !!ws.personal)) {
+  // Personal handles are random ("u-k3x9m2p7"): never derived from a person's name or email, and never confirming an
+  // account exists. The owner can choose another.
+  let base = ws.personal ? "u" : slugify(ws.name, 30);
+  if (!ws.personal && (!base || base.length < 2 || RESERVED_HANDLES.has(base))) base = `${base || "team"}-ws`;
+  for (const h of ws.personal ? Array.from({ length: 6 }, () => `u-${rand(8)}`) : candidates(base, 39, false)) {
     if (!HANDLE_RE.test(h) || RESERVED_HANDLES.has(h)) continue;
     try {
       const r = await env.DB.prepare("UPDATE workspaces SET handle = ? WHERE id = ? AND handle IS NULL").bind(h, ws.id).run();
@@ -78,21 +80,29 @@ export async function ensureSlug(env, p) {
   throw new HttpError(503, "slug_unavailable", "Couldn't assign a project address; try again");
 }
 
+export const ASSIGN_PER_CALL = 20;
 /** Map project id -> "<handle>/<slug>" for the given ids (assigning missing handles and slugs). Unknown ids are absent. */
 export async function projectPaths(env, ids) {
   const want = [...new Set((ids ?? []).filter((x) => typeof x === "string" && x))];
   const out = new Map();
   if (!want.length || !env?.DB) return out;
   const rows = (await env.DB.prepare(
-    `SELECT p.id, p.title, p.slug, w.id AS wid, w.handle, w.personal, w.name, w.status, pr.label
+    `SELECT p.id, p.title, p.slug, w.id AS wid, w.handle, w.personal, w.name, w.status
      FROM projects p JOIN workspaces w ON w.id = COALESCE(p.workspace_id, 'wsp_' || p.owner_id)
-     LEFT JOIN principals pr ON pr.id = w.created_by
      WHERE p.id IN (SELECT value FROM json_each(?))`
   ).bind(JSON.stringify(want.slice(0, 1000))).all()).results;
+  // Missing handles/slugs are assigned here (first use after migration 0020), at most ASSIGN_PER_CALL per request so
+  // one request stays far below D1's per-invocation query limit; the rest get theirs on later requests.
   const handles = new Map();
+  let budget = ASSIGN_PER_CALL;
   for (const r of rows) {
     if (r.status === "deleting") continue;
-    if (!handles.has(r.wid)) handles.set(r.wid, await ensureHandle(env, { id: r.wid, handle: r.handle, personal: r.personal, name: r.name, label: r.label }));
+    if (!handles.has(r.wid)) {
+      if (!r.handle && budget-- <= 0) { handles.set(r.wid, null); continue; }
+      handles.set(r.wid, await ensureHandle(env, { id: r.wid, handle: r.handle, personal: r.personal, name: r.name }));
+    }
+    if (!handles.get(r.wid)) continue;
+    if (!r.slug && budget-- <= 0) continue;
     out.set(r.id, `${handles.get(r.wid)}/${await ensureSlug(env, { id: r.id, slug: r.slug, title: r.title })}`);
   }
   return out;
@@ -112,28 +122,35 @@ export async function resolveProjectRef(env, ref) {
   return id ?? NO_PROJECT;
 }
 
-// Only the link fields this code generates are rewritten, never document text or user data that happens to contain
-// a link (an export, a read body, records).
-const LINK_KEYS = new Set(["web_url", "preview_url", "version_url"]);
+// Only the link fields this code generates are rewritten, at fixed places in its own result shapes (never inside
+// records, document bodies or files), and only for projects the caller may open (`allowed`): a link can never reveal
+// another workspace's address.
+const LINK_KEYS = ["web_url", "preview_url", "version_url"];
+const LIST_KEYS = ["artifacts", "projects", "revisions", "results", "changes", "templates", "files"];
+const ONE_KEYS = ["artifact", "file", "template"];
 const appOrigin = (env) => {
   const h = env?.APP_HOST?.toLowerCase();
   if (!h || !/^[a-z0-9.-]+(:\d{1,5})?$/.test(h)) return null;
   return /^(127\.0\.0\.1|localhost)(:\d+)?$/.test(h) ? `http://${h}` : `https://${h}`;
 };
-function linkFields(value, f, depth = 0) {
-  if (typeof value !== "object" || value === null || depth > 6) return;
-  for (const k of Object.keys(value)) {
-    if (typeof value[k] === "string") { if (LINK_KEYS.has(k)) f(value, k); }
-    else linkFields(value[k], f, depth + 1);
-  }
+function linkFields(value, f) {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return;
+  const own = (o) => { if (o && typeof o === "object" && !Array.isArray(o)) for (const k of LINK_KEYS) if (typeof o[k] === "string") f(o, k); };
+  own(value);
+  for (const k of ONE_KEYS) own(value[k]);
+  for (const k of LIST_KEYS) if (Array.isArray(value[k])) for (const x of value[k].slice(0, 1000)) own(x);
 }
-/** Rewrites web_url / preview_url / version_url (…/p/<id>…) in a result object, in place, to …/<handle>/<slug>…. */
-export async function addressLinks(env, value) {
+/**
+ * Rewrites generated links (…/p/<id>…) in a result object, in place, to …/<handle>/<slug>…. `allowed` is the set of
+ * project ids the caller can open (others keep their /p/<id> link).
+ */
+export async function addressLinks(env, value, allowed) {
   const o = appOrigin(env);
-  if (!o) return value;
+  if (!o || !allowed) return value;
+  const ok = allowed instanceof Set ? allowed : new Set(allowed);
   const pre = `${o}/p/`, idOf = (s) => /^([A-Za-z0-9_-]{1,64})(?:[/?#]|$)/.exec(s.slice(pre.length))?.[1];
   const ids = new Set();
-  linkFields(value, (obj, k) => { if (obj[k].startsWith(pre)) { const id = idOf(obj[k]); if (id) ids.add(id); } });
+  linkFields(value, (obj, k) => { if (obj[k].startsWith(pre)) { const id = idOf(obj[k]); if (id && ok.has(id)) ids.add(id); } });
   if (!ids.size) return value;
   const paths = await projectPaths(env, [...ids]);
   linkFields(value, (obj, k) => {
@@ -143,11 +160,14 @@ export async function addressLinks(env, value) {
   });
   return value;
 }
-/** Same for a JSON API response (v1, publisher). Anything else passes through untouched. */
-export async function addressLinksResponse(env, res) {
-  if (!res || res.status >= 300 || !/^application\/json/.test(res.headers.get("content-type") ?? "") || !appOrigin(env)) return res;
+// Responses that carry stored content (files, records, text chunks, exports, renders) are never rewritten.
+const CONTENT_ROUTE = /\/(content|records|text|backup|render|preview|diff|export)(\/|$)/;
+/** Same for a JSON API response the code built (v1, publisher, browser API), for the caller's `allowed` projects. */
+export async function addressLinksResponse(env, res, pathname, allowed) {
+  if (!res || res.status >= 300 || CONTENT_ROUTE.test(pathname) || !/^application\/json/.test(res.headers.get("content-type") ?? "") || !appOrigin(env)) return res;
   const text = await res.text();
   if (!text.includes(`${appOrigin(env)}/p/`)) return new Response(text, res);
   let v; try { v = JSON.parse(text); } catch { return new Response(text, res); }
-  return new Response(JSON.stringify(await addressLinks(env, v)), res);
+  const ok = typeof allowed === "function" ? await allowed() : allowed;
+  return new Response(JSON.stringify(await addressLinks(env, v, ok)), res);
 }

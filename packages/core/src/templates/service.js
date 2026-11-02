@@ -140,7 +140,7 @@ async function tplProvenance(ctx, pid, a) {
 }
 
 function tplTools(oauth = false) {
-  const project = { type: "string", maxLength: 64, description: "Project ID from list_projects" };
+  const project = { type: "string", maxLength: 110, description: "Project ID or path (workspace/project) from list_projects" };
   const text = { type: "string", maxLength: 64 };
   const schema = (properties, required) => ({ type: "object", properties: { project_id: project, ...properties }, required: oauth ? required : ["project_id", ...required], additionalProperties: false });
   const ro = { readOnlyHint: true, destructiveHint: false, openWorldHint: false };

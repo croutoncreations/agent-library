@@ -2,6 +2,7 @@ import { readText, storeText } from "../content-store.js";
 import { authzSql, limitsFor, rateLimit } from "../auth.js";
 import { CONTENT_TYPE, MIME, byteLength, checkFile } from "../formats.js";
 import { appOrigin, artifactWebUrl, previewWebUrl } from "../links.js";
+import { addressLinksResponse } from "../paths.js";
 import { SCOPES, livePublisher } from "../oauth/server.js";
 import { LIMITS, connectionInfo, idemLookup } from "../service.js";
 import { memberRoleSql, readOnlyError } from "../tenancy.js";
@@ -948,7 +949,7 @@ async function handlePublisherApi(req, env, ctx) {
     const p = await livePublisher(env, ctx.props).catch(() => null);
     if (!p) throw new HttpError(401, "unauthenticated", "Token is no longer valid; reconnect the app");
     if (p.revoked) throw new HttpError(401, "publisher_revoked", "This publisher has been revoked by the owner");
-    const res = await route(req, env, p, requestId);
+    const res = await addressLinksResponse(env, await route(req, env, p, requestId), new URL(req.url).pathname, [p.project_id]);
     const r = new Response(res.body, res);
     r.headers.set("x-request-id", requestId);
     return r;

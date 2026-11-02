@@ -44,7 +44,7 @@ async function signIn(page, user) {
 }
 const waitText = (page, re) => page.waitForFunction((src) => new RegExp(src, "i").test(document.body.innerText), { timeout: 10000 }, re.source);
 
-test("an address link opens the document after sign-in; the project page shows and copies its address", { skip: !available && "Chrome/puppeteer not installed" }, async () => {
+test("an address link opens the document after sign-in; the project page shows and copies its address", { timeout: 60000, skip: !available && "Chrome/puppeteer not installed" }, async () => {
   const page = await signedOutPage();
   await page.goto(`${APP}/acme/q3-notes/a/${DOC}`);
   await signIn(page, "alice");
@@ -64,7 +64,7 @@ test("an address link opens the document after sign-in; the project page shows a
   await page.close();
 });
 
-test("an admin changes the project address; the old link then says not available, the new one works", { skip: !available && "Chrome/puppeteer not installed" }, async () => {
+test("an admin changes the project address; the old link then says not available, the new one works", { timeout: 60000, skip: !available && "Chrome/puppeteer not installed" }, async () => {
   const page = await signedOutPage();
   await page.goto(`${APP}/acme/q3-notes`);
   await signIn(page, "alice");
@@ -74,9 +74,12 @@ test("an admin changes the project address; the old link then says not available
   await page.$eval("#proj-slug", (i) => { i.value = ""; });
   await page.type("#proj-slug", "quarterly");
   await page.screenshot({ path: `${EV}/addresses-settings.png` });
-  page.once("dialog", (d) => { assert.match(d.message(), /\/acme\/q3-notes stop working/); d.accept(); });
+  // Accept first (an assertion throwing inside the handler would leave the dialog open), then check its text.
+  let dialogText = "";
+  page.once("dialog", (d) => { dialogText = d.message(); d.accept(); });
   await (await page.waitForSelector("xpath/.//form[@aria-label='Project settings']//button[normalize-space()='Save']")).click();
   await page.waitForFunction(() => document.querySelector(".proj-addr code")?.textContent === "/acme/quarterly", { timeout: 10000 });
+  assert.match(dialogText, /links to \/acme\/q3-notes will stop working\. Nobody loses access/);
   await page.goto(`${APP}/acme/q3-notes`); await page.reload();
   await waitText(page, /Project not available/);
   await page.goto(`${APP}/acme/quarterly`); await page.reload();
@@ -84,7 +87,7 @@ test("an admin changes the project address; the old link then says not available
   await page.close();
 });
 
-test("someone without access gets the same 'not available' as for an unknown address (mobile)", { skip: !available && "Chrome/puppeteer not installed" }, async () => {
+test("someone without access gets the same 'not available' as for an unknown address (mobile)", { timeout: 60000, skip: !available && "Chrome/puppeteer not installed" }, async () => {
   const page = await signedOutPage(390);
   await page.goto(`${APP}/acme/quarterly`);
   await signIn(page, "bob");

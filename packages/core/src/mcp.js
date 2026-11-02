@@ -15,7 +15,7 @@ var unwrap2 = /* @__PURE__ */ __name((r) => r && typeof r.status === "number" &&
 var TOOLS2 = [
   { name: "connection_info", description: "Identify this authenticated grant and current project access. Read-only; compare the safe ID in Connections.", inputSchema: S2({}, []), annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }, run: (c) => legacyConnectionInfo(c) },
   ...tplTools(false),
-  { name: "list_changes", description: "Poll published changes in one explicit project. WITHOUT cursor establishes a current checkpoint and returns NO history (initialized=true). Store next_cursor; follow has_more, then poll again. At-least-once: deduplicate by event_id. Cursors expire after 30 days; checkpoint BEFORE reconciling current content. Publishers excluded. No bodies or push notifications.", inputSchema: S2({ project_id: { type: "string", maxLength: 64 }, cursor: { type: "string", maxLength: 2048 }, limit: { type: "integer", minimum: 1, maximum: 50 } }, ["project_id"]), run: (c,a) => listChanges(c,a.project_id,a) },
+  { name: "list_changes", description: "Poll published changes in one explicit project. WITHOUT cursor establishes a current checkpoint and returns NO history (initialized=true). Store next_cursor; follow has_more, then poll again. At-least-once: deduplicate by event_id. Cursors expire after 30 days; checkpoint BEFORE reconciling current content. Publishers excluded. No bodies or push notifications.", inputSchema: S2({ project_id: { type: "string", maxLength: 110, description: "Project ID or path (workspace/project)" }, cursor: { type: "string", maxLength: 2048 }, limit: { type: "integer", minimum: 1, maximum: 50 } }, ["project_id"]), run: (c,a) => listChanges(c,a.project_id,a) },
   { name: "search_artifacts", description: "Ranked lexical search of currently readable projects, with excerpts and revision-pinned links. All words must match. Live pagination.", inputSchema: RS_SCHEMA, annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }, run: (c,a) => searchArtifacts(c,a,"mcp") },
   { name: "list_projects", description: "List projects this identity may access.", inputSchema: S2({}, []), run: (c) => listProjects(c) },
   {
@@ -181,9 +181,9 @@ async function handleMcp(req, env, requestId, origin) {
       const missing = (tool.inputSchema.required ?? []).find((k) => args[k] === undefined || args[k] === null);
       if (missing) return reply(rpcErr2(msg.id, -32602, `Missing argument ${missing}`));
       if (typeof args.project_id === "string" && args.project_id.includes("/")) args.project_id = await resolveProjectRef(env, args.project_id);
-      if (Array.isArray(args.project_ids)) args.project_ids = await Promise.all(args.project_ids.map((x) => resolveProjectRef(env, x)));
+      if (Array.isArray(args.project_ids) && args.project_ids.length <= 20) args.project_ids = await Promise.all(args.project_ids.map((x) => resolveProjectRef(env, x)));
       try {
-        const result = await addressLinks(env, withWebUrls(tool.name, args, args.project_id, await tool.run({ ...ctx, clientInfo: mcpClientInfo(msg.params, ctx.grantClientInfo), rpcIdBytes: rtIdBytes(msg.id) }, args), appOrigin(env.APP_HOST) ?? origin));
+        const result = await addressLinks(env, withWebUrls(tool.name, args, args.project_id, await tool.run({ ...ctx, clientInfo: mcpClientInfo(msg.params, ctx.grantClientInfo), rpcIdBytes: rtIdBytes(msg.id) }, args), appOrigin(env.APP_HOST) ?? origin), [ctx.grant?.project_id]);
         return reply(rpc2(msg.id, { content: [{ type: "text", text: JSON.stringify(result) }], structuredContent: result, isError: false }));
       } catch (e) {
         if (!(e instanceof HttpError)) throw e;
