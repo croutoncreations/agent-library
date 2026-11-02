@@ -12,8 +12,8 @@ const src = Object.fromEntries(SOURCES.map((f) => [f, readFileSync(f, 'utf8')]))
 // Browser sources go into APP_JS (String.raw template) and APP_CSS (template): no backtick or interpolation.
 for (const f of ['src/review/browser.js', 'src/review/browser.css']) if (/[`]|\$\{/.test(src[f]) || (f.endsWith('.css') && src[f].includes('\\'))) throw Error(f + ' would break its template literal');
 const moduleOf = (i) => { const m = input.lastIndexOf('\n// src/', i); return input.slice(m + 1, input.indexOf('\n', m + 1)); };
-const SERVICE = '// src/service.ts', AUTHM = '// src/auth.ts', UPLOADS = '// src/uploads.ts', CLEANUP = '// src/cleanup.ts', BACKUP = '// src/backup.ts',
-  OMCP = '// src/oauth/mcp.ts', LMCP = '// src/mcp.ts', V1 = '// src/api/v1.ts', CRED = '// src/api/credentials.ts', INDEX = '// src/index.ts', UI = '// src/ui.ts', HOME = '// src/home.ts';
+const SERVICE = '// src/service.ts', UPLOADS = '// src/uploads.ts', CLEANUP = '// src/cleanup.ts', BACKUP = '// src/backup.ts',
+  OMCP = '// src/oauth/mcp.ts', LMCP = '// src/mcp.ts', V1 = '// src/api/v1.ts', CRED = '// src/api/credentials.ts', INDEX = '// src/index.ts', UI = '// src/ui.ts';
 // [name, module (or list, one per occurrence), find, replace, count = 1]
 const PATCHES = [
   // ------------------------------------------------------------------ service: sources, reads, gates

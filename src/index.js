@@ -5967,8 +5967,10 @@ const RV_PURGE_MS = 30 * 86400000;
 const RV_PAGE = 50;
 const RV_OPEN = "EXISTS (SELECT 1 FROM proposals WHERE id = ? AND status = 'approving')";
 // Extra columns on every artifact row read through ART_COLS: open proposal count and the advisory reviewed version.
-const RV_ART_COLS = `, (SELECT COUNT(*) FROM proposals WHERE artifact_id = a.id AND status = 'pending') AS rv_pending, CASE WHEN a.review_mode = 'advisory' THEN (SELECT MAX(rv.rev_no) FROM reviews rv WHERE rv.artifact_id = a.id AND rv.rev_no IS NOT NULL AND rv.decision <> 'rejected'
-  AND NOT EXISTS (SELECT 1 FROM reviews rx WHERE rx.artifact_id = rv.artifact_id AND rx.rev_no = rv.rev_no AND rx.rowid > rv.rowid)) END AS rv_reviewed`;
+// One definition of "the reviewed version" (newest version whose latest review is not a rejection), shared below.
+const RV_REVIEWED_SQL = `(SELECT MAX(rv.rev_no) FROM reviews rv WHERE rv.artifact_id = a.id AND rv.rev_no IS NOT NULL AND rv.decision <> 'rejected'
+  AND NOT EXISTS (SELECT 1 FROM reviews rx WHERE rx.artifact_id = rv.artifact_id AND rx.rev_no = rv.rev_no AND rx.rowid > rv.rowid))`;
+const RV_ART_COLS = `, (SELECT COUNT(*) FROM proposals WHERE artifact_id = a.id AND status = 'pending') AS rv_pending, CASE WHEN a.review_mode = 'advisory' THEN ${RV_REVIEWED_SQL} END AS rv_reviewed`;
 
 function rvVia(ctx) {
   const p = provenance(ctx, null);
@@ -6533,8 +6535,6 @@ async function reviewRevision(ctx, projectId, artifactId, revNo, input, key) {
   return { status: 200, body };
 }
 // Latest version whose latest review is an approval (advisory); in required mode every version is reviewed.
-const RV_REVIEWED_SQL = `(SELECT MAX(rv.rev_no) FROM reviews rv WHERE rv.artifact_id = a.id AND rv.rev_no IS NOT NULL AND rv.decision <> 'rejected'
-  AND NOT EXISTS (SELECT 1 FROM reviews rx WHERE rx.artifact_id = rv.artifact_id AND rx.rev_no = rv.rev_no AND rx.rowid > rv.rowid))`;
 async function rvReviewedOf(ctx, artifactId, mode, head) {
   if (mode === "required") return head;
   return (await db(ctx).prepare(`SELECT ${RV_REVIEWED_SQL} AS n FROM artifacts a WHERE a.id = ?`).bind(artifactId).first("n")) ?? null;

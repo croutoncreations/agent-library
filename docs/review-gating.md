@@ -75,7 +75,7 @@ Rollback of the Worker does not undo migrations, and the previous Worker knows n
 - `review_gate_revisions` / `review_gate_meta` triggers refuse any agent (`oauth`, `api_key`, `grant`) version or details version on a `required` document unless it comes from an approved proposal. On the previous Worker, agent writes to gated documents fail closed instead of bypassing review.
 - `review_default_on_insert` applies the project default to every new non-publisher document, whichever Worker creates it.
 
-So there is one deploy and no feature variable. The previous Worker keeps working on the new schema for everything else (`test/review-gating.test.mjs` runs the previous bundle against it).
+So there is one deploy and no feature variable. The previous Worker keeps working on the new schema for everything else: the migration only adds columns with defaults and new tables, which it never reads. `test/review-gating.test.mjs` checks the triggers with direct SQL inserts that simulate the previous Worker's writes; it does not run the previous bundle.
 
 ## Search, changes feed, backups
 
@@ -100,7 +100,7 @@ Proposal files count toward the project's binary quota until approved (then they
 | Project default (owner) | — | — | `GET/PUT …/review-settings`, `POST …/review-settings/apply {expected_default}` (409 `settings_changed` if the saved default differs) |
 | Can review (owner) | — | — | `PUT /api/review-grants` |
 
-Documents in `advisory`/`required` mode, or with pending proposals, carry `review: { mode, reviewed_revision, pending_proposals }` in their views; documents with review off keep their exact previous shape. History entries carry `proposal_id` and `review { decision, who, via, note }`. Approve-with-edits attributes each part separately: the reviewer authors the part they changed (body, or title/folder/tags), the proposer keeps the rest. `revision=reviewed` (`?revision=reviewed` on `/v1` files, text and content; `?rev=reviewed` on the owner API's read and content routes; `reviewed: true` in MCP `read_artifact`, files included) returns the latest reviewed version. The browser's preview and render routes don't accept it (they show a given version or the current one).
+Documents in `advisory`/`required` mode, or with pending proposals, carry `review: { mode, reviewed_revision, pending_proposals }` in their views; documents with review off keep their exact previous shape. History entries of reviewed versions carry `review { decision, who, via, note, proposal_id, proposed_by? }`. Approve-with-edits attributes each part separately: the reviewer authors the part they changed (body, or title/folder/tags), the proposer keeps the rest. `revision=reviewed` (`?revision=reviewed` on `/v1` files, text and content; `?rev=reviewed` on the owner API's read and content routes; `reviewed: true` in MCP `read_artifact`, files included) returns the latest reviewed version. The browser's preview and render routes don't accept it (they show a given version or the current one).
 
 ## Browser UI
 

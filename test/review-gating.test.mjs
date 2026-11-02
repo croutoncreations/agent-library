@@ -1,6 +1,6 @@
 // Review gating (docs/review-gating.md): required and advisory modes, proposals, review permission, visibility on every
-// read path, files, quotas, backups, the changes feed and search, and the database gate that keeps a rolled-back
-// Worker fail-closed. Real Worker (wrangler dev, local D1/R2), real OAuth consent flow, the official MCP SDK client,
+// read path, files, quotas, backups, the changes feed and search, templates, JSON files, legacy /mcp, publishers, and
+// the database triggers (checked with direct SQL that simulates a rolled-back Worker's writes). Real Worker (wrangler dev, local D1/R2), real OAuth consent flow, the official MCP SDK client,
 // legacy agent tokens and API keys. Synthetic fixtures only; tokens stay in memory and are never printed.
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
@@ -367,7 +367,7 @@ test("advisory: reviews bind to one version; later edits are unreviewed; reviewe
   assert.equal((await setMode(id, "required")).reviewed_revision, 4);
 });
 
-test("owner settings: mode change is revision-guarded; apply-to-existing reports exactly what it vouched for; publishers exempt", async () => {
+test("owner settings: mode change is revision-guarded; apply-to-existing refuses a stale setting and reports what it changed", async () => {
   const id = await ownerDoc("Guarded");
   ok(await writer.call("save_markdown", { project_id: P, artifact_id: id, expected_revision: 1, body: "agent slipped in", change_note: "x", idempotency_key: key() }));
   const stale = await owner.req("PUT", art(id) + "/review-mode", { mode: "required", expected_revision: 1 });
@@ -380,6 +380,63 @@ test("owner settings: mode change is revision-guarded; apply-to-existing reports
   const ap = await owner.req("POST", base + "/review-settings/apply", { expected_default: "advisory" });
   assert.equal(ap.status, 200); assert.ok(Array.isArray(ap.body.updated));
   assert.equal((await owner.req("PUT", base + "/review-settings", { default: "off" })).status, 200);
+});
+
+test("every agent write path is gated: templates, JSON data files, legacy /mcp; search shows only approved text; publishers exempt", async () => {
+  // Fresh connections: the earlier tests use up the shared ones' per-minute budgets (fixed 60 reads/min per OAuth connection).
+  const rv2 = await h.connectMcpAgent({ [P]: "read" }, { clientName: "Reviewer Two" });
+  assert.equal((await allowReview("oauth", await connId("Reviewer Two"))).status, 200);
+  const rd2 = await h.connectMcpAgent({ [P]: "read" }, { clientName: "Reader Two" });
+  const wr2 = await h.connectMcpAgent({ [P]: "write" }, { clientName: "Writer Three" });
+  // Template copies in a required project become hidden new documents too.
+  const src = await ownerDoc("Template source", "# Weekly\n\nNotes:");
+  const t = await owner.req("POST", base + "/templates", { source_artifact_id: src, source_revision: 1, title: "Weekly", description: "d" });
+  assert.equal(t.status, 201, JSON.stringify(t.body));
+  assert.equal((await owner.req("PUT", base + "/review-settings", { default: "required" })).status, 200);
+  try {
+    const c = ok(await wr2.call("create_from_template", { project_id: P, template_id: t.body.artifact_id, template_revision: 1, title: "Week 1", date: "2026-10-27", change_note: "w", idempotency_key: key() }));
+    assert.equal(c.status, "pending_review", JSON.stringify(c));
+    assert.equal(err(await rd2.call("read_artifact", { project_id: P, artifact_id: c.artifact_id })).code, "not_found");
+    ok(await wr2.call("withdraw_proposal", { project_id: P, proposal_id: c.proposal_id, idempotency_key: key() }));
+  } finally { assert.equal((await owner.req("PUT", base + "/review-settings", { default: "off" })).status, 200); }
+  // JSON data files (App Connect on): /v1 saves become proposals.
+  const j = await owner.req("POST", base + "/artifacts", { kind: "json", title: "Data", content: "{\"a\":1}" });
+  assert.equal(j.status, 201, JSON.stringify(j.body)); await setMode(j.body.artifact_id, "required");
+  const js = await api("PUT", `/projects/${P}/files/${j.body.artifact_id}`, { expected_revision: 1, content: "{\"a\":2}", change_note: "j" });
+  assert.equal(js.body.status, "pending_review", JSON.stringify(js.body));
+  assert.equal((await api("GET", `/projects/${P}/files/${j.body.artifact_id}`)).body.content, "{\"a\":1}");
+  // Approve with edits on JSON validates the reviewer's text like any save.
+  assert.equal(err(await rv2.call("review_proposal", { project_id: P, proposal_id: js.body.proposal_id, decision: "approve", body: "{not json", expected_revision: 1, idempotency_key: key() })).code, "invalid_content");
+  ok(await rv2.call("review_proposal", { project_id: P, proposal_id: js.body.proposal_id, decision: "approve", body: "{\"a\":3}", expected_revision: 1, idempotency_key: key() }));
+  assert.equal((await api("GET", `/projects/${P}/files/${j.body.artifact_id}`)).body.content, "{\"a\":3}");
+  // Legacy /mcp (agent token): saves are proposals, reviewed reads work, review tools only with permission.
+  const id = await ownerDoc("Legacy", "legacy v1 zebraword"); await setMode(id, "required");
+  const lp = ok(await legacy.call("save_markdown", { project_id: P, artifact_id: id, expected_revision: 1, body: "legacy draft quokkaword", change_note: "l", idempotency_key: key() }));
+  assert.equal(lp.status, "pending_review");
+  assert.equal(ok(await legacy.call("read_artifact", { project_id: P, artifact_id: id, reviewed: true })).body, "legacy v1 zebraword");
+  const names = (await legacy.client.listTools()).tools.map((x) => x.name);
+  assert.ok(names.includes("list_proposals") && !names.includes("review_proposal"), "legacy lists review tools only with permission");
+  // Search never sees pending text.
+  for (const c of [rd2, wr2]) {
+    const hits = ok(await c.call("search_artifacts", { query: "quokkaword" }));
+    assert.equal((hits.results ?? []).length, 0, "pending text is not searchable");
+  }
+  assert.ok((ok(await rd2.call("search_artifacts", { query: "zebraword" })).results ?? []).some((r) => r.artifact_id === id), "approved text is");
+  // Publishers (App Connect) are never gated, even with a required project default. (Own project: projects with
+  // App Connect files can't be backed up yet, and the backup test below exports P.)
+  const PP = "rvw-pub";
+  assert.equal((await owner.req("POST", "/api/projects", { id: PP, title: "Exports" })).status, 201);
+  assert.equal((await owner.req("PUT", `/api/projects/${PP}/review-settings`, { default: "required" })).status, 200);
+  {
+    const app = await h.registerApp({ display_name: "Synthetic exporter", redirect_uris: ["http://localhost:5175/cb"], origins: [] });
+    const pub = await h.connectPublisher(app, { project_id: PP, destination: "new", new_folder_name: "Exports" });
+    const json = JSON.stringify({ schema: "agentlib.measurements/1", meta: { source_app: "synthetic" }, records: [] });
+    const r = await h.pub(pub.access_token, "POST", "/publisher/snapshots", { idem: key("snap"), body: { source_revision: 1, exported_at: "2026-10-03T00:00:12-07:00", coverage: { from: null, to: null },
+      files: [{ name: "export.json", kind: "json", role: "authoritative", schema: "agentlib.measurements/1", content: json }] } });
+    assert.equal(r.status, 201, r.text.slice(0, 300));
+    const rows = sql(`SELECT review_mode, pending_review, head_rev FROM artifacts WHERE publisher_id = '${pub.publisher_id}'`);
+    assert.ok(rows.length >= 1); for (const x of rows) { assert.equal(x.review_mode, "off"); assert.equal(x.pending_review, 0); assert.ok(x.head_rev >= 1); }
+  }
 });
 
 test("database gate: a rolled-back Worker's agent writes to required documents fail closed; owner and publisher writes don't", async () => {
