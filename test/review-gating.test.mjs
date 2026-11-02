@@ -219,6 +219,15 @@ test("new documents in a required project are hidden until approved; the author 
     assert.equal(c2.supersedes, c.proposal_id);
     const rp = ok(await reviewer.call("read_proposal", { project_id: P, proposal_id: c2.proposal_id }));
     assert.equal(rp.body, "draft two"); assert.equal(rp.details.proposed.title, "Secret plan");
+    // A details-only edit of a pending new document keeps the proposed title and folder (not the hidden shell's placeholder).
+    const lc = ok(await legacy.call("create_markdown", { project_id: P, title: "Legacy plan", folder: "Plans", body: "x", idempotency_key: key() }));
+    assert.equal(lc.status, "pending_review");
+    const shellMv = sql(`SELECT meta_version FROM artifacts WHERE id = '${lc.artifact_id}'`)[0].meta_version;
+    const tagsOnly = await agentHttp(h.appUi, legacyGrant.token)("PATCH", art(lc.artifact_id), { expected_meta_version: shellMv, tags: ["a"] });
+    assert.equal(tagsOnly.status, 200, JSON.stringify(tagsOnly.body)); assert.equal(tagsOnly.body.supersedes, lc.proposal_id);
+    const kept = sql(`SELECT title, folder, tags FROM proposals WHERE id = '${tagsOnly.body.proposal_id}'`)[0];
+    assert.deepEqual([kept.title, kept.folder, JSON.parse(kept.tags)], ["Legacy plan", "Plans", ["a"]]);
+    sql(`UPDATE proposals SET status = 'withdrawn', decided_at = '2000-01-01T00:00:00Z' WHERE id = '${tagsOnly.body.proposal_id}'`);
     const cp = ok(await reader.call("list_changes", { project_id: P })).next_cursor;
     // The reviewer edits only the title: the content keeps its proposer as author.
     ok(await reviewer.call("review_proposal", { project_id: P, proposal_id: c2.proposal_id, decision: "approve", title: "Secret plan (final)", idempotency_key: key() }));
@@ -364,6 +373,8 @@ test("advisory: reviews bind to one version; later edits are unreviewed; reviewe
   // A later rejection of the same version withdraws it from "reviewed".
   ok(await reviewer.call("review_revision", { project_id: P, artifact_id: id, revision: 2, decision: "rejected", note: "on second look", idempotency_key: key() }));
   assert.equal(ok(await reader.call("read_artifact", { project_id: P, artifact_id: id })).artifact.review.reviewed_revision, null);
+  const hist = ok(await reader.call("artifact_history", { project_id: P, artifact_id: id }));
+  assert.equal(hist.revisions.find((v) => v.rev === 2).review, undefined, "history shows no approval after a later rejection");
   // Owner marks the current version reviewed; switching to required keeps exactly that state.
   assert.equal((await owner.req("POST", art(id) + "/revisions/4/review", { decision: "approved" })).status, 200);
   assert.equal((await setMode(id, "required")).reviewed_revision, 4);
