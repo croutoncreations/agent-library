@@ -1,5 +1,5 @@
 // Upload finalization races (build-upload-fixes.mjs; security review 2026-10-23, findings 1 and 3). Drives the
-// production uploadFinish/reconcileUploads from the deploy bundle (src/index.js) over every migration applied to an
+// production uploadFinish/reconcileUploads from the deploy bundle (packages/core/src/index.js) over every migration applied to an
 // in-memory SQLite (node:sqlite) and a controlled R2 double, so each interleaving is scheduled exactly, not hoped for.
 // The bundle's cloudflare:workers import is replaced by an inert class only so Node can load it. Synthetic data only.
 import { test, after } from "node:test";

@@ -1,5 +1,5 @@
-// CSV and JSON inline previews in the browser app (src/web/app.js renderDataFile / dataPreview).
-//  1. Parser parity: the browser CSV parser and the server's parseCsv (src/formats.js) accept and reject the same
+// CSV and JSON inline previews in the browser app (packages/core/src/web/app.js renderDataFile / dataPreview).
+//  1. Parser parity: the browser CSV parser and the server's parseCsv (packages/core/src/formats.js) accept and reject the same
 //     inputs and produce the same cells, so a preview never disagrees with validation.
 //  2. Real Chrome against the real local runtime (loopback, synthetic owner, App Connect on so the owner can
 //     create csv/json files): cells, tree, Table toggle, Raw text, mobile overflow, hostile content, large-file caps.
@@ -23,7 +23,7 @@ const PHONE_390 = { width: 390, height: 844, deviceScaleFactor: 3, isMobile: tru
 const PHONE_320 = { width: 320, height: 658, deviceScaleFactor: 2, isMobile: true, hasTouch: true };
 
 // ---------- 1. parser parity ----------
-const appJs = readFileSync(join(ROOT, "src/web/app.js.txt"), "utf8");
+const appJs = readFileSync(join(ROOT, "packages/core/src/web/app.js.txt"), "utf8");
 const slice = (from, to) => { const a = appJs.indexOf(from), b = appJs.indexOf(to, a); assert.ok(a >= 0 && b > a, from); return appJs.slice(a, b); };
 const csvParse = new Function(slice("function csvParse(", "\n// JSON numbers keep") + "; return csvParse;")();
 // The real formatting helpers and JSON code from app.js (cut at function boundaries, not comments).
@@ -31,7 +31,7 @@ const J = new Function(slice("function fmtCount(", "\n// RFC 4180") + slice("fun
   slice("function isJsonContainer(", "\n// An array of flat objects") + slice("var NUMERIC_CELL", "\nfunction dataNote(") +
   slice("function jsonPath(", "\nfunction jsonSummary(") + slice("function jsonErrorText(", "\nfunction jsonScalar(") +
   "; return { jsonParse, jsonChanges, jsonBrief, isNumericCell, jsonErrorText, JSON_EXACT_NUMBERS };")();
-// The server's parseCsv (src/formats.js, the shipped module), checked against the browser parser so neither drifts.
+// The server's parseCsv (packages/core/src/formats.js, the shipped module), checked against the browser parser so neither drifts.
 let serverParseCsv;
 before(async () => { serverParseCsv = (await loadWorker({ "formats.js": ["parseCsv"] })).parseCsv; });
 
@@ -42,7 +42,7 @@ const CORPUS = [
   "name,note\n<img src=x onerror=alert(1)>,=HYPERLINK(\"http://example.invalid\",\"x\")\n",
   "\n", "a,b\n1,\n", "a\n\"x\ry\"\n", "\"h1\",\"h,2\"\n1,2\n", " \t,b\n1,2\n", "a,b\n1,2\r\n3,4", "a,,b\n1,2,3\n",
 ];
-test("CSV parser parity: the browser preview and server validation (src/formats.js) accept, reject and split identically", () => {
+test("CSV parser parity: the browser preview and server validation (packages/core/src/formats.js) accept, reject and split identically", () => {
   for (const [name, server] of [["formats.js", serverParseCsv]]) for (const text of CORPUS) {
     let s, c;
     try { s = { ok: server(text) }; } catch (e) { s = { err: e.message }; }

@@ -1,4 +1,4 @@
-import { accessEnabled, verifyAccess } from "./access.js";
+import { adapters } from "./adapters.js";
 import { humanGate, memberRoleSql, requireProjectRole, readOnlyError } from "./tenancy.js";
 import { HttpError, nowMs, sha256Hex } from "./util.js";
 
@@ -52,7 +52,8 @@ async function authenticateInner(req, env, requestId) {
   if (authz) {
     const m = /^Bearer ([A-Za-z0-9._~-]{20,200})$/.exec(authz);
     if (!m) throw new HttpError(401, "unauthenticated", "Malformed bearer token");
-    if (accessEnabled(env)) await verifyAccess(req, env, { requireOwner: false });
+    // The installation's sign-in provider may gate agents too (self-host: Cloudflare Access service tokens).
+    await adapters(env).identity.bearer(req, env);
     const row = await env.DB.prepare(
       `SELECT g.id, g.project_id, g.can_write, g.expires_at, g.revoked_at, g.client_info, p.id AS pid, p.kind, p.label,
               ${memberRoleSql("g.project_id", "viewer", "g.created_by")} AS creator_ok
@@ -78,8 +79,9 @@ async function authenticateInner(req, env, requestId) {
        JOIN principals p ON p.id = s.principal_id WHERE s.id_hash = ?`
     ).bind(await sha256Hex(sid)).first();
     if (row && row.revoked_at === null && row.expires_at > nowMs() && row.kind === "human") {
-      if (accessEnabled(env)) {
-        const id = await verifyAccess(req, env);
+      // The provider's current identity must still be this session's person (self-host: the Access JWT on every request).
+      const id = await adapters(env).identity.session(req, env);
+      if (id) {
         const p = await env.DB.prepare("SELECT issuer, subject FROM principals WHERE id = ?").bind(row.id).first();
         if (!p || p.issuer !== id.issuer || p.subject !== id.subject) throw new HttpError(401, "unauthenticated", "Session does not match Access identity");
       }

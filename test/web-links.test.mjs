@@ -118,7 +118,7 @@ test("deep-link routes serve only the data-free app shell; data still requires a
 });
 
 test("URL encoding: path-significant characters are percent-encoded; host validation", async () => {
-  const { projectWebUrl, artifactWebUrl, appOrigin } = await import("../src/links.js");
+  const { projectWebUrl, artifactWebUrl, appOrigin } = await import("../packages/core/src/links.js");
   assert.equal(projectWebUrl("https://x", "a/b?c#d"), "https://x/p/a%2Fb%3Fc%23d");
   assert.equal(artifactWebUrl("https://x", "p", "a b"), "https://x/p/p/a/a%20b");
   assert.equal(appOrigin("evil.com/path"), null);

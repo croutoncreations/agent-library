@@ -10,7 +10,7 @@ and `listProjects`; publishers use `livePublisher` and their sole destination. T
 Only IDs, labels, permitted project metadata, capabilities and timestamps are
 serialized; credential records, owner identity and secrets never enter results.
 
-The serializer lives in the service layer (`src/service.js`, `connectionInfo` and `legacyConnectionInfo`); the UI is in `src/web/app.js.txt`.
+The serializer lives in the service layer (`packages/core/src/service.js`, `connectionInfo` and `legacyConnectionInfo`); the UI is in `packages/core/src/web/app.js.txt`.
 
 Owner summaries describe saved access, status and safe IDs. They neither probe
 clients nor promise a successful read/write. Existing disconnect, replacement

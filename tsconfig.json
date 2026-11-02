@@ -11,6 +11,6 @@
     "lib": ["ES2022"],
     "types": ["@cloudflare/workers-types"]
   },
-  "include": ["src/**/*.js", "src/**/*.ts", "src/**/*.d.ts"],
-  "exclude": ["src/web/**"]
+  "include": ["packages/self-host/src/**/*.js", "packages/core/src/**/*.js", "packages/core/src/**/*.ts", "packages/core/src/**/*.d.ts"],
+  "exclude": ["packages/core/src/web/**"]
 }

@@ -1,4 +1,4 @@
-import { verifyAccess } from "./access.js";
+import { adapters, notify, resolveAdapters, withAdapters } from "./adapters.js";
 import { disableAppClient, listAppClients, registerAppClient, revokePublisher, updateAppClient } from "./api/app-clients.js";
 import { createApiKey, listApiKeys, replaceApiKey, revokeApiKey, setApiKeyScope } from "./api/credentials.js";
 import { handleV1, isV1Path } from "./api/v1.js";
@@ -82,7 +82,8 @@ async function devLogin(req, env, url) {
 async function accessLogin(req, env, url) {
   const origin = req.headers.get("origin");
   if (origin && origin !== url.origin) throw new HttpError(403, "bad_origin", "Cross-origin requests are not allowed");
-  const id = await verifyAccess(req, env);
+  const id = await adapters(env).identity.login(req, env);
+  if (!id) throw new HttpError(401, "access_not_configured", "Hosted identity is not configured");
   let p = await env.DB.prepare("SELECT id, kind FROM principals WHERE issuer = ? AND subject = ?").bind(id.issuer, id.subject).first();
   if (p && p.kind !== "human") throw new HttpError(403, "forbidden", "Not a human principal");
   if (!p) {
@@ -133,7 +134,7 @@ async function route3(req, env, url, requestId) {
   if (origin && origin !== url.origin) throw new HttpError(403, "bad_origin", "Cross-origin requests are not allowed");
   const tm = /^\/api\/transfers\/([A-Za-z0-9_-]+)$/.exec(path);
   if (tm && m === "PUT") return uploadPut(req, env, requestId, tm[1]);
-  if (!path.startsWith("/api/")) throw new HttpError(404, "not_found", "Not found");
+  if (!path.startsWith("/api/")) return extraRoute(req, env, url, requestId, null);
   const ctx = await authenticate(req, env, requestId);
   if (m !== "GET" && m !== "HEAD") requireCsrf(ctx, req);
   await enforceRate(ctx, m !== "GET" && m !== "HEAD");
@@ -288,10 +289,32 @@ async function route3(req, env, url, requestId) {
     if (sub === "comments" && m === "GET") return json(await listComments(ctx, pid, aid));
     if (sub === "comments" && m === "POST") return out(await addComment(ctx, pid, aid, await body(req), key()));
   }
-  throw new HttpError(404, "not_found", "Not found");
+  return extraRoute(req, env, url, requestId, ctx);
 }
 __name(route3, "route");
-var index_default = {
+/**
+ * Routes an installation adds (hosted: billing, sign-up). Only reached when no core route matched, so they can't
+ * shadow or bypass core routes. Under /api/ they get the authenticated ctx (CSRF and rate limits already applied).
+ */
+async function extraRoute(req, env, url, requestId, ctx) {
+  for (const r of adapters(env).routes) {
+    if (r.method && r.method !== req.method) continue;
+    const hit = typeof r.path === "string" ? r.path === url.pathname : r.path.exec(url.pathname);
+    if (!hit) continue;
+    if (url.pathname.startsWith("/api/") !== !!ctx) continue;
+    return r.handler(req, env, { url, requestId, ctx, match: hit === true ? null : hit });
+  }
+  throw new HttpError(404, "not_found", "Not found");
+}
+/** The Worker for one installation: core plus its adapters (packages/self-host, or the hosted repo). */
+function createWorker(adapterConfig = {}) {
+  const A = resolveAdapters(adapterConfig);
+  return {
+    scheduled: (ev, env, ctx) => coreWorker.scheduled(ev, withAdapters(env, A), ctx),
+    fetch: (req, env, ctx) => coreWorker.fetch(req, withAdapters(env, A), ctx)
+  };
+}
+var coreWorker = {
   // Cron: expire abandoned uploads and delete their R2 objects (bounded, idempotent).
   async scheduled(_ev, env, ctx) {
     ctx.waitUntil(cleanupChanges(env));
@@ -325,4 +348,4 @@ var index_default = {
     }
   }
 };
-export { index_default as default };
+export { createWorker, notify };

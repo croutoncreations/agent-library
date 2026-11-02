@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Build the deployable Worker from src/ into dist/worker/index.js (one ES module, no network, no secrets).
+// Build the deployable Worker from packages/core/src/ into dist/worker/index.js (one ES module, no network, no secrets).
 // The output is deterministic for a given source tree, lockfile and pinned esbuild; scripts/check-build.mjs
 // rebuilds it in a temp dir and compares hashes. Local dev, the test servers and the deploy pipeline all run this
 // file with no_bundle, so what was tested is what ships.
@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 export const ESBUILD_VERSION = '0.28.2';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
-export async function buildWorker({ entry = join(root, 'src/index.js'), outfile = join(root, 'dist/worker/index.js') } = {}) {
+export async function buildWorker({ entry = join(root, 'packages/self-host/src/index.js'), outfile = join(root, 'dist/worker/index.js') } = {}) {
   const esbuild = await import('esbuild');
   if (esbuild.version !== ESBUILD_VERSION) throw new Error(`Use pinned esbuild ${ESBUILD_VERSION} (found ${esbuild.version})`);
   const result = await build({

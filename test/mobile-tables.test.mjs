@@ -20,7 +20,7 @@ const PIXEL9 = { width: 412, height: 923, deviceScaleFactor: 2.625, isMobile: tr
 const ANDROID_320 = { width: 320, height: 658, deviceScaleFactor: 2, isMobile: true, hasTouch: true };
 const DESKTOP = { width: 1440, height: 900, deviceScaleFactor: 1 };
 
-const moduleSrc = moduleScript("src/markdown.js");
+const moduleSrc = moduleScript("packages/core/src/markdown.js");
 const { renderMarkdown } = new Function("__name", moduleSrc + "; return { renderMarkdown };")((f) => f);
 const FIXTURE = readFileSync(new URL("./fixtures/mobile-tables.md", import.meta.url), "utf8");
 
@@ -71,7 +71,7 @@ test("renderer: bounded and linear on hostile input (long delimiter lines, huge 
 });
 
 test("client: no regex lookbehind in the shipped UI (older Safari cannot parse it and would load nothing)", () => {
-  const js = readFileSync(new URL("../src/web/app.js.txt", import.meta.url), "utf8");
+  const js = readFileSync(new URL("../packages/core/src/web/app.js.txt", import.meta.url), "utf8");
   assert.doesNotMatch(js, /\(\?<[=!]/);
 });
 

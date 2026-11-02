@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Offline only. No credentials, subprocesses, network, resource creation or deployment.
-// Builds the Worker from src/ (dist/worker/index.js, deterministic and offline) and stages exactly that file.
+// Builds the Worker from packages/core/src/ (dist/worker/index.js, deterministic and offline) and stages exactly that file.
 import { readFileSync, writeFileSync, mkdirSync, cpSync } from 'node:fs';
 import { buildWorker } from '../build.mjs';
 import { resolve, dirname, join } from 'node:path';

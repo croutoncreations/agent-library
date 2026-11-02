@@ -1,4 +1,7 @@
-import { HttpError } from "./util.js";
+// Self-host identity adapter: Cloudflare Access in front of the app host admits only OWNER_EMAIL (one person), and
+// service tokens may front agents. With no Access configured (local dev), there is no provider and the install is
+// multi-user so shared-workspace flows can be exercised.
+import { HttpError } from "../../core/src/util.js";
 
 function certsUrl(env, team) {
   const o = env.ACCESS_CERTS_URL;
@@ -57,4 +60,12 @@ certCache = null;
 unb64url = (s) => Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((s.length + 3) % 4)), (c) => c.charCodeAt(0));
 accessEnabled = (env) => !!(env.ACCESS_TEAM_DOMAIN || env.ACCESS_AUD);
 
+export const accessIdentity = {
+  name: "cloudflare-access",
+  enabled: (env) => accessEnabled(env),
+  multiUser: (env) => !accessEnabled(env),
+  login: (req, env) => verifyAccess(req, env),
+  async session(req, env) { return accessEnabled(env) ? verifyAccess(req, env) : null; },
+  async bearer(req, env) { if (accessEnabled(env)) await verifyAccess(req, env, { requireOwner: false }); }
+};
 export { accessEnabled, verifyAccess };

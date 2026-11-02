@@ -32,7 +32,7 @@ test('signed cursors reject payload edits, expiry, other bindings and signing-ke
  let clock=1000000;
  class HttpError extends Error {constructor(status,code,message){super(message);this.status=status;this.code=code;}}
  const ctx=createContext({crypto:webcrypto,TextEncoder,TextDecoder,Uint8Array,btoa,atob,HttpError,nowMs:()=>clock});
- runInContext(moduleScript('src/search/service.js'),ctx);
+ runInContext(moduleScript('packages/core/src/search/service.js'),ctx);
  const key='synthetic-signing-key',binding='fixture-binding',after=[1001,'2026-10-28T00:00:00.000Z','art_fixture'];
  const cursor=await ctx.rsCursorEncode(key,binding,after);assert.ok(cursor.length<=512);
  assert.deepEqual(Array.from(await ctx.rsCursorDecode(key,binding,cursor)),after);
@@ -42,11 +42,11 @@ test('signed cursors reject payload edits, expiry, other bindings and signing-ke
  const parts=cursor.split('.');const payload=JSON.parse(Buffer.from(parts[1],'base64url'));payload.a[0]=0;
  parts[1]=Buffer.from(JSON.stringify(payload)).toString('base64url');await bad(()=>ctx.rsCursorDecode(key,binding,parts.join('.')));
  clock+=900000;await bad(()=>ctx.rsCursorDecode(key,binding,cursor));
- assert.ok(!moduleScript('src/search/service.js').includes('OAUTH_KV.'));
+ assert.ok(!moduleScript('packages/core/src/search/service.js').includes('OAUTH_KV.'));
 });
 
 test('MCP initialize/ping/unrelated calls bypass search; catalogs use only the singleton flag and tolerate search outages',async()=>{
- const ctx=createContext({});runInContext(moduleScript('src/search/service.js'),ctx);
+ const ctx=createContext({});runInContext(moduleScript('packages/core/src/search/service.js'),ctx);
  const queries=[],env={DB:{prepare(query){queries.push(query);return {first:async()=>1};}}};
  for(const msg of [{method:'initialize'},{method:'ping'},{method:'tools/call',params:{name:'read_artifact'}},{method:'tools/call',params:{name:'save_markdown'}}]) assert.equal(await ctx.rsToolReady(env,msg),true);
  assert.deepEqual(queries,[]);
@@ -59,7 +59,7 @@ test('MCP initialize/ping/unrelated calls bypass search; catalogs use only the s
 });
 
 test('owner status reads only the singleton flag, without a corpus scan',async()=>{
- const queries=[],ctx=createContext({});runInContext(moduleScript('src/search/service.js'),ctx);
+ const queries=[],ctx=createContext({});runInContext(moduleScript('packages/core/src/search/service.js'),ctx);
  const env={DB:{prepare(q){queries.push(q);return{first:async()=>1};}}};
  assert.equal(await ctx.rsReady(env),true);assert.deepEqual(queries,['SELECT ready FROM artifact_search_state WHERE id=1']);
 });

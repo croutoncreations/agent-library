@@ -1,6 +1,7 @@
 // Workspace administration (docs/workspaces.md): human-only. Every mutation re-checks the actor's role inside the
 // same statement, and the "at least one owner" rule is enforced in SQL so two concurrent demotions can't both win.
 import { requireHuman } from "./auth.js";
+import { adapters, notify } from "./adapters.js";
 import { ROLES, ROLE_RANK, multiUserInstall, requireWorkspaceRole, workspaceRoleSql } from "./tenancy.js";
 import { HttpError, nowIso, nowMs, randomId, sha256Hex, str } from "./util.js";
 
@@ -39,12 +40,14 @@ export async function createWorkspace(ctx, input) {
   requireHuman(ctx);
   if (!multiUser(ctx.env)) throw new HttpError(403, "single_user", "This installation has a single user; shared workspaces aren't available");
   const name = wsName(input?.name);
+  await adapters(ctx.env).entitlements.check(ctx.env, "workspace.create", { principalId: ctx.principal.id });
   const id = randomId("wsp", 12), at = nowIso();
   await ctx.env.DB.batch([
     ctx.env.DB.prepare("INSERT INTO workspaces (id, name, personal, status, plan, created_by, created_at) VALUES (?, ?, 0, 'active', 'free', ?, ?)").bind(id, name, ctx.principal.id, at),
     ctx.env.DB.prepare("INSERT INTO workspace_members (workspace_id, principal_id, role, added_by, created_at) VALUES (?, ?, 'owner', ?, ?)").bind(id, ctx.principal.id, ctx.principal.id, at),
     wsAudit(ctx.env, ctx, id, "workspace.create", id, "ok")
   ]);
+  await notify(ctx.env, "workspaceCreated", { id, name, createdBy: ctx.principal.id });
   return { id, name, personal: false, status: "active", role: "owner", member_count: 1 };
 }
 
@@ -74,6 +77,7 @@ export async function deleteWorkspace(ctx, id) {
     wsAudit(ctx.env, ctx, id, "workspace.delete", id, "ok", "changes() = 1")
   ]);
   if (!r.meta.changes) throw new HttpError(403, "forbidden", "Needs the owner role in this workspace");
+  await notify(ctx.env, "workspaceDeleted", { id, by: ctx.principal.id });
   return { ok: true, status: "deleting" };
 }
 
@@ -164,6 +168,7 @@ export async function createInvite(ctx, id, input, origin) {
     "SELECT 1 FROM workspace_members m JOIN principals p ON p.id = m.principal_id WHERE m.workspace_id = ? AND lower(p.email) = ?"
   ).bind(id, email).first();
   if (already) throw new HttpError(409, "already_member", "That person is already a member");
+  await adapters(ctx.env).entitlements.check(ctx.env, "invite.create", { principalId: ctx.principal.id, workspaceId: id });
   const token = randomId("inv", 32), inviteId = randomId("inv", 12), expires = nowMs() + INVITE_DAYS * 864e5;
   const [, ins] = await ctx.env.DB.batch([
     // A new invitation for the same address replaces any pending one (its link stops working).
@@ -177,7 +182,9 @@ export async function createInvite(ctx, id, input, origin) {
   if (!ins.meta.changes) throw new HttpError(403, "forbidden", "Needs the admin role in this workspace");
   // The link is returned once. It is a path (not a #fragment) so it survives a sign-in redirect; the token alone
   // grants nothing (signed-in, verified matching email, single use, <= 14 days). Hosted delivery emails it.
-  return { id: inviteId, email, role: r, expires_at: new Date(expires).toISOString(), accept_url: `${origin}/invite/${token}` };
+  const accept_url = `${origin}/invite/${token}`;
+  await notify(ctx.env, "inviteCreated", { id: inviteId, workspaceId: id, email, role: r, acceptUrl: accept_url, by: ctx.principal.id });
+  return { id: inviteId, email, role: r, expires_at: new Date(expires).toISOString(), accept_url };
 }
 
 export async function revokeInvite(ctx, id, inviteId) {

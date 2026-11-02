@@ -1,4 +1,4 @@
-// Read a maintained src/ module as plain script text for vm-based unit tests: strips its `import` and `export`
+// Read a maintained packages/core/src/ module as plain script text for vm-based unit tests: strips its `import` and `export`
 // statements so the test supplies dependencies (fakes or real helpers) through the vm context or Function params.
 // The code under test is exactly the shipped module body.
 import { readFileSync } from "node:fs";

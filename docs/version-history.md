@@ -1,6 +1,6 @@
 # Version history
 
-Status: implemented. Sources in `src/history/`, migration `0010_version_history.sql`, tests in `test/version-history.test.mjs`.
+Status: implemented. Sources in `packages/core/src/history/`, migration `0010_version_history.sql`, tests in `test/version-history.test.mjs`.
 
 ## Goal
 

@@ -1,4 +1,4 @@
-// Revision-pinned chunked reads (src/reads/service.js), run directly against the real migrations in node:sqlite.
+// Revision-pinned chunked reads (packages/core/src/reads/service.js), run directly against the real migrations in node:sqlite.
 // Deterministic coverage of what a live server can only hit by timing: access that ends between authentication and
 // the chunk's own statement, and exact encoded-size bounds for random text. Synthetic data only.
 import { test } from "node:test";
@@ -13,17 +13,17 @@ import { moduleScript } from "./module-source.mjs";
 class HttpError extends Error { constructor(status, code, message) { super(message); this.status = status; this.code = code; } }
 let clock = Date.now();
 function load() {
-  const src = moduleScript("src/reads/service.js");
+  const src = moduleScript("packages/core/src/reads/service.js");
   const int = (v, name, min = 0, max = Number.MAX_SAFE_INTEGER) => {
     if (typeof v !== "number" || !Number.isInteger(v) || v < min || v > max) throw new HttpError(400, "invalid_input", `${name} must be an integer in [${min}, ${max}]`);
     return v;
   };
   const authorizeProject = async (ctx, pid) => { if (ctx.principal.kind === "agent" && ctx.grant.project_id !== pid) throw new HttpError(404, "not_found", "Project not found"); };
   const db = (ctx) => ctx.env.DB;
-  // The real per-statement access gate (src/auth.js credentialGate over src/tenancy.js), with this test's clock.
-  const T = new Function("HttpError", moduleScript("src/tenancy.js") + "\nreturn { humanGate, memberRoleSql, requireProjectRole };")(HttpError);
-  const credentialGate = new Function("HttpError", "nowMs", "humanGate", "memberRoleSql", "requireProjectRole", "accessEnabled", "verifyAccess", "sha256Hex",
-    moduleScript("src/auth.js") + "\nreturn credentialGate;")(HttpError, () => clock, T.humanGate, T.memberRoleSql, T.requireProjectRole, () => false, null, null);
+  // The real per-statement access gate (packages/core/src/auth.js credentialGate over packages/core/src/tenancy.js), with this test's clock.
+  const T = new Function("HttpError", moduleScript("packages/core/src/tenancy.js") + "\nreturn { humanGate, memberRoleSql, requireProjectRole };")(HttpError);
+  const credentialGate = new Function("HttpError", "nowMs", "humanGate", "memberRoleSql", "requireProjectRole", "adapters", "sha256Hex",
+    moduleScript("packages/core/src/auth.js") + "\nreturn credentialGate;")(HttpError, () => clock, T.humanGate, T.memberRoleSql, T.requireProjectRole, null, null);
   return new Function("HttpError", "nowMs", "int", "authorizeProject", "credentialGate", "db",
     src + "\nreturn { readTextChunk, rtQuery, rtIdBytes, rtChunkLimit, rtFit, RT_ID_TOO_LONG, RT_KINDS_ALL, RT_KINDS_DOCS };")(HttpError, () => clock, int, authorizeProject, credentialGate, db);
 }

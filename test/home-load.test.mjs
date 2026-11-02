@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
 
-const HOME_JS = readFileSync(new URL("../src/web/home.js.txt", import.meta.url), "utf8");
+const HOME_JS = readFileSync(new URL("../packages/core/src/web/home.js.txt", import.meta.url), "utf8");
 
 class Store {
   constructor() { this.m = new Map(); }

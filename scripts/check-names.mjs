@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Fail on any undefined or misspelled identifier in src/ (TS2304/TS2552/TS2662/TS2663) using tsc with checkJs
+// Fail on any undefined or misspelled identifier in packages/core/src/ (TS2304/TS2552/TS2662/TS2663) using tsc with checkJs
 // (tsconfig.names.json). esbuild would otherwise treat a leftover reference as a global and the Worker would only
 // fail at runtime. Type-compatibility diagnostics are reported as a count but not enforced: the modules are
 // JavaScript (pending decision D7: incremental TypeScript conversion vs. converting now). Any configuration error (TS5xxx, TS2688, ...) fails the check rather than passing it.
@@ -16,4 +16,4 @@ const bad = lines.filter((l) => NAME.test(l) || !TYPE_ONLY.test(l));
 // A tsc that exits non-zero without any diagnostic line (crash, missing config) must not read as success.
 if (r.status !== 0 && !lines.length) bad.push(`tsc exited ${r.status} without diagnostics: ${(r.stdout + r.stderr).trim().slice(0, 500)}`);
 if (r.error || bad.length) { console.error((bad.length ? bad : [String(r.error)]).map((l) => `::error::${l}`).join('\n')); process.exit(1); }
-console.log(`names OK: no undefined identifiers in src/ (${lines.length} type-level diagnostics in untyped JS not enforced)`);
+console.log(`names OK: no undefined identifiers in packages/core/src/ (${lines.length} type-level diagnostics in untyped JS not enforced)`);

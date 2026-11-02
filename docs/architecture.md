@@ -2,7 +2,7 @@
 
 ## Pieces
 
-One Cloudflare Worker (`src/index.js`) answers on two hostnames:
+One Cloudflare Worker (`packages/core/src/index.js`) answers on two hostnames:
 
 - **`APP_HOST` (owner).** The browser UI (an installable PWA), `/api/*` for the UI, and authenticated content and preview routes. The whole host sits behind a Cloudflare Access self-hosted application. The Worker verifies the Access JWT (`ACCESS_TEAM_DOMAIN`, `ACCESS_AUD`) on every request and requires the verified email to be `OWNER_EMAIL`. It then issues an HttpOnly app session with CSRF protection.
 - **`MCP_HOST` (agents and apps).** It serves:
@@ -48,16 +48,30 @@ Every artifact has a stable owner URL: `https://APP_HOST/p/<project>/a/<artifact
 
 ## How the Worker is built
 
-The Worker is ordinary ES modules under `src/` (entry `src/index.js`). `npm run build` bundles them with the pinned esbuild into one module, `dist/worker/index.js`, which the deploy pipeline and the self-host setup upload unchanged (`no_bundle`). `npm run dev` and the test servers build first and run that same file under `wrangler dev` (`wrangler.local.toml` sets `no_bundle`). Nothing generated is committed.
+The Worker is ordinary ES modules in two packages. `packages/core/src/` holds everything that decides who can see what (service layer, authorization, workspaces, MCP, OAuth, App Connect, UI, migrations). `packages/self-host/src/` is the thin self-hosted entry: `createWorker({ identity: accessIdentity })`, with Cloudflare Access as the sign-in provider. That entry is what gets built. `npm run build` bundles them with the pinned esbuild into one module, `dist/worker/index.js`, which the deploy pipeline and the self-host setup upload unchanged (`no_bundle`). `npm run dev` and the test servers build first and run that same file under `wrangler dev` (`wrangler.local.toml` sets `no_bundle`). Nothing generated is committed.
 
-- `src/web/*.txt` are the browser assets (UI shell, styles, app script, Home loader, prebuilt CodeMirror editor). They are imported as text and served verbatim; `app.js.txt` has three build-free placeholders filled in `src/ui.js`.
-- `src/service.js` is the shared service layer used by the browser API, `/v1`, MCP and App Connect. Focused modules split from it: `search/`, `changes/`, `reads/`, `history/`, `templates/`.
-- `src/content-store.js` is the only module that touches R2 (`BLOBS`); it is the seam for per-workspace encryption ([encryption.md](encryption.md)).
-- `src/oauth/` is the OAuth server, consent pages and MCP-over-OAuth; `src/api/` holds `/v1`, API keys, app clients and the publisher API.
+- `packages/core/src/web/*.txt` are the browser assets (UI shell, styles, app script, Home loader, prebuilt CodeMirror editor). They are imported as text and served verbatim; `app.js.txt` has three build-free placeholders filled in `packages/core/src/ui.js`.
+- `packages/core/src/service.js` is the shared service layer used by the browser API, `/v1`, MCP and App Connect. Focused modules split from it: `search/`, `changes/`, `reads/`, `history/`, `templates/`.
+- `packages/core/src/content-store.js` is the only module that touches R2 (`BLOBS`); it is the seam for per-workspace encryption ([encryption.md](encryption.md)).
+- `packages/core/src/oauth/` is the OAuth server, consent pages and MCP-over-OAuth; `packages/core/src/api/` holds `/v1`, API keys, app clients and the publisher API.
 
 `npm run check:bundle` builds twice in fresh directories and fails if the outputs differ, if the bundle imports anything but `cloudflare:workers`, or if an installation-specific value appears. The editor bundle's provenance is checked separately (`npm run check:editor`).
 
 The modules were recovered mechanically from the previous byte-pinned bundle (Phase 0 of the hosted plan). The existing test suite passed on the old bundle and passes on this build; test servers run the built `dist/worker/index.js` itself (`wrangler.local.toml` uses `no_bundle`).
+
+### Packages and adapters
+
+`createWorker(adapters)` (`packages/core/src/index.js`) returns the Worker's `fetch`/`scheduled` handlers with the installation's adapters attached to `env` (`packages/core/src/adapters.js`). Every adapter is optional; the defaults are below.
+
+| Adapter | Self-host | Hosted (private repo) | Default |
+|---|---|---|---|
+| `identity`: `login`, `session`, `bearer`, `multiUser` | Cloudflare Access (`packages/self-host/src/access-identity.js`): one owner, single-user | OIDC (Supabase) | No provider: local dev sign-in only, multi-user |
+| `entitlements.check(env, op, info)` | Unlimited | Plan limits (throws 402) | Unlimited |
+| `lifecycle`: `workspaceCreated`, `workspaceDeleted`, `inviteCreated` | None | Billing customer, invitation email | None |
+| `routes`: `{ method?, path, handler }` | None | Billing, sign-up, legal pages | None |
+| `mailer.send` | Logs only | SendGrid | Logs only |
+
+Rules: adapters never decide access to content (that stays in core's SQL gates). Extra routes are tried only after every core route missed, so they can't shadow one; under `/api/` they run after authentication, CSRF and rate limiting, and get the authenticated `ctx`. Entitlement checks run before anything is written. Lifecycle hooks run after the change is committed, and a failing hook is logged without undoing it. `MULTI_USER=1`/`0` still overrides the identity adapter's single/multi-user answer.
 
 ## Configuration
 
@@ -72,12 +86,12 @@ Rate limits and upload TTLs have defaults and optional vars. See [wrangler.examp
 
 ## Ranked search
 
-[Ranked search](ranked-search.md) adds a D1 FTS5 index over current published heads, live permission filtering, opaque query-bound pagination, a Home search view, `/api/search`, `/v1/search` and the `search_artifacts` MCP tool. Sources: `src/search/`.
+[Ranked search](ranked-search.md) adds a D1 FTS5 index over current published heads, live permission filtering, opaque query-bound pagination, a Home search view, `/api/search`, `/v1/search` and the `search_artifacts` MCP tool. Sources: `packages/core/src/search/`.
 
 ## Templates
 
-Project-scoped Markdown templates reuse artifact revisions and metadata history; identity and copy provenance are additive fields. Owner-only definition maintenance is enforced in the shared service and transaction fences. Both MCP transports, /v1 and the owner picker use the same implementation (`src/templates/`). See [Document templates](templates.md) for date/retry semantics, /2 backup compatibility and rollback notes.
+Project-scoped Markdown templates reuse artifact revisions and metadata history; identity and copy provenance are additive fields. Owner-only definition maintenance is enforced in the shared service and transaction fences. Both MCP transports, /v1 and the owner picker use the same implementation (`packages/core/src/templates/`). See [Document templates](templates.md) for date/retry semantics, /2 backup compatibility and rollback notes.
 
 ## File types
 
-File types in the browser UI (`src/web/app.js.txt`, `src/web/home.js.txt`): lists label files by their stored MIME type ("PNG image", "MP4 video", "PDF"), Home can filter and sort by type, and list rows show small thumbnails for images and videos. Thumbnails are drawn in the browser from the revision-pinned `/content` URL, lazily and within a per-minute budget, kept as 96px object URLs for the session and dropped on sign-out. The owner list route adds `mime` only with `?include=mime`, and owner search adds it for human sessions only, so MCP, `/v1` and default `/api` shapes are unchanged. No migration.
+File types in the browser UI (`packages/core/src/web/app.js.txt`, `packages/core/src/web/home.js.txt`): lists label files by their stored MIME type ("PNG image", "MP4 video", "PDF"), Home can filter and sort by type, and list rows show small thumbnails for images and videos. Thumbnails are drawn in the browser from the revision-pinned `/content` URL, lazily and within a per-minute budget, kept as 96px object URLs for the session and dropped on sign-out. The owner list route adds `mime` only with `?include=mime`, and owner search adds it for human sessions only, so MCP, `/v1` and default `/api` shapes are unchanged. No migration.

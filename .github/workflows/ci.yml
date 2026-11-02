@@ -60,7 +60,7 @@ jobs:
         run: npm run typecheck
       - name: Deploy guards, config and migration ordering
         run: npm run test:deploy
-      - name: Worker builds reproducibly from src/
+      - name: Worker builds reproducibly from packages/core/src/
         run: npm run check:bundle
       - name: Generated self-host config uploads exactly the built Worker (offline dry run)
         run: npm run check:self-host-upload

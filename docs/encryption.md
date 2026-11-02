@@ -8,7 +8,7 @@ end-to-end encryption: the Worker reads plaintext to serve people and agents.
 
 ## The seam for per-workspace encryption
 
-Stored file bytes (R2 `BLOBS`) are read and written only through `src/content-store.js` (`getBlob`,
+Stored file bytes (R2 `BLOBS`) are read and written only through `packages/core/src/content-store.js` (`getBlob`,
 `getBlobBytes`, `putBlob`, `headBlob`, `deleteBlob`). `test/content-store.test.mjs` fails if any other module
 touches `env.BLOBS`. Per-workspace envelope encryption replaces those functions with ones that:
 
@@ -25,7 +25,7 @@ new key and updating the revision's `blob_key` in a revision-guarded statement.
 
 Markdown, HTML, JSON and CSV bodies live in `revisions.body`; comments in `comments.body`. JavaScript writes bind
 `storeText(text)` and JavaScript reads of a selected body go through `readText(stored)` (both in
-`src/content-store.js`). `test/content-store.test.mjs` checks this two ways: a static check that every `INSERT` of a
+`packages/core/src/content-store.js`). `test/content-store.test.mjs` checks this two ways: a static check that every `INSERT` of a
 body binds `storeText` (or is a marked SQL-side copy), and a run of the main write and read paths (documents,
 comments, history, restore, templates, JSON files and records, backup export and restore) with a marker codec in
 place of the two functions. Reads on paths outside that run are not checked mechanically yet.
@@ -35,10 +35,10 @@ when text encryption is built:
 
 | Where | What reads the body in SQL |
 |---|---|
-| `migrations/0014_ranked_search.sql` triggers, `src/search/service.js` | FTS5 index of title and body |
-| `src/reads/service.js` | byte-range `substr` of the body for chunked reads |
-| `src/service.js` (`listArtifacts`) | owner `LIKE` filter over the head body |
-| `src/api/publisher.js` | generation commit copies staged part bodies into revisions with `INSERT … SELECT` (marked `content-store: sql-side`) and refreshes the search index from them; `json_extract` over staged parts |
+| `migrations/0014_ranked_search.sql` triggers, `packages/core/src/search/service.js` | FTS5 index of title and body |
+| `packages/core/src/reads/service.js` | byte-range `substr` of the body for chunked reads |
+| `packages/core/src/service.js` (`listArtifacts`) | owner `LIKE` filter over the head body |
+| `packages/core/src/api/publisher.js` | generation commit copies staged part bodies into revisions with `INSERT … SELECT` (marked `content-store: sql-side`) and refreshes the search index from them; `json_extract` over staged parts |
 | `publisher_generation_parts.body` | staged App Connect parts are plaintext in D1 from upload until commit (then cleared) |
 
 Plan when per-workspace encryption is built: add a nullable `key_version` to `revisions` and `comments` (NULL =

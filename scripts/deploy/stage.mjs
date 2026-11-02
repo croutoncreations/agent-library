@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Build the Worker (dist/worker/index.js = deploy/production.json "main") from src/, then copy it
+// Build the Worker (dist/worker/index.js = deploy/production.json "main") from packages/core/src/, then copy it
 // into the isolated directory wrangler.toml [env.hosted] uploads from, and verify the bytes.
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';

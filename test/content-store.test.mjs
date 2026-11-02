@@ -1,4 +1,4 @@
-// Every stored-bytes access goes through src/content-store.js (the encryption seam; docs/encryption.md).
+// Every stored-bytes access goes through packages/core/src/content-store.js (the encryption seam; docs/encryption.md).
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync, readdirSync, statSync } from "node:fs";
@@ -13,8 +13,8 @@ function jsFiles(dir) {
   });
 }
 
-test("only src/content-store.js touches the R2 binding", () => {
-  const offenders = jsFiles(join(ROOT, "src"))
+test("only packages/core/src/content-store.js touches the R2 binding", () => {
+  const offenders = jsFiles(join(ROOT, "packages", "core", "src"))
     .filter((f) => !f.endsWith("content-store.js"))
     .filter((f) => /\bBLOBS\b/.test(readFileSync(f, "utf8")))
     .map((f) => f.slice(ROOT.length + 1));
@@ -22,7 +22,7 @@ test("only src/content-store.js touches the R2 binding", () => {
 });
 
 // Text bodies in D1 (revisions.body, comments.body). Two checks:
-// 1. Static: every statement in src/ that inserts into revisions or comments either binds storeText(...) or is an
+// 1. Static: every statement in packages/core/src/ that inserts into revisions or comments either binds storeText(...) or is an
 //    SQL-side copy marked "content-store: sql-side" (listed in docs/encryption.md).
 // 2. Behavioural: the build is made with storeText/readText replaced by a reversible marker codec and the main write
 //    and read paths (documents, comments, history, restore, templates, JSON files and records, backup export and
@@ -30,7 +30,7 @@ test("only src/content-store.js touches the R2 binding", () => {
 //    out of the stored row or leaks it into a response. Paths not exercised here are covered only by check 1 (writes).
 test("every INSERT of a text body binds storeText or is a marked SQL-side copy", () => {
   const bad = [];
-  for (const f of jsFiles(join(ROOT, "src"))) {
+  for (const f of jsFiles(join(ROOT, "packages", "core", "src"))) {
     const text = readFileSync(f, "utf8");
     const re = /INSERT INTO (revisions|comments) \(([^)]*)\)/g;
     for (let m; (m = re.exec(text));) {
@@ -46,7 +46,7 @@ test("every INSERT of a text body binds storeText or is a marked SQL-side copy",
 test("main JS write and read paths of text bodies go through storeText/readText (marker codec)", async () => {
   const { loadWorker } = await import("./load-worker.mjs");
   const lib = await loadWorker({ "service.js": ["createMarkdown", "createFile", "saveFile", "readRecords", "saveMarkdown", "getArtifact", "addComment", "listComments", "restoreRevision"], "templates/service.js": ["saveAsTemplate", "createFromTemplate"], "backup.js": ["exportBackup", "restoreBackup"], "history/service.js": ["diffRevisions"] },
-    { "content-store.js": "export * from \"./src/content-store.js\"; export function storeText(t) { return \"ENC:\" + t; } export function readText(s) { if (!String(s).startsWith(\"ENC:\")) throw new Error(\"unencoded body read: \" + String(s).slice(0, 20)); return String(s).slice(4); }" });
+    { "content-store.js": "export * from \"./packages/core/src/content-store.js\"; export function storeText(t) { return \"ENC:\" + t; } export function readText(s) { if (!String(s).startsWith(\"ENC:\")) throw new Error(\"unencoded body read: \" + String(s).slice(0, 20)); return String(s).slice(4); }" });
   const { DatabaseSync } = await import("node:sqlite");
   const sql = new DatabaseSync(":memory:");
   for (const f of readdirSync(join(ROOT, "migrations")).filter((f) => f.endsWith(".sql")).sort()) sql.exec(readFileSync(join(ROOT, "migrations", f), "utf8"));

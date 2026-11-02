@@ -3,18 +3,19 @@
 // delegated credential (OAuth connection, API key, legacy grant, publisher) works only while the human who created
 // it still has enough role there. All checks are SQL fragments evaluated in the same statement as the operation,
 // so removal or demotion takes effect on the very next request.
+import { adapters } from "./adapters.js";
 import { HttpError } from "./util.js";
 
 export const ROLES = ["viewer", "member", "admin", "owner"];
 /**
- * Can more than one person sign in? A self-hosted installation behind Cloudflare Access admits only OWNER_EMAIL
- * (src/access.js), so shared workspaces would never work there. Hosted sets MULTI_USER=1; local dev (no Access) is
- * multi-user so the flows can be tested. MULTI_USER=0 forces single-user.
+ * Can more than one person sign in? The identity adapter decides (self-host behind Cloudflare Access admits only
+ * OWNER_EMAIL, so it is single-user; local dev with no provider is multi-user so the flows can be tested).
+ * MULTI_USER=1 / MULTI_USER=0 override it.
  */
 export function multiUserInstall(env) {
   if (env?.MULTI_USER === "1") return true;
   if (env?.MULTI_USER === "0") return false;
-  return !(env?.ACCESS_TEAM_DOMAIN || env?.ACCESS_AUD);
+  return !!adapters(env).identity.multiUser(env);
 }
 export const ROLE_RANK = { none: 0, viewer: 1, member: 2, admin: 3, owner: 4 };
 /** Minimum role for an operation class. */

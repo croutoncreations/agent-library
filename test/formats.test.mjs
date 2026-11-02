@@ -1,4 +1,4 @@
-// Pure-format checks for src/formats.js (no server), loaded from the shipped source.
+// Pure-format checks for packages/core/src/formats.js (no server), loaded from the shipped source.
 import { test, before } from "node:test";
 import assert from "node:assert/strict";
 

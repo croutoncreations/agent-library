@@ -1,6 +1,6 @@
 # Upload finalization and recovery
 
-Upload finalization lives in `src/uploads.js` (`uploadFinish`) with the cron reconciler in `src/cleanup.js`.
+Upload finalization lives in `packages/core/src/uploads.js` (`uploadFinish`) with the cron reconciler in `packages/core/src/cleanup.js`.
 
 Migration `0011_upload_finalize_lease.sql` must precede the new Worker. It adds:
 

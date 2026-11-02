@@ -49,7 +49,7 @@ test("primary navigation marks exactly the current section (home, projects, proj
 });
 
 test("brand: the approved Fold mark renders in the sidebar and mobile header (exact original crop, not the fallback tile)", { skip: !haveChrome && "Chrome not installed" }, async () => {
-  const want = createHash("sha256").update(readFileSync(new URL("../src/web/brand/fold-mark-128.png", import.meta.url))).digest("hex");
+  const want = createHash("sha256").update(readFileSync(new URL("../packages/core/src/web/brand/fold-mark-128.png", import.meta.url))).digest("hex");
   assert.equal(want, "ed862b3e0f232612e7dcab6541475509ff9d51600dc3df3bcf0020f8f66a8e68", "committed original crop unchanged");
   for (const vp of [{ width: 1440, height: 900 }, { width: 412, height: 923, deviceScaleFactor: 2.625, isMobile: true, hasTouch: true }]) {
     await page.setViewport(vp);
@@ -71,7 +71,7 @@ test("brand: the approved Fold mark renders in the sidebar and mobile header (ex
 });
 
 test("installed-app icons are the Fold mark: manifest, favicon and touch icon serve the committed PNGs; old URLs serve them too", async () => {
-  const brand = (f) => readFileSync(new URL("../src/web/brand/" + f, import.meta.url));
+  const brand = (f) => readFileSync(new URL("../packages/core/src/web/brand/" + f, import.meta.url));
   const hash = (b) => createHash("sha256").update(b).digest("hex");
   const get = async (p) => { const r = await fetch(ORIGIN + p); assert.equal(r.status, 200, p); return r; };
   const bytes = async (p) => { const r = await get(p); assert.equal(r.headers.get("content-type"), "image/png", p); return hash(Buffer.from(await r.arrayBuffer())); };

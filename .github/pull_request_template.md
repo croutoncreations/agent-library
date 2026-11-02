@@ -9,7 +9,7 @@
 ## Checklist
 
 - [ ] Read [AGENTS.md](https://github.com/croutoncreations/agent-library/blob/main/AGENTS.md) and [CONTRIBUTING.md](https://github.com/croutoncreations/agent-library/blob/main/CONTRIBUTING.md)
-- [ ] If anything that ships changed: edited `src/` (the Worker is built from it by `npm run build`; nothing generated is committed)
+- [ ] If anything that ships changed: edited `packages/core/src/` (the Worker is built from it by `npm run build`; nothing generated is committed)
 - [ ] `npm run typecheck`, `npm run check:bundle` and `npm test` pass locally
 - [ ] Migrations (if any) are additive and retry-safe
 - [ ] Synthetic test data only; no credentials, real hostnames or personal data

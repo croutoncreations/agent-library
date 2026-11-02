@@ -103,7 +103,7 @@ test("cleanup deletes at most 1000 rows; preserves monotonic high and records fl
     d.exec(
       `INSERT INTO project_changes(project_id,artifact_id,kind,type,changed_fields,at) VALUES('p','a','markdown','artifact.created','[]','1900-01-01');`,
     );
-  const code = moduleScript("src/changes/service.js");
+  const code = moduleScript("packages/core/src/changes/service.js");
   const warnings = [];
   const cleanup = vm.runInNewContext(code + ";cleanupChanges", {
     nowMs: () => Date.now(),
@@ -151,7 +151,7 @@ test("cleanup deletes at most 1000 rows; preserves monotonic high and records fl
 
 test("OAuth kind gates independently apply App Connect and file approval", () => {
   const kinds = vm.runInNewContext(
-    moduleScript("src/changes/service.js") + ";chKinds",
+    moduleScript("packages/core/src/changes/service.js") + ";chKinds",
     {
       appConnectEnabled: (env) => env.APP_CONNECT_ENABLED === "1",
     },
@@ -208,7 +208,7 @@ test("metadata changes made entirely inside trash produce no new reconciliation 
 });
 
 test("opaque cursors hide global counters, use fresh nonces and reject ciphertext tampering", async () => {
-  const code = moduleScript("src/changes/service.js");
+  const code = moduleScript("packages/core/src/changes/service.js");
   class HttpError extends Error {
     constructor(status, code, message) {
       super(message);
@@ -261,7 +261,7 @@ test("opaque cursors hide global counters, use fresh nonces and reject ciphertex
 
 test("publisher coverage fingerprints stay ordered across scan order and query-plan changes", () => {
   const coverage = vm.runInNewContext(
-    moduleScript("src/changes/service.js") + ";CH_COVERAGE_SQL",
+    moduleScript("packages/core/src/changes/service.js") + ";CH_COVERAGE_SQL",
   );
   const d = new DatabaseSync(":memory:");
   d.exec(`CREATE TABLE publishers(id TEXT PRIMARY KEY,project_id TEXT,current_snapshot_id TEXT);

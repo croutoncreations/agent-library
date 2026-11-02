@@ -10,7 +10,7 @@
 #    (docs/deploy-pipeline.md), this file lives in your private deploy repo, next to deploy/production.json
 #    (from deploy/production.example.json); keep the two identical, the pipeline checks both before every deploy.
 name = "agent-library"
-main = "src/index.js"
+main = "dist/worker/index.js"
 compatibility_date = "2025-09-01"
 # Required by workers-oauth-provider for Client ID Metadata Document fetches (SSRF protection).
 compatibility_flags = ["global_fetch_strictly_public"]
@@ -35,7 +35,7 @@ binding = "BLOBS"
 bucket_name = "agent-library-blobs"
 
 # ---- Your installation (wrangler deploy --env hosted) ----
-# The Worker is built from src/ by `npm run build` (dist/worker/index.js) and uploaded unmodified from an isolated copy
+# The Worker is built from packages/ (core + self-host entry) by `npm run build` (dist/worker/index.js) and uploaded unmodified from an isolated copy
 # (`npm run stage:hosted` copies it to dist/hosted/index.js and verifies its sha256), so wrangler
 # cannot attach neighbouring sources as extra modules.
 [env.hosted]

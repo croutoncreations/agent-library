@@ -11,10 +11,10 @@ Agent Library is a self-hosted home for everything your agents make: one Cloudfl
 
 ## How the deployable Worker is built
 
-- The Worker is ordinary ES modules under `src/` (entry `src/index.js`). `npm run build` bundles them with the pinned esbuild into `dist/worker/index.js`, which deploys and self-host setup upload unchanged. Nothing generated is committed.
-- Browser assets are `src/web/*.txt`, imported as text and served verbatim (`src/ui.js` fills three placeholders in `app.js.txt`). The prebuilt editor (`src/web/editor.js.txt`) is pinned by `editor/provenance.json`; `npm run check:editor` reproduces it.
+- The Worker is ordinary ES modules: `packages/core/src/` (all authorization and features; `createWorker(adapters)`) and `packages/self-host/src/` (the built entry: core plus the Cloudflare Access identity adapter). Installation differences go through adapters (`packages/core/src/adapters.js`, docs/architecture.md#packages-and-adapters), never through authorization changes. `npm run build` bundles them with the pinned esbuild into `dist/worker/index.js`, which deploys and self-host setup upload unchanged. Nothing generated is committed.
+- Browser assets are `packages/core/src/web/*.txt`, imported as text and served verbatim (`packages/core/src/ui.js` fills three placeholders in `app.js.txt`). The prebuilt editor (`packages/core/src/web/editor.js.txt`) is pinned by `editor/provenance.json`; `npm run check:editor` reproduces it.
 - `npm run check:bundle` (CI) builds twice in fresh directories and fails on any difference, an unexpected runtime import, or an installation-specific value.
-- Tests that need internals in Node use `test/load-worker.mjs` (bundles the real `src/`) or `test/module-source.mjs` (one module's body for vm-based tests). Never test a copy of the code.
+- Tests that need internals in Node use `test/load-worker.mjs` (bundles the real `packages/core/src/`) or `test/module-source.mjs` (one module's body for vm-based tests). Never test a copy of the code.
 - No installation-specific value belongs in code: hostnames, owners, gateways and callbacks all come from Worker vars (see `wrangler.example.toml`). Use `example.com`, `example.test` or `.invalid` names in code, tests and docs.
 
 ## Configuration files

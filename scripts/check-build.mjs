@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// CI: the Worker builds from src/ reproducibly (two builds in fresh temp dirs are byte-identical), loads as an
+// CI: the Worker builds from packages/core/src/ reproducibly (two builds in fresh temp dirs are byte-identical), loads as an
 // ES module exporting fetch and scheduled handlers, and contains only installation-neutral values.
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
