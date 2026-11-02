@@ -162,13 +162,19 @@ async function createGrant(ctx, projectId, input) {
   const principalId = randomId("agt");
   const grantId = randomId("grt");
   const expires = nowMs() + ttlHours * 36e5;
-  await db(ctx).batch([
-    db(ctx).prepare("INSERT INTO principals (id, kind, issuer, subject, label, created_at) VALUES (?, 'agent', 'agent-library', ?, ?, ?)").bind(principalId, principalId, label, nowIso()),
+  // Connected-agents limit (Phase 4): live grant tokens count. Checked in the principal INSERT; a refused principal
+  // fails the grant row's foreign key and rolls the batch back.
+  const lg = await projectLimitGuard(ctx.env, projectId, { agents: 1 });
+  try { await db(ctx).batch([
+    db(ctx).prepare(`INSERT INTO principals (id, kind, issuer, subject, label, created_at) SELECT ?, 'agent', 'agent-library', ?, ?, ? WHERE ${lg.sql}`).bind(principalId, principalId, label, nowIso(), ...lg.params),
     db(ctx).prepare(
       "INSERT INTO grants (id, project_id, principal_id, token_hash, can_write, expires_at, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
     ).bind(grantId, projectId, principalId, await sha256Hex(token), canWrite, expires, ctx.principal.id, nowIso()),
     audit(ctx, projectId, "grant.create", grantId, null, "ok")
-  ]);
+  ]); } catch (e) {
+    if (lg.workspaceId && /FOREIGN KEY/i.test(String(e?.message ?? e))) await explainLimit(ctx.env, lg.workspaceId, { agents: 1 }, lg.limits);
+    throw e;
+  }
   return { grant_id: grantId, principal_id: principalId, label, can_write: !!canWrite, expires_at: new Date(expires).toISOString(), token };
 }
 async function listGrants(ctx, projectId) {
@@ -323,8 +329,9 @@ async function publishRevision(ctx, projectId, artifactId, expected, i, rev, ext
   const next = expected + 1;
   const azBase = authzSql(ctx, projectId);
   const cw = contentWriteSql(ctx, artifactId);
-  // Text revisions count against storage here; file revisions were reserved (and counted) when the upload began.
-  const addBytes = rev.blobKey ? 0 : rev.size ?? 0;
+  // Text revisions count against storage here; new file revisions were reserved (and counted) when the upload began.
+  // A restored file version adds a revision row of its size (counted in usage), so it is checked here too.
+  const addBytes = rev.blobKey && !rev.restoredFrom ? 0 : rev.size ?? 0;
   const lg = addBytes ? await projectLimitGuard(ctx.env, projectId, { storage_bytes: addBytes }) : { sql: "1", params: [], limits: {} };
   const az = { sql: `${azBase.sql} AND ${cw.sql} AND ${lg.sql}${rev.fence ? " AND " + rev.fence.sql : ""}`, params: [...azBase.params, ...cw.params, ...lg.params, ...rev.fence?.params ?? []] };
   const now = nowIso();

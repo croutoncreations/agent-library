@@ -31,18 +31,24 @@ export async function personLimits(env, principalId) {
 }
 
 // --- Usage, as SQL over one workspace (wsExpr: an SQL expression for the workspace id) ---------------------------
-const PROJECTS_OF = (ws) => `SELECT id FROM projects WHERE workspace_id = ${ws} OR (workspace_id IS NULL AND 'wsp_' || owner_id = ${ws})`;
+// Index-friendly: legacy rows (workspace_id NULL) belong to 'wsp_' || owner, matched via the owner index.
+const inWs = (wsCol, ownerCol, ws) => `(${wsCol} = ${ws} OR (${wsCol} IS NULL AND ${ownerCol} = substr(${ws}, 5) AND 'wsp_' || ${ownerCol} = ${ws}))`;
+const PROJECTS_OF = (ws) => `SELECT id FROM projects WHERE ${inWs("workspace_id", "owner_id", ws)}`;
+const NOW_MS = "CAST(strftime('%s','now') AS INTEGER) * 1000";
 /** Bytes stored: every revision (text and files) plus reservations in flight (uploads, staged app generations). */
 export const usageSql = {
   storage_bytes: (ws) => `((SELECT COALESCE(SUM(size), 0) FROM revisions WHERE project_id IN (${PROJECTS_OF(ws)}))
-    + (SELECT COALESCE(SUM(expected_size), 0) FROM uploads WHERE project_id IN (${PROJECTS_OF(ws)}) AND state IN ('pending','receiving','received','sealed'))
-    + (SELECT COALESCE(SUM(total_bytes), 0) FROM publisher_generations WHERE project_id IN (${PROJECTS_OF(ws)}) AND state = 'staged'))`,
+    + (SELECT COALESCE(SUM(expected_size), 0) FROM uploads WHERE project_id IN (${PROJECTS_OF(ws)})
+         AND (state IN ('receiving','sealed') OR (state IN ('pending','received') AND expires_at > ${NOW_MS})))
+    + (SELECT COALESCE(SUM(total_bytes), 0) FROM publisher_generations WHERE project_id IN (${PROJECTS_OF(ws)}) AND state = 'staged' AND expires_at > ${NOW_MS}))`,
   projects: (ws) => `(SELECT COUNT(*) FROM (${PROJECTS_OF(ws)}))`,
   members: (ws) => `((SELECT COUNT(*) FROM workspace_members WHERE workspace_id = ${ws})
     + (SELECT COUNT(*) FROM workspace_invites WHERE workspace_id = ${ws} AND accepted_at IS NULL AND revoked_at IS NULL AND expires_at > CAST(strftime('%s','now') AS INTEGER) * 1000))`,
-  agents: (ws) => `((SELECT COUNT(*) FROM oauth_connections c WHERE COALESCE(c.workspace_id, 'wsp_' || c.owner_principal_id) = ${ws} AND c.revoked_at IS NULL AND c.expires_at > CAST(strftime('%s','now') AS INTEGER) * 1000)
-    + (SELECT COUNT(*) FROM api_credentials k WHERE COALESCE(k.workspace_id, 'wsp_' || k.owner_principal_id) = ${ws} AND k.revoked_at IS NULL AND k.expires_at > CAST(strftime('%s','now') AS INTEGER) * 1000)
-    + (SELECT COUNT(*) FROM publishers p WHERE COALESCE(p.workspace_id, 'wsp_' || p.owner_principal_id) = ${ws} AND p.revoked_at IS NULL))`,
+  // Live OAuth connections, API keys, publishing apps and (legacy) project grant tokens.
+  agents: (ws) => `((SELECT COUNT(*) FROM oauth_connections c WHERE ${inWs("c.workspace_id", "c.owner_principal_id", ws)} AND c.revoked_at IS NULL AND c.expires_at > ${NOW_MS})
+    + (SELECT COUNT(*) FROM api_credentials k WHERE ${inWs("k.workspace_id", "k.owner_principal_id", ws)} AND k.revoked_at IS NULL AND k.expires_at > ${NOW_MS})
+    + (SELECT COUNT(*) FROM publishers p WHERE ${inWs("p.workspace_id", "p.owner_principal_id", ws)} AND p.revoked_at IS NULL)
+    + (SELECT COUNT(*) FROM grants g WHERE g.project_id IN (${PROJECTS_OF(ws)}) AND g.revoked_at IS NULL AND g.expires_at > ${NOW_MS}))`,
   owned_workspaces: (who) => `(SELECT COUNT(*) FROM workspaces w WHERE w.created_by = ${who} AND w.personal = 0 AND w.status <> 'deleting')`
 };
 
@@ -72,11 +78,23 @@ export async function explainLimit(env, workspaceId, adds, limits) {
     if ((used ?? 0) + n > limits[k]) throw limitError(k, used ?? 0, limits[k]);
   }
 }
+// What frees room, per limit (no in-app upgrade yet; owners/admins can do these).
+const FIX = {
+  storage_bytes: "Delete documents or files you no longer need (deleted items stop counting once they're removed from the trash), or ask the workspace owner about a bigger plan.",
+  projects: "Delete a project you no longer need, or ask the workspace owner about a bigger plan.",
+  members: "Cancel a pending invitation or remove a member, or ask the workspace owner about a bigger plan.",
+  agents: "Disconnect an app or revoke an API key you no longer use (Connections), or ask the workspace owner about a bigger plan.",
+  owned_workspaces: "Delete a shared workspace you no longer need."
+};
 export function limitError(k, used, allowed) {
-  return new HttpError(402, "limit_reached", `This workspace has reached its limit for ${LABEL[k] ?? k} (${k === "storage_bytes" ? fmtBytes(allowed) : allowed}). Remove something or upgrade the plan.`,
+  return new HttpError(402, "limit_reached", `This workspace has reached its limit for ${LABEL[k] ?? k} (${k === "storage_bytes" ? fmtBytes(allowed) : allowed}). ${FIX[k] ?? ""}`.trim(),
     { limit: k, used, allowed });
 }
-const fmtBytes = (n) => n >= 1073741824 ? `${+(n / 1073741824).toFixed(1)} GB` : `${Math.round(n / 1048576)} MB`;
+/** Same scale and wording as the app's usage panel (1024-based, "KB/MB/GB", one decimal). */
+export const fmtBytes = (n) => {
+  const u = [[1073741824, "GB"], [1048576, "MB"], [1024, "KB"]].find(([d]) => n >= d);
+  return u ? `${+(n / u[0]).toFixed(1)} ${u[1]}` : `${n} bytes`;
+};
 
 /** Current usage and limits of a workspace (for the app and GET /api/workspaces/:id/usage). */
 export async function workspaceUsage(env, workspaceId) {

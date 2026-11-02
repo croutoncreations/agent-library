@@ -11,7 +11,7 @@ how core enforces them. (Plan phase 4; decision D18 sets the hosted free tier's 
 | `storage_bytes` | Every stored version of every document and file, plus uploads and app generations still in flight | workspace |
 | `projects` | Projects | workspace |
 | `members` | Members plus pending invitations | workspace |
-| `agents` | Live OAuth connections (ChatGPT, Claude…), API keys and publishing apps | workspace |
+| `agents` | Live OAuth connections (ChatGPT, Claude…), API keys, publishing apps and project grant tokens | workspace |
 | `owned_workspaces` | Shared workspaces a person created (not deleted) | person |
 
 ## How it's enforced
@@ -21,10 +21,17 @@ how core enforces them. (Plan phase 4; decision D18 sets the hosted free tier's 
 - A refusal is `402 limit_reached` with `{ limit, used, allowed }` and a message saying what to remove or upgrade.
   Nothing is written. The OAuth and publishing consent pages say so before the consent is used, so the person can go
   back and change their choice.
-- **Downgrades never lose data.** A workspace over its new limits keeps everything and stays fully readable and
-  editable; it just can't grow (no new projects, versions over the storage limit, members or agents) until it's under
-  the limit again. A failed payment is different: the workspace becomes read-only (D11 B / D13 A).
-- Replacing an API key or an OAuth connection doesn't need a free slot. Revoking one frees it.
+- **Downgrades never lose data** (decision D19, pending; this is the proposed default). A workspace over its new
+  limits keeps everything and stays readable; it just can't grow until it's under the limit again: no new projects,
+  members or agents, and over the storage limit no new versions (every save adds a version, so text edits are refused
+  too; title, folder and tag changes, trash and deletion still work). A failed payment is different: the workspace
+  becomes read-only (D11 B / D13 A).
+- Replacing an OAuth connection in the same workspace doesn't need a free slot (the old one is revoked in the same
+  step). Replacing an API key does, because the old key keeps working until you revoke it. Revoking frees a slot.
+- Expired upload reservations and app generations stop counting when they expire. Comments and title/tag history are
+  small and not counted.
+- Not plan limits yet: maximum file size and version retention stay the installation-wide limits (docs/README limits)
+  for every plan.
 - `GET /api/workspaces/:id/usage` (any member) returns `{ storage_bytes, projects, members, agents }`, each
   `{ used, limit }` (`limit: null` = unlimited).
 

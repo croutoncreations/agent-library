@@ -442,7 +442,7 @@ async function authorizePost(req, env, as, origin) {
     let replaced = null;
     if (replaceId) {
       if (replaceId !== sess.replace_candidate) return retry("That earlier connection can't be replaced.");
-      replaced = await env.DB.prepare("SELECT id, project_id FROM oauth_connections WHERE id = ? AND owner_principal_id = ? AND revoked_at IS NULL").bind(replaceId, sess.principal_id).first();
+      replaced = await env.DB.prepare("SELECT id, project_id, COALESCE(workspace_id, 'wsp_' || owner_principal_id) AS ws FROM oauth_connections WHERE id = ? AND owner_principal_id = ? AND revoked_at IS NULL").bind(replaceId, sess.principal_id).first();
       // Audit the revoke in every project it covered, like revoking from settings shows per project.
       if (replaced) replaced.projects = (await env.DB.prepare("SELECT project_id FROM oauth_connection_projects WHERE connection_id = ?").bind(replaced.id).all()).results.map((r) => r.project_id);
       if (!replaced) return errorPage("That earlier connection was already replaced, perhaps in another tab. Start connecting again from the app.");
@@ -450,11 +450,13 @@ async function authorizePost(req, env, as, origin) {
     // Workspace limits (Phase 4), checked before the consent is used up so the person can go back and fix it. The
     // same conditions are repeated inside the inserts below, so a concurrent request can't slip past.
     const newProjects = chosen.filter((c) => c.isNew).length;
-    const agentGuard = replaced ? { sql: "1", params: [], limits: {} } : await limitGuard(env, connWs, { agents: 1 });
+    // Replacing a connection in the same workspace frees its slot in the same batch; one in another workspace doesn't.
+    const swap = !!replaced && replaced.ws === connWs;
+    const agentGuard = swap ? { sql: "1", params: [], limits: {} } : await limitGuard(env, connWs, { agents: 1 });
     const projGuard = newProjects ? await limitGuard(env, connWs, { projects: 1 }) : null;
-    const preGuard = await limitGuard(env, connWs, replaced ? { projects: newProjects } : { agents: 1, projects: newProjects });
+    const preGuard = await limitGuard(env, connWs, swap ? { projects: newProjects } : { agents: 1, projects: newProjects });
     if (preGuard.sql !== "1" && !await env.DB.prepare(`SELECT ${preGuard.sql} AS ok`).bind(...preGuard.params).first("ok"))
-      return retry(newProjects && preGuard.limits.projects !== undefined ? "This workspace can't take more projects or connected apps on its plan. Pick existing projects, disconnect an app you no longer use, or upgrade." : "This workspace has reached its limit of connected apps and API keys. Disconnect one you no longer use (Connections), or upgrade.");
+      return retry(newProjects && preGuard.limits.projects !== undefined ? "This workspace can't take more projects or connected apps on its plan. Pick existing projects, or disconnect an app you no longer use (Connections), then try again." : "This workspace has reached its limit of connected apps and API keys. Disconnect one you no longer use (Connections), then try again.");
     const approved = await oauth.approveConsent(req, handle, { scope });
     await env.OAUTH_KV.delete(`consentctx:${await sha(handle)}`);
     const ar = approved.request;
@@ -763,7 +765,7 @@ async function publishConsentPost(req, env, oauth, form, handle, origin) {
     // refused principal makes the publisher row's foreign key fail, rolling the batch back.
     const pg = await limitGuard(env, proj.workspace_id, { agents: 1 });
     if (pg.sql !== "1" && !await env.DB.prepare(`SELECT ${pg.sql} AS ok`).bind(...pg.params).first("ok"))
-      return retry("This workspace has reached its limit of connected apps and API keys. Disconnect one you no longer use (Connections), or upgrade.");
+      return retry("This workspace has reached its limit of connected apps and API keys. Disconnect one you no longer use (Connections), then try again.");
     stmts.push(
       env.DB.prepare(`INSERT INTO principals (id, kind, issuer, subject, label, created_at) SELECT ?, 'agent', 'agent-library-publisher', ?, ?, ? WHERE ${pg.sql}`).bind(principalId, publisherId, `publisher:${app.display_name}`.slice(0, 200), at, ...pg.params),
       env.DB.prepare(`INSERT INTO publishers (id, owner_principal_id, principal_id, app_client_id, display_name, project_id, folder_id, created_at, workspace_id, created_by)

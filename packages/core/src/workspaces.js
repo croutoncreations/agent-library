@@ -194,10 +194,13 @@ export async function createInvite(ctx, id, input, origin) {
   const token = randomId("inv", 32), inviteId = randomId("inv", 12), expires = nowMs() + INVITE_DAYS * 864e5;
   // Members limit: members + pending invitations. Replacing a pending invite for the same address doesn't add one.
   const lg = await limitGuard(ctx.env, id, { members: 1 });
+  // The replaced invite is revoked only if the new one will fit (usage <= limit before the swap), so a refused
+  // re-invite leaves the pending one working.
+  const lg0 = await limitGuard(ctx.env, id, { members: 0 });
   const [, ins] = await ctx.env.DB.batch([
     // A new invitation for the same address replaces any pending one (its link stops working).
     ctx.env.DB.prepare(`UPDATE workspace_invites AS wi SET revoked_at = ? WHERE wi.workspace_id = ? AND wi.email = ? AND wi.accepted_at IS NULL AND wi.revoked_at IS NULL
-        AND ${workspaceRoleSql("wi.workspace_id", "admin")}`).bind(nowMs(), id, email, ctx.principal.id),
+        AND ${workspaceRoleSql("wi.workspace_id", "admin")} AND ${lg0.sql}`).bind(nowMs(), id, email, ctx.principal.id, ...lg0.params),
     ctx.env.DB.prepare(`INSERT INTO workspace_invites (id, workspace_id, email, role, token_hash, invited_by, created_at, expires_at)
         SELECT ?, ?, ?, ?, ?, ?, ?, ? WHERE ${workspaceRoleSql("?", r === "admin" ? "owner" : "admin")} AND ${lg.sql}`)
       .bind(inviteId, id, email, r, await sha256Hex(token), ctx.principal.id, nowIso(), expires, ctx.principal.id, id, ...lg.params),

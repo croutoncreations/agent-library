@@ -81,11 +81,20 @@ test("storage: text saves count; the save that would exceed it is refused; the d
   const big = png(room + 1);
   refused(await begin(alice, big), "storage_bytes");
   const half = png(Math.floor(room / 2) + 10);
-  ok(await begin(alice, half), 201);
   const g = ok(await alice.req("POST", `/api/projects/${p}/grants`, { label: "uploader", can_write: true }), 201);
   const agent = agentHttp(APP, g.token);
-  const second = await agent("POST", `/api/projects/${p}/uploads`, { title: "b.png", mime: "image/png", size: half.length, sha256: createHash("sha256").update(half).digest("hex") });
-  refused({ status: second.status, body: second.body }, "storage_bytes");
+  const up = await agent("POST", `/api/projects/${p}/uploads`, { title: "a.png", mime: "image/png", size: half.length, sha256: createHash("sha256").update(half).digest("hex") });
+  assert.equal(up.status, 201, JSON.stringify(up.body));
+  const second = await begin(alice, half);
+  refused(second, "storage_bytes");
+  // Finish the first upload; restoring that file version adds another revision of its size, which doesn't fit.
+  assert.equal((await agent("PUT", up.body.put_url, undefined, { raw: half })).status, 200);
+  const fin = await agent("POST", `/api/projects/${p}/uploads/${up.body.upload_id}/finish`, {});
+  assert.equal(fin.status, 200, JSON.stringify(fin.body));
+  const rs = await agent("POST", `/api/projects/${p}/artifacts/${fin.body.artifact_id}/restore`, { expected_revision: 1, from_revision: 1 });
+  refused(rs, "storage_bytes");
+  assert.equal(sql(`SELECT COUNT(*) AS n FROM revisions WHERE artifact_id = '${fin.body.artifact_id}'`)[0].n, 1);
+  ok(await alice.req("PATCH", `/api/projects/${p}/grants/${g.grant_id}`, { revoke: true }));
 });
 
 test("members: members + pending invitations; refused invite creates nothing", async () => {
@@ -98,12 +107,23 @@ test("members: members + pending invitations; refused invite creates nothing", a
   const pending = ok(await alice.req("GET", `/api/workspaces/${W.team}/members`)).invites;
   ok(await alice.req("POST", `/api/workspaces/${W.team}/invites/${pending.find((i) => i.email === "carol@example.test").id}/revoke`, {}));
   ok(await alice.req("POST", `/api/workspaces/${W.team}/invites`, { email: "dave@example.test", role: "viewer" }), 201);
+  // Over the limit (a downgrade): re-inviting a pending address is refused and leaves the pending invitation working.
+  sql(`INSERT INTO workspace_members (workspace_id, principal_id, role, created_at) SELECT '${W.team}', id, 'viewer', '2026-01-01T00:00:00Z' FROM principals WHERE kind = 'human' AND id NOT IN (SELECT principal_id FROM workspace_members WHERE workspace_id = '${W.team}') LIMIT 1`);
+  refused(await alice.req("POST", `/api/workspaces/${W.team}/invites`, { email: "dave@example.test", role: "member" }), "members");
+  assert.equal(sql(`SELECT COUNT(*) AS n FROM workspace_invites WHERE workspace_id = '${W.team}' AND email = 'dave@example.test' AND revoked_at IS NULL`)[0].n, 1);
 });
 
-test("connected agents: API keys count; replacing a key is allowed; revoking frees a slot", async () => {
+test("connected agents: API keys and grant tokens count; replacing a key needs a slot; revoking frees one", async () => {
   const mk = (label) => alice.req("POST", "/api/api-keys", { label, projects: [{ project_id: W.p, access: "read" }] });
-  const k1 = ok(await mk("one"), 201), k2 = ok(await mk("two"), 201);
+  const k1 = ok(await mk("one"), 201);
+  const g = ok(await alice.req("POST", `/api/projects/${W.p}/grants`, { label: "grant-two" }), 201);
+  refused(await alice.req("POST", `/api/projects/${W.p}/grants`, { label: "grant-three" }), "agents");
+  assert.equal(sql("SELECT COUNT(*) AS n FROM principals WHERE label = 'grant-three'")[0].n, 0, "refused grant wrote nothing");
+  ok(await alice.req("PATCH", `/api/projects/${W.p}/grants/${g.grant_id}`, { revoke: true }));
+  const k2 = ok(await mk("two"), 201);
   refused(await mk("three"), "agents");
+  // The old key keeps working until it's revoked, so a replacement needs a free slot too.
+  refused(await alice.req("POST", `/api/api-keys/${k1.id}/replace`, {}), "agents");
   assert.equal(sql("SELECT COUNT(*) AS n FROM api_credentials WHERE label = 'three'")[0].n, 0);
   assert.equal(sql("SELECT COUNT(*) AS n FROM principals WHERE label = 'three'")[0].n, 0, "no orphan agent principal");
   // The refused key's would-be secret is useless; existing keys still work.
@@ -148,12 +168,13 @@ test("browser: the workspace page shows plan usage; a refused project says why",
       await page.goto(`${APP}/#/workspaces/${W.team}`); await page.reload();
       await page.waitForSelector(".usage");
       const txt = await page.$eval(".usage", (e) => e.innerText);
-      assert.match(txt, /Projects\s+6 of 3 · limit reached/);
-      assert.match(txt, /Storage\s+[\d.]+ KiB of [\d.]+ KiB/);
+      assert.match(txt, /Storage\s+[\d.]+ KB of [\d.]+ KB/);
+      assert.match(txt, /Projects\s+6 of 3 · over the limit/);
       if (w === 1280) {
         await page.type("input[aria-label='New project name']", "One too many");
         await (await page.waitForSelector("xpath/.//button[normalize-space()='Create project']")).click();
-        await page.waitForFunction(() => /reached its limit for projects/.test(document.body.innerText), { timeout: 10000 });
+        await page.waitForFunction(() => /reached its limit for projects \(3\)\. Delete a project/.test(document.body.innerText), { timeout: 10000 });
+        assert.doesNotMatch(await page.evaluate(() => document.body.innerText), /402|limit_reached|upgrade/);
       }
       await new Promise((r) => setTimeout(r, 400));
       await page.screenshot({ path: `tmp/test-evidence/${name}.png`, fullPage: true });

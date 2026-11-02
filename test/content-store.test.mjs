@@ -45,7 +45,7 @@ test("every INSERT of a text body binds storeText or is a marked SQL-side copy",
 });
 test("main JS write and read paths of text bodies go through storeText/readText (marker codec)", async () => {
   const { loadWorker } = await import("./load-worker.mjs");
-  const lib = await loadWorker({ "service.js": ["createMarkdown", "createFile", "saveFile", "readRecords", "saveMarkdown", "getArtifact", "addComment", "listComments", "restoreRevision"], "templates/service.js": ["saveAsTemplate", "createFromTemplate"], "backup.js": ["exportBackup", "restoreBackup"], "history/service.js": ["diffRevisions"] },
+  const lib = await loadWorker({ "service.js": ["createMarkdown", "createFile", "saveFile", "readRecords", "saveMarkdown", "getArtifact", "addComment", "listComments", "restoreRevision"], "templates/service.js": ["saveAsTemplate", "createFromTemplate"], "backup.js": ["exportBackup", "restoreBackup"], "history/service.js": ["diffRevisions"], "adapters.js": ["withAdapters", "defaultAdapters"] },
     { "content-store.js": "export * from \"./packages/core/src/content-store.js\"; export function storeText(t) { return \"ENC:\" + t; } export function readText(s) { if (!String(s).startsWith(\"ENC:\")) throw new Error(\"unencoded body read: \" + String(s).slice(0, 20)); return String(s).slice(4); }" });
   const { DatabaseSync } = await import("node:sqlite");
   const sql = new DatabaseSync(":memory:");
@@ -56,7 +56,8 @@ test("main JS write and read paths of text bodies go through storeText/readText 
   const at = new Date().toISOString();
   sql.prepare("INSERT INTO principals (id, kind, issuer, subject, label, created_at) VALUES ('hum_s','human','synthetic','s','Owner',?)").run(at);
   sql.prepare("INSERT INTO projects (id, owner_id, title, created_at) VALUES ('proj-s','hum_s','Synthetic',?)").run(at);
-  const ctx = { env: { DB }, requestId: "req_s", principal: { id: "hum_s", kind: "human", label: "Owner" } };
+  const E = (env) => lib.withAdapters(env, lib.defaultAdapters());
+  const ctx = { env: E({ DB }), requestId: "req_s", principal: { id: "hum_s", kind: "human", label: "Owner" } };
   const c = await lib.createMarkdown(ctx, "proj-s", { title: "Doc", body: "first body" }, "idem-create-1");
   const aid = c.body.artifact_id;
   await lib.saveMarkdown(ctx, "proj-s", aid, { expected_revision: 1, body: "second body" }, "idem-save-1");
@@ -73,7 +74,7 @@ test("main JS write and read paths of text bodies go through storeText/readText 
   const used = await lib.createFromTemplate(ctx, "proj-s", { template_id: tpl.body.artifact_id, template_revision: 1, title: "From tpl" }, "idem-tpl-2");
   assert.equal((await lib.getArtifact(ctx, "proj-s", used.body.artifact_id)).body, "second body");
   // JSON file + records query (App Connect paths).
-  const actx = { ...ctx, env: { DB, APP_CONNECT_ENABLED: "1" } };
+  const actx = { ...ctx, env: E({ DB, APP_CONNECT_ENABLED: "1" }) };
   const records = JSON.stringify({ schema: "agentlib.measurements/1", records: [{ id: "r1", recorded_at: "2026-01-02T08:00:00Z", date: "2026-01-02", metric: "steps", value: 1, unit: "count" }] });
   const jf = await lib.createFile(actx, "proj-s", { kind: "json", title: "M", content: records, schema: "agentlib.measurements/1" }, "idem-json-1");
   assert.equal(sql.prepare("SELECT body FROM revisions WHERE artifact_id = ?").get(jf.body.artifact_id).body, "ENC:" + records);
@@ -88,6 +89,6 @@ test("main JS write and read paths of text bodies go through storeText/readText 
   for (const f of readdirSync(join(ROOT, "migrations")).filter((f) => f.endsWith(".sql")).sort()) sql2.exec(readFileSync(join(ROOT, "migrations", f), "utf8"));
   sql2.prepare("INSERT INTO principals (id, kind, issuer, subject, label, created_at) VALUES ('hum_s','human','synthetic','s','Owner',?)").run(at);
   const DB2 = mkDB(sql2);
-  await lib.restoreBackup({ ...ctx, env: { DB: DB2 } }, bk);
+  await lib.restoreBackup({ ...ctx, env: E({ DB: DB2 }) }, bk);
   for (const r of sql2.prepare("SELECT body FROM revisions WHERE body IS NOT NULL UNION ALL SELECT body FROM comments").all()) assert.ok(r.body.startsWith("ENC:"), "restored bodies are encoded");
 });
