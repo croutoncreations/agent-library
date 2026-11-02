@@ -13,7 +13,7 @@ before(async () => {
   W = await loadWorker({
     "index.js": ["createWorker"],
     "adapters.js": ["resolveAdapters", "withAdapters", "adapters", "notify", "defaultAdapters", "HOOK_MS"],
-    "auth.js": ["authenticate"],
+    "auth.js": ["authenticate", "sessionCookie"],
     "tenancy.js": ["multiUserInstall"],
     "workspaces.js": ["createWorkspace"],
     "../../self-host/src/access-identity.js": ["accessIdentity"]
@@ -164,4 +164,23 @@ test("a hanging lifecycle hook is cut off and logs no details", async () => {
   assert.equal(logs.length, 2); assert.match(logs[0], /HookTimeout/);
   assert.ok(!logs.join("\n").includes("example.test") && !logs.join("\n").includes("inv_secret"));
   assert.equal(W.HOOK_MS, 5000);
+});
+
+test("session cookie: __Host- on https (legacy name cleared, still read); plain name on http", async () => {
+  const https = W.sessionCookie(new URL("https://app.example.test/x"), "ses_abc", 60);
+  assert.match(https[0], /^__Host-al_session=ses_abc; HttpOnly; Secure; SameSite=Strict; Path=\/; Max-Age=60$/);
+  assert.doesNotMatch(https[0], /Domain=/);
+  assert.match(https[1], /^al_session=; .*Max-Age=0$/);
+  assert.deepEqual(W.sessionCookie(new URL("http://localhost:1/"), "ses_abc", 60), ["al_session=ses_abc; HttpOnly; SameSite=Strict; Path=/; Max-Age=60"]);
+  const row = { csrf: "c", expires_at: Date.now() + 1e6, revoked_at: null, id: "hum_s", kind: "human", label: "S" };
+  const seen = [];
+  const stmt = { bind(h) { seen.push(h); return stmt; }, async first() { return row; } };
+  const env = W.withAdapters({ DB: { prepare: () => stmt } }, W.defaultAdapters());
+  const sha = async (s) => [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s)))].map((b) => b.toString(16).padStart(2, "0")).join("");
+  // https: the __Host- cookie wins over a planted plain cookie (a sibling subdomain can only set the plain name).
+  await W.authenticate(new Request("https://app.example.test/api/me", { headers: { cookie: "al_session=planted; __Host-al_session=real" } }), env, "r");
+  assert.equal(seen.at(-1), await sha("real"));
+  // Sessions issued before this release (plain name) still work.
+  await W.authenticate(new Request("https://app.example.test/api/me", { headers: { cookie: "al_session=old" } }), env, "r");
+  assert.equal(seen.at(-1), await sha("old"));
 });

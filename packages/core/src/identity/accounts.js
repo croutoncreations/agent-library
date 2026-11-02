@@ -14,6 +14,11 @@ export function signupAllowed(env, email) {
   return raw.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean).some((e) => e.startsWith("@") ? email.slice(at) === e : email === e);
 }
 
+/** Could this address create a new account here (sign-up open to it, or a pending invitation)? For email-link providers. */
+export async function mayCreateAccount(env, email) {
+  if (!adapters(env).identity.createAccounts?.(env)) return await invitedEmail(env, email);
+  return signupAllowed(env, email) || await invitedEmail(env, email);
+}
 async function invitedEmail(env, email) {
   return !!await env.DB.prepare("SELECT 1 FROM workspace_invites WHERE email = ? AND accepted_at IS NULL AND revoked_at IS NULL AND expires_at > ?").bind(email, Date.now()).first();
 }

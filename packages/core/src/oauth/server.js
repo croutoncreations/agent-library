@@ -3,8 +3,9 @@ import { handlePublisherApi } from "../api/publisher.js";
 import { rateLimit } from "../auth.js";
 import { handleOAuthMcp } from "./mcp.js";
 import { adapters } from "../adapters.js";
-import { principalForIdentity } from "../identity/accounts.js";
+import { mayCreateAccount, principalForIdentity } from "../identity/accounts.js";
 import { randomToken } from "../identity/jwt.js";
+import { EMAIL_RE, checkEmailPage, limitSigninStart, startFailure } from "../identity/browser.js";
 import { HttpError } from "../util.js";
 import { __name } from "../runtime.js";
 import { folderName } from "../service.js";
@@ -230,10 +231,11 @@ function cxStart(handle, choices = []) {
   const head = `<form method="post" action="/authorize"><input type="hidden" name="handle" value="${esc(handle)}"><input type="hidden" name="step" value="signin"><input type="hidden" name="decision" value="approve">`;
   if (!choices.length) return `<form method="post" action="/authorize"><input type="hidden" name="handle" value="${esc(handle)}"><input type="hidden" name="step" value="signin">
 <div class="bar"><button name="decision" value="deny">Cancel</button><button name="decision" value="approve" class="primary">Continue${cxIcon("next")}</button></div></form>`;
-  // Several ways to sign in (hosted): one form per option, plus Cancel.
-  const opts = choices.map((c) => c.email
-    ? `${head}<input type="hidden" name="choice" value="${esc(c.id)}"><label class="fine" for="cx-email">Email</label><div class="bar"><input id="cx-email" name="email" type="email" required autocomplete="email" placeholder="you@example.com" style="flex:1"><button class="primary">${esc(c.label)}</button></div></form>`
-    : `${head}<input type="hidden" name="choice" value="${esc(c.id)}"><div class="bar"><button class="primary" style="flex:1">${esc(c.label)}${cxIcon("next")}</button></div></form>`).join("\n");
+  // Several ways to sign in (hosted): provider buttons (secondary), then "or" and the email link (primary), plus Cancel.
+  // Same hierarchy as the app's sign-in card.
+  const opts = choices.map((c, i) => c.email
+    ? `${i ? '<div class="or" aria-hidden="true">or</div>' : ""}${head}<input type="hidden" name="choice" value="${esc(c.id)}"><label class="fine" for="cx-email">Email</label><input id="cx-email" name="email" type="email" required autocomplete="email" placeholder="you@example.com" pattern="[^\\s@]+@[^\\s@]+\\.[^\\s@]{2,}" title="Enter an address like you@example.com" style="width:100%;min-height:44px;margin:4px 0 8px"><button class="primary" style="width:100%">${esc(c.label)}</button></form>`
+    : `${head}<input type="hidden" name="choice" value="${esc(c.id)}"><button style="width:100%;margin-bottom:8px">${esc(c.label)}</button></form>`).join("\n");
   return `${opts}
 <form method="post" action="/authorize"><input type="hidden" name="handle" value="${esc(handle)}"><input type="hidden" name="step" value="signin"><div class="bar"><button name="decision" value="deny">Cancel</button></div></form>`;
 }
@@ -366,12 +368,16 @@ async function authorizePost(req, env, as, origin) {
     let email = null;
     if (picked?.email) {
       email = String(form.get("email") ?? "").trim().toLowerCase();
-      if (!/^[^\s@]{1,64}@[^\s@]{1,189}\.[^\s@]{2,}$/.test(email) || email.length > 254) return errorPage("That doesn't look like an email address. Go back and check it.");
+      if (!EMAIL_RE.test(email) || email.length > 254) return errorPage("That doesn't look like an email address. Go back and check it.");
     }
+    try { await limitSigninStart(env, req, email); }
+    catch (e) { const f = startFailure(e); return errorPage(`${f.title}. ${f.msg}`, f.status); }
     const approved = await oauth.approveConsent(req, handle, { scope: [SCOPES.read] });
     const secrets = { verifier: randomToken(64), nonce: randomToken(32) };
     const { state, headers } = await oauth.beginUpstream(approved.request, { data: secrets, headers: approved.headers });
-    const target = await upstreamFor(env).start({ redirectUri: `${origin}/callback`, state, nonce: secrets.nonce, verifier: secrets.verifier, choice: picked?.id ?? null, email });
+    let target;
+    try { target = await upstreamFor(env).start({ redirectUri: `${origin}/callback`, state, nonce: secrets.nonce, verifier: secrets.verifier, choice: picked?.id ?? null, email, mayCreateAccount: (e) => mayCreateAccount(env, e) }); }
+    catch (e) { const f = startFailure(e); return errorPage(`${f.title}. ${f.msg}`, f.status); }
     headers.set("location", target.startsWith("/") && !target.startsWith("//") ? origin + target : target);
     return new Response(null, { status: 302, headers });
   }
@@ -776,6 +782,8 @@ async function handleOAuthHost(req, env, ctx, host) {
       if (req.method === "POST") return await authorizePost(req, env, as, origin);
       return new Response(null, { status: 405, headers: { allow: "GET, POST" } });
     }
+    // "Check your email" after asking for a sign-in link from the consent page (same page as on the app host).
+    if (url.pathname === "/auth/check-email" && req.method === "GET") return checkEmailPage();
     if (url.pathname === "/callback" && req.method === "GET") {
       await rateLimit(env, "oauthauthz:" + ip, lim(env, "authorize"));
       return await callback(req, env, as, origin);
@@ -990,6 +998,9 @@ button:hover{background:var(--sunk)}
 button:active{transform:translateY(1px)}
 button.primary{border-color:var(--accent);background:var(--accent);color:var(--on-accent);font-weight:600}
 button.primary:hover{background:var(--accent);filter:brightness(1.08)}
+a.btnlink{font:inherit;display:inline-flex;align-items:center;justify-content:center;min-height:40px;padding:6px 16px;border-radius:var(--r2);border:1px solid var(--line2);background:var(--card);color:var(--fg);text-decoration:none}
+a.btnlink.primary{border-color:var(--accent);background:var(--accent);color:var(--on-accent);font-weight:600}
+.or{display:flex;align-items:center;gap:10px;color:var(--muted);font-size:13px;margin:14px 0 4px}.or::before,.or::after{content:"";flex:1;border-top:1px solid var(--line)}
 .state{text-align:center;padding:8px 0}
 .state .big{display:inline-flex;align-items:center;justify-content:center;width:52px;height:52px;margin:0 0 14px;border-radius:50%}
 .state .big svg{width:26px;height:26px;stroke-width:2.2}
@@ -1007,4 +1018,13 @@ oauthJson = (status, body2) => new Response(JSON.stringify(body2), { status, hea
 AS_PATHS = /* @__PURE__ */ new Set(["/.well-known/oauth-authorization-server", "/oauth/token", "/oauth/register"]);
 RS_META = "/.well-known/oauth-protected-resource/mcp";
 
-export { SCOPES, _servers, handleOAuthHost, liveConnection, livePublisher, originFor, servers };
+/**
+ * A branded status page (sign-in errors, "check your email") in the consent pages' look: mark, card, icon, heading,
+ * message and link-style actions [{ href, label, primary? }]. Same-origin hrefs only.
+ */
+function statusPage(title, msg, { status = 200, icon = "alert", actions = [], headers } = {}) {
+  const links = actions.filter((a) => typeof a.href === "string" && a.href.startsWith("/") && !a.href.startsWith("//"))
+    .map((a) => `<a class="btnlink${a.primary ? " primary" : ""}" href="${esc(a.href)}">${esc(a.label)}</a>`).join("");
+  return page(title, cxShell(`<div class="state${icon === "alert" ? " off" : icon === "check" ? " on" : " neutral"}"><span class="big" aria-hidden="true">${cxIcon(icon)}</span><h1>${esc(title)}</h1><p class="lede">${esc(msg)}</p></div>${links ? `<div class="bar">${links}</div>` : ""}`, false), headers, status);
+}
+export { SCOPES, _servers, handleOAuthHost, liveConnection, livePublisher, originFor, servers, statusPage };

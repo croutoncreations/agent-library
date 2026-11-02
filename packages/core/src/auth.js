@@ -72,7 +72,9 @@ async function authenticateInner(req, env, requestId) {
       grantClientInfo: row.client_info ?? null
     };
   }
-  const sid = cookie(req, SESSION_COOKIE);
+  // https: the __Host- name (a sibling subdomain can't set or overwrite it); the plain name is still read for sessions
+  // issued before this release, and on http (local dev, where __Host- is not allowed).
+  const sid = (new URL(req.url).protocol === "https:" ? cookie(req, HOST_SESSION_COOKIE) : null) ?? cookie(req, SESSION_COOKIE);
   if (sid) {
     const row = await env.DB.prepare(
       `SELECT s.csrf, s.expires_at, s.revoked_at, p.id, p.kind, p.label FROM sessions s
@@ -169,7 +171,14 @@ function credentialGate(ctx, projectId, need) {
 function authzSql(ctx, projectId) {
   return credentialGate(ctx, projectId, "write");
 }
-var SESSION_COOKIE;
+var SESSION_COOKIE, HOST_SESSION_COOKIE;
 SESSION_COOKIE = "al_session";
+HOST_SESSION_COOKIE = "__Host-al_session";
+/** Set-Cookie values for a new session (and clearing the legacy name on https). maxAge seconds; 0 = sign out. */
+function sessionCookie(url, sid, maxAge) {
+  if (url.protocol !== "https:") return [`${SESSION_COOKIE}=${sid}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${maxAge}`];
+  return [`${HOST_SESSION_COOKIE}=${sid}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=${maxAge}`,
+    `${SESSION_COOKIE}=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0`];
+}
 
-export { SESSION_COOKIE, authenticate, authorizeProject, authzSql, credentialGate, contentWriteSql, enforceRate, limitsFor, protectSql, rateLimit, requireCsrf, requireHuman };
+export { HOST_SESSION_COOKIE, SESSION_COOKIE, sessionCookie, authenticate, authorizeProject, authzSql, credentialGate, contentWriteSql, enforceRate, limitsFor, protectSql, rateLimit, requireCsrf, requireHuman };

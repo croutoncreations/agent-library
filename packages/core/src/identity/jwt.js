@@ -64,7 +64,7 @@ export async function verifyJwt(token, opts) {
   const now = Math.floor(Date.now() / 1e3);
   const aud = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
   if (claims.iss !== opts.issuer) throw deny("Token issuer mismatch");
-  if (!aud.includes(opts.audience) || (aud.length > 1 && opts.azp && claims.azp !== opts.azp)) throw deny("Token audience mismatch");
+  if (!aud.includes(opts.audience) || (opts.azp && (aud.length > 1 || claims.azp !== undefined) && claims.azp !== opts.azp)) throw deny("Token audience mismatch");
   if (typeof claims.exp !== "number" || claims.exp <= now) throw deny("Token expired");
   if (typeof claims.iat === "number" && claims.iat > now + 120) throw deny("Token issued in the future");
   if (typeof claims.nbf === "number" && claims.nbf > now + 60) throw deny("Token not yet valid");

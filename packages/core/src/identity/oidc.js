@@ -41,8 +41,11 @@ export function oidcClient(config) {
       if (typeof claims.iat !== "number") throw new HttpError(401, "upstream_denied", "ID token lacks iat");
       if (typeof claims.nonce !== "string" || claims.nonce !== p.nonce) throw new HttpError(401, "upstream_denied", "ID token nonce mismatch");
       const email = typeof claims.email === "string" && claims.email.length <= 254 ? claims.email.toLowerCase() : null;
-      return { issuer: claims.iss, subject: claims.sub, email, emailVerified: !!email && claims.email_verified !== false && claims.email_verified !== "false",
-        emailVerifiedClaim: claims.email_verified };
+      // Only an explicit email_verified=true counts: some providers omit it and let people edit their email, and the
+      // verified email decides sign-up (SIGNUP_ALLOWLIST) and invitation matching. OIDC_TRUST_EMAIL=1 is the opt-in for
+      // providers that only ever issue verified addresses but never send the claim.
+      const verified = claims.email_verified === true || claims.email_verified === "true" || (c.trustEmail === true && claims.email_verified === undefined);
+      return { issuer: claims.iss, subject: claims.sub, email, emailVerified: !!email && verified };
     }
   };
 }
@@ -53,5 +56,5 @@ export function oidcFromEnv(env) {
   const urls = [env.OIDC_ISSUER, env.OIDC_AUTHORIZATION_URL, env.OIDC_TOKEN_URL, env.OIDC_JWKS_URL];
   if (!urls.every(https) || !env.OIDC_CLIENT_ID || !env.OIDC_CLIENT_SECRET) throw new HttpError(503, "oidc_not_configured", "Sign-in is not configured");
   return oidcClient({ issuer: env.OIDC_ISSUER, clientId: env.OIDC_CLIENT_ID, clientSecret: env.OIDC_CLIENT_SECRET,
-    authorization: env.OIDC_AUTHORIZATION_URL, token: env.OIDC_TOKEN_URL, jwks: env.OIDC_JWKS_URL });
+    authorization: env.OIDC_AUTHORIZATION_URL, token: env.OIDC_TOKEN_URL, jwks: env.OIDC_JWKS_URL, trustEmail: env.OIDC_TRUST_EMAIL === "1" });
 }

@@ -56,7 +56,7 @@ before(async () => {
     vars: { MCP_HOST: `127.0.0.1:${PORT}`, APP_HOST: `localhost:${PORT}`,
       OIDC_ISSUER: IDP, OIDC_CLIENT_ID: CLIENT, OIDC_CLIENT_SECRET: SECRET,
       OIDC_AUTHORIZATION_URL: `${IDP}/authorize`, OIDC_TOKEN_URL: `${IDP}/token`, OIDC_JWKS_URL: `${IDP}/jwks`,
-      SIGNUP_ALLOWLIST: "@example.test, invitee-host@example.org",
+      SIGNUP_ALLOWLIST: "@example.test, invitee-host@example.org", RATE_SIGNIN_PER_MIN: "40",
       RATE_READS_PER_MIN: "100000", RATE_WRITES_PER_MIN: "100000", RATE_AUTHFAIL_PER_MIN: "100000", OAUTH_RATE_MULTIPLIER: "100" },
   });
 });
@@ -100,9 +100,15 @@ test("first sign-in creates an account with a personal workspace and returns to 
 test("sign-up rules: unverified email refused; outside the allowlist refused unless invited", async () => {
   const unverified = await signIn({ sub: "u-unv", email: "unv@example.test", email_verified: false });
   assert.equal(unverified.res.status, 403); assert.match(unverified.html, /Verify your email/);
+  // A provider that omits email_verified doesn't count as verified (some let people edit their email freely).
+  const silent = await signIn({ sub: "u-silent", email: "silent@example.test" });
+  assert.equal(silent.res.status, 403); assert.match(silent.html, /Verify your email/);
+  // Error pages look like the rest of the app and lead back to the sign-in card (not a loop).
+  assert.match(unverified.html, /class="mark"/); assert.match(unverified.html, /href="\/"[^>]*>Back to sign in|Back to sign in/);
   const outsider = await signIn({ sub: "u-out", email: "out@elsewhere.example" , email_verified: true });
   assert.equal(outsider.res.status, 403); assert.match(outsider.html, /isn&#39;t open|isn't open/);
-  assert.equal(sql("SELECT COUNT(*) AS n FROM principals WHERE subject IN ('u-unv','u-out')")[0].n, 0);
+  assert.equal(sql("SELECT COUNT(*) AS n FROM principals WHERE subject IN ('u-unv','u-out','u-silent')")[0].n, 0);
+  assert.match(outsider.html, /Use a different account/);
   // Ada invites the outsider into a shared workspace: now they can create their account and accept.
   const ada = await signIn({ sub: "u-ada", email: "ada@example.test", email_verified: true });
   const csrf = ada.me.csrf;
@@ -196,4 +202,30 @@ test("Cloudflare Access session check and local dev login are off on an OIDC ins
   // dev-login still works on loopback for tests; the Access exchange endpoint isn't a sign-in path here.
   const r = await fetch(`${APP}/auth/access-login`, { method: "POST" });
   assert.equal(r.status, 401);
+});
+
+test("provider errors on return: an expired or used email link is named as such; cancel says cancelled", async () => {
+  for (const [q, re] of [["error=access_denied&error_code=otp_expired&error_description=Email+link+is+invalid+or+has+expired", /expired/], ["error=access_denied", /cancelled/i], ["error=server_error", /didn&#39;t complete|didn't complete/]]) {
+    const b = browser();
+    const r = await b.go(`${APP}/auth/signin`);
+    const state = new URL(r.headers.get("location")).searchParams.get("state");
+    const res = await b.go(`${APP}/auth/callback?state=${encodeURIComponent(state)}&${q}`);
+    assert.equal(res.status, 401); assert.match(await res.text(), re);
+  }
+});
+
+test("check-email page is served on the app host and the OAuth host", async () => {
+  for (const base of [APP, MCP]) {
+    const r = await fetch(`${base}/auth/check-email`);
+    assert.equal(r.status, 200, base); assert.match(await r.text(), /in this browser/);
+  }
+});
+
+test("starting a sign-in is rate limited per IP (RATE_SIGNIN_PER_MIN), with a page (not JSON)", async () => {
+  // Last test: wrangler dev ignores a client-sent cf-connecting-ip, so every request here counts as the same client.
+  let last;
+  for (let i = 0; i < 42; i++) last = await fetch(`${APP}/auth/signin`, { redirect: "manual" });
+  assert.equal(last.status, 429);
+  assert.match(last.headers.get("content-type"), /text\/html/);
+  assert.match(await last.text(), /Too many sign-in attempts/);
 });

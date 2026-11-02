@@ -131,7 +131,9 @@ By default one person signs in, through Cloudflare Access (`OWNER_EMAIL`). To le
 
 1. Create a confidential "web" client at the provider with the callbacks `https://<APP_HOST>/auth/callback` (browser sign-in) and `https://<MCP_HOST>/callback` (connecting ChatGPT, Claude and other agents), scopes `openid email`, PKCE allowed.
 2. Set `OIDC_ISSUER`, `OIDC_CLIENT_ID`, `OIDC_AUTHORIZATION_URL`, `OIDC_TOKEN_URL` and `OIDC_JWKS_URL` (from the provider's `/.well-known/openid-configuration`), and the secret `OIDC_CLIENT_SECRET`. Remove `ACCESS_TEAM_DOMAIN`, `ACCESS_AUD` and the Access application in front of `APP_HOST`: the app signs people in itself.
-3. Decide who can create an account: `SIGNUP_ALLOWLIST` (comma-separated emails or `@domain`s) or `SIGNUP_OPEN = "1"`. With neither, only people you invite can join. Invited people can always create their account. The provider must report a verified email (`email_verified` not false).
+3. Decide who can create an account: `SIGNUP_ALLOWLIST` (comma-separated emails or `@domain`s) or `SIGNUP_OPEN = "1"`. With neither, only people you invite can join. Invited people can always create their account. The provider must report a verified email: `email_verified` must be `true` in the ID token. For a provider that only ever issues verified addresses but never sends that claim, set `OIDC_TRUST_EMAIL = "1"`; never do this for providers that let people change their email freely (for example multi-tenant Entra ID), because the email decides sign-up and invitations.
+
+**Switching an existing installation from Access to OIDC:** accounts are keyed by the sign-in provider's user ID, never matched by email, so your first OIDC sign-in creates a new, empty account. To keep your data, export each project before switching and import it into your new workspace afterwards (`Workspaces → Import`).
 
 Signing in only proves who someone is. What they can see comes from their workspace memberships, never from the provider's claims. Tokens are checked against the provider's keys (RS256 or ES256), issuer, audience, expiry and the per-sign-in nonce, and a sign-in only completes in the browser that started it.
 

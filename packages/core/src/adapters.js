@@ -21,7 +21,7 @@ export const noIdentity = {
   async bearer() {},
   /**
    * Sign-in by redirect (consent sign-in on the OAuth host; browser sign-in when browserSignIn(env)):
-   * an object { origins(), start({ redirectUri, state, verifier, nonce, choice, email }), finish({ url, redirectUri, verifier, nonce }),
+   * an object { origins(), start({ redirectUri, state, verifier, nonce, choice, email, mayCreateAccount(email) -> Promise<bool> }), finish({ url, redirectUri, verifier, nonce }),
    * choices?() } whose finish() returns { issuer, subject, email|null, emailVerified }. choices() lists sign-in options
    * ({ id, label, email?: true }) shown as buttons (and an email field); the picked id arrives as `choice`. start() may
    * return a same-origin path (e.g. "check your email") instead of the provider's URL. Core's generic OIDC client is

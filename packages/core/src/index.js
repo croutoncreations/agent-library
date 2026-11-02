@@ -1,9 +1,9 @@
 import { adapters, notify, resolveAdapters, withAdapters } from "./adapters.js";
-import { browserSignInEnabled, signinCallback, signinChoices, signinStart } from "./identity/browser.js";
+import { browserSignInEnabled, checkEmailPage, signinCallback, signinChoices, signinStart } from "./identity/browser.js";
 import { disableAppClient, listAppClients, registerAppClient, revokePublisher, updateAppClient } from "./api/app-clients.js";
 import { createApiKey, listApiKeys, replaceApiKey, revokeApiKey, setApiKeyScope } from "./api/credentials.js";
 import { handleV1, isV1Path } from "./api/v1.js";
-import { SESSION_COOKIE, authenticate, enforceRate, requireCsrf, requireHuman } from "./auth.js";
+import { authenticate, enforceRate, requireCsrf, requireHuman, sessionCookie } from "./auth.js";
 import { exportBackup, importBackup, restoreBackup } from "./backup.js";
 import { reconcileUploads } from "./cleanup.js";
 import { EDITOR_JS, EDITOR_JS_SHA256 } from "./editor-bundle.js";
@@ -43,6 +43,10 @@ async function projectMedia(env, pid, refs) {
     return mime ? { url: `/api/projects/${encodeURIComponent(pid)}/artifacts/${encodeURIComponent(ref)}/content`, mime } : null;
   };
 }
+function withCookies(res, cookies) {
+  for (const c of cookies) res.headers.append("set-cookie", c);
+  return res;
+}
 function withSec(res) {
   const r = new Response(res.body, res);
   for (const [k, v] of Object.entries(SEC_HEADERS)) if (!r.headers.has(k)) r.headers.set(k, v);
@@ -76,9 +80,7 @@ async function devLogin(req, env, url) {
   const sid = randomId("ses", 32);
   const csrf = randomId("csrf", 18);
   await env.DB.prepare("INSERT INTO sessions (id_hash, principal_id, csrf, expires_at) VALUES (?, ?, ?, ?)").bind(await sha256Hex(sid), p, csrf, nowMs() + 8 * 36e5).run();
-  return json({ ok: true, csrf }, 200, {
-    "set-cookie": `${SESSION_COOKIE}=${sid}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800${url.protocol === "https:" ? "; Secure" : ""}`
-  });
+  return withCookies(json({ ok: true, csrf }), sessionCookie(url, sid, 28800));
 }
 async function accessLogin(req, env, url) {
   const origin = req.headers.get("origin");
@@ -105,9 +107,7 @@ async function accessLogin(req, env, url) {
   const sid = randomId("ses", 32);
   const csrf = randomId("csrf", 18);
   await env.DB.prepare("INSERT INTO sessions (id_hash, principal_id, csrf, expires_at) VALUES (?, ?, ?, ?)").bind(await sha256Hex(sid), p.id, csrf, nowMs() + 30 * 864e5).run();
-  return json({ ok: true, csrf }, 200, {
-    "set-cookie": `${SESSION_COOKIE}=${sid}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=2592000`
-  });
+  return withCookies(json({ ok: true, csrf }), sessionCookie(url, sid, 2592000));
 }
 async function route3(req, env, url, requestId) {
   const path = url.pathname;
@@ -135,6 +135,7 @@ async function route3(req, env, url, requestId) {
   if (m === "GET" && path === "/auth/methods") return json({ redirect: browserSignInEnabled(env), choices: signinChoices(env), access: adapters(env).identity.enabled(env), local: !!env.LOCAL_DEV_LOGIN && ["localhost", "127.0.0.1"].includes(url.hostname) }, 200, { "cache-control": "no-store" });
   if ((m === "GET" || m === "POST") && path === "/auth/signin") return signinStart(req, env, url);
   if (m === "GET" && path === "/auth/callback") return signinCallback(req, env, url);
+  if (m === "GET" && path === "/auth/check-email" && browserSignInEnabled(env)) return checkEmailPage();
   const origin = req.headers.get("origin");
   if (origin && origin !== url.origin) throw new HttpError(403, "bad_origin", "Cross-origin requests are not allowed");
   const tm = /^\/api\/transfers\/([A-Za-z0-9_-]+)$/.exec(path);
@@ -151,7 +152,7 @@ async function route3(req, env, url, requestId) {
   if (seg[0] === "logout" && m === "POST") {
     requireHuman(ctx);
     await env.DB.prepare("UPDATE sessions SET revoked_at = ? WHERE principal_id = ? AND revoked_at IS NULL").bind(nowMs(), ctx.principal.id).run();
-    return json({ ok: true }, 200, { "set-cookie": `${SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0` });
+    return withCookies(json({ ok: true }), [...sessionCookie(url, "", 0), "al_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"]);
   }
   if (seg[0] === "workspaces") {
     if (seg.length === 1 && m === "GET") return json(await listWorkspaces(ctx));
