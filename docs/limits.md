@@ -50,3 +50,21 @@ The hosted Worker uses core's `planEntitlements`, configured by the `PLAN_LIMITS
 - Invalid JSON logs `plan_limits_invalid` and applies no limits (plan data never decides access).
 
 Other installations can supply their own `entitlements.limits(env, { workspaceId } | { principalId })` adapter.
+
+## Billing
+
+Core keeps a provider-neutral billing state per workspace (`workspace_billing`, `billing_events`; migration 0022) and
+decides what a billing change does, in one batch (`billing.js` `applyBillingChange`):
+
+- **Replay-safe:** each provider event id is applied at most once; a redelivered event changes nothing.
+- **Ordered:** an event older than the last applied status change is ignored, so a late delivery can't undo a newer one.
+  Adapters send the subscription's *current* state, fetched from the provider, not the event's payload.
+- **Paid** (`active`, `trialing`, and `past_due` while the provider retries) sets `workspaces.plan` to the paid plan.
+  Cancelled or lapsed sets it back to `free`, and over-limit data is kept (D19).
+- **Payment failure** (`unpaid`, `incomplete_expired`) suspends the workspace: read-only, nothing deleted (D11 B /
+  D13 A). Paying again lifts it. Billing lifts only a suspension it set itself, never an operator's.
+- Every applied change is audited as `workspace.billing` (actor `system:billing`).
+
+The entitlements adapter may add `billing(env, { workspaceId })`. Its result shows on the workspace page for admins and
+owners only: plan, status, a notice, and actions (same-origin POST routes that answer `{ url }` on the provider's page).
+The hosted Worker's Stripe adapter is in the private hosted repository.

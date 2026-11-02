@@ -45,7 +45,13 @@ export const unlimited = {
    * Usage limits core enforces inside each write (limits.js): { storage_bytes, projects, members, agents } for
    * { workspaceId }, { owned_workspaces } for { principalId }. Missing = unlimited. See planEntitlements (PLAN_LIMITS).
    */
-  async limits() { return {}; }
+  async limits() { return {}; },
+  /**
+   * Billing shown to workspace admins (hosted): null = no billing. Otherwise { plan, status?, period_end?, notice?,
+   * actions: [{ id, label, path }] } where each path is a same-origin POST /api/... route (the installation's own
+   * adapter route) that answers { url } to send the browser to (checkout, billing portal).
+   */
+  async billing() { return null; }
 };
 
 export const noLifecycle = {

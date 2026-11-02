@@ -204,7 +204,7 @@ async function route3(req, env, url, requestId, seen = {}) {
       return json(await importBackup(ctx, wid, parsed, k ? idemKey(k) : null, k ? await sha256Hex(raw) : ""), 201);
     }
     if (seg[2] === "invites" && seg.length === 3 && m === "POST") return json(await createInvite(ctx, wid, await body(req), url.origin), 201);
-    if (seg[2] === "usage" && seg.length === 3 && m === "GET") { await requireWorkspaceRole(ctx, wid, "viewer", true); return json(await workspaceUsage(env, wid)); }
+    if (seg[2] === "usage" && seg.length === 3 && m === "GET") { const w = await requireWorkspaceRole(ctx, wid, "viewer", true); return json(await workspaceUsage(env, wid, w.role)); }
     if (seg[2] === "invites" && seg.length === 5 && seg[4] === "revoke" && m === "POST") return json(await revokeInvite(ctx, wid, str(seg[3], "invite", 80)));
     throw new HttpError(404, "not_found", "Not found");
   }
@@ -401,4 +401,7 @@ var coreWorker = {
   }
 };
 export { createWorker, notify };
-export { planEntitlements } from "./limits.js";
+export { planEntitlements, workspaceUsage } from "./limits.js";
+export { applyBillingChange, workspaceBilling } from "./billing.js";
+export { requireWorkspaceRole } from "./tenancy.js";
+export { HttpError, json } from "./util.js";

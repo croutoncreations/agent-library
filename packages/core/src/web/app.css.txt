@@ -503,3 +503,7 @@ main > .tabs,main > nav.tabs{margin:16px 0 12px}
 .meter.near>span{background:var(--warn)}
 .meter.full>span{background:var(--bad)}
 @media (max-width:600px){.usage{grid-template-columns:1fr}.usage dt{margin-top:6px}}
+.billing{display:flex;flex-direction:column;gap:8px;margin:0 0 12px}
+.billing p{margin:0}
+.billing .notice{padding:8px 12px;border-radius:8px;border:1px solid var(--bad);color:var(--bad)}
+.billing .row{display:flex;flex-wrap:wrap;gap:8px}

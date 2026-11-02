@@ -751,7 +751,7 @@ async function viewWorkspace(id) {
       suspended ? h("div", { class: "callout", role: "note" }, icon("alert"), h("div", null, h("strong", { text: "This workspace is suspended and read-only. " }),
         "Everyone can still read, download and export its projects, and connected agents can still read. Editing, uploads, new projects, invitations and role changes are paused until it's reactivated." + (owner ? " You can still remove members or delete the workspace." : ""))) : null,
       ws.handle ? h("p", { class: "proj-addr" }, h("span", { class: "muted small", text: "Project links start with" }), h("code", { text: "/" + ws.handle + "/" })) : null,
-      usagePanel(usage, admin),
+      usagePanel(usage, admin, realAdmin && suspended),
       h("h2", { id: "projects-h", tabIndex: -1, text: "Projects" }), projMsg, projList, newProj,
       h("h2", { id: "members-h", tabIndex: -1, text: "Members" }), memMsg, members];
 
@@ -819,10 +819,32 @@ async function viewWorkspace(id) {
   load();
 }
 var ROLE_RANK_UI = { viewer: 1, member: 2, admin: 3, owner: 4 };
+// Billing (hosted; admins only): plan, payment notice and the installation's checkout/portal actions. Each action is a
+// same-origin POST that answers { url } on the payment provider, where the browser goes next.
+function billingBlock(b) {
+  if (!b) return null;
+  var msg = h("p", { class: "msg", role: "status" });
+  var plan = String(b.plan || "free");
+  var line = "Plan: " + plan.charAt(0).toUpperCase() + plan.slice(1) + (b.status && b.status !== "active" ? " (" + b.status.replace(/_/g, " ") + ")" : "") +
+    (b.period_end && b.status === "active" ? " · renews " + new Date(b.period_end).toLocaleDateString() : "");
+  var buttons = (b.actions || []).map(function (a, i) {
+    var btn = h("button", { type: "button", class: i === 0 && a.id.indexOf("checkout") === 0 ? "" : "secondary" }, a.label);
+    btn.onclick = async function () {
+      btn.disabled = true; showMsg(msg, "Opening the payment page…", true);
+      try { var r = await api("POST", a.path, a.body || {}); location.assign(r.url); }
+      catch (err) { showErr(msg, err); btn.disabled = false; }
+    };
+    return btn;
+  });
+  return h("div", { class: "billing" }, h("p", { text: line }),
+    b.notice ? h("p", { class: "notice", role: "alert", text: b.notice }) : null,
+    buttons.length ? h("div", { class: "row" }, buttons) : null, msg);
+}
 // Plan usage (hosted installations with plan limits). Nothing is shown when the workspace has no limits.
 var USAGE_ROWS = [["storage_bytes", "Storage"], ["projects", "Projects"], ["members", "Members and invitations"], ["agents", "Connected apps and API keys"]];
-function usagePanel(u, canManage) {
-  if (!u || !USAGE_ROWS.some(function (r) { return u[r[0]] && u[r[0]].limit != null; })) return null;
+function usagePanel(u, canManage, suspendedAdmin) {
+  var limited = u && USAGE_ROWS.some(function (r) { return u[r[0]] && u[r[0]].limit != null; });
+  if (!u || (!limited && !u.billing)) return null;
   var list = h("dl", { class: "usage" });
   USAGE_ROWS.forEach(function (r) {
     var x = u[r[0]]; if (!x || x.limit == null) return;
@@ -833,9 +855,10 @@ function usagePanel(u, canManage) {
       h("span", { class: "meter" + (pct >= 100 ? " full" : pct >= 80 ? " near" : ""), "aria-hidden": "true" }, h("span", { style: "width:" + pct + "%" }))));
   });
   var over = USAGE_ROWS.some(function (r) { var x = u[r[0]]; return x && x.limit != null && x.used > x.limit; });
-  return h("section", { "aria-labelledby": "usage-h" }, h("h2", { id: "usage-h", text: "Plan usage" }), list,
+  return h("section", { "aria-labelledby": "usage-h" }, h("h2", { id: "usage-h", text: "Plan usage" }), billingBlock(u.billing), limited ? list : null,
     h("p", { class: "muted small", text: (over ? "Everything over a limit is kept; nothing is removed. " : "At a limit nothing is removed; you just can't add more. ") +
-      (canManage ? "To make room, delete what you no longer need (projects, documents, invitations or connected apps)." : "Only the workspace owner or admins can free up room.") }));
+      (canManage ? "To make room, delete what you no longer need (projects, documents, invitations or connected apps)." :
+        suspendedAdmin ? "While the workspace is read-only, nothing can be added or removed." : "Only the workspace owner or admins can free up room.") }));
 }
 var ADDR_HINT = "Lower-case letters, digits and hyphens.";
 var focusAddrAfterRender = false; // after saving project settings, focus the (re-rendered) address line

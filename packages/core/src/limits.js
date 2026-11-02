@@ -97,11 +97,13 @@ export const fmtBytes = (n) => {
 };
 
 /** Current usage and limits of a workspace (for the app and GET /api/workspaces/:id/usage). */
-export async function workspaceUsage(env, workspaceId) {
+export async function workspaceUsage(env, workspaceId, role = "viewer") {
   const limits = await workspaceLimits(env, workspaceId);
+  // Billing (plan, payment status, upgrade/manage links) is for admins and owners only.
+  const billing = role === "admin" || role === "owner" ? await adapters(env).entitlements.billing?.(env, { workspaceId }) ?? null : null;
   const keys = ["storage_bytes", "projects", "members", "agents"];
   const row = await env.DB.prepare(`SELECT ${keys.map((k) => `${usageSql[k]("?1")} AS ${k}`).join(", ")}`).bind(workspaceId).first();
-  return Object.fromEntries(keys.map((k) => [k, { used: row?.[k] ?? 0, limit: limits[k] ?? null }]));
+  return { ...Object.fromEntries(keys.map((k) => [k, { used: row?.[k] ?? 0, limit: limits[k] ?? null }])), ...billing ? { billing } : {} };
 }
 
 /** limitGuard for a write inside an existing project (its workspace resolved the same way as everywhere else). */
