@@ -61,8 +61,15 @@ decides what a billing change does, in one batch (`billing.js` `applyBillingChan
   Adapters send the subscription's *current* state, fetched from the provider, not the event's payload.
 - **Paid** (`active`, `trialing`, and `past_due` while the provider retries) sets `workspaces.plan` to the paid plan.
   Cancelled or lapsed sets it back to `free`, and over-limit data is kept (D19).
-- **Payment failure** (`unpaid`, `incomplete_expired`) suspends the workspace: read-only, nothing deleted (D11 B /
-  D13 A). Paying again lifts it. Billing lifts only a suspension it set itself, never an operator's.
+- **Payment failure** (`unpaid`: a renewal still unpaid after the provider's retries) suspends the workspace:
+  read-only, nothing deleted (D11 B / D13 A). Free limits apply until it's paid. Paying lifts it; cancelling the
+  unpaid subscription also lifts it (Free, over-limit growth blocked). Billing lifts only a suspension it set itself.
+  A first payment that never completed (`incomplete_expired`) doesn't suspend anything.
+- **One customer, one open subscription per workspace.** The stored customer is never replaced; events for another
+  customer, or for a second subscription while one is open, are refused and logged (`billing_event_refused`) so the
+  duplicate can be refunded.
+- Operators who suspend a workspace by hand should also set `workspace_billing.suspended_by_billing = 0`, so a later
+  payment can't lift their suspension.
 - Every applied change is audited as `workspace.billing` (actor `system:billing`).
 
 The entitlements adapter may add `billing(env, { workspaceId })`. Its result shows on the workspace page for admins and

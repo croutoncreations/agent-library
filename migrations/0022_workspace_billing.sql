@@ -21,6 +21,6 @@ CREATE TABLE IF NOT EXISTS billing_events (
   event_id TEXT NOT NULL,
   type TEXT NOT NULL,
   workspace_id TEXT,
-  received_at TEXT NOT NULL,
+  received_at TEXT NOT NULL,                    -- ISO time + ' ' + a per-call nonce (marks which call recorded it)
   PRIMARY KEY (provider, event_id)
 );

@@ -402,6 +402,6 @@ var coreWorker = {
 };
 export { createWorker, notify };
 export { planEntitlements, workspaceUsage } from "./limits.js";
-export { applyBillingChange, workspaceBilling } from "./billing.js";
+export { applyBillingChange, linkBillingCustomer, workspaceBilling } from "./billing.js";
 export { requireWorkspaceRole } from "./tenancy.js";
 export { HttpError, json } from "./util.js";

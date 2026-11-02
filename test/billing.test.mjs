@@ -9,7 +9,7 @@ import { DatabaseSync } from "node:sqlite";
 import { loadWorker } from "./load-worker.mjs";
 import { ROOT } from "./helpers.mjs";
 
-const lib = await loadWorker({ "billing.js": ["applyBillingChange", "workspaceBilling"] });
+const lib = await loadWorker({ "billing.js": ["applyBillingChange", "workspaceBilling", "linkBillingCustomer"] });
 
 function mkDB() {
   const sql = new DatabaseSync(":memory:");
@@ -79,5 +79,39 @@ test("deleting or unknown workspaces: recorded, nothing changes; bad input refus
   assert.equal(ws(sql).plan, "free");
   assert.deepEqual(await lib.applyBillingChange(env, ev({ workspaceId: "wsp_nope", status: "active", plan: "pro" })), { applied: false, reason: "no_workspace" });
   await assert.rejects(lib.applyBillingChange(env, ev({ status: "active", plan: "Pro; DROP" })), /bad plan/);
-  await assert.rejects(lib.applyBillingChange(env, ev({ eventAt: -1 })), /bad eventAt/);
+  await assert.rejects(lib.applyBillingChange(env, ev({ eventAt: -1, status: "active" })), /bad eventAt/);
+  await assert.rejects(lib.applyBillingChange(env, ev({ status: undefined })), /bad status/);
+});
+
+test("one customer and one open subscription per workspace: duplicates are refused, not applied", async () => {
+  const { sql, env } = mkDB();
+  assert.equal(await lib.linkBillingCustomer(env, "wsp_team", "stripe", "cus_1"), "cus_1");
+  assert.equal(await lib.linkBillingCustomer(env, "wsp_team", "stripe", "cus_2"), "cus_1", "first customer wins");
+  await lib.applyBillingChange(env, ev({ status: "active", plan: "pro" }));
+  // Another customer's subscription for this workspace (e.g. a second checkout): refused, logged for a refund.
+  assert.equal((await lib.applyBillingChange(env, ev({ customerId: "cus_2", subscriptionId: "sub_2", status: "canceled" }))).reason, "other_customer");
+  // Same customer, a second open subscription: its cancellation doesn't downgrade the paid one.
+  assert.equal((await lib.applyBillingChange(env, ev({ subscriptionId: "sub_2", status: "active", plan: "pro" }))).reason, "other_subscription");
+  assert.equal((await lib.applyBillingChange(env, ev({ subscriptionId: "sub_2", status: "canceled" }))).reason, "other_subscription");
+  assert.equal(ws(sql).plan, "pro");
+  // Once the stored one has ended, a new subscription takes over.
+  await lib.applyBillingChange(env, ev({ status: "canceled" }));
+  assert.equal(ws(sql).plan, "free");
+  assert.deepEqual(await lib.applyBillingChange(env, ev({ subscriptionId: "sub_3", status: "active", plan: "pro" })), { applied: true });
+  assert.equal(ws(sql).plan, "pro");
+  assert.equal((await lib.workspaceBilling(env, "wsp_team")).customer_id, "cus_1");
+});
+
+test("a first payment that never completed doesn't suspend; unpaid then cancelled ends the suspension (back to Free)", async () => {
+  const { sql, env } = mkDB();
+  await lib.applyBillingChange(env, ev({ status: "incomplete", plan: "pro" }));
+  await lib.applyBillingChange(env, ev({ status: "incomplete_expired", plan: "pro" }));
+  assert.deepEqual(ws(sql), { status: "active", plan: "free" });
+  await lib.applyBillingChange(env, ev({ subscriptionId: "sub_9", status: "active", plan: "pro" }));
+  await lib.applyBillingChange(env, ev({ subscriptionId: "sub_9", status: "unpaid", plan: "pro" }));
+  assert.deepEqual(ws(sql), { status: "suspended", plan: "free" });
+  assert.equal((await lib.workspaceBilling(env, "wsp_team")).plan, "pro", "the subscribed plan is kept for display");
+  // Cancelling the unpaid subscription settles nothing is owed going forward: Free, editable (over-limit growth blocked, D19).
+  await lib.applyBillingChange(env, ev({ subscriptionId: "sub_9", status: "canceled", plan: "pro" }));
+  assert.deepEqual(ws(sql), { status: "active", plan: "free" });
 });

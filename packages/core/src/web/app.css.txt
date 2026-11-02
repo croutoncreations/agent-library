@@ -507,3 +507,4 @@ main > .tabs,main > nav.tabs{margin:16px 0 12px}
 .billing p{margin:0}
 .billing .notice{padding:8px 12px;border-radius:8px;border:1px solid var(--bad);color:var(--bad)}
 .billing .row{display:flex;flex-wrap:wrap;gap:8px}
+.billing-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px}
