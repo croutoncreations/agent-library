@@ -5982,7 +5982,9 @@ function rvGated(ctx, a) { return rvGatedActor(ctx) && (a.review_mode === "requi
 function rvSelf(ctx, row) {
   if (ctx.principal.kind === "human") return false;
   const v = rvVia(ctx);
-  return row.via_kind === v.kind && (row.via_id ?? null) === (v.id ?? null);
+  // Agents always carry a connection/key/token id; never treat two id-less agents as the same author.
+  if (!v.id || !row.via_id) return false;
+  return row.via_kind === v.kind && row.via_id === v.id;
 }
 // Self-review: the same connection, or (API keys) any key this key replaced, directly or through earlier replacements.
 // Replacing a key keeps its review permission, so the old key's proposals still count as the caller's own work.
@@ -6608,8 +6610,10 @@ async function getReviewSettings(ctx, projectId) {
   const p = await db(ctx).prepare("SELECT review_default, kinds FROM project_review_settings WHERE project_id = ?").bind(projectId).first() ?? { review_default: "off", kinds: null };
   const c = await db(ctx).prepare("SELECT review_mode, COUNT(*) AS n FROM artifacts WHERE project_id = ? AND publisher_id IS NULL AND pending_review = 0 AND head_rev > 0 AND trashed_at IS NULL GROUP BY review_mode").bind(projectId).all();
   const pend = await db(ctx).prepare("SELECT COUNT(*) AS n FROM proposals WHERE project_id = ? AND status = 'pending'").bind(projectId).first("n");
-  return { default: p.review_default, kinds: p.kinds ? JSON.parse(p.kinds) : null,
+  const out = { default: p.review_default, kinds: p.kinds ? JSON.parse(p.kinds) : null,
     documents: Object.fromEntries(RV_MODES.map((m) => [m, c.results.find((r) => r.review_mode === m)?.n ?? 0])), pending_proposals: pend ?? 0 };
+  Object.defineProperty(out, "kindsRaw", { value: p.kinds ?? null, enumerable: false });
+  return out;
 }
 async function setReviewSettings(ctx, projectId, input) {
   requireHuman(ctx);
@@ -6640,11 +6644,14 @@ async function applyReviewSettings(ctx, projectId, input) {
     throw new HttpError(409, "settings_changed", "The project review setting changed; reload and check it before applying", { default: s.default, kinds: s.kinds });
   const r = await db(ctx).prepare(`SELECT id, kind, head_rev, review_mode FROM artifacts WHERE project_id = ? AND publisher_id IS NULL AND pending_review = 0 AND head_rev > 0
     AND trashed_at IS NULL AND review_mode <> ? AND (? IS NULL OR kind IN (SELECT value FROM json_each(?)))`).bind(projectId, s.default, s.kinds ? JSON.stringify(s.kinds) : null, s.kinds ? JSON.stringify(s.kinds) : null).all();
-  const now = nowIso(), stmts = [], plan = [];
+  const now = nowIso(), stmts = [], plan = [], az = authzSql(ctx, projectId);
   for (const a of r.results) {
     const vouch = s.default === "required" || s.default === "advisory" && a.review_mode === "required";
     plan.push({ a, idx: stmts.length });
-    stmts.push(db(ctx).prepare("UPDATE artifacts SET review_mode = ? WHERE id = ? AND head_rev = ? AND review_mode = ? AND pending_review = 0").bind(s.default, a.id, a.head_rev, a.review_mode));
+    // Live: owner access, not trashed, and the project setting still the one being applied (default and kinds).
+    stmts.push(db(ctx).prepare(`UPDATE artifacts SET review_mode = ? WHERE id = ? AND project_id = ? AND head_rev = ? AND review_mode = ? AND pending_review = 0 AND trashed_at IS NULL AND ${az.sql}
+      AND COALESCE((SELECT review_default || '|' || COALESCE(kinds, '') FROM project_review_settings WHERE project_id = ?), 'off|') = ?`)
+      .bind(s.default, a.id, projectId, a.head_rev, a.review_mode, ...az.params, projectId, s.default + "|" + (s.kindsRaw ?? "")));
     if (vouch) stmts.push(db(ctx).prepare(`INSERT INTO reviews (id, artifact_id, project_id, rev_no, decision, author_id, via_kind, note, created_at)
       SELECT ?, ?, ?, ?, 'approved', ?, 'browser', ?, ? WHERE changes() = 1`).bind(randomId("rvw"), a.id, projectId, a.head_rev, ctx.principal.id, "Project review setting applied", now));
   }
@@ -6672,16 +6679,20 @@ async function setReviewGrant(ctx, input) {
   const pathId = str(input.path_id, "path_id", 80, { min: 1 }), projectId = str(input.project_id, "project_id", 64, { min: 1 });
   if (typeof input.can_review !== "boolean") throw new HttpError(400, "invalid_input", "can_review must be true or false");
   await authorizeProject(ctx, projectId, true);
+  // Owner-only, and the path must be active with this project in scope at the moment of the write (one statement).
+  const own = "EXISTS (SELECT 1 FROM projects WHERE id = ? AND owner_id = ?)";
+  const has = "EXISTS (SELECT 1 FROM review_grants WHERE path_kind = ? AND path_id = ? AND project_id = ?)";
   if (input.can_review) {
-    const ok = await db(ctx).prepare(RV_PATHS[kind]).bind(pathId, projectId, ctx.principal.id, nowMs()).first();
-    if (!ok) throw new HttpError(404, "not_found", "Active connection with access to this project not found");
     await db(ctx).batch([
-      db(ctx).prepare("INSERT OR IGNORE INTO review_grants (path_kind, path_id, project_id, created_at) VALUES (?, ?, ?, ?)").bind(kind, pathId, projectId, nowIso()),
-      audit(ctx, projectId, "review_grant.add", pathId, null, "ok:" + kind)
+      db(ctx).prepare(`INSERT OR IGNORE INTO review_grants (path_kind, path_id, project_id, created_at) SELECT ?, ?, ?, ? WHERE ${own} AND EXISTS (${RV_PATHS[kind]})`)
+        .bind(kind, pathId, projectId, nowIso(), projectId, ctx.principal.id, pathId, projectId, ctx.principal.id, nowMs()),
+      audit(ctx, projectId, "review_grant.add", pathId, null, "ok:" + kind, has, [kind, pathId, projectId])
     ]);
+    if (!(await db(ctx).prepare(`SELECT 1 AS x WHERE ${has}`).bind(kind, pathId, projectId).first("x")))
+      throw new HttpError(404, "not_found", "Active connection with access to this project not found");
   } else await db(ctx).batch([
-    db(ctx).prepare("DELETE FROM review_grants WHERE path_kind = ? AND path_id = ? AND project_id = ?").bind(kind, pathId, projectId),
-    audit(ctx, projectId, "review_grant.remove", pathId, null, "ok:" + kind)
+    db(ctx).prepare(`DELETE FROM review_grants WHERE path_kind = ? AND path_id = ? AND project_id = ? AND ${own}`).bind(kind, pathId, projectId, projectId, ctx.principal.id),
+    audit(ctx, projectId, "review_grant.remove", pathId, null, "ok:" + kind, own, [projectId, ctx.principal.id])
   ]);
   return { path_kind: kind, path_id: pathId, project_id: projectId, can_review: input.can_review };
 }
@@ -6753,10 +6764,17 @@ async function rvRestorePrepare(backup, blobs, decoded, pid) {
   if (r === undefined || r === null) return;
   if (typeof r !== "object" || !Array.isArray(r.modes) || !Array.isArray(r.proposals) || !Array.isArray(r.reviews)) throw new HttpError(400, "bad_backup", "Invalid review section");
   if (!RV_MODES.includes(r.default)) throw new HttpError(400, "bad_backup", "Invalid review default");
+  if (r.kinds !== undefined && r.kinds !== null) {
+    let k = null; try { k = JSON.parse(r.kinds); } catch {}
+    if (!Array.isArray(k) || !k.length || k.some((x) => !RV_KINDS.includes(x))) throw new HttpError(400, "bad_backup", "Invalid review kinds");
+  }
   const ids = new Set((backup.artifacts ?? []).map((a) => a.id));
   for (const m of r.modes) if (!ids.has(m.id) || !RV_MODES.includes(m.review_mode)) throw new HttpError(400, "bad_backup", "Invalid review mode");
   for (const x of r.proposals) {
     if (!ids.has(x.artifact_id) || !["pending", "approved", "rejected", "superseded", "withdrawn"].includes(x.status) || !RV_KINDS.includes(x.kind)) throw new HttpError(400, "bad_backup", "Invalid proposal");
+    // Every stored-bytes key must belong to this project, purged or not; open proposals can't be purged.
+    if (x.blob_key !== undefined && x.blob_key !== null && !new RegExp(`^blobs/${pid}/[A-Za-z0-9_-]+/[A-Za-z0-9_-]+$`).test(x.blob_key)) throw new HttpError(400, "bad_backup", "Bad blob key");
+    if (x.blob_purged_at && x.status === "pending") throw new HttpError(400, "bad_backup", "A pending proposal can't have purged bytes");
     if (x.blob_key && !x.blob_purged_at) {
       if (!new RegExp(`^blobs/${pid}/[A-Za-z0-9_-]+/[A-Za-z0-9_-]+$`).test(x.blob_key)) throw new HttpError(400, "bad_backup", "Bad blob key");
       const b = blobs[x.blob_key];

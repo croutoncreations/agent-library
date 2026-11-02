@@ -341,6 +341,8 @@ test("review permission: owner-only grant, live revocation, publisher never, too
   const tid = await connId("Temp reviewer");
   assert.equal((await allowReview("oauth", tid)).status, 200);
   assert.equal((await owner.req("POST", `/api/connections/${tid}/revoke`)).status, 200);
+  assert.equal(sql(`SELECT COUNT(*) AS n FROM review_grants WHERE path_id = '${tid}'`)[0].n, 0, "revoking drops review permission");
+  assert.equal((await allowReview("oauth", tid)).status, 404, "no review permission for a revoked connection");
   assert.equal((await extra.call("review_proposal", { project_id: P, proposal_id: p.proposal_id, decision: "approve", idempotency_key: key() })).isError, true);
   assert.equal(sql(`SELECT status FROM proposals WHERE id = '${p.proposal_id}'`)[0].status, "pending");
 });
@@ -469,6 +471,15 @@ test("backup /3 round trip keeps modes, proposals, reviews and pre-review agent 
   const fresh = await startAppConnectServer({ port: SERVER_PORTS["review-gating-restore"] });
   try {
     const o2 = await fresh.owner();
+    // Crafted backups are refused before anything is written: a purged proposal can't point at another project's
+    // bytes, a pending one can't be "purged", and the project default's kinds must be valid.
+    const bad = (mut) => { const b = structuredClone(ex.body); mut(b); return o2.req("POST", "/api/restore", b); };
+    const anyProp = (b) => b.review.proposals[0];
+    for (const [why, mut] of [
+      ["foreign key on a purged proposal", (b) => Object.assign(anyProp(b), { blob_key: "blobs/other-project/x/y", blob_purged_at: "2000-01-01T00:00:00Z", status: "rejected" })],
+      ["pending with purged bytes", (b) => Object.assign(anyProp(b), { blob_key: `blobs/${P}/x/y`, blob_purged_at: "2000-01-01T00:00:00Z", status: "pending" })],
+      ["malformed kinds", (b) => { b.review.kinds = "not json"; }]
+    ]) { const r = await bad(mut); assert.equal(r.status, 400, why + ": " + JSON.stringify(r.body)); assert.equal(r.body.error.code, "bad_backup", why); }
     const r = await o2.req("POST", "/api/restore", ex.body);
     assert.equal(r.status, 201, JSON.stringify(r.body));
     const q = JSON.parse(execFileSync("wrangler", ["d1", "--config", LOCAL_CONFIG, "execute", "DB", "--local", "--persist-to", fresh.dir, "--json", "--command",

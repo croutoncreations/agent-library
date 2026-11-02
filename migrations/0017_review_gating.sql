@@ -120,6 +120,8 @@ CREATE INDEX IF NOT EXISTS reviews_proposal ON reviews(proposal_id);
 CREATE TABLE IF NOT EXISTS review_restore_context (id INTEGER PRIMARY KEY CHECK (id = 1));
 
 CREATE TRIGGER IF NOT EXISTS review_gate_revisions BEFORE INSERT ON revisions
+-- Gated agent kinds are listed explicitly: browser, publisher and the NULL-kind details baseline rows (copies of
+-- current details) must pass. A new agent access path must add its via_kind here and in rvGatedActor.
 WHEN NEW.via_kind IN ('oauth','api_key','grant')
   AND NOT EXISTS (SELECT 1 FROM review_restore_context)
   AND EXISTS (SELECT 1 FROM artifacts WHERE id = NEW.artifact_id AND review_mode = 'required')
@@ -135,11 +137,13 @@ WHEN NEW.via_kind IN ('oauth','api_key','grant')
 BEGIN
   SELECT RAISE(ABORT, 'review_required');
 END;
+-- Purge: "no version references these bytes" is checked per candidate.
+CREATE INDEX IF NOT EXISTS revisions_blob_key ON revisions(blob_key) WHERE blob_key IS NOT NULL;
 CREATE TRIGGER IF NOT EXISTS review_default_on_insert AFTER INSERT ON artifacts
 WHEN NEW.publisher_id IS NULL AND NEW.review_mode = 'off'
   AND NOT EXISTS (SELECT 1 FROM review_restore_context)
   AND EXISTS (SELECT 1 FROM project_review_settings s WHERE s.project_id = NEW.project_id AND s.review_default <> 'off'
-    AND (s.kinds IS NULL OR EXISTS (SELECT 1 FROM json_each(s.kinds) WHERE value = NEW.kind)))
+    AND (s.kinds IS NULL OR json_valid(s.kinds) AND EXISTS (SELECT 1 FROM json_each(s.kinds) WHERE value = NEW.kind)))
 BEGIN
   UPDATE artifacts SET review_mode = (SELECT review_default FROM project_review_settings WHERE project_id = NEW.project_id) WHERE id = NEW.id;
 END;
