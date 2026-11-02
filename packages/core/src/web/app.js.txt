@@ -643,10 +643,11 @@ async function viewWorkspace(id) {
   var linkBox = h("div", { class: "card", hidden: true }); // kept across reloads while an invitation link is shown
   var focusAfter = null; // selector of the element to focus after the next reload
   async function load() {
-    var d, projects;
+    var d, projects, usage;
     try {
-      var r = await Promise.all([api("GET", "/api/workspaces/" + enc(id) + "/members"), api("GET", "/api/projects")]);
-      d = r[0]; noteProjects(r[1].projects); projects = r[1].projects.filter(function (p) { return p.workspace_id === id; });
+      var r = await Promise.all([api("GET", "/api/workspaces/" + enc(id) + "/members"), api("GET", "/api/projects"),
+        api("GET", "/api/workspaces/" + enc(id) + "/usage").catch(function () { return null; })]);
+      d = r[0]; noteProjects(r[1].projects); projects = r[1].projects.filter(function (p) { return p.workspace_id === id; }); usage = r[2];
     } catch (err) {
       if (err.status === 401) return;
       setCrumbs([{ t: "Home", href: "#/" }, { t: "Workspaces", href: "#/workspaces" }, { t: "Not available" }]);
@@ -749,6 +750,7 @@ async function viewWorkspace(id) {
       suspended ? h("div", { class: "callout", role: "note" }, icon("alert"), h("div", null, h("strong", { text: "This workspace is suspended and read-only. " }),
         "Everyone can still read, download and export its projects, and connected agents can still read. Editing, uploads, new projects, invitations and role changes are paused until it's reactivated." + (owner ? " You can still remove members or delete the workspace." : ""))) : null,
       ws.handle ? h("p", { class: "proj-addr" }, h("span", { class: "muted small", text: "Project links start with" }), h("code", { text: "/" + ws.handle + "/" })) : null,
+      usagePanel(usage),
       h("h2", { id: "projects-h", tabIndex: -1, text: "Projects" }), projMsg, projList, newProj,
       h("h2", { id: "members-h", tabIndex: -1, text: "Members" }), memMsg, members];
 
@@ -816,6 +818,21 @@ async function viewWorkspace(id) {
   load();
 }
 var ROLE_RANK_UI = { viewer: 1, member: 2, admin: 3, owner: 4 };
+// Plan usage (hosted installations with plan limits). Nothing is shown when the workspace has no limits.
+var USAGE_ROWS = [["storage_bytes", "Storage"], ["projects", "Projects"], ["members", "Members and invitations"], ["agents", "Connected apps and API keys"]];
+function usagePanel(u) {
+  if (!u || !USAGE_ROWS.some(function (r) { return u[r[0]] && u[r[0]].limit != null; })) return null;
+  var list = h("dl", { class: "usage" });
+  USAGE_ROWS.forEach(function (r) {
+    var x = u[r[0]]; if (!x || x.limit == null) return;
+    var bytes = r[0] === "storage_bytes", pct = x.limit ? Math.min(100, Math.round(100 * x.used / x.limit)) : 100;
+    var txt = bytes ? fmtBytes(x.used) + " of " + fmtBytes(x.limit) : x.used + " of " + x.limit;
+    list.append(h("dt", { text: r[1] }), h("dd", null, h("span", { text: txt + (x.used >= x.limit ? " · limit reached" : "") }),
+      h("span", { class: "meter" + (pct >= 100 ? " full" : pct >= 80 ? " near" : ""), role: "img", "aria-label": pct + "% used" }, h("span", { style: "width:" + pct + "%" }))));
+  });
+  return h("section", { "aria-labelledby": "usage-h" }, h("h2", { id: "usage-h", text: "Plan usage" }), list,
+    h("p", { class: "muted small", text: "At a limit, nothing is removed: you just can't add more until you free some up or upgrade." }));
+}
 var ADDR_HINT = "Lower-case letters, digits and hyphens.";
 var focusAddrAfterRender = false; // after saving project settings, focus the (re-rendered) address line
 function addrInput(id, value, max, help) {

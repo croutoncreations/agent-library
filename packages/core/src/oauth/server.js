@@ -7,6 +7,7 @@ import { mayCreateAccount, principalForIdentity } from "../identity/accounts.js"
 import { randomToken } from "../identity/jwt.js";
 import { EMAIL_RE, checkEmailPage, limitSigninStart, startFailure } from "../identity/browser.js";
 import { TURNSTILE_ORIGIN, requireHuman, turnstileSiteKey } from "../identity/turnstile.js";
+import { limitGuard } from "../limits.js";
 import { HttpError } from "../util.js";
 import { __name } from "../runtime.js";
 import { folderName } from "../service.js";
@@ -446,6 +447,14 @@ async function authorizePost(req, env, as, origin) {
       if (replaced) replaced.projects = (await env.DB.prepare("SELECT project_id FROM oauth_connection_projects WHERE connection_id = ?").bind(replaced.id).all()).results.map((r) => r.project_id);
       if (!replaced) return errorPage("That earlier connection was already replaced, perhaps in another tab. Start connecting again from the app.");
     }
+    // Workspace limits (Phase 4), checked before the consent is used up so the person can go back and fix it. The
+    // same conditions are repeated inside the inserts below, so a concurrent request can't slip past.
+    const newProjects = chosen.filter((c) => c.isNew).length;
+    const agentGuard = replaced ? { sql: "1", params: [], limits: {} } : await limitGuard(env, connWs, { agents: 1 });
+    const projGuard = newProjects ? await limitGuard(env, connWs, { projects: 1 }) : null;
+    const preGuard = await limitGuard(env, connWs, replaced ? { projects: newProjects } : { agents: 1, projects: newProjects });
+    if (preGuard.sql !== "1" && !await env.DB.prepare(`SELECT ${preGuard.sql} AS ok`).bind(...preGuard.params).first("ok"))
+      return retry(newProjects && preGuard.limits.projects !== undefined ? "This workspace can't take more projects or connected apps on its plan. Pick existing projects, disconnect an app you no longer use, or upgrade." : "This workspace has reached its limit of connected apps and API keys. Disconnect one you no longer use (Connections), or upgrade.");
     const approved = await oauth.approveConsent(req, handle, { scope });
     await env.OAUTH_KV.delete(`consentctx:${await sha(handle)}`);
     const ar = approved.request;
@@ -468,20 +477,22 @@ async function authorizePost(req, env, as, origin) {
       ...chosen.filter((c) => c.isNew).flatMap((c) => [
         // Gated in-statement: if the signer lost admin or the workspace closed since the check, no row is written and
         // the connection rows below fail their project foreign key, so the whole batch rolls back.
-        env.DB.prepare(`INSERT INTO projects (id, owner_id, title, created_at, workspace_id) SELECT ?, ?, ?, ?, ? WHERE ${workspaceRoleSql("?", "admin")}`).bind(c.id, wsOwner ?? sess.principal_id, c.isNew, at, connWs, sess.principal_id, connWs),
+        env.DB.prepare(`INSERT INTO projects (id, owner_id, title, created_at, workspace_id) SELECT ?, ?, ?, ?, ? WHERE ${workspaceRoleSql("?", "admin")} AND ${projGuard.sql}`).bind(c.id, wsOwner ?? sess.principal_id, c.isNew, at, connWs, sess.principal_id, connWs, ...projGuard.params),
         audit2(c.id, "project.create", c.id, "ok:oauth-consent")
       ]),
       // file_access = 1 only when the page the owner saw offered files (offered: "files", set when it was shown). A page
       // opened before files were offered keeps documents only (migration 0013; build-file-tools-fixes.mjs).
+      // A connection row refused by the limit makes oauth_connection_projects' foreign key fail below, which rolls the
+      // whole batch back (reported like the admin race).
       env.DB.prepare(`INSERT INTO oauth_connections (id, owner_principal_id, project_id, client_id, client_name, redirect_uri, resource, can_read, can_write, file_access, created_at, expires_at, workspace_id, created_by)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)`).bind(connectionId, sess.principal_id, chosen[0].id, ar.clientId, (client?.clientName ?? ar.clientId).slice(0, 200), ar.redirectUri, `${origin}/mcp`, anyWrite ? 1 : 0, sess.offered === "files" ? 1 : 0, at, CONNECTION_EXPIRES_AT, connWs, sess.principal_id),
+        SELECT ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ? WHERE ${agentGuard.sql}`).bind(connectionId, sess.principal_id, chosen[0].id, ar.clientId, (client?.clientName ?? ar.clientId).slice(0, 200), ar.redirectUri, `${origin}/mcp`, anyWrite ? 1 : 0, sess.offered === "files" ? 1 : 0, at, CONNECTION_EXPIRES_AT, connWs, sess.principal_id, ...agentGuard.params),
       ...chosen.flatMap((c) => [
         env.DB.prepare("INSERT INTO oauth_connection_projects (connection_id, project_id, can_write) VALUES (?, ?, ?)").bind(connectionId, c.id, c.write ? 1 : 0),
         audit2(c.id, "oauth.connect", connectionId, c.write ? "ok:read+write" : "ok:read")
       ])
     ]); } catch (e) {
       // The in-statement admin check lost a race (demoted, or the workspace closed): nothing was written.
-      if (/FOREIGN KEY/i.test(String(e?.message ?? e))) return errorPage("Your access to that workspace changed. Start connecting again from the app.", 403);
+      if (/FOREIGN KEY/i.test(String(e?.message ?? e))) return errorPage("Your access to that workspace, or its plan limits, changed. Start connecting again from the app.", 403);
       throw e;
     }
     // Lost a race with another tab replacing the same connection: withdraw this one before any code is issued, so
@@ -748,8 +759,13 @@ async function publishConsentPost(req, env, oauth, form, handle, origin) {
       folderId = randomId("fld");
       stmts.push(env.DB.prepare("INSERT INTO folders (id, project_id, name, name_key, created_at, created_by, publisher_id) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(folderId, projectId, nm.name, nm.key, at, sess.principal_id, publisherId), audit2(projectId, "folder.create", folderId, "ok:publisher-consent"));
     } else return retry("Choose a folder option.");
+    // Connected-agents limit (Phase 4): checked now (the person can go back), and again in the principal insert; a
+    // refused principal makes the publisher row's foreign key fail, rolling the batch back.
+    const pg = await limitGuard(env, proj.workspace_id, { agents: 1 });
+    if (pg.sql !== "1" && !await env.DB.prepare(`SELECT ${pg.sql} AS ok`).bind(...pg.params).first("ok"))
+      return retry("This workspace has reached its limit of connected apps and API keys. Disconnect one you no longer use (Connections), or upgrade.");
     stmts.push(
-      env.DB.prepare("INSERT INTO principals (id, kind, issuer, subject, label, created_at) VALUES (?, 'agent', 'agent-library-publisher', ?, ?, ?)").bind(principalId, publisherId, `publisher:${app.display_name}`.slice(0, 200), at),
+      env.DB.prepare(`INSERT INTO principals (id, kind, issuer, subject, label, created_at) SELECT ?, 'agent', 'agent-library-publisher', ?, ?, ? WHERE ${pg.sql}`).bind(principalId, publisherId, `publisher:${app.display_name}`.slice(0, 200), at, ...pg.params),
       env.DB.prepare(`INSERT INTO publishers (id, owner_principal_id, principal_id, app_client_id, display_name, project_id, folder_id, created_at, workspace_id, created_by)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(publisherId, sess.principal_id, principalId, app.id, app.display_name, projectId, folderId, at, proj.workspace_id, sess.principal_id),
       audit2(projectId, "publisher.connect", publisherId, folderId ? "ok:folder" : "ok:root")
@@ -761,6 +777,7 @@ async function publishConsentPost(req, env, oauth, form, handle, origin) {
   try {
     res = await env.DB.batch(stmts);
   } catch (e) {
+    if (/FOREIGN KEY/i.test(String(e?.message))) return errorPage("Your access to that project, or its workspace's plan limits, changed. Start connecting again from the app.", 403);
     if (/UNIQUE/i.test(String(e?.message))) return errorPage("A folder with that name was just created in this project. Start connecting again from the app and choose it as an existing folder, or pick another name.");
     throw e;
   }

@@ -3,7 +3,8 @@ import { deleteBlob, getBlob, putBlob, readText, storeText } from "./content-sto
 import { requireHuman } from "./auth.js";
 import { BINARY_TYPES, LIMITS, tplDate } from "./service.js";
 import { requireProjectRole, requireWorkspaceRole, workspaceRoleSql } from "./tenancy.js";
-import { HttpError, int, nowIso, randomId, sha256Hex, str } from "./util.js";
+import { HttpError, int, nowIso, randomId, sha256Hex, str } from "./util.js";import { explainLimit, limitGuard } from "./limits.js";
+
 
 var SCHEMA = "agent-library-backup/1";
 var b64 = (b) => {
@@ -212,10 +213,17 @@ async function importBackup(ctx, workspaceId, input, idemKeyValue, digest = "") 
   const keyMap = new Map([...decoded.keys()].map((k) => [k, newKey(k)]));
   // Every check is done; re-check the role right before writing bytes (also checked inside the project INSERT).
   if (!await DB.prepare(`SELECT ${workspaceRoleSql("?", "admin")} AS ok`).bind(me, workspaceId).first("ok")) throw new HttpError(403, "forbidden", "Needs the admin role in an active workspace");
+  // Workspace limits (Phase 4): one more project, and every version's bytes, checked in the project INSERT (the rest
+  // of the batch depends on that row). Checked first too, so nothing is uploaded for a refused import.
+  const addBytes = backup.revisions.reduce((n, r) => n + r.size, 0);
+  const lg = await limitGuard(ctx.env, workspaceId, { projects: 1, storage_bytes: addBytes });
+  if (lg.sql !== "1" && !await DB.prepare(`SELECT ${lg.sql} AS ok`).bind(...lg.params).first("ok")) {
+    await explainLimit(ctx.env, workspaceId, { projects: 1, storage_bytes: addBytes }, lg.limits);
+  }
   const stmts = [
-    // Gated in-statement: the importer must still be an admin of the active workspace.
-    DB.prepare(`INSERT INTO projects (id, owner_id, title, created_at, workspace_id) SELECT ?, COALESCE((SELECT created_by FROM workspaces WHERE id = ?), ?), ?, ?, ? WHERE ${workspaceRoleSql("?", "admin")}`)
-      .bind(pid, workspaceId, me, title, at, workspaceId, me, workspaceId)
+    // Gated in-statement: the importer must still be an admin of the active workspace, within its limits.
+    DB.prepare(`INSERT INTO projects (id, owner_id, title, created_at, workspace_id) SELECT ?, COALESCE((SELECT created_by FROM workspaces WHERE id = ?), ?), ?, ?, ? WHERE ${workspaceRoleSql("?", "admin")} AND ${lg.sql}`)
+      .bind(pid, workspaceId, me, title, at, workspaceId, me, workspaceId, ...lg.params)
   ];
   for (const a of backup.artifacts) {
     const src = a.source_artifact_id != null && artId.has(a.source_artifact_id);
@@ -245,12 +253,19 @@ async function importBackup(ctx, workspaceId, input, idemKeyValue, digest = "") 
   catch (e) {
     await dropBlobs();
     // The admin check lost a race (no project row): the dependent rows fail their foreign key and nothing is written.
-    if (/FOREIGN KEY/i.test(String(e?.message ?? e))) throw new HttpError(403, "forbidden", "Needs the admin role in an active workspace");
+    if (/FOREIGN KEY/i.test(String(e?.message ?? e))) {
+      await explainLimit(ctx.env, workspaceId, { projects: 1, storage_bytes: addBytes }, lg.limits);
+      throw new HttpError(403, "forbidden", "Needs the admin role in an active workspace");
+    }
     if (/UNIQUE|PRIMARY KEY/i.test(String(e?.message ?? e)) && idemKeyValue) { const prior = await replay(); if (prior) return prior; }
     throw e;
   }
   // Empty backup and a lost race: no dependent row failed, but no project was created either.
-  if (!res[0].meta.changes) { await dropBlobs(); throw new HttpError(403, "forbidden", "Needs the admin role in an active workspace"); }
+  if (!res[0].meta.changes) {
+    await dropBlobs();
+    await explainLimit(ctx.env, workspaceId, { projects: 1, storage_bytes: addBytes }, lg.limits);
+    throw new HttpError(403, "forbidden", "Needs the admin role in an active workspace");
+  }
   return result;
 }
 

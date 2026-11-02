@@ -67,6 +67,7 @@ The modules were recovered mechanically from the previous byte-pinned bundle (Ph
 |---|---|---|---|
 | `identity`: `login`, `session`, `bearer`, `multiUser`, `upstream`, `browserSignIn`, `createAccounts`, `linkSoleOwner` | Cloudflare Access (`packages/self-host/src/access-identity.js`): one owner, single-user; or any OpenID Connect provider when `OIDC_ISSUER` is set (`packages/core/src/identity/oidc-identity.js`) | Supabase PKCE sign-in (private repo; decision D15 A) | No provider: local dev sign-in only, multi-user |
 | `entitlements.check(env, op, info)` | Unlimited | Plan limits (throws 402) | Unlimited |
+| `entitlements.limits(env, {workspaceId} \| {principalId})` | None | `planEntitlements` (`PLAN_LIMITS`; [limits.md](limits.md)) | None |
 | `lifecycle`: `workspaceCreated`, `workspaceDeleted`, `inviteCreated` | None | Billing customer, invitation email | None |
 | `routes`: `{ method?, path, handler }` | None | Billing, sign-up, legal pages | None |
 | `mailer.send` | Logs only | SendGrid | Logs only |

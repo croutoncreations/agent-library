@@ -10,6 +10,7 @@ import { createFromTemplate, listTemplates, previewTemplate, saveAsTemplate, tpl
 import { ROLE_RANK, memberRoleSql, personalWorkspaceId, projectRole, workspaceRoleSql, requireProjectRole, requireWorkspaceRole, visibleProjects } from "./tenancy.js";
 import { HttpError, int, nowIso, nowMs, randomId, sha256Hex, str } from "./util.js";
 import { checkSlug, ensureHandle, ensureSlug, projectPaths, slugify } from "./paths.js";
+import { explainLimit, limitGuard, projectLimitGuard } from "./limits.js";
 
 function requireAppConnect(ctx) {
   if (!appConnectEnabled(ctx.env)) throw new HttpError(404, "not_found", "Not found");
@@ -113,9 +114,10 @@ async function createProject(ctx, input) {
   const base = chosen ?? (slugify(title, 58) || "project");
   let slug = base;
   for (let i = 2; !chosen && i < 50 && await db(ctx).prepare("SELECT 1 FROM projects WHERE workspace_id = ? AND slug = ?").bind(ws.id, slug).first(); i++) slug = `${base}-${i}`;
+  const lg = await limitGuard(ctx.env, ws.id, { projects: 1 });
   const [ins] = await db(ctx).batch([
     db(ctx).prepare(`INSERT INTO projects (id, owner_id, title, created_at, workspace_id, slug) SELECT ?, ?, ?, ?, ?, ?
-      WHERE ${workspaceRoleSql("?", "admin")}`).bind(id, ownerId, title, nowIso(), ws.id, slug, ctx.principal.id, ws.id),
+      WHERE ${workspaceRoleSql("?", "admin")} AND ${lg.sql}`).bind(id, ownerId, title, nowIso(), ws.id, slug, ctx.principal.id, ws.id, ...lg.params),
     db(ctx).prepare("INSERT INTO audits (at, actor_id, project_id, action, object_id, rev_no, result, request_id, workspace_id) SELECT ?, ?, ?, 'project.create', ?, NULL, 'ok', ?, ? WHERE EXISTS (SELECT 1 FROM projects WHERE id = ? AND workspace_id = ?)")
       .bind(nowIso(), ctx.principal.id, id, id, ctx.requestId, ws.id, id, ws.id)
   ]).catch((e) => {
@@ -123,7 +125,10 @@ async function createProject(ctx, input) {
     if (/UNIQUE|constraint/i.test(String(e))) throw new HttpError(409, "exists", "Project already exists");
     throw e;
   });
-  if (!ins.meta.changes) throw new HttpError(403, "forbidden", "Needs the admin role in this workspace");
+  if (!ins.meta.changes) {
+    await explainLimit(ctx.env, ws.id, { projects: 1 }, lg.limits);
+    throw new HttpError(403, "forbidden", "Needs the admin role in this workspace");
+  }
   const handle = await ensureHandle(ctx.env, ws);
   return { id, title, slug, path: `${handle}/${slug}`, workspace_id: ws.id };
 }
@@ -290,7 +295,10 @@ async function createMarkdown(ctx, projectId, input, key, kind = "markdown") {
   const artId = randomId("art");
   const revId = randomId("rev");
   const sha2 = await sha256Hex(body2);
-  const az = authzSql(ctx, projectId);
+  const bytes = new TextEncoder().encode(body2).length;
+  const lg = await projectLimitGuard(ctx.env, projectId, { storage_bytes: bytes });
+  const az0 = authzSql(ctx, projectId);
+  const az = { sql: `${az0.sql} AND ${lg.sql}`, params: [...az0.params, ...lg.params] };
   const now = nowIso();
   const result = { status: 201, body: kind === "markdown" && folderId === null ? { artifact_id: artId, revision: 1, revision_id: revId, sha256: sha2 } : { artifact_id: artId, kind, folder_id: folderId, schema, revision: 1, revision_id: revId, sha256: sha2 } };
   const out2 = await runBatch(ctx, [
@@ -304,7 +312,10 @@ async function createMarkdown(ctx, projectId, input, key, kind = "markdown") {
     audit(ctx, projectId, "artifact.create", artId, 1, "ok", "EXISTS (SELECT 1 FROM artifacts WHERE id = ?)", [artId])
   ], i);
   if (!Array.isArray(out2)) return out2;
-  if (!out2[1].meta.changes) throw new HttpError(403, "forbidden", "Grant no longer valid");
+  if (!out2[1].meta.changes) {
+    if (lg.workspaceId) await explainLimit(ctx.env, lg.workspaceId, { storage_bytes: bytes }, lg.limits);
+    throw new HttpError(403, "forbidden", "Grant no longer valid");
+  }
   return result;
 }
 async function publishRevision(ctx, projectId, artifactId, expected, i, rev, extra = [], action = "artifact.save") {
@@ -312,7 +323,10 @@ async function publishRevision(ctx, projectId, artifactId, expected, i, rev, ext
   const next = expected + 1;
   const azBase = authzSql(ctx, projectId);
   const cw = contentWriteSql(ctx, artifactId);
-  const az = { sql: `${azBase.sql} AND ${cw.sql}${rev.fence ? " AND " + rev.fence.sql : ""}`, params: [...azBase.params, ...cw.params, ...rev.fence?.params ?? []] };
+  // Text revisions count against storage here; file revisions were reserved (and counted) when the upload began.
+  const addBytes = rev.blobKey ? 0 : rev.size ?? 0;
+  const lg = addBytes ? await projectLimitGuard(ctx.env, projectId, { storage_bytes: addBytes }) : { sql: "1", params: [], limits: {} };
+  const az = { sql: `${azBase.sql} AND ${cw.sql} AND ${lg.sql}${rev.fence ? " AND " + rev.fence.sql : ""}`, params: [...azBase.params, ...cw.params, ...lg.params, ...rev.fence?.params ?? []] };
   const now = nowIso();
   const gate = "EXISTS (SELECT 1 FROM revisions WHERE id = ?)";
   const body2 = { artifact_id: artifactId, revision: next, revision_id: revId, sha256: rev.sha256 };
@@ -354,6 +368,7 @@ async function publishRevision(ctx, projectId, artifactId, expected, i, rev, ext
     if (cur?.trashed_at) throw new HttpError(409, "trashed", "Artifact is in trash");
     if (cur && cur.head_rev !== expected)
       throw new HttpError(409, "revision_conflict", "Expected revision is stale", { current_revision: cur.head_rev, expected_revision: expected });
+    if (addBytes && lg.workspaceId) await explainLimit(ctx.env, lg.workspaceId, { storage_bytes: addBytes }, lg.limits);
     const pub = await db(ctx).prepare("SELECT publisher_id FROM artifacts WHERE id = ?").bind(artifactId).first("publisher_id");
     if (pub && !ctx.publisher) throw new HttpError(403, "protected_source", "This file is a source export owned by a connected app and cannot be modified here");
     throw new HttpError(403, "forbidden", "Grant no longer valid");

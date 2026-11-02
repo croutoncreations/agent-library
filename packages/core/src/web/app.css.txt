@@ -494,3 +494,12 @@ main > .tabs,main > nav.tabs{margin:16px 0 12px}
 .addr-input input{border:0;background:transparent;padding-left:2px}
 .addr-input input:focus{outline:none;box-shadow:none}
 .addr-input .muted{font-weight:400;font-size:14px}
+/* Plan usage */
+.usage{display:grid;grid-template-columns:minmax(10rem,auto) 1fr;gap:8px 16px;margin:0;font-size:14px}
+.usage dt{color:var(--muted)}
+.usage dd{margin:0;display:flex;flex-direction:column;gap:4px}
+.meter{display:block;height:6px;border-radius:3px;background:var(--sunk);overflow:hidden;max-width:24rem}
+.meter>span{display:block;height:100%;background:var(--accent)}
+.meter.near>span{background:var(--warn)}
+.meter.full>span{background:var(--bad)}
+@media (max-width:600px){.usage{grid-template-columns:1fr}.usage dt{margin-top:6px}}

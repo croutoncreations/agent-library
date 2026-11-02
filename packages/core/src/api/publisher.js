@@ -3,6 +3,7 @@ import { authzSql, limitsFor, rateLimit } from "../auth.js";
 import { CONTENT_TYPE, MIME, byteLength, checkFile } from "../formats.js";
 import { appOrigin, artifactWebUrl, previewWebUrl } from "../links.js";
 import { addressLinksResponse } from "../paths.js";
+import { explainLimit, projectLimitGuard } from "../limits.js";
 import { SCOPES, livePublisher } from "../oauth/server.js";
 import { LIMITS, connectionInfo, idemLookup } from "../service.js";
 import { memberRoleSql, readOnlyError } from "../tenancy.js";
@@ -196,7 +197,10 @@ async function begin(env, p, req) {
   const r0 = await replay();
   if (r0)
     return r0;
-  const az = authzSql(context(env, p, "generation-begin"), p.project_id);
+  const az0 = authzSql(context(env, p, "generation-begin"), p.project_id);
+  // Workspace storage (Phase 4): a staged generation reserves its declared bytes, like an upload.
+  const lg = await projectLimitGuard(env, p.project_id, { storage_bytes: Number(f.total_bytes) || 0 });
+  const az = { sql: `${az0.sql} AND ${lg.sql}`, params: [...az0.params, ...lg.params] };
   let changes = 0;
   try {
     const r = await env.DB.prepare(`INSERT INTO publisher_generations (publisher_id, id, project_id, folder_id, token_epoch, source_revision, expected_current_snapshot_id,
@@ -219,6 +223,7 @@ async function begin(env, p, req) {
     const staged = await env.DB.prepare("SELECT COUNT(*) AS n FROM publisher_generations WHERE publisher_id = ? AND state = 'staged'").bind(p.id).first("n");
     if ((staged ?? 0) >= C.max_staged_generations)
       throw new HttpError(409, "too_many_staged_generations", "Two generations are already staged; commit or DELETE one", { max_staged_generations: C.max_staged_generations });
+    if (lg.workspaceId) await explainLimit(env, lg.workspaceId, { storage_bytes: Number(f.total_bytes) || 0 }, lg.limits);
     throw new HttpError(413, "quota_exceeded", "Retained generation quota or authorization check failed; nothing was staged", { max_retained_bytes: h.maxRetainedBytes, max_retained_parts: h.maxRetainedParts });
   }
   const g = await generation(env, p, f.generation_id);
@@ -743,11 +748,12 @@ async function commitSnapshot(env, p, req, requestId) {
   const quota = `(SELECT COUNT(*) FROM artifacts WHERE publisher_id = ? AND generation_id IS NULL) + ? <= ${PUB_QUOTA.files}
     AND (SELECT COALESCE(SUM(r.size), 0) FROM revisions r JOIN artifacts a ON a.id = r.artifact_id WHERE a.publisher_id = ?) + (SELECT COALESCE(SUM(total_bytes),0) FROM publisher_generations WHERE publisher_id = ? AND state='staged') + ? <= ${PUB_QUOTA.bytes}`;
   const quotaParams = [p.id, newNames.length, p.id, p.id, addBytes];
+  const lg = await projectLimitGuard(env, p.project_id, { storage_bytes: addBytes }); // workspace storage (Phase 4)
   const noNew = newNames.length ? `NOT EXISTS (SELECT 1 FROM artifacts WHERE publisher_id = ? AND export_name IN (${newNames.map(() => "?").join(",")}))` : "1";
   const noNewParams = newNames.length ? [p.id, ...newNames] : [];
   stmts.push(env.DB.prepare(`UPDATE publishers SET current_snapshot_id = ?, current_source_revision = ?
     WHERE id = ? AND token_epoch = ? AND (current_source_revision IS NULL OR current_source_revision < ?) AND current_snapshot_id IS ? AND ${az.sql}
-      AND ${filesStill} AND ${noNew} AND ${quota}`).bind(snapshotId, snap.source_revision, p.id, p.token_epoch, snap.source_revision, p.current_snapshot_id ?? null, ...az.params, ...filesParams, ...noNewParams, ...quotaParams));
+      AND ${filesStill} AND ${noNew} AND ${quota} AND ${lg.sql}`).bind(snapshotId, snap.source_revision, p.id, p.token_epoch, snap.source_revision, p.current_snapshot_id ?? null, ...az.params, ...filesParams, ...noNewParams, ...quotaParams, ...lg.params));
   const gate = "EXISTS (SELECT 1 FROM publishers WHERE id = ? AND current_snapshot_id = ?)";
   const gp = [p.id, snapshotId];
   await testPause(env, req);
@@ -834,6 +840,7 @@ async function commitSnapshot(env, p, req, requestId) {
       (SELECT COALESCE(SUM(r.size), 0) FROM revisions r JOIN artifacts a ON a.id = r.artifact_id WHERE a.publisher_id = ?) AS bytes`).bind(p.id, p.id).first();
     if (q && (q.n + newNames.length > PUB_QUOTA.files || q.bytes + addBytes > PUB_QUOTA.bytes))
       throw new HttpError(413, "quota_exceeded", "This app has reached its storage quota in the library; ask the owner", { max_files: PUB_QUOTA.files, max_bytes: PUB_QUOTA.bytes });
+    if (lg.workspaceId) await explainLimit(env, lg.workspaceId, { storage_bytes: addBytes }, lg.limits);
     throw new HttpError(409, "conflict", "A concurrent snapshot commit won; re-read /publisher/me and retry");
   }
   if (res.some((r, idx) => idx > 0 && !r.meta.changes)) {

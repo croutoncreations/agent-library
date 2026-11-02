@@ -5,6 +5,7 @@ import { adapters, notify } from "./adapters.js";
 import { ROLES, ROLE_RANK, multiUserInstall, requireWorkspaceRole, workspaceRoleSql } from "./tenancy.js";
 import { HttpError, nowIso, nowMs, randomId, sha256Hex, str } from "./util.js";
 import { checkHandle, ensureHandle } from "./paths.js";
+import { explainLimit, limitError, limitGuard, ownedWorkspacesGuard, usageSql } from "./limits.js";
 const isUnique = (e) => /UNIQUE|constraint/i.test(String(e?.message ?? e));
 const handleTaken = () => new HttpError(409, "handle_taken", "That address is already taken; choose another");
 
@@ -49,11 +50,16 @@ export async function createWorkspace(ctx, input) {
   const handle = input?.handle === undefined || input?.handle === "" ? null : checkHandle(input.handle);
   await adapters(ctx.env).entitlements.check(ctx.env, "workspace.create", { principalId: ctx.principal.id });
   const id = randomId("wsp", 12), at = nowIso();
-  await ctx.env.DB.batch([
-    ctx.env.DB.prepare("INSERT INTO workspaces (id, name, personal, status, plan, created_by, created_at, handle) VALUES (?, ?, 0, 'active', 'free', ?, ?, ?)").bind(id, name, ctx.principal.id, at, handle),
-    ctx.env.DB.prepare("INSERT INTO workspace_members (workspace_id, principal_id, role, added_by, created_at) VALUES (?, ?, 'owner', ?, ?)").bind(id, ctx.principal.id, ctx.principal.id, at),
-    wsAudit(ctx.env, ctx, id, "workspace.create", id, "ok")
+  const og = await ownedWorkspacesGuard(ctx.env, ctx.principal.id);
+  const [wins] = await ctx.env.DB.batch([
+    ctx.env.DB.prepare(`INSERT INTO workspaces (id, name, personal, status, plan, created_by, created_at, handle) SELECT ?, ?, 0, 'active', 'free', ?, ?, ? WHERE ${og.sql}`).bind(id, name, ctx.principal.id, at, handle, ...og.params),
+    ctx.env.DB.prepare("INSERT INTO workspace_members (workspace_id, principal_id, role, added_by, created_at) SELECT ?, ?, 'owner', ?, ? WHERE EXISTS (SELECT 1 FROM workspaces WHERE id = ?)").bind(id, ctx.principal.id, ctx.principal.id, at, id),
+    wsAudit(ctx.env, ctx, id, "workspace.create", id, "ok", "EXISTS (SELECT 1 FROM workspaces WHERE id = ?)", [id])
   ]).catch((e) => { if (handle && isUnique(e)) throw handleTaken(); throw e; });
+  if (!wins.meta.changes) {
+    const used = await ctx.env.DB.prepare(`SELECT ${usageSql.owned_workspaces("?")} AS n`).bind(ctx.principal.id).first("n");
+    throw limitError("owned_workspaces", used ?? 0, og.limits.owned_workspaces);
+  }
   await notify(ctx.env, "workspaceCreated", { id, name, createdBy: ctx.principal.id });
   return { id, name, handle: handle ?? await ensureHandle(ctx.env, { id, name, personal: 0 }), personal: false, status: "active", role: "owner", member_count: 1 };
 }
@@ -186,16 +192,21 @@ export async function createInvite(ctx, id, input, origin) {
   if (already) throw new HttpError(409, "already_member", "That person is already a member");
   await adapters(ctx.env).entitlements.check(ctx.env, "invite.create", { principalId: ctx.principal.id, workspaceId: id });
   const token = randomId("inv", 32), inviteId = randomId("inv", 12), expires = nowMs() + INVITE_DAYS * 864e5;
+  // Members limit: members + pending invitations. Replacing a pending invite for the same address doesn't add one.
+  const lg = await limitGuard(ctx.env, id, { members: 1 });
   const [, ins] = await ctx.env.DB.batch([
     // A new invitation for the same address replaces any pending one (its link stops working).
     ctx.env.DB.prepare(`UPDATE workspace_invites AS wi SET revoked_at = ? WHERE wi.workspace_id = ? AND wi.email = ? AND wi.accepted_at IS NULL AND wi.revoked_at IS NULL
         AND ${workspaceRoleSql("wi.workspace_id", "admin")}`).bind(nowMs(), id, email, ctx.principal.id),
     ctx.env.DB.prepare(`INSERT INTO workspace_invites (id, workspace_id, email, role, token_hash, invited_by, created_at, expires_at)
-        SELECT ?, ?, ?, ?, ?, ?, ?, ? WHERE ${workspaceRoleSql("?", r === "admin" ? "owner" : "admin")}`)
-      .bind(inviteId, id, email, r, await sha256Hex(token), ctx.principal.id, nowIso(), expires, ctx.principal.id, id),
+        SELECT ?, ?, ?, ?, ?, ?, ?, ? WHERE ${workspaceRoleSql("?", r === "admin" ? "owner" : "admin")} AND ${lg.sql}`)
+      .bind(inviteId, id, email, r, await sha256Hex(token), ctx.principal.id, nowIso(), expires, ctx.principal.id, id, ...lg.params),
     wsAudit(ctx.env, ctx, id, "invite.create", inviteId, `ok:${r}`, "changes() = 1")
   ]);
-  if (!ins.meta.changes) throw new HttpError(403, "forbidden", "Needs the admin role in this workspace");
+  if (!ins.meta.changes) {
+    await explainLimit(ctx.env, id, { members: 1 }, lg.limits);
+    throw new HttpError(403, "forbidden", "Needs the admin role in this workspace");
+  }
   // The link is returned once. It is a path (not a #fragment) so it survives a sign-in redirect; the token alone
   // grants nothing (signed-in, verified matching email, single use, <= 14 days). Hosted delivery emails it.
   const accept_url = `${origin}/invite/${token}`;

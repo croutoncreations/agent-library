@@ -3,6 +3,7 @@ import { authenticate, authorizeProject, authzSql, enforceRate, limitsFor, requi
 import { reconcileUploads } from "./cleanup.js";
 import { CONTENT_TYPE, spreadsheetSafeCsv } from "./formats.js";
 import { __name } from "./runtime.js";
+import { explainLimit, projectLimitGuard } from "./limits.js";
 import { BINARY_TYPES, IMAGE_TYPES, LIMITS, VIDEO_TYPES, assertWritable, audit, idemLookup, loadArtifact, publishRevision } from "./service.js";
 import { HttpError, int, nowIso, nowMs, randomId, sha256Hex, str } from "./util.js";
 
@@ -63,12 +64,14 @@ async function uploadBegin(ctx, projectId, input, key) {
     instructions: "PUT the raw file bytes to put_url with the same Authorization, then call upload_finish."
   };
   const gate = "EXISTS (SELECT 1 FROM uploads WHERE id = ?)";
+  // Workspace storage limit (Phase 4): the reservation counts as used until it publishes or is released.
+  const lg = await projectLimitGuard(ctx.env, projectId, { storage_bytes: size });
   stmts.push(
     // Reservation: inserted only if the project quota still has room, evaluated in the same statement.
     // The partial unique index uploads_one_active rejects a second concurrent active upload outright.
     db2(ctx).prepare(`INSERT INTO uploads (id, project_id, artifact_id, principal_id, base_rev, expected_size, expected_sha256, mime, state, staging_key, expires_at, created_at)
       SELECT ?2, ?1, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', ?9, ?10, ?11
-      WHERE ${quotaUsedSql(nowMs())} + ?6 <= ?12 AND ${az.sql}`).bind(projectId, uploadId, artifactId, ctx.principal.id, baseRev, size, sha2, mime, `staging/${projectId}/${uploadId}`, expires, nowIso(), limits.projectBinaryBytes, ...az.params),
+      WHERE ${quotaUsedSql(nowMs())} + ?6 <= ?12 AND ${az.sql} AND ${lg.sql}`).bind(projectId, uploadId, artifactId, ctx.principal.id, baseRev, size, sha2, mime, `staging/${projectId}/${uploadId}`, expires, nowIso(), limits.projectBinaryBytes, ...az.params, ...lg.params),
     db2(ctx).prepare(`INSERT INTO idempotency (principal_id, project_id, op, key, digest, status, response, created_at)
       SELECT ?, ?, ?, ?, ?, 201, ?, ? WHERE ${gate}`).bind(ctx.principal.id, projectId, i.op, i.key, i.digest, JSON.stringify(body2), nowIso(), uploadId),
     audit(ctx, projectId, "upload.begin", artifactId, baseRev, "ok", gate, [uploadId])
@@ -87,6 +90,7 @@ async function uploadBegin(ctx, projectId, input, key) {
     const used = await db2(ctx).prepare(`SELECT ${quotaUsedSql(nowMs())} AS n`).bind(projectId).first("n");
     if ((used ?? 0) + size > limits.projectBinaryBytes)
       throw new HttpError(413, "quota_exceeded", "Project binary storage quota exceeded", { used_bytes: used, limit_bytes: limits.projectBinaryBytes });
+    if (lg.workspaceId) await explainLimit(ctx.env, lg.workspaceId, { storage_bytes: size }, lg.limits);
     throw new HttpError(403, "forbidden", "Grant no longer valid");
   }
   return { status: 201, body: body2 };

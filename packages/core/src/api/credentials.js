@@ -1,6 +1,8 @@
 import { requireHuman } from "../auth.js";
 import { ROLE_RANK, memberRoleSql, projectRole, workspaceRoleSql, readOnlyError } from "../tenancy.js";
 import { HttpError, nowIso, nowMs, randomId, sha256Hex, str } from "../util.js";
+import { explainLimit, limitGuard } from "../limits.js";
+
 
 var KEY_LIFETIMES_DAYS = [1, 7, 30, 90];
 var DEFAULT_LIFETIME_DAYS = 90;
@@ -36,7 +38,8 @@ function lifetime(raw) {
   if (!KEY_LIFETIMES_DAYS.includes(d)) throw new HttpError(400, "invalid_input", `lifetime_days must be one of ${KEY_LIFETIMES_DAYS.join(", ")}`);
   return d;
 }
-function auditStmt(env, ctx, projectId, action, objectId, result) {
+function auditStmt(env, ctx, projectId, action, objectId, result, gate, gateParams = []) {
+  if (gate) return env.DB.prepare(`INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id) SELECT ?, ?, ?, ?, ?, ?, ? WHERE ${gate}`).bind(nowIso(), ctx.principal.id, projectId, action, objectId, result, ctx.requestId, ...gateParams);
   return env.DB.prepare("INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(nowIso(), ctx.principal.id, projectId, action, objectId, result, ctx.requestId);
 }
 async function insertKey(ctx, label, days, scope, replacesId) {
@@ -45,13 +48,21 @@ async function insertKey(ctx, label, days, scope, replacesId) {
   const id = randomId("akey", 12);
   const principalId = randomId("agt");
   const expires = nowMs() + days * 864e5;
-  await env.DB.batch([
-    env.DB.prepare("INSERT INTO principals (id, kind, issuer, subject, label, created_at) VALUES (?, 'agent', 'agent-library-api', ?, ?, ?)").bind(principalId, principalId, label, nowIso()),
+  // Connected-agents limit (Phase 4), checked in the INSERT; the rows after it are gated on the key existing.
+  const lg = await limitGuard(env, scope.workspaceId, { agents: 1 });
+  const exists = "EXISTS (SELECT 1 FROM api_credentials WHERE id = ?)";
+  const [prin] = await env.DB.batch([
+    // The agent principal is written only while the limit has room; the key row needs it (principal_id).
+    env.DB.prepare(`INSERT INTO principals (id, kind, issuer, subject, label, created_at) SELECT ?, 'agent', 'agent-library-api', ?, ?, ? WHERE ${lg.sql}`).bind(principalId, principalId, label, nowIso(), ...lg.params),
     env.DB.prepare(`INSERT INTO api_credentials (id, owner_principal_id, principal_id, label, token_hash, created_at, expires_at, replaces_id, workspace_id, created_by)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(id, ctx.principal.id, principalId, label, await sha256Hex(secret), nowIso(), expires, replacesId, scope.workspaceId, ctx.principal.id),
-    ...scope.map((s) => env.DB.prepare("INSERT INTO api_credential_projects (credential_id, project_id, can_write) VALUES (?, ?, ?)").bind(id, s.project_id, s.can_write ? 1 : 0)),
-    ...scope.map((s) => auditStmt(env, ctx, s.project_id, replacesId ? "apikey.replace" : "apikey.create", id, s.can_write ? "ok:read_write" : "ok:read"))
+      SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM principals WHERE id = ?)`).bind(id, ctx.principal.id, principalId, label, await sha256Hex(secret), nowIso(), expires, replacesId, scope.workspaceId, ctx.principal.id, principalId),
+    ...scope.map((s) => env.DB.prepare(`INSERT INTO api_credential_projects (credential_id, project_id, can_write) SELECT ?, ?, ? WHERE ${exists}`).bind(id, s.project_id, s.can_write ? 1 : 0, id)),
+    ...scope.map((s) => auditStmt(env, ctx, s.project_id, replacesId ? "apikey.replace" : "apikey.create", id, s.can_write ? "ok:read_write" : "ok:read", exists, [id]))
   ]);
+  if (!prin.meta.changes) {
+    await explainLimit(env, scope.workspaceId, { agents: 1 }, lg.limits);
+    throw new HttpError(409, "conflict", "The key couldn't be created; try again");
+  }
   return { id, label, expires_at: new Date(expires).toISOString(), projects: scope.map((s) => ({ project_id: s.project_id, access: s.can_write ? "read_write" : "read" })), secret };
 }
 async function createApiKey(ctx, input) {

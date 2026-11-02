@@ -40,7 +40,12 @@ export const noIdentity = {
 export const unlimited = {
   name: "unlimited",
   /** Throw HttpError(402/413) to refuse. op: "workspace.create" | "invite.create" | ... ; info: { workspaceId, ... }. */
-  async check() {}
+  async check() {},
+  /**
+   * Usage limits core enforces inside each write (limits.js): { storage_bytes, projects, members, agents } for
+   * { workspaceId }, { owned_workspaces } for { principalId }. Missing = unlimited. See planEntitlements (PLAN_LIMITS).
+   */
+  async limits() { return {}; }
 };
 
 export const noLifecycle = {
