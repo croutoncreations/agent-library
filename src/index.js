@@ -6054,6 +6054,12 @@ async function rvPropose(ctx, projectId, a, i, s) {
     // A new document needs both: keep the pending part this save doesn't replace.
     if (!content) content = { body: prev.body ?? void 0, blobKey: prev.blob_key ?? void 0, size: prev.size, sha256: prev.sha256, mime: prev.mime, restoredFrom: null };
     if (!meta) meta = { title: prev.title, folder: prev.folder, folderId: prev.folder_id, tags: prev.tags };
+    // The shell holds placeholder details: fields the caller omitted keep the pending proposal's values.
+    else if (s.metaInput) {
+      const m = s.metaInput, sameFolder = m.folder === undefined;
+      meta = { title: m.title !== undefined ? meta.title : prev.title, folder: sameFolder ? prev.folder : meta.folder,
+        folderId: sameFolder ? prev.folder_id : meta.folderId, tags: m.tags !== undefined ? meta.tags : prev.tags };
+    }
     if (s.content && s.expectedRev !== 0) throw new HttpError(409, "revision_conflict", "This document is waiting for review; save it with expected_revision 0", { current_revision: 0, expected_revision: s.expectedRev });
     if (s.meta && s.expectedMeta !== a.meta_version) throw new HttpError(409, "metadata_conflict", "Expected metadata version is stale", { current_meta_version: a.meta_version });
   } else {
@@ -6111,7 +6117,7 @@ async function rvGateContent(ctx, projectId, a, i, expected, rev) {
 async function rvGateMeta(ctx, projectId, a, i, expected, input, v, restoredFrom) {
   if (!rvGated(ctx, a)) return null;
   if (input.trashed !== undefined) throw new HttpError(403, "review_required", "This document requires review; only the owner can move it to or from the trash");
-  return rvPropose(ctx, projectId, a, i, { meta: { title: v.title, folder: v.folder, tags: v.tags }, expectedMeta: expected, note: input.change_note ?? (restoredFrom ? "Restored details from version " + restoredFrom : void 0), metaRestoredFrom: restoredFrom, status: 200 });
+  return rvPropose(ctx, projectId, a, i, { meta: { title: v.title, folder: v.folder, tags: v.tags }, metaInput: input, expectedMeta: expected, note: input.change_note ?? (restoredFrom ? "Restored details from version " + restoredFrom : void 0), metaRestoredFrom: restoredFrom, status: 200 });
 }
 // upload_finish: the gate is evaluated at finish, so a mode change after upload_begin is honored.
 async function rvGateUpload(ctx, projectId, u, i, rev, fence, token) {
@@ -6563,10 +6569,16 @@ async function rvDecorateHistory(ctx, projectId, artifactId, out) {
   const revs = out.revisions.map((v) => v.rev);
   if (!revs.length && !out.meta_versions?.length) return out;
   const r = await db(ctx).prepare(`SELECT rv.*, p.via_kind AS p_kind, p.via_id AS p_id, p.via_label AS p_label, p.author_id AS p_author FROM reviews rv
-    LEFT JOIN proposals p ON p.id = rv.proposal_id WHERE rv.artifact_id = ? AND rv.project_id = ? AND rv.decision <> 'rejected' ORDER BY rv.rowid`).bind(artifactId, projectId).all();
+    LEFT JOIN proposals p ON p.id = rv.proposal_id WHERE rv.artifact_id = ? AND rv.project_id = ? ORDER BY rv.rowid`).bind(artifactId, projectId).all();
   const me = ctx.principal.kind === "human" ? ctx.principal.id : null;
   const byRev = new Map(), byMeta = new Map();
   for (const rv of r.results) {
+    // The latest decision wins: a later rejection withdraws an earlier approval.
+    if (rv.decision === "rejected") {
+      if (rv.rev_no !== null) byRev.delete(rv.rev_no);
+      if (rv.meta_version !== null) byMeta.delete(rv.meta_version);
+      continue;
+    }
     const view = { ...rvReviewView(ctx, rv), ...rv.decision === "approved_with_edits" && rv.p_kind ? { proposed_by: whoLabel({ via_kind: rv.p_kind, via_id: rv.p_id, via_label: rv.p_label, author_id: rv.p_author }, me) } : {} };
     if (rv.rev_no !== null) byRev.set(rv.rev_no, view);
     if (rv.meta_version !== null) byMeta.set(rv.meta_version, view);
