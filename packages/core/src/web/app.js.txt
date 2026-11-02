@@ -485,7 +485,7 @@ async function resolvePathRoute(p) {
   var find = function () { for (var id in projectPaths) if (projectPaths[id] === want) return id; return null; };
   // Always ask the server: addresses can change, so a cached match could open the wrong project.
   shell([{ t: "Home", href: "#/" }, { t: "Opening…" }], h("div", { role: "status" }, h("span", { class: "sr", text: "Opening project…" }), h("span", { class: "skel-line wide", "aria-hidden": "true" })));
-  try { projectPaths = {}; noteProjects((await api("GET", "/api/projects")).projects); }
+  try { var fresh = (await api("GET", "/api/projects")).projects; projectPaths = {}; noteProjects(fresh); }
   catch (e) {
     if (e.status === 401 || token !== pathSeq) return;
     shell([{ t: "Home", href: "#/" }, { t: "Couldn't open" }], stateBox("error", "alert", "Couldn't open this link",
@@ -817,6 +817,7 @@ async function viewWorkspace(id) {
 }
 var ROLE_RANK_UI = { viewer: 1, member: 2, admin: 3, owner: 4 };
 var ADDR_HINT = "Lower-case letters, digits and hyphens.";
+var focusAddrAfterRender = false; // after saving project settings, focus the (re-rendered) address line
 function addrInput(id, value, max, help) {
   var input = h("input", { id: id, type: "text", value: value, maxLength: max, required: true, autocomplete: "off", autocapitalize: "none", spellcheck: false,
     pattern: "[a-z0-9]([a-z0-9-]*[a-z0-9])?", "aria-describedby": help, title: ADDR_HINT });
@@ -871,8 +872,7 @@ function toggleProjectSettings(pid, opener) {
     try {
       var r = await api("PATCH", "/api/projects/" + enc(pid), b);
       projectTitles[pid] = r.title; if (r.path) projectPaths[pid] = r.path;
-      toast("Project updated"); route();
-      setTimeout(function () { var c = app.querySelector(".proj-addr code"); if (c) { c.tabIndex = -1; c.focus(); } }, 0);
+      toast("Project updated"); focusAddrAfterRender = true; route();
     } catch (err) { if (b.slug) addrError(sl, msg, err); else sectionErr(msg, err); save.disabled = false; }
   } }, h("h2", { text: "Project settings" }), msg,
     h("label", { class: "field" }, h("span", { text: "Title" }), title),
@@ -1692,6 +1692,7 @@ async function viewList(pid, trash) {
       copyIcon("link", "Copy project link", function () { return projectUrl(pid); }),
       admin ? h("button", { type: "button", class: "ghost addr-settings", "aria-expanded": "false", "aria-controls": "proj-settings", onclick: function (e) { toggleProjectSettings(pid, e.currentTarget); } }, icon("settings"), "Project settings") : null);
     addr.hidden = false;
+    if (focusAddrAfterRender) { focusAddrAfterRender = false; var c = addr.querySelector("code"); c.tabIndex = -1; c.focus(); }
   }
   shell(projCrumbs(pid, trash ? [{ t: "Trash" }] : []),
     pageHead(titleH1, { eyebrow: trash ? (projectTitles[pid] || "Project") : "Project", actions: actions }),
