@@ -228,6 +228,17 @@ test("new documents in a required project are hidden until approved; the author 
     const kept = sql(`SELECT title, folder, tags FROM proposals WHERE id = '${tagsOnly.body.proposal_id}'`)[0];
     assert.deepEqual([kept.title, kept.folder, JSON.parse(kept.tags)], ["Legacy plan", "Plans", ["a"]]);
     sql(`UPDATE proposals SET status = 'withdrawn', decided_at = '2000-01-01T00:00:00Z' WHERE id = '${tagsOnly.body.proposal_id}'`);
+    // A new file uploaded by an agent is a hidden pending new document too (proposal created at upload_finish).
+    const lg = agentHttp(h.appUi, legacyGrant.token), png = makePng(10, 10);
+    const ub = await lg("POST", base + "/uploads", { title: "Map.png", mime: "image/png", size: png.length, sha256: sha256(png) });
+    assert.equal(ub.status, 201, JSON.stringify(ub.body));
+    assert.equal((await lg("PUT", ub.body.put_url, undefined, { raw: png, idem: false })).status, 200);
+    const uf = await lg("POST", `${base}/uploads/${ub.body.upload_id}/finish`, {});
+    assert.equal(uf.body.status, "pending_review", JSON.stringify(uf.body));
+    assert.equal((await api("GET", `/projects/${P}/files/${uf.body.artifact_id}`)).status, 404, "hidden from other agents");
+    const up = (await owner.req("GET", `${base}/proposals/${uf.body.proposal_id}`)).body;
+    assert.equal(up.proposal.is_new, true); assert.equal(up.details.proposed.title, "Map.png");
+    assert.equal((await lg("POST", `${base}/proposals/${uf.body.proposal_id}/withdraw`, {})).status, 200);
     const cp = ok(await reader.call("list_changes", { project_id: P })).next_cursor;
     // The reviewer edits only the title: the content keeps its proposer as author.
     ok(await reviewer.call("review_proposal", { project_id: P, proposal_id: c2.proposal_id, decision: "approve", title: "Secret plan (final)", idempotency_key: key() }));
@@ -380,6 +391,10 @@ test("review permission: owner-only grant, live revocation, publisher never, too
 });
 
 test("advisory: reviews bind to one version; later edits are unreviewed; reviewed=true reads it; owner saves are not auto-reviewed", async () => {
+  // Own reviewer and reader connections: the shared ones use up their fixed 60 reads/min in the earlier tests.
+  const reviewer = await h.connectMcpAgent({ [P]: "read" }, { clientName: "Advisory reviewer" });
+  assert.equal((await allowReview("oauth", await connId("Advisory reviewer"))).status, 200);
+  const reader = await h.connectMcpAgent({ [P]: "read" }, { clientName: "Advisory reader" });
   const id = await ownerDoc("Advisory", "v1");
   const m = await setMode(id, "advisory");
   assert.equal(m.reviewed_revision, null);
