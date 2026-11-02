@@ -47,6 +47,12 @@ Routes (all under `https://YOUR_MCP_HOST`):
 
 Writes need an `Idempotency-Key` header. Request and response shapes are in `src/api/v1.ts`, and `test/api-v1.test.mjs` has working examples. Don't log request headers.
 
+## Review
+
+The owner can require review for a document (or for new documents in a project). Then a save, restore or title/folder/tag change by your agent returns `status: "pending_review"` and a `proposal_id` instead of a new revision: readers keep seeing the approved version until a reviewer approves it. Saving again replaces your pending proposal. Use `list_proposals`, `read_proposal` and `withdraw_proposal` to follow it; `read_proposal` shows the reviewer's decision and note. Moving a required document to trash is refused (`review_required`).
+
+Agents the owner allows to review (Connections → Review permission) also get `review_proposal` (approve, approve with edits, reject) and `review_revision` (mark a version reviewed in advisory mode). They can never review their own edits. To read only reviewed content, pass `reviewed: true` to `read_artifact` (or `?revision=reviewed` over `/v1`). Details: [Review](review-gating.md).
+
 ## Security and conflicts
 
 After connecting a new agent, check that it can't see other projects, that a read-only connection can't write, and that it loses access as soon as you revoke it.

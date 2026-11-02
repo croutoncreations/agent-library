@@ -1,0 +1,605 @@
+{
+  "base_file_types_sha256": "cea551a7d442927605e0890073072e7bad69968f1fdf6a4a3886d3dc79a6b1cf",
+  "integrated_sha256": "9694fad68fdd6836cdf8bc9502e46d9262dbf24c9c9e2bc726462a44c01f2fcf",
+  "preserved_outside_patches_sha256": "8542d6597122a3a5a256096a4987ee2041d05bb1597eb43daa7386a824f29822",
+  "sources_sha256": {
+    "src/review/service.js": "1a78b2fa0cf9e304c17fbea61ecee5d32b7bc180e4bef32cd33a650949a64c51",
+    "src/review/tools.js": "192903fbdd905f4b632a23a22263874502c8691d02a394ddb1596aa8b43d2991",
+    "src/review/browser.js": "5c349c632b0f33e8129460e06c07f20fa4171ee85b1528b968a92f3184fa5553",
+    "src/review/browser.css": "b6b631c3be24b2b9d2cc9bc2a44ee4c74347315f42d17d4787e041f1335c1fd6"
+  },
+  "patches": [
+    {
+      "name": "review service and tools",
+      "module": "// src/service.ts",
+      "count": 1,
+      "find_sha256": "990995796303ae28bc68934e504c2b6e7f0f96c0f983ddbb77909c58bbaead9f",
+      "replace_sha256": "182c3ffce94373e95a357132c6bfea39c39de54612b4c910219b6ca895fc9cec"
+    },
+    {
+      "name": "hidden new documents exist only for their proposer (writes) and nobody (reads)",
+      "module": "// src/service.ts",
+      "count": 1,
+      "find_sha256": "98c72322ac6c2d06ce0c834c7d7cfb596a68e3ba7f9adb29232fa434cf5cbf7e",
+      "replace_sha256": "9bed49c9f1697176bad55ad07114a9edcf77cafa2c2107cae7d9b3684f00db48"
+    },
+    {
+      "name": "artifact rows carry pending count and reviewed version",
+      "module": "// src/service.ts",
+      "count": 1,
+      "find_sha256": "4e1191d91cff7102f527223e3e5563595b646e6cd0db72f52544167d03b659e6",
+      "replace_sha256": "1d41d97ea73763ce5eedae735cd02568945b8d0c23bbb7e2c5d45c84f714fc65"
+    },
+    {
+      "name": "artifact view: review state (only when review is on or edits are pending)",
+      "module": "// src/service.ts",
+      "count": 1,
+      "find_sha256": "821a586588af787d0b33804e6b082bc163142f548c9054030009847e9e2bf5a6",
+      "replace_sha256": "b828256b9d088119b95434e3571670f26b0701addf18d7b76ee7a6b71628cfcd"
+    },
+    {
+      "name": "reads resolve the reviewed version",
+      "module": "// src/service.ts",
+      "count": 1,
+      "find_sha256": "8785550e04493a5a92c4169e49edddcb0204a49944545eaa9082ae052d146c18",
+      "replace_sha256": "7796de5b27dac45527454ac732e672f6a02e5eede089c543d14e56fc36d0eef2"
+    },
+    {
+      "name": "history: who reviewed each version",
+      "module": "// src/service.ts",
+      "count": 1,
+      "find_sha256": "4465cfe37350b3e33d2a7e8d282e87ac4106b9851d31adadde967d8753bc6d18",
+      "replace_sha256": "f2127c9e2b8fe7e4c0c2ccc2b31397954bf0d444bee620a54e82f019f170c021"
+    },
+    {
+      "name": "hidden documents do not count toward the document limit",
+      "module": "// src/service.ts",
+      "count": 2,
+      "find_sha256": "4c68df925677e799e8b35c01791e86ef3c1ee69b3c03b149703952543dee5374",
+      "replace_sha256": "64a07c9edc417bfaba34eb8bb20d1e3ff69e9d1c7127167be1de6ebfb6a0784f"
+    },
+    {
+      "name": "template copies: hidden documents do not count",
+      "module": "// src/service.ts",
+      "count": 1,
+      "find_sha256": "4b668438b444c35f1ca0e3f0712af0188cd9069a7a4b6340632a97e13817d823",
+      "replace_sha256": "fb8e344b46d8ce508c8bd0d77cd91daae45b31d430171b6babce89a6ac5d9be1"
+    },
+    {
+      "name": "create: gated new documents become proposals",
+      "module": "// src/service.ts",
+      "count": 1,
+      "find_sha256": "8384617b32f20bbf31a603919bacd01e15868bc50dbf1a0138dd9753378e2662",
+      "replace_sha256": "2dd592569d91d4f9e79f4bcf87a2b010dc2df545726b8400daa11f25026b5d2d"
+    },
+    {
+      "name": "template copy: gated new documents become proposals",
+      "module": "// src/service.ts",
+      "count": 1,
+      "find_sha256": "0c886363fd5292612a589f0782520f23ecbc547b3c046225fc07b0f96b87cbb8",
+      "replace_sha256": "7af38f9b167ad3cb7f8112d45cef99b812db8bdf6f56445a1fde1e71175d1cb3"
+    },
+    {
+      "name": "content writes: gate (uploads are gated at finish)",
+      "module": "// src/service.ts",
+      "count": 1,
+      "find_sha256": "15584f2a5c1741d5e3128641f48c9c670c35eb39de37e86f87f2516ef9350fb2",
+      "replace_sha256": "0b183e8509734fc4ace576ba827ad597ed0e3a6722f6195dfb1fd804bd17267e"
+    },
+    {
+      "name": "save: a pending new document is saved at revision 0",
+      "module": "// src/service.ts",
+      "count": 1,
+      "find_sha256": "5c25118d39b4d8e20321cff2d35d72edabe54f5c72cbe81a7476e473db5b1434",
+      "replace_sha256": "92a21b188b9b93e3258cbb8ef8ed7ceb80dde6c873c4dcfb187802d6bebce5bc"
+    },
+    {
+      "name": "save: the proposer can revise a pending new document",
+      "module": "// src/service.ts",
+      "count": 1,
+      "find_sha256": "694074e4e3f2aee71c024877924a9eb7468e36e9a038224dcd6a79d6304ff92b",
+      "replace_sha256": "9aa99b81c6a88a72dfb5e632670b2a9d62d90bfc0b9703cd9f2ee0a3ed1b3a9f"
+    },
+    {
+      "name": "data-file save: revision 0",
+      "module": "// src/service.ts",
+      "count": 1,
+      "find_sha256": "8c924f9f85bcd0d1d7aacea22fdd063c6bf9b9925572ece8df8b4f8d7f902508",
+      "replace_sha256": "4c81c6b59c769e582ef2dff1ccb742d3177aad427dab131d29c3d65b7a9462fc"
+    },
+    {
+      "name": "data-file save: the proposer can revise a pending new document",
+      "module": "// src/service.ts",
+      "count": 1,
+      "find_sha256": "94ed563e37a5683e5ce7a893777bffc6e6195378c41eba6539b7ec2108b15adf",
+      "replace_sha256": "282ce8f8597b31106f161d055828cfc2a75c7ac642ee00b8e65ff3a08464ee4e"
+    },
+    {
+      "name": "details: the proposer can revise a pending new document",
+      "module": "// src/service.ts",
+      "count": 1,
+      "find_sha256": "92ab0e6d5c6df11a1478e19405f4940cd034cef5110009b8de356f0be96c60d2",
+      "replace_sha256": "431bd9bc8f9bc9111e10dd438c5805323ee934cde257dcf7caee6e89c4395af6"
+    },
+    {
+      "name": "details: gate (trash refused)",
+      "module": "// src/service.ts",
+      "count": 1,
+      "find_sha256": "c44680504c3164994b2abaff9a1f4119a46806e04bbd9fd78a03975a98bc120e",
+      "replace_sha256": "440b99ae0270a252aa352ed754f3aa63628feb49e83958808c48c9c4d85bb836"
+    },
+    {
+      "name": "a trigger refusal is a conflict, not a crash",
+      "module": "// src/service.ts",
+      "count": 1,
+      "find_sha256": "4264f320d10d53ca3feb8461561940fdd913eecbac1ec8ea7a6a0047bac0f7f5",
+      "replace_sha256": "d29d48636cb2aa2d788c44ab667584fbcb31ecd747a092c72f585ebf09d6f0e8"
+    },
+    {
+      "name": "upload: placeholder for gated new files",
+      "module": "// src/uploads.ts",
+      "count": 1,
+      "find_sha256": "b9bed03b8a6d4195e60f044c3ff86faa3a984a8cf280d57433ffdac9d20ce90e",
+      "replace_sha256": "1244a80ef88e42a8d17f237b6dee8bc2a36fcb48a4f06f00274b90bbbfbc5b14"
+    },
+    {
+      "name": "upload: new version of a pending new file at revision 0",
+      "module": "// src/uploads.ts",
+      "count": 1,
+      "find_sha256": "d9ee29f58477758c1e67f110d222b0cf8457e2b7d311a18eb5e1e06a6baae37f",
+      "replace_sha256": "3268c00b9b0ed929072e7136be8e13fa5e48b6544d514800022c986be37e9091"
+    },
+    {
+      "name": "upload: gated new file shell",
+      "module": "// src/uploads.ts",
+      "count": 1,
+      "find_sha256": "2d8e0a23d4dcae3ef28dd8d0b58a34fc653e593721bc94d2b63bfe0b51e4b78d",
+      "replace_sha256": "052f7739b7b24c15a745b1a125e1ee093242370e7da6a51c50d3306424fe8573"
+    },
+    {
+      "name": "upload: remember the proposed title of a gated new file",
+      "module": "// src/uploads.ts",
+      "count": 1,
+      "find_sha256": "524335c1689f18d9a138e7f9c84b8633dc53a6a4ff24b7e8bad6ed2a871a774a",
+      "replace_sha256": "56d512ffbfdae170fba3953c1048f2c5bb33fd5ffbef804b273ca3bb204ec6f7"
+    },
+    {
+      "name": "upload finish: gated files become proposals (gate evaluated now)",
+      "module": "// src/uploads.ts",
+      "count": 1,
+      "find_sha256": "63492b75bc5c0e6b2503d0780e105de7bbedf2735775627f6401b964276dd4ec",
+      "replace_sha256": "0ceba50e096994a9bdb45f7a76c081071c652208c2e051142cd01dd1274855ff"
+    },
+    {
+      "name": "quota: proposal files count until purged (once)",
+      "module": "// src/uploads.ts",
+      "count": 1,
+      "find_sha256": "74ef235f17d8baa1bdfd58463e7f3849bc2ba15b1d06503e30ab370ddcde9ed5",
+      "replace_sha256": "28e45d38a8ba487839ad05c4d9b9d6eaf0aba4d56405c712b10e17822d36cad8"
+    },
+    {
+      "name": "uploads/cleanup never purge a file a proposal references",
+      "module": [
+        "// src/cleanup.ts",
+        "// src/uploads.ts"
+      ],
+      "count": 2,
+      "find_sha256": "7e4cda6a598dd50255a844d5459c01248528a885f565a95b9d4c8a15bbf2d126",
+      "replace_sha256": "86715fb9a18af0e77436fc899600cd517b6c976d2fa6908d1e81df97ce55b0b6"
+    },
+    {
+      "name": "cleanup: purge closed proposal files after 30 days",
+      "module": "// src/cleanup.ts",
+      "count": 1,
+      "find_sha256": "0172ec7ed4e2292867441d43d88bc88daedf705c66549c273ddb6790f0065b30",
+      "replace_sha256": "0464d76b9e9cf1c6fbc7548ce57d757f44d65e3e335ffe7d1d1da1bfee1f9257"
+    },
+    {
+      "name": "backup: include hidden pending documents",
+      "module": "// src/backup.ts",
+      "count": 1,
+      "find_sha256": "4d87e563ede1a78920f2b3fab37a4704c5b9d2fb33aad32247b896682830a5f5",
+      "replace_sha256": "2ecc5b6fda4536ac3366014b503c15ca4ffb52c7b0593e83bfe05f15843a95a3"
+    },
+    {
+      "name": "backup: review section",
+      "module": "// src/backup.ts",
+      "count": 1,
+      "find_sha256": "6f1d3d1b34dc1984b38f6ee5fff1b39799bf97a384e29ff63de20f205adb779e",
+      "replace_sha256": "3c02c62a59d6d9d81b16c27d567e71739cd06373749847918d048656ab955d82"
+    },
+    {
+      "name": "backup: /3 when review data is present (older Workers refuse it)",
+      "module": "// src/backup.ts",
+      "count": 1,
+      "find_sha256": "03d49ec0f5b67c947f22e79f4277689e38f38b93a4c6bfaea4fef6a0f1b30ad5",
+      "replace_sha256": "c9ed9905da4d7bb1fed5acbceb6504be95979871bbd2abe1e73f6532c7caba36"
+    },
+    {
+      "name": "backup: export review data",
+      "module": "// src/backup.ts",
+      "count": 1,
+      "find_sha256": "13f758313b0311fb55aae615b223f0e5dcf21c6b634acfbadcbc0a6e122b00cc",
+      "replace_sha256": "8a1d33849c1154ce436ca9c7d4abb62f00a8cd09ec5961c7940b9dfcd3105dce"
+    },
+    {
+      "name": "restore: accept /3",
+      "module": "// src/backup.ts",
+      "count": 1,
+      "find_sha256": "ea28037e3716148f890c5cbac20752864cbe9f04da372f730e8855f036f2f55b",
+      "replace_sha256": "1e84ed5738a912897477a53794ffb8cfd70b84e2c38b203d7f148a4af932d661"
+    },
+    {
+      "name": "restore: validate review data and its files first",
+      "module": "// src/backup.ts",
+      "count": 1,
+      "find_sha256": "fff410af424831a6b45abbfeec1dd27bf94b000561e9860dd01e96dc16e3912d",
+      "replace_sha256": "ec3e902e5e2d114d6e10089e1fad8363607ca11c7849f9440a98ce62c1d3df05"
+    },
+    {
+      "name": "restore: review authors",
+      "module": "// src/backup.ts",
+      "count": 1,
+      "find_sha256": "f7af1ad2bcb5d31982bb62eb10409119abaf67f859d59f38e45bea00e8c6074e",
+      "replace_sha256": "8fcd0d630455422c5de56e486450d97846b7ba411136b70e26fd92f575dd3030"
+    },
+    {
+      "name": "restore: history imports as it was (gates skip)",
+      "module": "// src/backup.ts",
+      "count": 1,
+      "find_sha256": "15eab5f8805cce75d2986722b4754307b069e73b9b48e4fc27d2710b3451810e",
+      "replace_sha256": "2e9e2510facb7d66ba61d60f8535b224af510074bad2f9dc5c12f527bc17fbdb"
+    },
+    {
+      "name": "restore: review data, then gates on again",
+      "module": "// src/backup.ts",
+      "count": 1,
+      "find_sha256": "f20ce9ce41aa4c966cba4d92e0ca53ac77c7dd359be8d0dd082d94731c5fb4c4",
+      "replace_sha256": "35a35e0bc47f4d38ada3696eac472d11632702037c474f23333b7872d4b4d6bc"
+    },
+    {
+      "name": "OAuth: review tools",
+      "module": "// src/oauth/mcp.ts",
+      "count": 1,
+      "find_sha256": "428c79c0c8cd071d9bb53d3c05602a169f9f00729d5e3a311ecf4ad53222d8d4",
+      "replace_sha256": "eaf0d9c317b52d730a863cf25da2d7bf5d2fa40dbd17fedc3795418e546d9ed5"
+    },
+    {
+      "name": "OAuth revoke drops review permission",
+      "module": "// src/oauth/connections.ts",
+      "count": 1,
+      "find_sha256": "8d8418602d3208cbe1f620355675609a5d0ddc238a56f20f9b03c332f3e374a6",
+      "replace_sha256": "74f4bfe2885a1ae245c73c7be6a7d8d8b17332f6c4c92735c6436ad7bf57fc43"
+    },
+    {
+      "name": "agent token revoke drops review permission",
+      "module": "// src/service.ts",
+      "count": 1,
+      "find_sha256": "0d92a1781e4808fa0699437aa49958ce90e7406e5b04b437af70d5ac6248c32a",
+      "replace_sha256": "752bccca513e14dc439f31d95237e80e418a7ba46c0773c742ca8ee16d4d96f9"
+    },
+    {
+      "name": "OAuth read_artifact: reviewed resolves before the document/file split",
+      "module": "// src/oauth/mcp.ts",
+      "count": 1,
+      "find_sha256": "ecf3ad613c9dc783250615b0a77d2df60ea43f84622ed275f6c5d335e49d3497",
+      "replace_sha256": "31d287138cb9faa1f1e12fb8e2781c93e76032f09b28894811e729866c447e46"
+    },
+    {
+      "name": "OAuth transfer: proposal file links serve the proposal (reviewer or proposer, live)",
+      "module": "// src/oauth/mcp.ts",
+      "count": 1,
+      "find_sha256": "a6505bf2ada6a9b45d1fc80f39166e67518161360eab539d5b7c5661ff63dcf9",
+      "replace_sha256": "528744a166b0cb7a4a3192ec6e72adb621d55c5a48e5abb4426dd229cf527d03"
+    },
+    {
+      "name": "OAuth read: reviewed version",
+      "module": "// src/oauth/mcp.ts",
+      "count": 1,
+      "find_sha256": "ee00b335cf7e64332b3fe5b6756f7a2af1fa5e110356db25598605e0f4cf707c",
+      "replace_sha256": "eb7d79f52909e213547f2190f29b0d50f8ef8500d9feeba8a3cb374d88b16a1b"
+    },
+    {
+      "name": "OAuth read: resolve reviewed",
+      "module": "// src/oauth/mcp.ts",
+      "count": 1,
+      "find_sha256": "fac1845903a21e1ffdf32390b7d68ef10ae75e299ec95df1979da7e2d7c8cfbc",
+      "replace_sha256": "1b7600f68e5d54ee45b3317d3c4fbc8a730bd7d45b6df970f56a7bb16955d6ca"
+    },
+    {
+      "name": "OAuth save: revision 0 for a pending new document",
+      "module": "// src/oauth/mcp.ts",
+      "count": 1,
+      "find_sha256": "c30ad0cf92f6948cd1cdce36f33fa8714311154a0395df77d6d4ab72bfb52b29",
+      "replace_sha256": "e83c34fe30c320b9c3abb8f7e2f8a3b4c6674e6bd49af0da6ffd15f70620747d"
+    },
+    {
+      "name": "OAuth save: the proposer can revise a pending new document",
+      "module": "// src/oauth/mcp.ts",
+      "count": 1,
+      "find_sha256": "ec0d8b2ab1dab3af48fa1d4499504f392347c09ec8a8a463a199800142f10e6e",
+      "replace_sha256": "ef2a22298d09d66bb242ab916c92038bf22e36214f9732a2a4c54c1194f7297e"
+    },
+    {
+      "name": "OAuth uploads: revision 0 for a pending new file",
+      "module": "// src/oauth/mcp.ts",
+      "count": 2,
+      "find_sha256": "8e4da3ac1accb25cf9b824bee74cf944df8d27a5b43873cd6d9b372ecd09b67b",
+      "replace_sha256": "7a7352274cdaf9984f2947cfb03c685e77c4160fd27dacb9d026942fbbcfd5c4"
+    },
+    {
+      "name": "OAuth uploads: the proposer can upload a pending new file again",
+      "module": "// src/oauth/mcp.ts",
+      "count": 1,
+      "find_sha256": "ee128fd70a3b9fc5aa1efecb888c275902f266543e5c53bb9d8715394d29291f",
+      "replace_sha256": "cfc7ac506eab462a2669fab7e3208b3439b2739b2ed7b128c888a5d9412bb589"
+    },
+    {
+      "name": "OAuth: review tools listed only where review was granted",
+      "module": "// src/oauth/mcp.ts",
+      "count": 1,
+      "find_sha256": "3d18735fb7a3be48d0189142c1dd16e851179b51a02b172a5f96c360c930a8a3",
+      "replace_sha256": "57bcc8324361aa014bf2a24e48041bd39069ddd7e9a09099ae284c575b429366"
+    },
+    {
+      "name": "OAuth: tools/list filter",
+      "module": "// src/oauth/mcp.ts",
+      "count": 1,
+      "find_sha256": "3c44b966ace9a8850c006aa31b49c0d3b8be7a6871b9299504e77f577aaf9f81",
+      "replace_sha256": "b75de45ea90821e85f61e2f26e70129b5f9570d8a8db00b91e173f1aaf23a107"
+    },
+    {
+      "name": "OAuth: reviews use the write rate bucket",
+      "module": "// src/oauth/mcp.ts",
+      "count": 1,
+      "find_sha256": "a9b986f6f649cb7f8d3ef421c46becd9ad2c731312c84c975cb5effc846bf327",
+      "replace_sha256": "a2b6352b55611779cf718b9413bb5c3557d607676ad182be2f961df61235a577"
+    },
+    {
+      "name": "legacy: review tools",
+      "module": "// src/mcp.ts",
+      "count": 1,
+      "find_sha256": "d0cd80c956c4356311cc52c0fadde86c17f43690f294af47816a25202ace1fac",
+      "replace_sha256": "e97396e0dde95d006876ba76b969977c4dbdbaedf7097f80e5c6f97a3110120c"
+    },
+    {
+      "name": "legacy read: reviewed version",
+      "module": "// src/mcp.ts",
+      "count": 1,
+      "find_sha256": "5f5d852c4856fe22dffb8b10634730ba48555e6bf924cb8dcba8545ba64c9eb0",
+      "replace_sha256": "19ae72e83c51c49bed62ad219d91b34de9804dbfeeef7285b16edbc6fe061cb0"
+    },
+    {
+      "name": "legacy read: resolve reviewed",
+      "module": "// src/mcp.ts",
+      "count": 1,
+      "find_sha256": "796a0a1e5c2df68ce78453d1836dae827159c6d85b13205f709b169938382577",
+      "replace_sha256": "e0874a410bdc93f3777355d772204eb73b56330fdc1999f7a6dfebab35d947e9"
+    },
+    {
+      "name": "legacy: review writes use the write bucket",
+      "module": "// src/mcp.ts",
+      "count": 1,
+      "find_sha256": "5cd3481af634db838e2ea9e6a6b1434641ab6a39962130701259a7af23bddcb1",
+      "replace_sha256": "0ba6c87eb3765b78f7747cacc055d8e13b346bfc83ad7242c0fde1049bad73d9"
+    },
+    {
+      "name": "legacy: review tools listed only where review was granted",
+      "module": "// src/mcp.ts",
+      "count": 1,
+      "find_sha256": "e177f1f248441263cdbb542fbe8aa10a6b036e81ccb805effff027960f4ff004",
+      "replace_sha256": "9ac3d732e081c531465e07a26073e944a29a552517234e896a854cf71f2ab5c2"
+    },
+    {
+      "name": "legacy: tools/list filter",
+      "module": "// src/mcp.ts",
+      "count": 1,
+      "find_sha256": "2ef5039314234834a1b2aa963b96067e61a5923e423db5e0598e68b129fd99f5",
+      "replace_sha256": "ddfbc926e683689904259b46b22926b044aeeaee0a0e4d5f79025e654ffabc07"
+    },
+    {
+      "name": "v1: review routes",
+      "module": "// src/api/v1.ts",
+      "count": 1,
+      "find_sha256": "b5e71f02148c6ff9dc138b516b736be38d5c956830bd926964819134a3902429",
+      "replace_sha256": "3bc283f162290a943d1028eaf6fc3ed52df9a91ad33c73493f0fc7d0d469cf3f"
+    },
+    {
+      "name": "v1: review handlers",
+      "module": "// src/api/v1.ts",
+      "count": 1,
+      "find_sha256": "f3b45adaa76d479a647d599fa3468eaebb9870fd61688b63faee169c02db3204",
+      "replace_sha256": "6ec6b209a1c11ad4a30c2f0db999f38b334a8dd2180b71252cb33f3bc8887a9d"
+    },
+    {
+      "name": "chunked text reads: ?revision=reviewed",
+      "module": "// src/service.ts",
+      "count": 1,
+      "find_sha256": "e82cf1cc1969d9784da682f14b33cf989844d59be35e2224030d9cb67c66f4de",
+      "replace_sha256": "3ce809f3ec1b27fd6898ab5105e4ef732b31345a161133e8645f04b06b69c388"
+    },
+    {
+      "name": "chunked text reads: resolve reviewed",
+      "module": "// src/service.ts",
+      "count": 1,
+      "find_sha256": "2ddfdbea7000609787f3bad05bee04900facf2270c77d76d48e379b00d74c1f2",
+      "replace_sha256": "6a390d44662e2d9fb5f3110a3d1bc87197065ba1b5e4275cca09a4db26ead64f"
+    },
+    {
+      "name": "content bytes: ?rev=reviewed / ?revision=reviewed",
+      "module": "// src/uploads.ts",
+      "count": 1,
+      "find_sha256": "38192e349ae08e8ccfea49291d4e07b39ed42c89b7e8a634e07027f9fb359476",
+      "replace_sha256": "81aa2ea698d7ad8fddd9e55a29ddc8bab330ef3d9d763854a07f814805b2031f"
+    },
+    {
+      "name": "v1 read: ?revision=reviewed",
+      "module": "// src/api/v1.ts",
+      "count": 1,
+      "find_sha256": "bfce60e37f384cb8eca5ec2a32837b381b21be3316b760d7a24b596d670d6614",
+      "replace_sha256": "a5cbad5415ebb5613ccce65458923ad8d42e655ff1a227be7ae17b4633b3a4dc"
+    },
+    {
+      "name": "v1 views keep review state with App Connect off",
+      "module": "// src/api/v1.ts",
+      "count": 1,
+      "find_sha256": "ac23ebd197c237ed34793f0cafc92372b41ebbdda5ca183a1caf2acc1286f014",
+      "replace_sha256": "f9d578eff6d214427844e61c02093c020e90366fd46117b2237d7d28f5ad2105"
+    },
+    {
+      "name": "API key replace keeps review permission",
+      "module": "// src/api/credentials.ts",
+      "count": 1,
+      "find_sha256": "5b949e2303f68de796965e1d4c16c69ea33d7174326fc22c5aa6e43191c59551",
+      "replace_sha256": "733181a3c1b1e3060936e003c1279975d191865c83ff4681acfd671110d6f0dc"
+    },
+    {
+      "name": "API key scope: review leaves with the project",
+      "module": "// src/api/credentials.ts",
+      "count": 1,
+      "find_sha256": "c10274a0d150cec06aabefdfede83cf9be9cb8d5900e3e0c645847d6bd55b020",
+      "replace_sha256": "49b85e09232dbdf03416de26420bfc69c263cd0ebbeb3a423c23834dad3cdc41"
+    },
+    {
+      "name": "owner API: queue and review permission",
+      "module": "// src/index.ts",
+      "count": 1,
+      "find_sha256": "87e49d58081ac06ce3205f4bb35fec475180562d0714c89173385be1348c5450",
+      "replace_sha256": "57fd332a2d1fd052093ffe596abd91e1a0dfd02954d9052c578d947c61699d6d"
+    },
+    {
+      "name": "owner API: proposals and project review settings",
+      "module": "// src/index.ts",
+      "count": 1,
+      "find_sha256": "2e240e05a46601727ce60a8b9de10c0f389058833f5a73940aac027cb456494e",
+      "replace_sha256": "cade3fcb79821f9caec287cf3a3f082343246b3895be7139969eab01ac1a6277"
+    },
+    {
+      "name": "owner API: document review mode and version review",
+      "module": "// src/index.ts",
+      "count": 1,
+      "find_sha256": "cff664256351f91321c2506e58a9cc23ad14fcb27302d8b495f5bb68b8a2c75a",
+      "replace_sha256": "3601337fe37cf3243a56a445bd55fd0120fbb5de58111b5721ee2e8c34e226b4"
+    },
+    {
+      "name": "owner API: ?rev=reviewed",
+      "module": "// src/index.ts",
+      "count": 1,
+      "find_sha256": "76d35ab3e294c5405d44fdde6e0f7518f17ae4232755af41a4bcee987972cbed",
+      "replace_sha256": "cda9150bbaa7800081453a72139b9ad4ad60e3d48d8dc87a6a8cd0e7b98de617"
+    },
+    {
+      "name": "ui: styles",
+      "module": "// src/ui.ts",
+      "count": 1,
+      "find_sha256": "dbf4cdd569563992bd40313f20a86bcb55703a554eed9585301382dce9e6ee4e",
+      "replace_sha256": "c602bf8ee36639e6e7e3740ddb847d10bb8e6599a43235970f7417261a46681e"
+    },
+    {
+      "name": "ui: review views and helpers",
+      "module": "// src/ui.ts",
+      "count": 1,
+      "find_sha256": "81bcf3ea5954073fece07463dbbe3470c23d9bf7692c635606fabb17e44ff27a",
+      "replace_sha256": "bc39932ad56e2eb89a4922a742386af99885cc9e21e44befd93e1fbd33dfaa30"
+    },
+    {
+      "name": "ui: review routes",
+      "module": "// src/ui.ts",
+      "count": 1,
+      "find_sha256": "61fc1a71fd6ff72a2b751ca17b460df420bb2b3519311fa1717e498747e2d4d6",
+      "replace_sha256": "08c3de2ac8202106ab8911e1a6f02b843ebe7e9c8140cef298feddb7ab7f3a47"
+    },
+    {
+      "name": "ui: project Review tab",
+      "module": "// src/ui.ts",
+      "count": 1,
+      "find_sha256": "914b0e731d80d848ae185d62fa2c6170dff720929693209180b62a1169578a98",
+      "replace_sha256": "0153f4df94a9d0870906a5662d0b13c39cf8f5dd3ec193a49d0fe2f411e6ae68"
+    },
+    {
+      "name": "ui: Home \"Needs review\" reloads with Home (Refresh, returning to the tab)",
+      "module": "// src/ui.ts",
+      "count": 1,
+      "find_sha256": "a218fea944178c1266a2dac9c16287bdd215d25307ead63d093ec09f79406e0d",
+      "replace_sha256": "d9a4cecd984b646e056926b153a915be09826d1501c5946ad6799d9f7fbcdf0f"
+    },
+    {
+      "name": "ui: Home \"Needs review\" section",
+      "module": "// src/ui.ts",
+      "count": 1,
+      "find_sha256": "df6fc3785b940d9fbc4423ecde30674f8f5f575a0c2381be620a9734a934d58f",
+      "replace_sha256": "509738b91bce3cdbe658b11ccaf13f2acc5752179c64c9cca2e84596cce2e984"
+    },
+    {
+      "name": "ui: Home \"Needs review\" (only when non-empty)",
+      "module": "// src/ui.ts",
+      "count": 1,
+      "find_sha256": "8db985826e83c82ec2e78c3662693c9b8f71d4218414875128dd67f14f25b1af",
+      "replace_sha256": "8450beee5727a2c04cd29b6607d83c0fcca986583614dddf83cb7f6d4c66796b"
+    },
+    {
+      "name": "ui: document review setting and pending banner",
+      "module": "// src/ui.ts",
+      "count": 1,
+      "find_sha256": "04e8d9726c0178aeb08fb43af307345217f05dfef175d62d43e18b4135999e9c",
+      "replace_sha256": "f9500ecaaf3b5e9e19ab9ad759b6deb67d10c44478b0ffafd0497d4ca2376ebe"
+    },
+    {
+      "name": "ui: review chip follows saves (owner autosave changes the current version)",
+      "module": "// src/ui.ts",
+      "count": 1,
+      "find_sha256": "eb11213dab3f030393d5bee6b6437d4132e571b11f90742485599beed96dd290",
+      "replace_sha256": "b9cfb0f0c8ec453b365c2c5139338f1072ae5f44848293b72f3765f5aa33698f"
+    },
+    {
+      "name": "ui: review chip follows details reloads",
+      "module": "// src/ui.ts",
+      "count": 1,
+      "find_sha256": "a60c7cdc952e397a20732d94c87b133ac078d42b8d0203828ee347467409c7c1",
+      "replace_sha256": "d46f30412b3fa6e3e8dbcbf26ed2f4b3badba17e0f26ff949fd4c84f9e8bb0b2"
+    },
+    {
+      "name": "ui: pending banner above the document",
+      "module": "// src/ui.ts",
+      "count": 1,
+      "find_sha256": "16856979b07114df4bae8c4808fc97b8aafa250e07e0c288b4e4913031aa9040",
+      "replace_sha256": "9749b3422cc38ade4d59e8d9b37789ef41a2cee4f8a96a85b3f852db210b4eab"
+    },
+    {
+      "name": "ui: history row review mark",
+      "module": "// src/ui.ts",
+      "count": 1,
+      "find_sha256": "c0e99987ca5b3925f9ccc724f8384106cf16ad9dfe5c4d9769b3859d761ba175",
+      "replace_sha256": "1b914ba39c936db004376c50d925b7d9fa81f8c268458735478bf8b8f0303ea7"
+    },
+    {
+      "name": "ui: history: mark a version reviewed (advisory)",
+      "module": "// src/ui.ts",
+      "count": 1,
+      "find_sha256": "1c0a297a5655439ed5c3c9b4a22e49aebfc574390ba07fd3a6c530848c42d514",
+      "replace_sha256": "86c62d6ca1d5fdbb80a84242e9ed27993ee5d947661f61608a795f24798f274d"
+    },
+    {
+      "name": "ui: apps: can review",
+      "module": "// src/ui.ts",
+      "count": 1,
+      "find_sha256": "4cfdaf184459deb401b93958593d017525a9f9160e3d358262270505fcc408e8",
+      "replace_sha256": "63366eb5e00135d5c30d1cc97d01d8f3217ed375f50c975ef5ba6c4c949a5cbb"
+    },
+    {
+      "name": "ui: agent tokens: can review",
+      "module": "// src/ui.ts",
+      "count": 1,
+      "find_sha256": "530038106e1b440b1a59317d2b7716611ac23cbd57a6d26f36ee548c46d54a02",
+      "replace_sha256": "4b88626fc8f55c9479328ec86a5ee0e5b4f6e60e9268ec7937aae7fbe68f089f"
+    },
+    {
+      "name": "ui: API keys: can review",
+      "module": "// src/ui.ts",
+      "count": 1,
+      "find_sha256": "9e608a802e7397eff61d21ab42837fbd9a0a9b2f9eb0022a220c78c9c22597f8",
+      "replace_sha256": "38e56d8b4980c168e054074b4817b8d506e8747e273cbb69555b55de79244f0a"
+    }
+  ],
+  "requires_migration": "0017_review_gating.sql"
+}
