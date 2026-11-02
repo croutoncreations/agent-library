@@ -199,3 +199,24 @@ test("demoted while typing: the refused save switches to view-only, keeps the te
   assert.equal(await bob.$(".unsaved-draft"), null, "discarded text does not come back");
   await alice.browserContext().close(); await bob.browserContext().close();
 });
+
+test("workspace admins can import a project from a backup file", { skip: !available && "Chrome/puppeteer not installed" }, async () => {
+  const alice = await pageAs("alice");
+  const { ws, backupJson } = await alice.evaluate(async () => {
+    const p = (await (await fetch("/api/projects")).json()).projects.find((x) => x.title === "Mine");
+    const ws = (await (await fetch("/api/workspaces")).json()).workspaces.find((w) => !w.personal);
+    return { ws: ws.id, backupJson: JSON.stringify(await (await fetch(`/api/projects/${p.id}/backup`)).json()) };
+  });
+  const { writeFileSync, mkdirSync } = await import("node:fs");
+  mkdirSync("tmp/test-evidence", { recursive: true });
+  writeFileSync("tmp/test-evidence/import-backup.json", backupJson);
+  await alice.goto(`${APP}/#/workspaces/${ws}`); await alice.reload();
+  await waitText(alice, /Import a project from a backup/);
+  await alice.screenshot({ path: "tmp/test-evidence/tenancy-import.png", fullPage: true });
+  const input = await alice.$("input[aria-label='Backup file to import']");
+  await input.uploadFile("tmp/test-evidence/import-backup.json");
+  await (await alice.$("xpath/.//button[normalize-space()='Import']")).click();
+  await alice.waitForFunction(() => /#\/p\/prj_/.test(location.hash), { timeout: 10000 });
+  await waitText(alice, /Mine/);
+  await alice.browserContext().close();
+});

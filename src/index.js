@@ -3,7 +3,7 @@ import { disableAppClient, listAppClients, registerAppClient, revokePublisher, u
 import { createApiKey, listApiKeys, replaceApiKey, revokeApiKey, setApiKeyScope } from "./api/credentials.js";
 import { handleV1, isV1Path } from "./api/v1.js";
 import { SESSION_COOKIE, authenticate, enforceRate, requireCsrf, requireHuman } from "./auth.js";
-import { exportBackup, restoreBackup } from "./backup.js";
+import { exportBackup, importBackup, restoreBackup } from "./backup.js";
 import { reconcileUploads } from "./cleanup.js";
 import { EDITOR_JS, EDITOR_JS_SHA256 } from "./editor-bundle.js";
 import { RENDER_CSP, htmlRefs, renderHtmlDocument } from "./html.js";
@@ -156,6 +156,7 @@ async function route3(req, env, url, requestId) {
     if (seg[2] === "members" && seg.length === 3 && m === "GET") return json(await listMembers(ctx, wid));
     if (seg[2] === "members" && seg.length === 4 && m === "PATCH") return json(await setMemberRole(ctx, wid, str(seg[3], "member", 80), await body(req)));
     if (seg[2] === "members" && seg.length === 4 && m === "DELETE") return json(await removeMember(ctx, wid, str(seg[3], "member", 80)));
+    if (seg[2] === "import" && seg.length === 3 && m === "POST") return json(await importBackup(ctx, wid, await body(req)), 201);
     if (seg[2] === "invites" && seg.length === 3 && m === "POST") return json(await createInvite(ctx, wid, await body(req), url.origin), 201);
     if (seg[2] === "invites" && seg.length === 5 && seg[4] === "revoke" && m === "POST") return json(await revokeInvite(ctx, wid, str(seg[3], "invite", 80)));
     throw new HttpError(404, "not_found", "Not found");

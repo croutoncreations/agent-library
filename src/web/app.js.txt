@@ -580,6 +580,24 @@ async function viewWorkspace(id) {
         try { var r = await api("POST", "/api/projects", { title: ptitle.value.trim(), workspace_id: id }); projectTitles[r.id] = r.title; location.hash = "#/p/" + enc(r.id); }
         catch (err) { sectionErr(projMsg, err); pbtn.disabled = false; }
       } }, ptitle, pbtn);
+      // Import a project from a backup file (new ids; everything is attributed to you).
+      var ifile = h("input", { type: "file", accept: "application/json,.json", "aria-label": "Backup file to import" });
+      var ibtn = h("button", { type: "submit", class: "secondary" }, icon("upload"), "Import");
+      var importForm = h("form", { class: "card import-form", "aria-label": "Import a project into " + wsLabel(ws), onsubmit: async function (e) {
+        e.preventDefault();
+        var f = ifile.files && ifile.files[0];
+        if (!f) { sectionErr(projMsg, { message: "Choose a backup file (.json) first." }); return; }
+        ibtn.disabled = true;
+        try {
+          var backup = JSON.parse(await f.text());
+          var r = await api("POST", "/api/workspaces/" + enc(id) + "/import", { backup: backup }, { key: uuid() });
+          projectTitles[r.project_id] = r.title; toast("Imported “" + r.title + "” (" + r.artifacts + (r.artifacts === 1 ? " item)" : " items)"));
+          location.hash = "#/p/" + enc(r.project_id);
+        } catch (err) { sectionErr(projMsg, err instanceof SyntaxError ? { message: "That file isn't an Agent Library backup (not valid JSON)." } : err); ibtn.disabled = false; }
+      } }, h("strong", { text: "Import a project from a backup" }),
+        h("p", { class: "muted small", text: "Creates a new project in this workspace from a backup file downloaded in Settings. Everything gets new IDs and is attributed to you." }),
+        h("div", { class: "row" }, ifile, ibtn));
+      newProj = h("div", null, newProj, importForm);
     }
 
     // Members. Role changes are a pending choice saved with a button, and promotions to admin/owner are confirmed.

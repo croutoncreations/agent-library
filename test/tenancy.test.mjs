@@ -191,3 +191,35 @@ test("rows written before migration 0017 (workspace_id NULL) resolve to the owne
 });
 
 async function me(h) { return (await h.req("GET", "/api/me")).body.principal; }
+
+test("import a backup into a workspace (D8 B): new ids, importer as author, admin-only, other workspaces untouched", async () => {
+  // Alice exports her private project (admin of her personal workspace) and imports it into the team workspace.
+  const bk = ok(await alice.req("GET", `/api/projects/${P.private}/backup`));
+  const r = ok(await alice.req("POST", `/api/workspaces/${WS}/import`, { backup: bk, title: "Imported diary" }), 201);
+  assert.notEqual(r.project_id, P.private, "new project id");
+  assert.equal(r.workspace_id, WS);
+  const list = ok(await alice.req("GET", `/api/projects/${r.project_id}/artifacts`)).artifacts;
+  assert.equal(list.length, bk.artifacts.length);
+  for (const a of list) assert.ok(!bk.artifacts.some((b) => b.id === a.id), "new document ids");
+  const doc = list.find((a) => a.title === "Diary");
+  const got = ok(await alice.req("GET", `/api/projects/${r.project_id}/artifacts/${doc.id}`));
+  assert.equal(got.body, "synthetic private zebracorn");
+  assert.equal(got.revision.author_id, (await me(alice)).id, "the importer is the author");
+  // The original is untouched and still private.
+  assert.equal(ok(await alice.req("GET", `/api/projects/${P.private}/artifacts/${ids.privateDoc}`)).body, "synthetic private zebracorn");
+  // Workspace members now see the imported project; outsiders don't; the audit names the workspace.
+  assert.ok(ok(await alice.req("GET", "/api/projects")).projects.some((p) => p.id === r.project_id && p.workspace_id === WS));
+  assert.equal((await dave.req("GET", `/api/projects/${r.project_id}/artifacts`)).status, 404);
+  const audit = sql(`SELECT workspace_id FROM audits WHERE action = 'backup.import' AND project_id = '${r.project_id}'`);
+  assert.equal(audit[0].workspace_id, WS);
+  // Not an admin there: 403; not a member: 404; tampered: 400 and nothing created.
+  assert.equal((await dave.req("POST", `/api/workspaces/${WS}/import`, { backup: bk })).status, 404);
+  const bad = structuredClone(bk); bad.revisions[0].sha256 = "0".repeat(64);
+  const before = sql(`SELECT COUNT(*) AS n FROM projects`)[0].n;
+  assert.equal((await alice.req("POST", `/api/workspaces/${WS}/import`, { backup: bad })).status, 400);
+  assert.equal(sql(`SELECT COUNT(*) AS n FROM projects`)[0].n, before);
+  // Suspended workspace: refused.
+  sql(`UPDATE workspaces SET status = 'suspended' WHERE id = '${WS}'`);
+  try { assert.equal((await alice.req("POST", `/api/workspaces/${WS}/import`, { backup: bk })).status, 403); }
+  finally { sql(`UPDATE workspaces SET status = 'active' WHERE id = '${WS}'`); }
+});

@@ -472,3 +472,7 @@ main > .tabs,main > nav.tabs{margin:16px 0 12px}
 .unsaved-draft .row{display:flex;gap:8px;flex-wrap:wrap}
 .titlebar + .view-only-note{margin-top:12px}
 .read-only [data-write]{display:none!important}
+.import-form{display:flex;flex-direction:column;gap:6px;margin-top:10px}
+.import-form p{margin:0}
+.import-form .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.import-form input[type=file]{min-width:0;max-width:100%}

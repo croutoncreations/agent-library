@@ -87,8 +87,13 @@ shared workspace exists, or accept this for the rollback window.
   other apps that I connected or can revoke as a project admin. `POST /api/app-clients` takes `workspace_id` (default
   personal; admin). A member may connect an app they registered into a project where they can write (like an API key
   it never exceeds their role); that project's admins see and can revoke it.
-- `POST /api/backup/restore` works only on a single-owner installation with no projects (`MULTI_USER` unset and at
-  most one person); shared installations answer 403 `restore_unavailable`.
+- `POST /api/workspaces/:id/import` `{backup, title?}` (admin of an active workspace): imports a project backup as a
+  **new** project in that workspace. Every id is new (project, documents, versions, comments, file keys), so nothing
+  collides with or reveals another workspace's ids. Authors in the backup aren't trusted as accounts: every version
+  and comment is attributed to the importer, keeping the original provenance labels. The workspace page offers it as
+  "Import a project from a backup". (Decision D8 B.)
+- `POST /api/restore` (whole-store restore with original ids) works only on a single-owner installation with no
+  projects (`MULTI_USER` unset and at most one person); shared installations answer 403 `restore_unavailable`.
 
 ## OAuth consent
 
