@@ -86,7 +86,8 @@ async function listProjects(ctx) {
   }
   // Every project in every active workspace I belong to (minus per-project 'none'), with my effective role.
   const ps = await visibleProjects(ctx.env, ctx.principal.id);
-  return { projects: ps.map((p) => ({ id: p.id, title: p.title, workspace_id: p.workspace_id, role: p.role, can_write: ROLE_RANK[p.role] >= ROLE_RANK.member })) };
+  return { projects: ps.map((p) => ({ id: p.id, title: p.title, workspace_id: p.workspace_id, role: p.role, can_write: ROLE_RANK[p.role] >= ROLE_RANK.member && p.workspace_status === "active",
+    ...p.workspace_status !== "active" ? { read_only_reason: "workspace_suspended" } : {} })) };
 }
 async function createProject(ctx, input) {
   requireHuman(ctx);
@@ -134,7 +135,7 @@ async function createGrant(ctx, projectId, input) {
 }
 async function listGrants(ctx, projectId) {
   requireHuman(ctx);
-  await requireProjectRole(ctx, projectId, "admin");
+  await requireProjectRole(ctx, projectId, "admin", true);
   const r = await db(ctx).prepare(
     `SELECT g.id, p.label, g.can_write, g.expires_at, g.revoked_at FROM grants g JOIN principals p ON p.id = g.principal_id
      WHERE g.project_id = ? ORDER BY g.created_at`
@@ -151,7 +152,8 @@ async function listGrants(ctx, projectId) {
 }
 async function updateGrant(ctx, projectId, grantId, input) {
   requireHuman(ctx);
-  await requireProjectRole(ctx, projectId, "admin");
+  // Revoking still works in a suspended (read-only) workspace; widening access doesn't.
+  await requireProjectRole(ctx, projectId, "admin", input?.revoke === true);
   let res;
   if (input.revoke === true) {
     res = await db(ctx).prepare("UPDATE grants SET revoked_at = ? WHERE id = ? AND project_id = ? AND revoked_at IS NULL").bind(nowMs(), grantId, projectId).run();
@@ -201,7 +203,7 @@ async function getArtifact(ctx, projectId, artifactId, revNo) {
   return {
     artifact: { ...artifactView(a, appConnectEnabled(ctx.env)), ...await tplProvenance(ctx, projectId, a) },
     revision: { rev: rev.rev_no, id: rev.id, size: rev.size, sha256: rev.sha256, mime: rev.mime, created_at: rev.created_at, author_id: rev.author_id },
-    ...access ? { access: { role: access.role, can_write: ROLE_RANK[access.role] >= ROLE_RANK.member } } : {},
+    ...access ? { access: { role: access.role, can_write: ROLE_RANK[access.role] >= ROLE_RANK.member && access.status === "active", ...access.status !== "active" ? { read_only_reason: "workspace_suspended" } : {} } } : {},
     ...a.kind === "markdown" || a.kind === "html" ? { body: readText(rev.body) } : a.kind === "json" || a.kind === "csv" ? { content: readText(rev.body), content_url: `/api/projects/${projectId}/artifacts/${artifactId}/content?rev=${rev.rev_no}` } : { content_url: `/api/projects/${projectId}/artifacts/${artifactId}/content?rev=${rev.rev_no}` }
   };
 }
@@ -570,7 +572,7 @@ async function listComments(ctx, projectId, artifactId) {
 }
 async function listAudit(ctx, projectId) {
   requireHuman(ctx);
-  await requireProjectRole(ctx, projectId, "admin");
+  await requireProjectRole(ctx, projectId, "admin", true);
   const r = await db(ctx).prepare(
     "SELECT seq, at, actor_id, action, object_id, rev_no, result, request_id FROM audits WHERE project_id = ? ORDER BY seq DESC LIMIT 200"
   ).bind(projectId).all();

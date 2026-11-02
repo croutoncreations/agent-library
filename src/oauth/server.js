@@ -40,18 +40,14 @@ function servers(origin, appConnect = false) {
   try {
     if (props?.publisher_id) {
       const publisher = await livePublisher(env, props);
-      if (!publisher && await publisherWorkspaceInactive(env, props)) throw new OAuthError("temporarily_unavailable", { description: "This workspace is not active", statusCode: 503, headers: { "retry-after": "3600" } });
       if (!publisher || publisher.revoked) throw new OAuthError("invalid_grant", { description: "Publisher revoked or token superseded" });
       if (env.__oauthRefreshClaimBusy) throw retry();
       return;
     }
     const connection = await liveConnection(env, props?.connection_id);
-    if (!connection) {
-      // A suspended workspace (e.g. billing) closes access but must not destroy connections: the provider revokes
-      // the grant on invalid_grant, so answer retryably instead. Revoked/expired/creator-removed stay invalid_grant.
-      if (await connectionWorkspaceInactive(env, props?.connection_id)) throw new OAuthError("temporarily_unavailable", { description: "This workspace is not active", statusCode: 503, headers: { "retry-after": "3600" } });
-      throw new OAuthError("invalid_grant", { description: "Connection revoked or expired" });
-    }
+    // Suspended workspaces stay readable (read-only), so their connections and publishers keep refreshing;
+    // revoked/expired connections, removed creators and deleting workspaces are invalid_grant.
+    if (!connection) throw new OAuthError("invalid_grant", { description: "Connection revoked or expired" });
     if (env.__oauthRefreshClaimBusy) throw retry();
     // Preserve only currently valid connections. Never revive an expired/revoked grant or widen its projects.
     const renewed = await env.DB.prepare("UPDATE oauth_connections SET expires_at = ? WHERE id = ? AND revoked_at IS NULL AND expires_at > ? RETURNING id")
@@ -95,27 +91,12 @@ function servers(origin, appConnect = false) {
   cache.set(cacheKey, s);
   return s;
 }
-// True when the credential is otherwise live, its creator is still a member, and only the workspace is suspended
-// (recoverable). Deleting workspaces and removed creators are terminal (invalid_grant).
-async function connectionWorkspaceInactive(env, id) {
-  if (typeof id !== "string" || !/^oac_[A-Za-z0-9_-]{10,64}$/.test(id)) return false;
-  return !!await env.DB.prepare(`SELECT 1 FROM oauth_connections oc JOIN oauth_connection_projects cp ON cp.connection_id = oc.id JOIN projects p ON p.id = cp.project_id
-    JOIN workspaces w ON w.id = COALESCE(p.workspace_id, 'wsp_' || p.owner_id)
-    WHERE oc.id = ? AND oc.revoked_at IS NULL AND oc.expires_at > ? AND w.status = 'suspended'
-      AND EXISTS (SELECT 1 FROM workspace_members m WHERE m.workspace_id = w.id AND m.principal_id = COALESCE(oc.created_by, oc.owner_principal_id)) LIMIT 1`).bind(id, nowMs()).first();
-}
-async function publisherWorkspaceInactive(env, p) {
-  if (!p || typeof p.publisher_id !== "string") return false;
-  return !!await env.DB.prepare(`SELECT 1 FROM publishers pb JOIN projects pj ON pj.id = pb.project_id JOIN workspaces w ON w.id = COALESCE(pj.workspace_id, 'wsp_' || pj.owner_id)
-    WHERE pb.id = ? AND pb.revoked_at IS NULL AND pb.token_epoch = ? AND w.status = 'suspended'
-      AND EXISTS (SELECT 1 FROM workspace_members m WHERE m.workspace_id = w.id AND m.principal_id = COALESCE(pb.created_by, pb.owner_principal_id))`).bind(p.publisher_id, p.epoch).first();
-}
 async function livePublisher(env, p) {
   if (!p || typeof p.publisher_id !== "string" || !/^pub_[A-Za-z0-9_-]{10,64}$/.test(p.publisher_id)) return null;
   const row = await env.DB.prepare(
     `SELECT pb.*, ac.client_id, ac.disabled_at AS client_disabled, ac.id AS apc_id FROM publishers pb JOIN app_clients ac ON ac.id = pb.app_client_id
      JOIN projects pj ON pj.id = pb.project_id WHERE pb.id = ?
-       AND ${memberRoleSql("pj.id", "member", "COALESCE(pb.created_by, pb.owner_principal_id)")}`
+       AND ${memberRoleSql("pj.id", "member", "COALESCE(pb.created_by, pb.owner_principal_id)", true)}`
   ).bind(p.publisher_id).first();
   if (!row) return null;
   if (row.revoked_at !== null) return { ...row, revoked: true };
@@ -168,7 +149,7 @@ function logRegistration(outcome, m) {
 // Projects a person can connect an agent to: every visible project, with whether they may grant edit access.
 async function consentProjects(env, principalId) {
   const list = (await visibleProjects(env, principalId)).slice(0, 500).map((p) => ({ id: p.id, title: p.title, workspace_id: p.workspace_id,
-    workspace_name: p.personal ? null : p.workspace_name, can_write: ROLE_RANK[p.role] >= ROLE_RANK.member }));
+    workspace_name: p.personal ? null : p.workspace_name, can_write: ROLE_RANK[p.role] >= ROLE_RANK.member && p.workspace_status === "active" }));
   // Active workspaces where the signer may create projects (admin+), including ones with no projects yet.
   list.adminWorkspaces = (await env.DB.prepare(`SELECT w.id, w.name, w.personal FROM workspace_members m JOIN workspaces w ON w.id = m.workspace_id
     WHERE m.principal_id = ? AND w.status = 'active' AND m.role IN ('owner','admin') ORDER BY w.personal DESC, w.created_at LIMIT 50`).bind(principalId).all()).results
@@ -180,9 +161,11 @@ async function liveConnection(env, id) {
   const row = await env.DB.prepare("SELECT * FROM oauth_connections WHERE id = ?").bind(id).first();
   if (!row || row.revoked_at !== null || row.expires_at <= nowMs()) return null;
   const ps = await env.DB.prepare(
-    `SELECT p.id, p.title, cp.can_write AND ${memberRoleSql("p.id", "member")} AS can_write FROM oauth_connection_projects cp JOIN projects p ON p.id = cp.project_id
+    `SELECT p.id, p.title, cp.can_write AND ${memberRoleSql("p.id", "member")} AS can_write,
+       cp.can_write AND ${memberRoleSql("p.id", "member", "?", true)} AND NOT ${memberRoleSql("p.id", "member")} AS read_only
+     FROM oauth_connection_projects cp JOIN projects p ON p.id = cp.project_id
      WHERE cp.connection_id = ? AND ${memberRoleSql("p.id", "viewer")} ORDER BY p.created_at LIMIT ${MAX_CONN_PROJECTS}`
-  ).bind(row.created_by ?? row.owner_principal_id, id, row.created_by ?? row.owner_principal_id).all();
+  ).bind(...Array(3).fill(row.created_by ?? row.owner_principal_id), id, row.created_by ?? row.owner_principal_id).all();
   if (!ps.results.length) return null;
   return { ...row, projects: ps.results };
 }

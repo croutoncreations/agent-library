@@ -197,7 +197,7 @@ test("every chunk re-checks current access in its own statement (grant, API key,
     ["key creator removed from the workspace", "apiKey", (s) => s.exec("DELETE FROM workspace_members WHERE principal_id = 'own'")],
     ["OAuth connection creator removed from the workspace", "oauth", (s) => s.exec("DELETE FROM workspace_members WHERE principal_id = 'own'")],
     ["grant creator removed from the workspace", "grant", (s) => s.exec("DELETE FROM workspace_members WHERE principal_id = 'own'")],
-    ["workspace suspended", "grant", (s) => s.exec("UPDATE workspaces SET status = 'suspended'")],
+    ["workspace being deleted", "grant", (s) => s.exec("UPDATE workspaces SET status = 'deleting'")],
   ];
   for (const [name, who, revoke] of cases) {
     clock = Date.now();

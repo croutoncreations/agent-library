@@ -1,5 +1,5 @@
 import { requireHuman } from "../auth.js";
-import { ROLE_RANK, memberRoleSql, projectRole, workspaceRoleSql } from "../tenancy.js";
+import { ROLE_RANK, memberRoleSql, projectRole, workspaceRoleSql, readOnlyError } from "../tenancy.js";
 import { HttpError, nowIso, nowMs, randomId, sha256Hex, str } from "../util.js";
 
 var KEY_LIFETIMES_DAYS = [1, 7, 30, 90];
@@ -8,7 +8,7 @@ var MAX_PROJECTS_PER_KEY = 50;
 var KEY_RE = /^alk_[A-Za-z0-9_-]{43}$/;
 // A key is managed by the person who created it, or an admin of its workspace. Columns are qualified: inside
 // workspaceRoleSql a bare workspace_id would bind to workspace_members.workspace_id (any admin anywhere).
-var KEY_MANAGER = `(COALESCE(k.created_by, k.owner_principal_id) = ? OR ${workspaceRoleSql("COALESCE(k.workspace_id, 'wsp_' || k.owner_principal_id)", "admin")})`;
+var KEY_MANAGER = `(COALESCE(k.created_by, k.owner_principal_id) = ? OR ${workspaceRoleSql("COALESCE(k.workspace_id, 'wsp_' || k.owner_principal_id)", "admin", "?", true)})`; // list/revoke work while suspended
 async function validateScope(env, ownerId, raw) {
   if (!Array.isArray(raw) || raw.length < 1 || raw.length > MAX_PROJECTS_PER_KEY)
     throw new HttpError(400, "invalid_input", `projects must list 1-${MAX_PROJECTS_PER_KEY} projects`);
@@ -23,7 +23,8 @@ async function validateScope(env, ownerId, raw) {
   }
   // Every project must be visible to the creator, all in one workspace, and read_write needs member or above.
   const roles = await Promise.all(out2.map((s) => projectRole(env, ownerId, s.project_id)));
-  if (roles.some((r) => !r || !r.role || r.status !== "active")) throw new HttpError(404, "not_found", "Project not found");
+  if (roles.some((r) => !r || !r.role || r.status === "deleting")) throw new HttpError(404, "not_found", "Project not found");
+  if (out2.some((s, i) => s.can_write && roles[i].status !== "active")) throw readOnlyError();
   if (new Set(roles.map((r) => r.workspace_id)).size !== 1) throw new HttpError(400, "invalid_input", "A key covers projects from one workspace");
   if (out2.some((s, i) => s.can_write && ROLE_RANK[roles[i].role] < ROLE_RANK.member)) throw new HttpError(403, "forbidden", "Your role in this workspace is read-only");
   out2.workspaceId = roles[0].workspace_id;
@@ -156,9 +157,11 @@ async function verifyApiKey(env, authz) {
   if (row.revoked_at !== null) throw new HttpError(401, "credential_revoked", "Credential revoked", { reason: "revoked", key_id: row.id });
   if (row.expires_at <= nowMs()) throw new HttpError(401, "credential_expired", "Credential expired", { reason: "expired", key_id: row.id });
   const ps = await env.DB.prepare(
-    `SELECT p.id, p.title, acp.can_write AND ${memberRoleSql("p.id", "member")} AS can_write FROM api_credential_projects acp JOIN projects p ON p.id = acp.project_id
+    `SELECT p.id, p.title, acp.can_write AND ${memberRoleSql("p.id", "member")} AS can_write,
+       acp.can_write AND ${memberRoleSql("p.id", "member", "?", true)} AND NOT ${memberRoleSql("p.id", "member")} AS read_only
+     FROM api_credential_projects acp JOIN projects p ON p.id = acp.project_id
      WHERE acp.credential_id = ? AND ${memberRoleSql("p.id", "viewer")} ORDER BY p.created_at LIMIT ${MAX_PROJECTS_PER_KEY}`
-  ).bind(row.created_by ?? row.owner_principal_id, row.id, row.created_by ?? row.owner_principal_id).all();
+  ).bind(...Array(3).fill(row.created_by ?? row.owner_principal_id), row.id, row.created_by ?? row.owner_principal_id).all();
   // The key's creator no longer reaches any of its projects (removed, or workspace closed): the key is inactive.
   if (!ps.results.length) throw new HttpError(401, "credential_inactive", "Credential has no active projects", { reason: "no_active_projects", key_id: row.id });
   if (!row.last_used_at || nowMs() - row.last_used_at > 6e4)
@@ -171,7 +174,7 @@ async function verifyApiKey(env, authz) {
     ownerId: row.owner_principal_id,
     principalId: row.principal_id,
     label: row.label,
-    projects: ps.results.map((p) => ({ id: p.id, title: p.title, can_write: !!p.can_write }))
+    projects: ps.results.map((p) => ({ id: p.id, title: p.title, can_write: !!p.can_write, read_only: !!p.read_only }))
   };
 }
 

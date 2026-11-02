@@ -83,7 +83,7 @@ async function listAppClients(ctx) {
     `SELECT pb.id, pb.app_client_id, pb.project_id, pb.folder_id, pb.created_at, pb.revoked_at, pb.current_source_revision, pb.current_snapshot_id
      FROM publishers pb WHERE (pb.app_client_id IN (SELECT c.id FROM app_clients c WHERE ${APP_MANAGER})
          AND (COALESCE(pb.created_by, pb.owner_principal_id) = ? OR ${memberRoleSql("pb.project_id", "viewer")}))
-       OR COALESCE(pb.created_by, pb.owner_principal_id) = ? OR ${memberRoleSql("pb.project_id", "admin")} ORDER BY pb.created_at DESC LIMIT 500`
+       OR COALESCE(pb.created_by, pb.owner_principal_id) = ? OR ${memberRoleSql("pb.project_id", "admin", "?", true)} ORDER BY pb.created_at DESC LIMIT 500`
   ).bind(ctx.principal.id, ctx.principal.id, ctx.principal.id, ctx.principal.id, ctx.principal.id, ctx.principal.id, ctx.principal.id).all();
   const pv = (p) => ({
     publisher_id: p.id,
@@ -104,7 +104,7 @@ async function listAppClients(ctx) {
 async function disableAppClient(ctx, id) {
   requireHuman(ctx);
   requireAppConnect(ctx);
-  const r = await ctx.env.DB.prepare(`UPDATE app_clients AS c SET disabled_at = ? WHERE c.id = ? AND (c.owner_principal_id = ? OR ${workspaceRoleSql(APP_WS, "admin")}) AND c.disabled_at IS NULL`).bind(nowMs(), id, ctx.principal.id, ctx.principal.id).run();
+  const r = await ctx.env.DB.prepare(`UPDATE app_clients AS c SET disabled_at = ? WHERE c.id = ? AND (c.owner_principal_id = ? OR ${workspaceRoleSql(APP_WS, "admin", "?", true)}) AND c.disabled_at IS NULL`).bind(nowMs(), id, ctx.principal.id, ctx.principal.id).run();
   if (!r.meta.changes) throw new HttpError(404, "not_found", "App not found or already disabled");
   await ctx.env.DB.prepare("INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id, workspace_id) VALUES (?, ?, NULL, 'app_client.disable', ?, 'ok', ?, (SELECT COALESCE(workspace_id, 'wsp_' || owner_principal_id) FROM app_clients WHERE id = ?))").bind(nowIso(), ctx.principal.id, id, ctx.requestId, id).run();
   return { ok: true };
@@ -114,7 +114,7 @@ async function revokePublisher(ctx, id) {
   requireAppConnect(ctx);
   // The person who connected the publisher, or an admin of the project's workspace.
   const r = await ctx.env.DB.prepare(`UPDATE publishers AS pb SET revoked_at = ? WHERE pb.id = ? AND pb.revoked_at IS NULL
-      AND (COALESCE(pb.created_by, pb.owner_principal_id) = ? OR ${memberRoleSql("pb.project_id", "admin")})`).bind(nowMs(), id, ctx.principal.id, ctx.principal.id).run();
+      AND (COALESCE(pb.created_by, pb.owner_principal_id) = ? OR ${memberRoleSql("pb.project_id", "admin", "?", true)})`).bind(nowMs(), id, ctx.principal.id, ctx.principal.id).run();
   if (!r.meta.changes) throw new HttpError(404, "not_found", "Publisher not found or already revoked");
   const p = await ctx.env.DB.prepare("SELECT project_id FROM publishers WHERE id = ?").bind(id).first("project_id");
   await ctx.env.DB.prepare("INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id) VALUES (?, ?, ?, 'publisher.revoke', ?, 'ok', ?)").bind(nowIso(), ctx.principal.id, p, id, ctx.requestId).run();

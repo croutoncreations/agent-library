@@ -235,36 +235,46 @@ test("idempotency replay does not outlive a demotion (API key and OAuth)", async
   ok(await bob.req("PATCH", `/api/workspaces/${WSA}/members/${ownerId}`, { role: "member" }));
 });
 
-test("suspension closes every credential into the workspace; OAuth refresh stays recoverable", async () => {
+test("suspension makes the workspace read-only for every credential; refresh keeps working; deleting closes it", async () => {
   sql(`UPDATE workspaces SET status = 'suspended' WHERE id = '${WSA}'`);
   try {
+    // Every read surface keeps working for every credential type (D11 B / D13 A).
+    for (const kind of ["session", "key", "grant"]) for (const [label, op] of readOps(kind, A)) {
+      const r = await op();
+      assert.ok(r.status === 200 || r.status === 206, `${kind} ${label} in a suspended workspace: ${r.status} ${r.text.slice(0, 160)}`);
+    }
+    for (const [label, op] of readOps("oauth", A, cred.oauthA)) assert.equal((await op()).status, 200, `oauth ${label} in a suspended workspace`);
+    // Every write surface is refused with workspace_read_only, and nothing changes.
+    const rev = ok(await bob.req("GET", `/api/projects/${A.project}/artifacts/${A.doc}`)).revision.rev;
+    for (const [label, op] of [
+      ["session save", () => session(bob, "PUT", `/api/projects/${A.project}/artifacts/${A.doc}`, { expected_revision: rev, body: "x" })],
+      ["session upload", () => session(bob, "POST", `/api/projects/${A.project}/uploads`, { title: "x", mime: "image/png", size: png.length, sha256: sha256(png) })],
+      ["session comment", () => session(bob, "POST", `/api/projects/${A.project}/artifacts/${A.doc}/comments`, { revision: rev, body: "x" })],
+      ["key save", () => v1(cred.key, "PUT", `/v1/projects/${A.project}/files/${A.doc}`, { body: { expected_revision: rev, body: "x" } })],
+      ["grant save", () => api(cred.grant, "PUT", `/api/projects/${A.project}/artifacts/${A.doc}`, { body: { expected_revision: rev, body: "x" } })],
+      ["grant mcp save", () => mcpCall(cred.grantMcp, "save_markdown", { project_id: A.project, artifact_id: A.doc, expected_revision: rev, body: "x", idempotency_key: key("s") })],
+      ["oauth save", () => oc(cred.oauthA, "save_markdown", { project_id: A.project, artifact_id: A.doc, expected_revision: rev, body: "x", idempotency_key: key("s") })],
+      ["oauth upload", () => oc(cred.oauthA, "upload_file", { project_id: A.project, title: "x", mime: "image/png", content_base64: png.toString("base64"), change_note: "x", idempotency_key: key("s") })],
+    ]) {
+      const r = await op();
+      assert.equal(r.status, 403, `${label} in a suspended workspace: ${r.status} ${r.text.slice(0, 160)}`);
+      assert.match(r.text, /workspace_read_only/, label);
+    }
+    assert.equal(ok(await bob.req("GET", `/api/projects/${A.project}/artifacts/${A.doc}`)).revision.rev, rev);
+    // Refresh keeps working while suspended: connections stay usable for reads.
+    const rt = await h.token({ grant_type: "refresh_token", refresh_token: cred.oauthA.refresh_token, client_id: cred.oauthA.client_id, resource: `${h.issuer}/mcp` });
+    assert.equal(rt.status, 200, JSON.stringify(rt.body));
+    cred.oauthA.refresh_token = rt.body.refresh_token;
+    // Deleting: closed for every credential, and refresh is terminal.
+    sql(`UPDATE workspaces SET status = 'deleting' WHERE id = '${WSA}'`);
     for (const kind of ["key", "grant"]) for (const [label, op] of readOps(kind, A)) {
       const r = await op();
-      assert.ok(r.status === 401 || r.status === 404, `${kind} ${label} into a suspended workspace: ${r.status}`);
+      assert.ok(r.status === 401 || r.status === 404, `${kind} ${label} in a deleting workspace: ${r.status}`);
       assert.doesNotMatch(r.text, /zebraAlpha/);
     }
-    for (const [label, op] of readOps("session", A)) {
-      const r = await op();
-      assert.ok(r.status === 403 || r.status === 404, `session ${label} into a suspended workspace: ${r.status}`);
-    }
-    for (const [label, op] of readOps("oauth", A, cred.oauthA)) {
-      const r = await op();
-      assert.notEqual(r.status, 200, `oauth ${label} into a suspended workspace`);
-      assert.doesNotMatch(r.text, /zebraAlpha/);
-    }
-    // Refresh during suspension: retryable, not invalid_grant (the provider would destroy the connection).
-    const rt = await h.token({ grant_type: "refresh_token", refresh_token: cred.oauthA.refresh_token, client_id: cred.oauthA.client_id, resource: `${h.issuer}/mcp` });
-    assert.equal(rt.status, 503, JSON.stringify(rt.body));
-    assert.equal(rt.body.error, "temporarily_unavailable");
+    for (const [label, op] of readOps("session", A)) assert.equal((await op()).status, 404, `session ${label} in a deleting workspace`);
   } finally { sql(`UPDATE workspaces SET status = 'active' WHERE id = '${WSA}'`); }
-  // Reactivated: the same refresh token works again once the single-use gate's 5-minute reclaim window for the
-  // refused attempt has passed (src/oauth/server.js singleUseGate). Simulate the wait instead of sleeping.
-  const early = await h.token({ grant_type: "refresh_token", refresh_token: cred.oauthA.refresh_token, client_id: cred.oauthA.client_id, resource: `${h.issuer}/mcp` });
-  assert.equal(early.status, 503, "still inside the reclaim window");
-  sql("UPDATE oauth_code_redemptions SET redeemed_at = redeemed_at - 301000");
-  const rt2 = await h.token({ grant_type: "refresh_token", refresh_token: cred.oauthA.refresh_token, client_id: cred.oauthA.client_id, resource: `${h.issuer}/mcp` });
-  assert.equal(rt2.status, 200, JSON.stringify(rt2.body));
-  cred.oauthA.refresh_token = rt2.body.refresh_token;
+  assert.equal((await v1(cred.key, "GET", `/v1/projects/${A.project}/files/${A.doc}`)).status, 200, "back to normal once active");
 });
 
 test("removal: every credential the person created becomes inactive; refresh is invalid_grant", async () => {

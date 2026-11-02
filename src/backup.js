@@ -17,7 +17,7 @@ async function exportBackup(ctx, projectId) {
   let metaVersionsExport = [];
   const DB = ctx.env.DB;
   // Exporting a whole project is an admin action in its workspace.
-  await requireProjectRole(ctx, projectId, "admin");
+  await requireProjectRole(ctx, projectId, "admin", true); // export works while suspended (read-only)
   const p = await DB.prepare("SELECT * FROM projects WHERE id = ?").bind(projectId).first();
   if (!p) throw new HttpError(404, "not_found", "Project not found");
   const pubFiles = await DB.prepare("SELECT COUNT(*) AS n FROM artifacts WHERE project_id = ? AND publisher_id IS NOT NULL").bind(projectId).first("n").catch(() => 0);

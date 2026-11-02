@@ -387,7 +387,7 @@ var projectTitles = {};
 // Effective access per project from /api/projects (role in its workspace). The server enforces it; the UI only
 // hides controls a viewer can't use. Unknown = treat as writable (never hide on missing data).
 var projectAccess = {};
-function noteProjects(list) { (list || []).forEach(function (p) { projectTitles[p.id] = p.title; projectAccess[p.id] = { role: p.role || "owner", can_write: p.can_write !== false, workspace_id: p.workspace_id }; }); }
+function noteProjects(list) { (list || []).forEach(function (p) { projectTitles[p.id] = p.title; projectAccess[p.id] = { role: p.role || "owner", can_write: p.can_write !== false, workspace_id: p.workspace_id, read_only_reason: p.read_only_reason || null }; }); }
 function canWrite(pid) { var a = projectAccess[pid]; return !a || a.can_write; }
 async function ensureProjectAccess(pid) {
   if (projectAccess[pid]) return projectAccess[pid];
@@ -406,8 +406,12 @@ function unsavedDraftBox(text, onDiscard) {
   return box;
 }
 // For people with view-only access: remove write controls (marked data-write) and say why, once per view.
-function viewOnlyNote() {
-  return h("div", { class: "callout view-only-note", role: "note" }, icon("alert"), h("div", null, "You have view-only access to this project. Ask a workspace admin if you need to edit."));
+function viewOnlyNote(pid) {
+  var a = pid ? projectAccess[pid] : null;
+  var suspended = a && a.read_only_reason === "workspace_suspended";
+  return h("div", { class: "callout view-only-note", role: "note" }, icon("alert"), h("div", null, suspended
+    ? "This workspace is suspended, so it's read-only. You can still read, download and export everything; an owner can reactivate it."
+    : "You have view-only access to this project. Ask a workspace admin if you need to edit."));
 }
 function projCrumbs(pid, extra) {
   // The brand returns Home; project crumbs keep the existing project navigation.
@@ -558,7 +562,10 @@ async function viewWorkspace(id) {
         err.status === 404 ? "It doesn't exist or you're not a member." : err.message, h("a", { class: "btn secondary", href: "#/workspaces" }, "All workspaces")));
       return;
     }
-    var ws = d.workspace, admin = ws.role === "owner" || ws.role === "admin", owner = ws.role === "owner";
+    var ws = d.workspace, suspended = ws.status === "suspended";
+    // Suspended workspaces are read-only: no new projects, invites, role changes or renames (cleanup still works).
+    var realAdmin = ws.role === "owner" || ws.role === "admin";
+    var admin = !suspended && realAdmin, owner = ws.role === "owner";
     setCrumbs([{ t: "Home", href: "#/" }, { t: "Workspaces", href: "#/workspaces" }, { t: wsLabel(ws) }]);
     var owners = d.members.filter(function (m) { return m.role === "owner"; }).length;
 
@@ -609,7 +616,8 @@ async function viewWorkspace(id) {
       var lastOwner = m.role === "owner" && owners < 2;
       // Owners manage every role; admins manage members and viewers. The last owner has no controls (the server
       // refuses too): a workspace needs at least one owner.
-      var canEdit = !ws.personal && !lastOwner && (owner || (admin && m.role !== "owner" && m.role !== "admin"));
+      var canManage = !ws.personal && !lastOwner && (owner || (realAdmin && m.role !== "owner" && m.role !== "admin"));
+      var canEdit = canManage && !suspended; // role changes need an active workspace; removing works while suspended
       var controls = h("span", { class: "row member-controls" });
       if (canEdit) {
         var sel = h("select", { "aria-label": "Role for " + m.label });
@@ -629,7 +637,7 @@ async function viewWorkspace(id) {
         });
         controls.append(sel, save);
       } else controls.append(h("span", { class: "badge" + (m.role === "owner" ? " accent" : ""), text: ROLE_LABEL[m.role], title: lastOwner && !ws.personal ? "A workspace needs at least one owner. Make someone else an owner first." : null }));
-      if (!ws.personal && !lastOwner && (m.me || canEdit)) controls.append(h("button", { type: "button", class: "danger secondary", onclick: async function (e) {
+      if (!ws.personal && !lastOwner && (m.me || canManage)) controls.append(h("button", { type: "button", class: "danger secondary", onclick: async function (e) {
         var q = m.me ? "Leave " + ws.name + "? You and the agents you connected lose access to its projects right away." : "Remove " + m.label + " from " + ws.name + "? They and the agents they connected lose access to its projects right away.";
         if (!confirm(q)) return;
         e.target.disabled = true;
@@ -645,6 +653,8 @@ async function viewWorkspace(id) {
 
     var parts = [pageHead(wsLabel(ws), { eyebrow: ws.personal ? "Personal workspace" : "Shared workspace",
       sub: ws.personal ? "Only you can see projects here." + (S.multiUser ? " Create a shared workspace to invite people." : "") : "Your role: " + ROLE_LABEL[ws.role] + ". " + ROLE_HELP[ws.role] + "." }),
+      suspended ? h("div", { class: "callout", role: "note" }, icon("alert"), h("div", null, h("strong", { text: "This workspace is suspended and read-only. " }),
+        "Everyone can still read, download and export its projects, and connected agents can still read. Editing, uploads, new projects, invitations and role changes are paused until it's reactivated." + (owner ? " You can still remove members or delete the workspace." : ""))) : null,
       h("h2", { id: "projects-h", tabIndex: -1, text: "Projects" }), projMsg, projList, newProj,
       h("h2", { id: "members-h", tabIndex: -1, text: "Members" }), memMsg, members];
 
@@ -689,7 +699,7 @@ async function viewWorkspace(id) {
       confirmName.addEventListener("input", function () { delBtn.disabled = confirmName.value.trim() !== ws.name; });
       var nProj = projects.length, nMem = d.members.length;
       parts.push(h("h2", { text: "Workspace settings" }), setMsg,
-        h("form", { class: "card row", "aria-label": "Rename workspace", onsubmit: async function (e) {
+        suspended ? null : h("form", { class: "card row", "aria-label": "Rename workspace", onsubmit: async function (e) {
           e.preventDefault();
           var v = rename.value.trim(); if (!v || v === ws.name) return;
           renameBtn.disabled = true;
@@ -1503,12 +1513,12 @@ async function viewList(pid, trash) {
   }
   // Viewers: no create/upload controls. Known from the cached project list, or applied once it arrives.
   var knownAccess = projectAccess[pid];
-  if (knownAccess && !knownAccess.can_write) { actions = null; panel = viewOnlyNote(); }
+  if (knownAccess && !knownAccess.can_write) { actions = null; panel = viewOnlyNote(pid); }
   else if (!knownAccess) ensureProjectAccess(pid).then(function (acc) {
     if (!acc || acc.can_write || !app.contains(titleH1)) return;
     app.querySelectorAll("[data-write]").forEach(function (el) { el.remove(); });
     (actions || []).forEach(function (b) { b.remove(); }); (Array.isArray(panel) ? panel : []).forEach(function (el) { el.remove(); });
-    var ph = app.querySelector(".page-head"); if (ph) ph.after(viewOnlyNote());
+    var ph = app.querySelector(".page-head"); if (ph) ph.after(viewOnlyNote(pid));
     load(true);
   });
   var titleH1 = h("h1", { text: trash ? "Trash" : (projectTitles[pid] || "Documents"), dataset: { projectTitle: pid } });
@@ -2400,7 +2410,7 @@ async function viewArtifact(pid, aid, initialTab) {
     if (tabBtns.edit) { tabBtns.edit.remove(); panels.edit.remove(); delete tabBtns.edit; }
     details.remove(); comForm.remove();
     app.querySelectorAll(".footbar, [data-write]").forEach(function (el) { el.remove(); });
-    var tb = app.querySelector(".titlebar"); if (tb && !app.querySelector(".view-only-note")) tb.after(viewOnlyNote());
+    var tb = app.querySelector(".titlebar"); if (tb && !app.querySelector(".view-only-note")) tb.after(viewOnlyNote(pid));
     var note = app.querySelector(".view-only-note");
     var metaLine = app.querySelector(".doc-meta");
     if (unsaved !== null && (metaLine || note)) (metaLine || note).after(unsavedDraftBox(unsaved, function () { clearDraft(pid, aid); }));

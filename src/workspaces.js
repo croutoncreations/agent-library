@@ -90,7 +90,7 @@ export async function listMembers(ctx, id) {
      ORDER BY created_at DESC LIMIT 200`
   ).bind(id, nowMs()).all() : { results: [] };
   return {
-    workspace: { id: ws.id, name: ws.name, personal: !!ws.personal, role: ws.role },
+    workspace: { id: ws.id, name: ws.name, personal: !!ws.personal, role: ws.role, status: ws.status },
     // Emails are shown to admins only; everyone sees names and roles.
     members: m.results.map((x) => ({ principal_id: x.principal_id, label: x.label, email: admin ? x.email : null, role: x.role, created_at: x.created_at, me: x.principal_id === ctx.principal.id })),
     invites: inv.results.map((i) => ({ ...i, expires_at: new Date(i.expires_at).toISOString() }))
@@ -129,7 +129,7 @@ export async function removeMember(ctx, id, principalId) {
   // Leaving works in a suspended workspace too (not while it is being deleted); removing others needs it active.
   const me = self
     ? await ctx.env.DB.prepare("SELECT w.id, w.personal, w.status, m.role FROM workspaces w JOIN workspace_members m ON m.workspace_id = w.id AND m.principal_id = ? WHERE w.id = ? AND w.status <> 'deleting'").bind(ctx.principal.id, id).first()
-    : await requireWorkspaceRole(ctx, id, "admin");
+    : await requireWorkspaceRole(ctx, id, "admin", true);
   if (!me) throw new HttpError(404, "not_found", "Workspace not found");
   if (me.personal && self) throw new HttpError(409, "personal_workspace", "You can't leave your personal workspace");
   const cur = await ctx.env.DB.prepare("SELECT role FROM workspace_members WHERE workspace_id = ? AND principal_id = ?").bind(id, principalId).first("role");
@@ -138,7 +138,7 @@ export async function removeMember(ctx, id, principalId) {
   const need = self ? "viewer" : cur === "owner" || cur === "admin" ? "owner" : "admin";
   const [r] = await ctx.env.DB.batch([
     ctx.env.DB.prepare(`DELETE FROM workspace_members AS wm WHERE wm.workspace_id = ? AND wm.principal_id = ? AND wm.role = ?
-        AND ${self ? "wm.principal_id = ?" : workspaceRoleSql("?", need)} AND ${OTHER_OWNER}`).bind(id, principalId, cur, ctx.principal.id, ...self ? [] : [id], id, principalId),
+        AND ${self ? "wm.principal_id = ?" : workspaceRoleSql("?", need, "?", true)} AND ${OTHER_OWNER}`).bind(id, principalId, cur, ctx.principal.id, ...self ? [] : [id], id, principalId),
     // Per-project caps go with the membership.
     ctx.env.DB.prepare(`DELETE FROM project_members WHERE principal_id = ? AND changes() = 1 AND project_id IN
         (SELECT id FROM projects WHERE COALESCE(workspace_id, 'wsp_' || owner_id) = ?)`).bind(principalId, id),
@@ -182,10 +182,10 @@ export async function createInvite(ctx, id, input, origin) {
 
 export async function revokeInvite(ctx, id, inviteId) {
   requireHuman(ctx);
-  await requireWorkspaceRole(ctx, id, "admin");
+  await requireWorkspaceRole(ctx, id, "admin", true);
   const [r] = await ctx.env.DB.batch([
     ctx.env.DB.prepare(`UPDATE workspace_invites AS wi SET revoked_at = ? WHERE wi.id = ? AND wi.workspace_id = ? AND wi.accepted_at IS NULL AND wi.revoked_at IS NULL
-        AND ${workspaceRoleSql("wi.workspace_id", "admin")}`).bind(nowMs(), inviteId, id, ctx.principal.id),
+        AND ${workspaceRoleSql("wi.workspace_id", "admin", "?", true)}`).bind(nowMs(), inviteId, id, ctx.principal.id),
     wsAudit(ctx.env, ctx, id, "invite.revoke", inviteId, "ok", "changes() = 1")
   ]);
   if (!r.meta.changes) throw new HttpError(404, "not_found", "Invite not found or no longer pending");

@@ -24,6 +24,12 @@ export const NEED = { read: "viewer", write: "member", manage: "admin", own: "ow
 export const projectWorkspaceSql = (alias) => `COALESCE(${alias}.workspace_id, 'wsp_' || ${alias}.owner_id)`;
 export const personalWorkspaceId = (principalId) => `wsp_${principalId}`;
 
+/**
+ * Suspended workspaces are read-only (decisions D11 B / D13 A): reading (viewer) works, writing and most
+ * administration need an active workspace. A few cleanup actions pass allowSuspended=true explicitly (revoking
+ * credentials, removing members, export, audit). 'deleting' workspaces are closed to everything.
+ */
+const statusOk = (alias, allowSuspended) => allowSuspended ? `${alias}.status IN ('active','suspended')` : `${alias}.status = 'active'`;
 const rankCase = (expr) => `CASE ${expr} WHEN 'owner' THEN 4 WHEN 'admin' THEN 3 WHEN 'member' THEN 2 WHEN 'viewer' THEN 1 ELSE 0 END`;
 
 /**
@@ -31,21 +37,21 @@ const rankCase = (expr) => `CASE ${expr} WHEN 'owner' THEN 4 WHEN 'admin' THEN 3
  * Both are SQL expressions ("?" placeholders are bound by the caller, principal first, then project).
  * Effective role = workspace role, capped by a project_members row if present; the workspace must be active.
  */
-export function memberRoleSql(projectIdExpr, need, principalExpr = "?") {
+export function memberRoleSql(projectIdExpr, need, principalExpr = "?", allowSuspended = need === "viewer") {
   const min = ROLE_RANK[need];
   if (!min) throw new Error("bad role " + need);
   return `EXISTS (SELECT 1 FROM projects t_p
       JOIN workspaces t_w ON t_w.id = ${projectWorkspaceSql("t_p")}
       JOIN workspace_members t_m ON t_m.workspace_id = t_w.id AND t_m.principal_id = ${principalExpr}
       LEFT JOIN project_members t_pm ON t_pm.project_id = t_p.id AND t_pm.principal_id = t_m.principal_id
-      WHERE t_p.id = ${projectIdExpr} AND t_w.status = 'active'
+      WHERE t_p.id = ${projectIdExpr} AND ${statusOk("t_w", allowSuspended)}
         AND MIN(${rankCase("t_m.role")}, CASE WHEN t_pm.role IS NULL THEN 4 ELSE ${rankCase("t_pm.role")} END) >= ${min})`;
 }
 
 /** SQL: human `principalExpr` has at least `need` in active workspace `workspaceExpr` (both SQL expressions). */
-export function workspaceRoleSql(workspaceExpr, need, principalExpr = "?") {
+export function workspaceRoleSql(workspaceExpr, need, principalExpr = "?", allowSuspended = need === "viewer") {
   return `EXISTS (SELECT 1 FROM workspaces t_w JOIN workspace_members t_m ON t_m.workspace_id = t_w.id AND t_m.principal_id = ${principalExpr}
-      WHERE t_w.id = ${workspaceExpr} AND t_w.status = 'active' AND ${rankCase("t_m.role")} >= ${ROLE_RANK[need]})`;
+      WHERE t_w.id = ${workspaceExpr} AND ${statusOk("t_w", allowSuspended)} AND ${rankCase("t_m.role")} >= ${ROLE_RANK[need]})`;
 }
 
 /** SQL fragment + params: human principal has `need` on project `projectId`. */
@@ -63,14 +69,16 @@ export async function projectWorkspace(env, projectId) {
   return env.DB.prepare(`SELECT w.* FROM projects p JOIN workspaces w ON w.id = ${projectWorkspaceSql("p")} WHERE p.id = ?`).bind(projectId).first();
 }
 
+export const readOnlyError = () => new HttpError(403, "workspace_read_only", "This workspace is suspended and read-only. Reading and export still work.");
+
 /** Throw unless the human has `need` in the workspace (404 when not a member at all, 403 when the role is too low). */
-export async function requireWorkspaceRole(ctx, workspaceId, need) {
+export async function requireWorkspaceRole(ctx, workspaceId, need, allowSuspended = need === "viewer") {
   if (ctx.principal.kind !== "human") throw new HttpError(403, "forbidden", "People only");
   const ws = await ctx.env.DB.prepare(
     "SELECT w.id, w.status, w.personal, w.name, m.role FROM workspaces w JOIN workspace_members m ON m.workspace_id = w.id AND m.principal_id = ? WHERE w.id = ?"
   ).bind(ctx.principal.id, workspaceId).first();
-  if (!ws) throw new HttpError(404, "not_found", "Workspace not found");
-  if (ws.status !== "active") throw new HttpError(403, "workspace_suspended", "This workspace is not active");
+  if (!ws || ws.status === "deleting") throw new HttpError(404, "not_found", "Workspace not found");
+  if (ws.status !== "active" && !allowSuspended) throw readOnlyError();
   if (ROLE_RANK[ws.role] < ROLE_RANK[need]) throw new HttpError(403, "forbidden", `Needs the ${need} role in this workspace`);
   return ws;
 }
@@ -92,24 +100,25 @@ export async function projectRole(env, principalId, projectId) {
 }
 
 /** Throw 404 / 403 unless the human has `need` on the project. */
-export async function requireProjectRole(ctx, projectId, need) {
+export async function requireProjectRole(ctx, projectId, need, allowSuspended = need === "viewer") {
   const r = await projectRole(ctx.env, ctx.principal.id, projectId);
-  if (!r || !r.role) throw new HttpError(404, "not_found", "Project not found");
-  if (r.status !== "active") throw new HttpError(403, "workspace_suspended", "This workspace is not active");
+  if (!r || !r.role || r.status === "deleting") throw new HttpError(404, "not_found", "Project not found");
+  if (r.status !== "active" && !allowSuspended) throw readOnlyError();
   if (ROLE_RANK[r.role] < ROLE_RANK[need]) throw new HttpError(403, "forbidden", need === "write" || need === "member" ? "Your role in this workspace is read-only" : `Needs the ${need} role`);
   return r;
 }
 
 /**
- * Projects a human can see, with their effective role (excludes 'none' and inactive workspaces).
+ * Projects a human can see, with their effective role (excludes 'none' and deleting workspaces; suspended ones are
+ * included as read-only, see workspace_status).
  * Driven from the person's memberships: projects_workspace serves current rows, projects_owner_legacy (0018) the
  * rows a rolled-back Worker wrote without workspace_id (they belong to the owner's personal workspace).
  */
 export async function visibleProjects(env, principalId) {
-  const cols = `t_p.id, t_p.title, t_p.created_at, t_w.id AS workspace_id, t_w.name AS workspace_name, t_w.personal, t_w.created_at AS ws_created, t_m.role AS ws_role,
+  const cols = `t_p.id, t_p.title, t_p.created_at, t_w.id AS workspace_id, t_w.name AS workspace_name, t_w.personal, t_w.status AS workspace_status, t_w.created_at AS ws_created, t_m.role AS ws_role,
        CASE MIN(${rankCase("t_m.role")}, CASE WHEN t_pm.role IS NULL THEN 4 ELSE ${rankCase("t_pm.role")} END)
          WHEN 4 THEN 'owner' WHEN 3 THEN 'admin' WHEN 2 THEN 'member' WHEN 1 THEN 'viewer' ELSE NULL END AS role`;
-  const from = (join) => `FROM workspace_members t_m JOIN workspaces t_w ON t_w.id = t_m.workspace_id AND t_w.status = 'active'
+  const from = (join) => `FROM workspace_members t_m JOIN workspaces t_w ON t_w.id = t_m.workspace_id AND ${statusOk("t_w", true)}
      JOIN projects t_p ON ${join}
      LEFT JOIN project_members t_pm ON t_pm.project_id = t_p.id AND t_pm.principal_id = t_m.principal_id
      WHERE t_m.principal_id = ?`;

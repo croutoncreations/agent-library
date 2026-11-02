@@ -4,7 +4,7 @@ import { memberRoleSql, workspaceRoleSql } from "../tenancy.js";
 import { HttpError, nowIso, nowMs } from "../util.js";
 
 // A connection is managed by the person who created it, or an admin of its workspace.
-const MANAGE = `(COALESCE(c.created_by, c.owner_principal_id) = ? OR ${workspaceRoleSql("COALESCE(c.workspace_id, 'wsp_' || c.owner_principal_id)", "admin")})`;
+const MANAGE = `(COALESCE(c.created_by, c.owner_principal_id) = ? OR ${workspaceRoleSql("COALESCE(c.workspace_id, 'wsp_' || c.owner_principal_id)", "admin", "?", true)})`; // list/revoke work while suspended
 
 async function listConnections(ctx, projectId) {
   requireHuman(ctx);
@@ -56,7 +56,7 @@ async function listAccess(ctx) {
   const grants = await ctx.env.DB.prepare(
     `SELECT g.id, g.project_id, pr.title, pl.label, g.can_write, g.expires_at, g.revoked_at, g.created_at
      FROM grants g JOIN projects pr ON pr.id = g.project_id JOIN principals pl ON pl.id = g.principal_id
-     WHERE (g.created_by = ? OR ${memberRoleSql("pr.id", "admin")}) ORDER BY g.created_at DESC LIMIT 200`
+     WHERE (g.created_by = ? OR ${memberRoleSql("pr.id", "admin", "?", true)}) ORDER BY g.created_at DESC LIMIT 200`
   ).bind(me2, me2).all();
   const now = nowMs();
   return {

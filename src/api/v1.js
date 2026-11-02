@@ -1,3 +1,4 @@
+import { readOnlyError } from "../tenancy.js";
 import { verifyApiKey } from "./credentials.js";
 import { limitsFor, rateLimit } from "../auth.js";
 import { appOrigin, artifactWebUrl, previewWebUrl, projectWebUrl } from "../links.js";
@@ -76,6 +77,7 @@ function projectCtx(env, k, requestId, pid) {
 var writeAllowed = (k, pid) => {
   const p = k.projects.find((x) => x.id === pid);
   if (!p) throw new HttpError(404, "not_found", "Project not found");
+  if (!p.can_write && p.read_only) throw readOnlyError(); // writable key, suspended workspace
   if (!p.can_write) throw new HttpError(403, "forbidden", "This credential cannot write to this project");
 };
 var P1_FIELDS = ["id", "project_id", "kind", "title", "folder", "tags", "revision", "meta_version", "trashed", "updated_at"];

@@ -1,5 +1,5 @@
 import { accessEnabled, verifyAccess } from "./access.js";
-import { humanGate, memberRoleSql, requireProjectRole } from "./tenancy.js";
+import { humanGate, memberRoleSql, requireProjectRole, readOnlyError } from "./tenancy.js";
 import { HttpError, nowMs, sha256Hex } from "./util.js";
 
 function limitsFor(env) {
@@ -102,6 +102,10 @@ async function authorizeProject(ctx, projectId, write) {
     // The credential's creator must still be a member with enough role (checked again inside every mutation).
     const g = credentialGate(ctx, projectId, write ? "write" : "read");
     const ok = await ctx.env.DB.prepare(`SELECT ${g.sql} AS ok`).bind(...g.params).first("ok");
+    if (!ok && write && await ctx.env.DB.prepare(`SELECT 1 FROM projects p JOIN workspaces w ON w.id = COALESCE(p.workspace_id, 'wsp_' || p.owner_id) WHERE p.id = ? AND w.status = 'suspended'`).bind(projectId).first()) {
+      const r = credentialGate(ctx, projectId, "read");
+      if (await ctx.env.DB.prepare(`SELECT ${r.sql} AS ok`).bind(...r.params).first("ok")) throw readOnlyError();
+    }
     if (!ok) throw new HttpError(write ? 403 : 404, write ? "forbidden" : "not_found", write ? "No write access to this project" : "Project not found");
     return;
   }

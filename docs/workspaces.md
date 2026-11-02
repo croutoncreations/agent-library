@@ -34,13 +34,13 @@ A workspace always has at least one owner. A `project_members` row can narrow on
    exists" would reveal another workspace's project. Single-owner installations keep chosen ids.
 4. **Administration is human-only** and needs the admin role in that workspace. No agent tool manages members,
    grants or keys.
-5. **Suspended or deleting workspaces are closed.** People get `workspace_suspended` (403) or 404. Agent credentials
-   whose creator no longer has an active workspace role stop working: API keys, legacy grants and OAuth tokens get 401
-   (`credential_inactive`, or the OAuth error), like a revoked credential. A key that still reaches another active
-   project keeps working there. OAuth refresh for a *suspended* workspace answers `temporarily_unavailable` (503),
-   so the provider keeps the connection and it works again when the workspace is reactivated; refresh for a revoked
-   connection, a removed creator or a workspace being deleted is `invalid_grant`. Owners can still delete a suspended
-   workspace.
+5. **Suspended workspaces are read-only; deleting workspaces are closed** (decisions D11 B, D13 A). While suspended
+   (e.g. a failed payment), people and agents can still read, download, search, see history and export; OAuth and
+   publisher refresh keep working, so connections survive. Every write is refused with 403 `workspace_read_only`:
+   saves, uploads, restores, comments, trash and rename, publishing, new projects and imports, write API keys and
+   Edit grants, invitations, role changes and renaming. Cleanup still works: revoking keys, connections, grants and
+   publishers, removing members, leaving and deleting the workspace. A workspace being deleted is closed: people get
+   404, agent credentials 401, and refresh is `invalid_grant`, like a revoked connection or a removed creator.
 
 ## Data model (migration 0017, additive)
 

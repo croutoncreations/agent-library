@@ -126,17 +126,32 @@ test("legacy grants and MCP follow the creator's live role", async (t) => {
   try {
     const r = await m.call("read_artifact", { project_id: `${P.team}`, artifact_id: ids.teamDoc });
     assert.equal(r.isError, false);
-    // Demote Alice's grant creator? Alice is the owner; demote by a second owner later. Here: suspend the workspace.
+    // Suspended (D11 B / D13 A): read-only for people and agents. Reads work; writes get 403 workspace_read_only.
     sql(`UPDATE workspaces SET status = 'suspended' WHERE id = '${WS}'`);
     t.after(() => sql(`UPDATE workspaces SET status = 'active' WHERE id = '${WS}'`));
-    // Every credential into a closed workspace stops: the grant and the key are inactive (401), the session 403.
-    const g401 = await A("GET", `/api/projects/${P.team}/artifacts/${ids.teamDoc}`);
-    assert.equal(g401.status, 401); assert.equal(g401.body.error.code, "credential_inactive");
-    assert.equal((await A("GET", "/api/projects")).status, 401);
-    // MCP refuses the whole request (401), like any inactive bearer token.
-    await assert.rejects(m.call("read_artifact", { project_id: `${P.team}`, artifact_id: ids.teamDoc }), (e) => e.code === 401);
-    assert.equal((await v1(ids.bobKey.secret, "GET", `/v1/projects/${P.team}/files/${ids.teamDoc}`)).status, 401);
-    assert.equal((await bob.req("GET", `/api/projects/${P.team}/artifacts/${ids.teamDoc}`)).status, 403);
+    assert.equal((await A("GET", `/api/projects/${P.team}/artifacts/${ids.teamDoc}`)).status, 200);
+    assert.equal((await m.call("read_artifact", { project_id: `${P.team}`, artifact_id: ids.teamDoc })).isError, false);
+    const gw = await A("PUT", `/api/projects/${P.team}/artifacts/${ids.teamDoc}`, { expected_revision: 1, body: "suspended write" });
+    assert.equal(gw.status, 403); assert.equal(gw.body.error.code, "workspace_read_only");
+    const mw = await m.call("save_markdown", { project_id: `${P.team}`, artifact_id: ids.teamDoc, expected_revision: 1, body: "x", idempotency_key: key("s") });
+    assert.equal(mw.isError, true); assert.equal(mw.data?.error?.code, "workspace_read_only");
+    assert.equal((await v1(ids.bobKey.secret, "GET", `/v1/projects/${P.team}/files/${ids.teamDoc}`)).status, 200);
+    assert.equal((await v1(ids.bobKey.secret, "PUT", `/v1/projects/${P.team}/files/${ids.teamDoc}`, { expected_revision: 1, body: "x" })).json.error.code, "workspace_read_only");
+    assert.equal((await bob.req("GET", `/api/projects/${P.team}/artifacts/${ids.teamDoc}`)).status, 200);
+    const sw = await bob.req("PUT", `/api/projects/${P.team}/artifacts/${ids.teamDoc}`, { expected_revision: 1, body: "x" });
+    assert.equal(sw.status, 403); assert.equal(sw.body.error.code, "workspace_read_only");
+    const listed = ok(await bob.req("GET", "/api/projects")).projects.find((p) => p.id === P.team);
+    assert.equal(listed.can_write, false); assert.equal(listed.read_only_reason, "workspace_suspended");
+    // Export and revoking still work; new write keys, invites and projects don't.
+    assert.equal((await alice.req("GET", `/api/projects/${P.team}/backup`)).status, 200);
+    assert.equal((await alice.req("POST", "/api/api-keys", { label: "rw", projects: [{ project_id: P.team, access: "read_write" }] })).body.error.code, "workspace_read_only");
+    assert.equal((await alice.req("POST", "/api/api-keys", { label: "ro", projects: [{ project_id: P.team, access: "read" }] })).status, 201);
+    assert.equal((await alice.req("POST", `/api/workspaces/${WS}/invites`, { email: "x@example.test", role: "member" })).body.error.code, "workspace_read_only");
+    assert.equal((await alice.req("POST", "/api/projects", { title: "x", workspace_id: WS })).body.error.code, "workspace_read_only");
+    // Deleting: closed to everyone.
+    sql(`UPDATE workspaces SET status = 'deleting' WHERE id = '${WS}'`);
+    assert.equal((await A("GET", `/api/projects/${P.team}/artifacts/${ids.teamDoc}`)).status, 401);
+    assert.equal((await bob.req("GET", `/api/projects/${P.team}/artifacts/${ids.teamDoc}`)).status, 404);
     sql(`UPDATE workspaces SET status = 'active' WHERE id = '${WS}'`);
     assert.equal((await A("GET", `/api/projects/${P.team}/artifacts/${ids.teamDoc}`)).status, 200);
   } finally { await m.close(); }
@@ -220,6 +235,6 @@ test("import a backup into a workspace (D8 B): new ids, importer as author, admi
   assert.equal(sql(`SELECT COUNT(*) AS n FROM projects`)[0].n, before);
   // Suspended workspace: refused.
   sql(`UPDATE workspaces SET status = 'suspended' WHERE id = '${WS}'`);
-  try { assert.equal((await alice.req("POST", `/api/workspaces/${WS}/import`, { backup: bk })).status, 403); }
+  try { const s = await alice.req("POST", `/api/workspaces/${WS}/import`, { backup: bk }); assert.equal(s.status, 403); assert.equal(s.body.error.code, "workspace_read_only"); }
   finally { sql(`UPDATE workspaces SET status = 'active' WHERE id = '${WS}'`); }
 });

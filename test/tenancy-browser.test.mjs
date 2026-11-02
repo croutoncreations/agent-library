@@ -5,7 +5,8 @@ import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import { existsSync } from "node:fs";
-import { startServer } from "./helpers.mjs";
+import { startServer, ROOT, LOCAL_CONFIG } from "./helpers.mjs";
+import { execFileSync } from "node:child_process";
 import { SERVER_PORTS } from "./ports.mjs";
 
 const require = createRequire(import.meta.url);
@@ -218,5 +219,31 @@ test("workspace admins can import a project from a backup file", { skip: !availa
   await (await alice.$("xpath/.//button[normalize-space()='Import']")).click();
   await alice.waitForFunction(() => /#\/p\/prj_/.test(location.hash), { timeout: 10000 });
   await waitText(alice, /Mine/);
+  await alice.browserContext().close();
+});
+
+test("a suspended workspace is read-only in the app: notes explain it, write controls are gone, export works", { skip: !available && "Chrome/puppeteer not installed" }, async () => {
+  const sql = (q) => execFileSync("wrangler", ["d1", "--config", LOCAL_CONFIG, "execute", "DB", "--local", "--persist-to", s.dir, "--command", q], { cwd: ROOT, stdio: "ignore" });
+  const alice = await pageAs("alice");
+  const { ws, pid } = await alice.evaluate(async () => {
+    const ws = (await (await fetch("/api/workspaces")).json()).workspaces.find((w) => !w.personal);
+    const p = (await (await fetch("/api/projects")).json()).projects.find((x) => x.title === "Lab notes");
+    return { ws: ws.id, pid: p.id };
+  });
+  sql(`UPDATE workspaces SET status = 'suspended' WHERE id = '${ws}'`);
+  try {
+    await alice.goto(`${APP}/#/workspaces/${ws}`); await alice.reload();
+    await waitText(alice, /suspended and read-only/);
+    const t = await text(alice);
+    assert.doesNotMatch(t, /Create project|Create invitation|Import a project|Rename/, "no write/admin forms while suspended");
+    assert.match(t, /Delete workspace/, "the owner can still delete");
+    await alice.screenshot({ path: "tmp/test-evidence/tenancy-suspended-workspace.png", fullPage: true });
+    await alice.goto(`${APP}/#/p/${pid}`); await alice.reload();
+    await waitText(alice, /workspace is suspended, so it's read-only/);
+    assert.equal(await alice.$("xpath/.//button[contains(., 'New document')]"), null);
+    const exp = await alice.evaluate(async (pid) => (await fetch(`/api/projects/${pid}/backup`)).status, pid);
+    assert.equal(exp, 200, "export works while suspended");
+    await alice.screenshot({ path: "tmp/test-evidence/tenancy-suspended-project.png", fullPage: true });
+  } finally { sql(`UPDATE workspaces SET status = 'active' WHERE id = '${ws}'`); }
   await alice.browserContext().close();
 });

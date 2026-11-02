@@ -131,6 +131,7 @@ async function handleOAuthMcp(req, env, ctx) {
         return reply(rpc(msg.id, toolError(err2)));
       }
       const canWrite = projectWrite(proj);
+      if (tool.write && !canWrite && proj.read_only) return reply(rpc(msg.id, toolError({ status: 403, code: "workspace_read_only", message: "This workspace is suspended and read-only. Reading still works." })));
       if (tool.write && !canWrite) return reply(rpc(msg.id, toolError({ status: 403, code: "forbidden", message: "This connection is read-only for this project" })));
       const { project_id: _omit, ...toolArgs } = args;
       const sctx = {

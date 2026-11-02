@@ -24,7 +24,6 @@ async function fixture({publisher=false}={}){
  const claims=new Map();
  const DB={prepare(q){return {bind(...p){return {async first(){
   if(q.includes('rate_counters'))return 1;
-  if(q.includes("w.status = 'suspended'"))return null; // workspace-suspension probe: these synthetic connections have none
   if(q.includes('UPDATE oauth_code_redemptions')){const old=claims.get(p[1]);if(old===undefined||old>p[2])return null;claims.set(p[1],p[0]);return {code_hash:p[1]};}
   const stage=q.startsWith('UPDATE')?'renew':'read';if(fail===stage)throw Error('synthetic database outage');
   if(q.startsWith('UPDATE')){if(revokedDuringRenewal)connection.revoked_at=1;if(connection.revoked_at!==null||connection.expires_at<=p[2])return null;connection.expires_at=p[0];return {id:connection.id};}
