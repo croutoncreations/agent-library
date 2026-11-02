@@ -46,7 +46,7 @@ test("an /api/ adapter route is never reached without authentication", async () 
   let reached = false;
   const w = W.createWorker({ routes: [{ path: "/api/billing", handler: async () => { reached = true; return new Response("x"); } }] });
   // No session or bearer: authentication fails (needs no DB) before any adapter route.
-  const stmt = { bind() { return stmt; }, async first() { return 1; } };
+  const stmt = { bind() { return stmt; }, async first() { return 1; }, async run() { return { meta: { changes: 0 } }; } };
   const r = await call(w, "/api/billing", {}, { DB: { prepare: () => stmt } });
   assert.equal(r.status, 401); assert.equal(reached, false);
 });
@@ -117,7 +117,7 @@ test("a build without a sign-in provider refuses to run where Access is configur
 
 test("enabled provider: a session without the provider's identity is refused (null fails closed)", async () => {
   const row = { csrf: "c", expires_at: Date.now() + 1e6, revoked_at: null, id: "hum_s", kind: "human", label: "S" };
-  const stmt = { bind() { return stmt; }, async first() { return row; } };
+  const stmt = { bind() { return stmt; }, async first() { return row; }, async run() { return { meta: { changes: 0 } }; } }; // run(): the limiter's occasional (2%) counter cleanup
   const mk = (session) => W.withAdapters({ DB: { prepare: () => stmt } }, W.resolveAdapters({ identity: { name: "x", enabled: () => true, session } }));
   const req = () => new Request(APP + "/api/me", { headers: { cookie: "al_session=ses_synthetic" } });
   await assert.rejects(W.authenticate(req(), mk(async () => null), "r"), (e) => e.status === 401);
@@ -174,7 +174,7 @@ test("session cookie: __Host- on https (legacy name cleared, still read); plain 
   assert.deepEqual(W.sessionCookie(new URL("http://localhost:1/"), "ses_abc", 60), ["al_session=ses_abc; HttpOnly; SameSite=Strict; Path=/; Max-Age=60"]);
   const row = { csrf: "c", expires_at: Date.now() + 1e6, revoked_at: null, id: "hum_s", kind: "human", label: "S" };
   const seen = [];
-  const stmt = { bind(h) { seen.push(h); return stmt; }, async first() { return row; } };
+  const stmt = { bind(h) { seen.push(h); return stmt; }, async first() { return row; }, async run() { return { meta: { changes: 0 } }; } };
   const env = W.withAdapters({ DB: { prepare: () => stmt } }, W.defaultAdapters());
   const sha = async (s) => [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s)))].map((b) => b.toString(16).padStart(2, "0")).join("");
   // https: the __Host- cookie wins over a planted plain cookie (a sibling subdomain can only set the plain name).
@@ -183,4 +183,27 @@ test("session cookie: __Host- on https (legacy name cleared, still read); plain 
   // Sessions issued before this release (plain name) still work.
   await W.authenticate(new Request("https://app.example.test/api/me", { headers: { cookie: "al_session=old" } }), env, "r");
   assert.equal(seen.at(-1), await sha("old"));
+});
+
+test("Turnstile fails closed on configuration mistakes (never silently off)", async () => {
+  const T = await loadWorker({ "identity/turnstile.js": ["requireHuman"] });
+  const realFetch = globalThis.fetch, logs = [], err = console.error;
+  console.error = (...a) => logs.push(a.join(" "));
+  try {
+    // Off when unset.
+    await T.requireHuman({}, undefined, "1.2.3.4", "app.example.test");
+    // A copy-pasted key with a trailing newline: refuse (503), don't skip.
+    await assert.rejects(T.requireHuman({ TURNSTILE_SITE_KEY: "0x4AAAAAAAsynthetic\n", TURNSTILE_SECRET_KEY: "s" }, "tok", null, "app.example.test"), (e) => e.status === 503 && e.code === "turnstile_not_configured");
+    // Key without secret.
+    await assert.rejects(T.requireHuman({ TURNSTILE_SITE_KEY: "0x4AAAAAAAsynthetic" }, "tok", null, "app.example.test"), (e) => e.status === 503);
+    // Cloudflare says the secret is wrong: a configuration error (503), not "try again" for the visitor.
+    globalThis.fetch = async () => new Response(JSON.stringify({ success: false, "error-codes": ["invalid-input-secret"] }), { headers: { "content-type": "application/json" } });
+    await assert.rejects(T.requireHuman({ TURNSTILE_SITE_KEY: "0x4AAAAAAAsynthetic", TURNSTILE_SECRET_KEY: "wrong" }, "tok", null, "app.example.test"), (e) => e.status === 503);
+    // A token solved on another hostname.
+    globalThis.fetch = async () => new Response(JSON.stringify({ success: true, hostname: "evil.example" }), { headers: { "content-type": "application/json" } });
+    await assert.rejects(T.requireHuman({ TURNSTILE_SITE_KEY: "0x4AAAAAAAsynthetic", TURNSTILE_SECRET_KEY: "s" }, "tok", null, "app.example.test"), (e) => e.status === 400);
+    globalThis.fetch = async () => new Response(JSON.stringify({ success: true, hostname: "app.example.test" }), { headers: { "content-type": "application/json" } });
+    await T.requireHuman({ TURNSTILE_SITE_KEY: "0x4AAAAAAAsynthetic", TURNSTILE_SECRET_KEY: "s" }, "tok", null, "app.example.test");
+  } finally { globalThis.fetch = realFetch; console.error = err; }
+  assert.ok(logs.some((l) => /turnstile_not_configured bad_site_key/.test(l)));
 });

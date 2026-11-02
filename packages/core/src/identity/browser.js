@@ -104,7 +104,7 @@ export async function signinStart(req, env, url) {
   const state = randomToken(32), bind = randomToken(32), verifier = randomToken(64), nonce = randomToken(32);
   try {
     // Email links only: the human check runs before anything is counted, stored or sent.
-    if (email) await requireHuman(env, params.get("cf-turnstile-response"), req.headers.get("cf-connecting-ip"));
+    if (email) await requireHuman(env, params.get("cf-turnstile-response"), req.headers.get("cf-connecting-ip"), url.hostname);
     await limitSigninStart(env, req, email);
     await env.OAUTH_KV.put(`signin:${await sha256Hex(state)}`, JSON.stringify({ bind: await sha256Hex(bind), verifier, nonce, next }), { expirationTtl: TX_TTL });
     target = await up.start({ redirectUri: `${url.origin}/auth/callback`, state, verifier, nonce, choice: picked?.id ?? null, email, mayCreateAccount: (e) => mayCreateAccount(env, e) });

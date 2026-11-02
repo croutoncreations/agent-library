@@ -48,8 +48,12 @@ async function projectMedia(env, pid, refs) {
  * The app shell's CSP. With the email-link human check on (TURNSTILE_SITE_KEY) and browser sign-in, Cloudflare's
  * Turnstile script and frame are allowed on the shell only; every other response keeps the strict default.
  */
+/** The site key the app's sign-in card renders, only when an email-link option exists (else no widget, no CSP change). */
+function emailTurnstile(env) {
+  return browserSignInEnabled(env) && signinChoices(env).some((c) => c.email) ? turnstileSiteKey(env) : null;
+}
 function appShellCsp(env) {
-  if (!turnstileSiteKey(env) || !browserSignInEnabled(env)) return {};
+  if (!emailTurnstile(env)) return {};
   return { "content-security-policy": SEC_HEADERS["content-security-policy"]
     .replace("script-src 'self'", `script-src 'self' ${TURNSTILE_ORIGIN}`).replace("frame-src 'self'", `frame-src 'self' ${TURNSTILE_ORIGIN}`) };
 }
@@ -142,7 +146,7 @@ async function route3(req, env, url, requestId) {
   if (m === "POST" && path === "/auth/dev-login") return devLogin(req, env, url);
   if (m === "POST" && path === "/auth/access-login") return accessLogin(req, env, url);
   // How this installation signs people in (public; the browser app picks its sign-in screen from it).
-  if (m === "GET" && path === "/auth/methods") return json({ redirect: browserSignInEnabled(env), choices: signinChoices(env), turnstile_site_key: browserSignInEnabled(env) ? turnstileSiteKey(env) : null, access: adapters(env).identity.enabled(env), local: !!env.LOCAL_DEV_LOGIN && ["localhost", "127.0.0.1"].includes(url.hostname) }, 200, { "cache-control": "no-store" });
+  if (m === "GET" && path === "/auth/methods") return json({ redirect: browserSignInEnabled(env), choices: signinChoices(env), turnstile_site_key: emailTurnstile(env), access: adapters(env).identity.enabled(env), local: !!env.LOCAL_DEV_LOGIN && ["localhost", "127.0.0.1"].includes(url.hostname) }, 200, { "cache-control": "no-store" });
   if ((m === "GET" || m === "POST") && path === "/auth/signin") return signinStart(req, env, url);
   if (m === "GET" && path === "/auth/callback") return signinCallback(req, env, url);
   if (m === "GET" && path === "/auth/check-email" && browserSignInEnabled(env)) return checkEmailPage();
