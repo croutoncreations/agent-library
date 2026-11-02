@@ -12,11 +12,15 @@ import { fileURLToPath } from 'node:url';
 export const ESBUILD_VERSION = '0.28.2';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
+// entry: the installation's Worker entry (default: the self-hosted one). An entry outside this repository (the hosted
+// service) imports the public core as `@agent-library/core/<module>`; it resolves to this checkout's packages/core/src.
 export async function buildWorker({ entry = join(root, 'packages/self-host/src/index.js'), outfile = join(root, 'dist/worker/index.js') } = {}) {
   const esbuild = await import('esbuild');
   if (esbuild.version !== ESBUILD_VERSION) throw new Error(`Use pinned esbuild ${ESBUILD_VERSION} (found ${esbuild.version})`);
   const result = await build({
     entryPoints: [entry],
+    alias: { '@agent-library/core': join(root, 'packages/core/src') },
+    nodePaths: [join(root, 'node_modules')],
     bundle: true,
     write: false,
     format: 'esm',

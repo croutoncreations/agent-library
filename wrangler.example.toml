@@ -74,9 +74,20 @@ APP_CONNECT_ENABLED = "1"
 # Optional: "1" turns on shared workspaces and invitations (several people). Leave unset on a
 # single-owner installation behind Access: only OWNER_EMAIL can sign in there (docs/workspaces.md).
 # MULTI_USER = "1"
+# Optional: sign in with any OpenID Connect provider instead of Cloudflare Access (several people,
+# shared workspaces; docs/self-hosting.md#sign-in-with-openid-connect). Setting OIDC_ISSUER switches it on;
+# then remove the Access settings above. New accounts need SIGNUP_ALLOWLIST (emails or @domains) or
+# SIGNUP_OPEN = "1"; people with a pending invitation can always join.
+# OIDC_ISSUER = "https://login.example.com"
+# OIDC_CLIENT_ID = "agent-library"
+# OIDC_AUTHORIZATION_URL = "https://login.example.com/authorize"
+# OIDC_TOKEN_URL = "https://login.example.com/oauth/token"
+# OIDC_JWKS_URL = "https://login.example.com/.well-known/jwks.json"
+# SIGNUP_ALLOWLIST = "@example.com"
 #
 # Worker secret (never in this file):
 #   ACCESS_OIDC_CLIENT_SECRET  (wrangler secret put ACCESS_OIDC_CLIENT_SECRET --env hosted)
+#   OIDC_CLIENT_SECRET         (only with OIDC_ISSUER)
 
 [[env.hosted.kv_namespaces]]
 binding = "OAUTH_KV"

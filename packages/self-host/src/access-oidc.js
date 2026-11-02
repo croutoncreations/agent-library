@@ -1,4 +1,6 @@
-import { HttpError } from "../util.js";
+// Self-host consent sign-in on the OAuth host: Cloudflare Access for SaaS as the OIDC provider, admitting only
+// OWNER_EMAIL (the installation's one person). Exposed to core as identity.upstream(env).
+import { HttpError } from "../../core/src/util.js";
 
 async function s256(v) {
   return b64u(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(v))));
@@ -113,4 +115,16 @@ unb64u = (s) => Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/") + "
 randomToken = (n = 32) => b64u(crypto.getRandomValues(new Uint8Array(n)));
 jwksCache = null;
 
+/** The identity adapter's upstream client (see packages/core/src/adapters.js). */
+export function accessOidc(env) {
+  const c = oidcConfig(env);
+  return {
+    origins: () => [new URL(c.authorization).origin],
+    start: (p) => authorizationUrl(env, p),
+    async finish(p) {
+      const id = await exchangeAndVerify(env, { code: p.url.searchParams.get("code") ?? "", redirectUri: p.redirectUri, verifier: p.verifier, nonce: p.nonce });
+      return { ...id, emailVerified: true };
+    }
+  };
+}
 export { authorizationUrl, exchangeAndVerify, newUpstreamSecrets, oidcConfig };

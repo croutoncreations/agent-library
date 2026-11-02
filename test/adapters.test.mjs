@@ -79,7 +79,7 @@ test("self-host identity: Cloudflare Access configured -> single-user; not confi
 
 test("self-host entry is createWorker with the Access identity (the shipped default export)", () => {
   const entry = readFileSync(join(ROOT, "packages/self-host/src/index.js"), "utf8");
-  assert.match(entry, /export default createWorker\(\{ identity: accessIdentity \}\);/);
+  assert.match(entry, /export default createWorker\(\{ identity: selfHostIdentity \}\);/);
   assert.equal(typeof W.default.fetch, "function"); assert.equal(typeof W.default.scheduled, "function");
 });
 

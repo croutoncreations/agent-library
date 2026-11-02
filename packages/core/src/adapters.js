@@ -18,7 +18,22 @@ export const noIdentity = {
    *  null, which core turns into 401) when the provider's token is missing or invalid. Not called when disabled. */
   async session() { return null; },
   /** Every bearer request: a provider gate in front of agents (throws to refuse). */
-  async bearer() {}
+  async bearer() {},
+  /**
+   * Sign-in by redirect (consent sign-in on the OAuth host; browser sign-in when browserSignIn(env)):
+   * an object { origins(), start({ redirectUri, state, verifier, nonce, choice, email }), finish({ url, redirectUri, verifier, nonce }),
+   * choices?() } whose finish() returns { issuer, subject, email|null, emailVerified }. choices() lists sign-in options
+   * ({ id, label, email?: true }) shown as buttons (and an email field); the picked id arrives as `choice`. start() may
+   * return a same-origin path (e.g. "check your email") instead of the provider's URL. Core's generic OIDC client is
+   * identity/oidc.js (oidcFromEnv / oidcClient). null = not configured.
+   */
+  upstream: () => null,
+  /** Does the app host sign people in through upstream() (GET /auth/signin)? */
+  browserSignIn: () => false,
+  /** May a first sign-in create an account (multi-user installs; SIGNUP_ALLOWLIST still applies)? */
+  createAccounts: () => false,
+  /** Only for upstreams that admit a single configured owner: link an unknown identity to the one existing person. */
+  linkSoleOwner: () => false
 };
 
 /** Unlimited: every operation is allowed (core's own hard limits still apply). */

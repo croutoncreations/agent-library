@@ -65,13 +65,15 @@ The modules were recovered mechanically from the previous byte-pinned bundle (Ph
 
 | Adapter | Self-host | Hosted (private repo) | Default |
 |---|---|---|---|
-| `identity`: `login`, `session`, `bearer`, `multiUser` | Cloudflare Access (`packages/self-host/src/access-identity.js`): one owner, single-user | OIDC (Supabase) | No provider: local dev sign-in only, multi-user |
+| `identity`: `login`, `session`, `bearer`, `multiUser`, `upstream`, `browserSignIn`, `createAccounts`, `linkSoleOwner` | Cloudflare Access (`packages/self-host/src/access-identity.js`): one owner, single-user; or any OpenID Connect provider when `OIDC_ISSUER` is set (`packages/core/src/identity/oidc-identity.js`) | Supabase PKCE sign-in (private repo; decision D15 A) | No provider: local dev sign-in only, multi-user |
 | `entitlements.check(env, op, info)` | Unlimited | Plan limits (throws 402) | Unlimited |
 | `lifecycle`: `workspaceCreated`, `workspaceDeleted`, `inviteCreated` | None | Billing customer, invitation email | None |
 | `routes`: `{ method?, path, handler }` | None | Billing, sign-up, legal pages | None |
 | `mailer.send` | Logs only | SendGrid | Logs only |
 
 Not yet adapters (deferred from the plan's interface list): a `KeyProvider` (per-workspace encryption; the seam is `content-store.js`, docs/encryption.md), an external `AuditSink`/metrics (phase 5; audits stay in D1), UI slots such as settings tabs (phase 3/4, with the hosted billing UI) and a `workspaceSuspended` hook (core has no suspend operation yet). Core doesn't call `mailer` yet; hosted mail is sent from lifecycle hooks. The plan's `createWorker(config, adapters)` became `createWorker(adapters)`: configuration stays in Worker vars.
+
+Sign-in by redirect (`packages/core/src/identity/`): `GET|POST /auth/signin` starts it (PKCE S256, nonce, state; the transaction is bound to the browser by an HttpOnly cookie and kept in KV for 10 minutes, single use), `GET /auth/callback` finishes it, and `GET /auth/methods` tells the browser app which sign-in screen to show. `identity/accounts.js` maps a verified identity to a person for both browser sign-in and the agent consent sign-in: an existing link, the sole owner (only for owner-only upstreams such as Access for SaaS), or a new account with a personal workspace when the adapter allows sign-up (verified email; `SIGNUP_ALLOWLIST`; invited emails always). Provider claims never grant access.
 
 The wiring fails closed: core code throws if `env` didn't come through `createWorker()`, and a build with no sign-in provider refuses requests where `ACCESS_TEAM_DOMAIN`/`ACCESS_AUD` is set. An enabled identity provider must return the current identity on every cookie request; `null` is refused.
 

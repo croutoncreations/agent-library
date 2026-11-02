@@ -218,11 +218,21 @@ async function api(method, path, body, opt) {
 
 // ---------- hosted session renewal ----------
 // Hosted = behind Cloudflare Access; loopback (localhost/127.0.0.1) keeps the local dev passphrase login.
+// Installations with redirect sign-in (GET /auth/methods redirect:true, e.g. hosted Supabase) sign in at /auth/signin.
 function hostedApp() { return !/^(localhost|127\.0\.0\.1)$/.test(location.hostname); }
+var AUTH = null;
+async function authMethods() {
+  if (AUTH) return AUTH;
+  try { var r = await fetch("/auth/methods", { credentials: "same-origin", cache: "no-store" }); AUTH = r.ok ? await r.json() : {}; }
+  catch (e) { AUTH = {}; }
+  return AUTH;
+}
+function redirectSignIn() { return !!(AUTH && AUTH.redirect); }
+function signInHref() { var n = location.hash && location.hash !== "#/" ? location.hash : ""; return "/auth/signin" + (n ? "?next=" + encodeURIComponent(n) : ""); }
 var renewing = null, signingOut = false;
 // The app session ended but Access may still be signed in: get a new app session for the same user.
 function renewSession() {
-  if (!hostedApp() || !S.me || signingOut) return Promise.resolve(false);
+  if (!hostedApp() || redirectSignIn() || !S.me || signingOut) return Promise.resolve(false);
   if (!renewing) {
     var uid = S.me.id;
     renewing = (async function () {
@@ -271,7 +281,7 @@ function onUnauthenticated() {
   HOME.cacheClear(null); thumbClear();
   S.me = null; S.csrf = null;
   runCleanups(true);
-  if (wasIn && hostedApp() && !signingOut && reloadForSignIn()) return;
+  if (wasIn && hostedApp() && !redirectSignIn() && !signingOut && reloadForSignIn()) return;
   viewLogin(wasIn ? "Your session ended. Any unsaved text was kept in this browser and will be offered again after you sign in as the same user. Log out to clear it." : "");
 }
 
@@ -461,6 +471,30 @@ async function logout() {
 
 // ---------- login ----------
 function viewLogin(note) {
+  if (redirectSignIn()) {
+    var nextHash = location.hash && location.hash !== "#/" ? location.hash : "";
+    var choices = (AUTH && AUTH.choices) || [];
+    var first = null, parts = [];
+    if (!choices.length) { first = h("a", { class: "btn", href: signInHref() }, "Continue to sign in"); parts.push(first); }
+    choices.forEach(function (c) {
+      if (c.email) {
+        var em = h("input", { type: "email", name: "email", required: true, autocomplete: "email", placeholder: "you@example.com", "aria-label": "Email address" });
+        // A plain form POST (same origin): the server answers with a redirect, like the provider buttons.
+        parts.push(h("form", { method: "post", action: "/auth/signin", class: "row signin-email" },
+          h("input", { type: "hidden", name: "choice", value: c.id }), h("input", { type: "hidden", name: "next", value: nextHash }), em,
+          h("button", { type: "submit" }, c.label)));
+        if (!first) first = em;
+      } else {
+        var b = h("a", { class: "btn secondary signin-choice", href: "/auth/signin?choice=" + encodeURIComponent(c.id) + (nextHash ? "&next=" + encodeURIComponent(nextHash) : "") }, c.label);
+        parts.push(b); if (!first) first = b;
+      }
+    });
+    shell([{ t: "Sign in" }], note ? h("p", { class: "banner", text: note }) : null,
+      h("div", { class: "card signin" }, h("h1", { text: "Sign in to Agent Library" }),
+        h("p", { class: "muted small", text: "New here? Signing in creates your account." }), parts));
+    if (first) first.focus();
+    return;
+  }
   if (hostedApp()) {
     var again = h("button", { type: "button", onclick: function () { location.reload(); } }, "Sign in");
     shell([{ t: "Sign in" }], note ? h("p", { class: "banner", text: note }) : null,
@@ -3679,10 +3713,11 @@ if (/[?&]source=pwa\b/.test(location.search)) history.replaceState(null, "", loc
 (async function boot() {
   try {
     var me;
+    await authMethods();
     try { me = await api("GET", "/api/me", undefined, { noAuthRedirect: true }); }
     catch (e1) {
       // Hosted: exchange the verified Cloudflare Access identity for an app session (no passphrase).
-      if (e1.status !== 401 || /^(localhost|127\.0\.0\.1)$/.test(location.hostname)) throw e1;
+      if (e1.status !== 401 || redirectSignIn() || /^(localhost|127\.0\.0\.1)$/.test(location.hostname)) throw e1;
       await api("POST", "/auth/access-login", {}, { noAuthRedirect: true });
       me = await api("GET", "/api/me", undefined, { noAuthRedirect: true });
     }

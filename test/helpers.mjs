@@ -1,8 +1,8 @@
 // Shared harness: isolated wrangler dev server per test file, human (cookie+csrf) and agent (bearer) clients, real MCP client.
 import { spawn, execFileSync } from "node:child_process";
-import { mkdirSync, rmSync, openSync, closeSync } from "node:fs";
+import { mkdirSync, rmSync, openSync, closeSync, readFileSync, writeFileSync } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
-import { join, dirname } from "node:path";
+import { join, dirname, basename } from "node:path";
 import { createServer as createNetServer } from "node:net";
 import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -28,11 +28,14 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const FUNCTIONAL_VARS = { RATE_READS_PER_MIN: "100000", RATE_WRITES_PER_MIN: "100000", RATE_AUTHFAIL_PER_MIN: "100000" };
 // Every server runs the shipped artifact (dist/worker/index.js). Built once per test process.
 let built = null;
-export async function startServer(name, port, { fresh = true, persistDir, vars = FUNCTIONAL_VARS, readyHeaders = {}, readyBase } = {}) {
+/**
+ * worker: optional path of another built Worker to run instead of dist/worker/index.js (the hosted repository runs its
+ * own bundle through this harness). It runs with the same local config, bindings and migrations.
+ */
+export async function startServer(name, port, { fresh = true, persistDir, vars = FUNCTIONAL_VARS, readyHeaders = {}, readyBase, worker } = {}) {
   if (!Object.values(SERVER_PORTS).includes(port)) throw new Error(`port ${port} is not in test/ports.mjs SERVER_PORTS`);
   for (const p of [port, port + INSPECTOR_OFFSET]) if (!(await portFree(p))) throw new Error(`port ${p} for server ${name} is already in use (a previous server did not exit?)`);
-  built ??= buildWorker();
-  await built;
+  if (!worker) { built ??= buildWorker(); await built; }
   const dir = persistDir ?? join(ROOT, "tmp", `test-state-${name}`);
   if (fresh) rmSync(dir, { recursive: true, force: true });
   mkdirSync(dir, { recursive: true });
@@ -41,7 +44,13 @@ export async function startServer(name, port, { fresh = true, persistDir, vars =
   const fd = openSync(logPath, "a");
   execFileSync("wrangler", ["d1", "--config", LOCAL_CONFIG, "migrations", "apply", "DB", "--local", "--persist-to", dir], { cwd: ROOT, env, stdio: ["ignore", fd, fd] });
   const passphrase = "test-" + randomBytes(18).toString("hex");
-  const child = spawn("wrangler", ["dev", "--config", LOCAL_CONFIG, "--local", "--port", String(port), "--ip", "127.0.0.1", "--persist-to", dir,
+  let config = LOCAL_CONFIG;
+  if (worker) {
+    // Same local config with main pointing at the other bundle; written next to it so the relative path is plain.
+    config = join(dirname(worker), `wrangler.${name}.toml`);
+    writeFileSync(config, readFileSync(LOCAL_CONFIG, "utf8").replace(/^main = .*$/m, `main = ${JSON.stringify(basename(worker))}`));
+  }
+  const child = spawn("wrangler", ["dev", "--config", config, "--local", "--port", String(port), "--ip", "127.0.0.1", "--persist-to", dir,
     "--var", `LOCAL_DEV_LOGIN:${passphrase}`, ...Object.entries(vars).flatMap(([k, v]) => ["--var", `${k}:${v}`]),
     "--show-interactive-dev-session=false", "--inspector-port", String(port + INSPECTOR_OFFSET)],
     { cwd: ROOT, env, stdio: ["ignore", fd, fd], detached: true });

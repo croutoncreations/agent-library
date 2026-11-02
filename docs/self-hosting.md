@@ -125,6 +125,16 @@ If sign-in fails, check the Access audience, team domain, owner email, OIDC clie
 
 If you prefer, copy `wrangler.example.toml` to `wrangler.toml` (gitignored), fill in the `[env.hosted]` section, run `npm run stage:hosted`, and pass `--env hosted` to every wrangler command. This is the layout the optional [deploy pipeline](deploy-pipeline.md) uses.
 
+## Sign in with OpenID Connect
+
+By default one person signs in, through Cloudflare Access (`OWNER_EMAIL`). To let several people sign in (shared workspaces, invitations), point the installation at an OpenID Connect provider you already use (Auth0, Okta, Keycloak, Google, Cloudflare Access for SaaS, ...) instead:
+
+1. Create a confidential "web" client at the provider with the callbacks `https://<APP_HOST>/auth/callback` (browser sign-in) and `https://<MCP_HOST>/callback` (connecting ChatGPT, Claude and other agents), scopes `openid email`, PKCE allowed.
+2. Set `OIDC_ISSUER`, `OIDC_CLIENT_ID`, `OIDC_AUTHORIZATION_URL`, `OIDC_TOKEN_URL` and `OIDC_JWKS_URL` (from the provider's `/.well-known/openid-configuration`), and the secret `OIDC_CLIENT_SECRET`. Remove `ACCESS_TEAM_DOMAIN`, `ACCESS_AUD` and the Access application in front of `APP_HOST`: the app signs people in itself.
+3. Decide who can create an account: `SIGNUP_ALLOWLIST` (comma-separated emails or `@domain`s) or `SIGNUP_OPEN = "1"`. With neither, only people you invite can join. Invited people can always create their account. The provider must report a verified email (`email_verified` not false).
+
+Signing in only proves who someone is. What they can see comes from their workspace memberships, never from the provider's claims. Tokens are checked against the provider's keys (RS256 or ES256), issuer, audience, expiry and the per-sign-in nonce, and a sign-in only completes in the browser that started it.
+
 ## Upgrading
 
 Pull a new release. Regenerate the config into a new directory, apply any new migrations, then deploy. See [operations.md](operations.md). Migrations are additive, so the previous Worker keeps working if you need to roll back. Worker rollback does not undo migrations.

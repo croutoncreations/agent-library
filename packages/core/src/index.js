@@ -1,4 +1,5 @@
 import { adapters, notify, resolveAdapters, withAdapters } from "./adapters.js";
+import { browserSignInEnabled, signinCallback, signinChoices, signinStart } from "./identity/browser.js";
 import { disableAppClient, listAppClients, registerAppClient, revokePublisher, updateAppClient } from "./api/app-clients.js";
 import { createApiKey, listApiKeys, replaceApiKey, revokeApiKey, setApiKeyScope } from "./api/credentials.js";
 import { handleV1, isV1Path } from "./api/v1.js";
@@ -130,6 +131,10 @@ async function route3(req, env, url, requestId) {
     });
   if (m === "POST" && path === "/auth/dev-login") return devLogin(req, env, url);
   if (m === "POST" && path === "/auth/access-login") return accessLogin(req, env, url);
+  // How this installation signs people in (public; the browser app picks its sign-in screen from it).
+  if (m === "GET" && path === "/auth/methods") return json({ redirect: browserSignInEnabled(env), choices: signinChoices(env), access: adapters(env).identity.enabled(env), local: !!env.LOCAL_DEV_LOGIN && ["localhost", "127.0.0.1"].includes(url.hostname) }, 200, { "cache-control": "no-store" });
+  if ((m === "GET" || m === "POST") && path === "/auth/signin") return signinStart(req, env, url);
+  if (m === "GET" && path === "/auth/callback") return signinCallback(req, env, url);
   const origin = req.headers.get("origin");
   if (origin && origin !== url.origin) throw new HttpError(403, "bad_origin", "Cross-origin requests are not allowed");
   const tm = /^\/api\/transfers\/([A-Za-z0-9_-]+)$/.exec(path);

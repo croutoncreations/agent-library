@@ -2,7 +2,10 @@ import { AuthorizationError, CimdFetchError, OAuthAuthorizationServer, OAuthErro
 import { handlePublisherApi } from "../api/publisher.js";
 import { rateLimit } from "../auth.js";
 import { handleOAuthMcp } from "./mcp.js";
-import { authorizationUrl, exchangeAndVerify, newUpstreamSecrets, oidcConfig } from "./oidc.js";
+import { adapters } from "../adapters.js";
+import { principalForIdentity } from "../identity/accounts.js";
+import { randomToken } from "../identity/jwt.js";
+import { HttpError } from "../util.js";
 import { __name } from "../runtime.js";
 import { folderName } from "../service.js";
 import { ROLE_RANK, memberRoleSql, personalWorkspaceId, visibleProjects, workspaceRoleSql } from "../tenancy.js";
@@ -223,9 +226,20 @@ var CX_ENTER = '<button name="decision" value="approve" class="enter" tabindex="
 function cxBar(lead) {
   return `<div class="bar">${lead}<button name="decision" value="deny">Cancel</button><button name="decision" value="approve" class="primary">Connect</button></div>`;
 }
-function cxStart(handle) {
-  return `<form method="post" action="/authorize"><input type="hidden" name="handle" value="${esc(handle)}"><input type="hidden" name="step" value="signin">
+function cxStart(handle, choices = []) {
+  const head = `<form method="post" action="/authorize"><input type="hidden" name="handle" value="${esc(handle)}"><input type="hidden" name="step" value="signin"><input type="hidden" name="decision" value="approve">`;
+  if (!choices.length) return `<form method="post" action="/authorize"><input type="hidden" name="handle" value="${esc(handle)}"><input type="hidden" name="step" value="signin">
 <div class="bar"><button name="decision" value="deny">Cancel</button><button name="decision" value="approve" class="primary">Continue${cxIcon("next")}</button></div></form>`;
+  // Several ways to sign in (hosted): one form per option, plus Cancel.
+  const opts = choices.map((c) => c.email
+    ? `${head}<input type="hidden" name="choice" value="${esc(c.id)}"><label class="fine" for="cx-email">Email</label><div class="bar"><input id="cx-email" name="email" type="email" required autocomplete="email" placeholder="you@example.com" style="flex:1"><button class="primary">${esc(c.label)}</button></div></form>`
+    : `${head}<input type="hidden" name="choice" value="${esc(c.id)}"><div class="bar"><button class="primary" style="flex:1">${esc(c.label)}${cxIcon("next")}</button></div></form>`).join("\n");
+  return `${opts}
+<form method="post" action="/authorize"><input type="hidden" name="handle" value="${esc(handle)}"><input type="hidden" name="step" value="signin"><div class="bar"><button name="decision" value="deny">Cancel</button></div></form>`;
+}
+/** Sign-in options of the consent sign-in ([] = one Continue button). */
+function cxChoices(env) {
+  return (upstreamFor(env).choices?.() ?? []).filter((x) => typeof x?.id === "string" && /^[a-z0-9_-]{1,32}$/.test(x.id) && typeof x.label === "string").map((x) => ({ id: x.id, label: x.label.slice(0, 60), email: !!x.email }));
 }
 function clientFacts(d) {
   const chips = [
@@ -315,21 +329,21 @@ async function authorizeGet(req, env, as, origin) {
     const hint = cxPublishHint(new URL(req.url).searchParams);
     if (hint) await env.OAUTH_KV.put(`pubhint:${await sha(parsed.clientId + " " + parsed.codeChallenge)}`, JSON.stringify(hint), { expirationTtl: 900 });
     const consent2 = await oauth.beginConsent(parsed);
-    const targets2 = [new URL(oidcConfig(env).authorization).origin];
+    const targets2 = upstreamFor(env).origins();
     const app = pubCheck.app;
     return page("Connect an app to Agent Library", cxShell(`${cxPair(app.display_name)}
 <h1>Connect ${esc(app.display_name)}</h1><p class="lede">It wants to publish its own files to your library. Sign in to choose where they go. Nothing is shared yet.</p>
 <div class="chips">${cxChip("ok", "check", "Registered by you")}${cxChip("", "back", `Returns to ${esc(new URL(parsed.redirectUri).host)}`)}</div>
-${cxStart(consent2.handle)}`), consent2.headers, 200, targets2);
+${cxStart(consent2.handle, cxChoices(env))}`), consent2.headers, 200, targets2);
   }
   if (!allowedRedirect(parsed.redirectUri)) return errorPage("This app's callback address is not allowed to connect.");
   const details = await oauth.describeConsent(parsed);
   const consent = await oauth.beginConsent(parsed);
-  const targets = [new URL(oidcConfig(env).authorization).origin];
+  const targets = upstreamFor(env).origins();
   return page("Connect an app to Agent Library", cxShell(`${cxPair(details.clientName)}
 <h1>Connect ${esc(details.clientName)}</h1><p class="lede">It wants to use documents in your library. Sign in to pick which projects. Nothing is shared yet.</p>
 ${clientFacts(details)}
-${cxStart(consent.handle)}`), consent.headers, 200, targets);
+${cxStart(consent.handle, cxChoices(env))}`), consent.headers, 200, targets);
 }
 async function authorizePost(req, env, as, origin) {
   const oauth = as.getOAuthApi(env);
@@ -345,10 +359,20 @@ async function authorizePost(req, env, as, origin) {
     return toClient(loc, denied.headers, new URL(loc).host);
   }
   if (step === "signin") {
+    // Validate the sign-in choice before the consent handle is used, so a typo can be fixed with Back.
+    const choices = cxChoices(env);
+    const picked = choices.find((c) => c.id === String(form.get("choice") ?? "")) ?? (choices.length ? null : undefined);
+    if (picked === null) return errorPage("Pick one of the sign-in options.");
+    let email = null;
+    if (picked?.email) {
+      email = String(form.get("email") ?? "").trim().toLowerCase();
+      if (!/^[^\s@]{1,64}@[^\s@]{1,189}\.[^\s@]{2,}$/.test(email) || email.length > 254) return errorPage("That doesn't look like an email address. Go back and check it.");
+    }
     const approved = await oauth.approveConsent(req, handle, { scope: [SCOPES.read] });
-    const secrets = newUpstreamSecrets();
+    const secrets = { verifier: randomToken(64), nonce: randomToken(32) };
     const { state, headers } = await oauth.beginUpstream(approved.request, { data: secrets, headers: approved.headers });
-    headers.set("location", await authorizationUrl(env, { redirectUri: `${origin}/callback`, state, nonce: secrets.nonce, verifier: secrets.verifier }));
+    const target = await upstreamFor(env).start({ redirectUri: `${origin}/callback`, state, nonce: secrets.nonce, verifier: secrets.verifier, choice: picked?.id ?? null, email });
+    headers.set("location", target.startsWith("/") && !target.startsWith("//") ? origin + target : target);
     return new Response(null, { status: 302, headers });
   }
   if (step === "publish") return publishConsentPost(req, env, oauth, form, handle, origin);
@@ -542,18 +566,19 @@ async function callback(req, env, as, origin) {
   }
   let ident;
   try {
-    ident = await exchangeAndVerify(env, { code: url.searchParams.get("code"), redirectUri: `${origin}/callback`, verifier: resumed.data.verifier, nonce: resumed.data.nonce });
+    ident = await upstreamFor(env).finish({ url, redirectUri: `${origin}/callback`, verifier: resumed.data.verifier, nonce: resumed.data.nonce });
   } catch (e) {
     console.log("upstream_signin_failed", e?.code ?? "error");
-    resumed.headers.set("location", authorizationErrorRedirect(resumed.request, "access_denied", "Owner sign-in failed"));
+    resumed.headers.set("location", authorizationErrorRedirect(resumed.request, "access_denied", "Sign-in failed"));
     return new Response(null, { status: 302, headers: resumed.headers });
   }
-  let principalId = await env.DB.prepare("SELECT principal_id FROM upstream_identities WHERE issuer = ? AND subject = ?").bind(ident.issuer, ident.subject).first("principal_id");
-  if (!principalId) {
-    const humans = await env.DB.prepare("SELECT id FROM principals WHERE kind = 'human' AND issuer <> 'restored'").all();
-    if (humans.results.length !== 1) return errorPage("No unique owner account to link. Sign in to the Agent Library web app first.", 403);
-    principalId = humans.results[0].id;
-    await env.DB.prepare("INSERT INTO upstream_identities (issuer, subject, principal_id, email, created_at) VALUES (?, ?, ?, ?, ?)").bind(ident.issuer, ident.subject, principalId, ident.email, nowIso()).run();
+  // The same account rules as browser sign-in (identity/accounts.js): an existing link, the single-user fallback, or
+  // (hosted) a new account. Messages are fixable by the person; no account details are revealed.
+  let principalId;
+  try { principalId = (await principalForIdentity(env, ident)).principalId; }
+  catch (e) {
+    if (e instanceof HttpError && e.status === 403) return errorPage(e.message, 403);
+    throw e;
   }
   const projects = { results: await consentProjects(env, principalId) };
   const pubApp = await appClientFor(env, resumed.request.clientId);
@@ -822,6 +847,12 @@ async function withPublisherCors(req, env, res) {
   }
   r.headers.set("vary", "Origin");
   return r;
+}
+/** The installation's consent sign-in (identity adapter); 503 when not configured. */
+function upstreamFor(env) {
+  const u = adapters(env).identity.upstream(env);
+  if (!u) throw new HttpError(503, "oidc_not_configured", "Upstream sign-in is not configured");
+  return u;
 }
 var acOn, LIM, lim, SCOPES, CATALOGUE, AC_CATALOGUE, CONNECTION_EXPIRES_AT, cache, HOSTED_CALLBACKS, LISTED_ONLY, isLoopbackRedirect, MAX_CONN_PROJECTS, NEW_PROJECT_SLOTS, esc, page, errorPage, oauthJson, AS_PATHS, RS_META;
 acOn = (env) => env.APP_CONNECT_ENABLED === "1";

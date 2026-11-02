@@ -2,6 +2,8 @@
 // service tokens may front agents. With no Access configured (local dev), there is no provider and the install is
 // multi-user so shared-workspace flows can be exercised.
 import { HttpError } from "../../core/src/util.js";
+import { accessOidc } from "./access-oidc.js";
+import { oidcConfigured, oidcIdentity } from "../../core/src/identity/oidc-identity.js";
 
 function certsUrl(env, team) {
   const o = env.ACCESS_CERTS_URL;
@@ -66,6 +68,26 @@ export const accessIdentity = {
   multiUser: (env) => !accessEnabled(env),
   login: (req, env) => verifyAccess(req, env),
   async session(req, env) { return accessEnabled(env) ? verifyAccess(req, env) : null; },
-  async bearer(req, env) { if (accessEnabled(env)) await verifyAccess(req, env, { requireOwner: false }); }
+  async bearer(req, env) { if (accessEnabled(env)) await verifyAccess(req, env, { requireOwner: false }); },
+  // Consent sign-in on the OAuth host (ChatGPT/Claude connections): Access for SaaS, owner only.
+  upstream: (env) => accessOidc(env),
+  browserSignIn: () => false,
+  createAccounts: () => false,
+  // Access for SaaS refuses every email but OWNER_EMAIL (access-oidc.js), so the sign-in is the owner.
+  linkSoleOwner: () => true
+};
+/** Per request: generic OIDC when OIDC_ISSUER is set, otherwise Cloudflare Access (or local dev with neither). */
+const pick = (env) => oidcConfigured(env) ? oidcIdentity : accessIdentity;
+export const selfHostIdentity = {
+  name: "self-host",
+  enabled: (env) => pick(env).enabled(env),
+  multiUser: (env) => pick(env).multiUser(env),
+  login: (req, env) => pick(env).login(req, env),
+  session: (req, env) => pick(env).session(req, env),
+  bearer: (req, env) => pick(env).bearer(req, env),
+  upstream: (env) => pick(env).upstream(env),
+  browserSignIn: (env) => pick(env).browserSignIn(env),
+  createAccounts: (env) => pick(env).createAccounts(env),
+  linkSoleOwner: (env) => !!pick(env).linkSoleOwner?.(env)
 };
 export { accessEnabled, verifyAccess };
