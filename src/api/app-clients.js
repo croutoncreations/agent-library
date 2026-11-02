@@ -1,11 +1,13 @@
 import { requireHuman } from "../auth.js";
-import { memberRoleSql, personalWorkspaceId, requireWorkspaceRole, workspaceRoleSql } from "../tenancy.js";
+import { memberRoleSql, personalWorkspaceId, readOnlyError, requireWorkspaceRole, workspaceRoleSql } from "../tenancy.js";
 
 // App registrations belong to a workspace (default: the registrant's personal workspace). The registrant or an admin
 // of that workspace manages one (columns qualified: see KEY_MANAGER in credentials.js).
 // The registrant must still be a member of the app's (active) workspace: someone removed loses the app too.
 var APP_WS = "COALESCE(c.workspace_id, 'wsp_' || c.owner_principal_id)";
 var APP_MANAGER = `((c.owner_principal_id = ? AND ${workspaceRoleSql(APP_WS, "viewer")}) OR ${workspaceRoleSql(APP_WS, "admin")})`;
+// Changing an app's settings is a write: refused while its workspace is suspended (read-only).
+var APP_EDITOR = `((c.owner_principal_id = ? AND ${workspaceRoleSql(APP_WS, "viewer", "?", false)}) OR ${workspaceRoleSql(APP_WS, "admin")})`;
 import { _servers, originFor } from "../oauth/server.js";
 import { requireAppConnect } from "../service.js";
 import { HttpError, nowIso, nowMs, randomId, str } from "../util.js";
@@ -43,8 +45,13 @@ async function updateAppClient(ctx, id, input) {
   requireHuman(ctx);
   requireAppConnect(ctx);
   const sp = suggestion(input?.suggested_project, "suggested_project"), sf = suggestion(input?.suggested_folder, "suggested_folder");
-  const r = await ctx.env.DB.prepare(`UPDATE app_clients AS c SET suggested_project = ?, suggested_folder = ? WHERE c.id = ? AND ${APP_MANAGER}`).bind(sp, sf, id, ctx.principal.id, ctx.principal.id, ctx.principal.id).run();
-  if (!r.meta.changes) throw new HttpError(404, "not_found", "App not found");
+  const r = await ctx.env.DB.prepare(`UPDATE app_clients AS c SET suggested_project = ?, suggested_folder = ? WHERE c.id = ? AND ${APP_EDITOR}`).bind(sp, sf, id, ctx.principal.id, ctx.principal.id, ctx.principal.id).run();
+  if (!r.meta.changes) {
+    // Visible to me but its workspace is suspended: say read-only instead of "not found".
+    const seen = await ctx.env.DB.prepare(`SELECT 1 FROM app_clients c WHERE c.id = ? AND ${APP_MANAGER}`).bind(id, ctx.principal.id, ctx.principal.id, ctx.principal.id).first();
+    if (seen) throw readOnlyError();
+    throw new HttpError(404, "not_found", "App not found");
+  }
   await ctx.env.DB.prepare("INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id, workspace_id) VALUES (?, ?, NULL, 'app_client.update', ?, 'ok', ?, (SELECT COALESCE(workspace_id, 'wsp_' || owner_principal_id) FROM app_clients WHERE id = ?))").bind(nowIso(), ctx.principal.id, id, ctx.requestId, id).run();
   return view(await ctx.env.DB.prepare("SELECT * FROM app_clients WHERE id = ?").bind(id).first());
 }

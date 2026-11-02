@@ -156,7 +156,15 @@ async function route3(req, env, url, requestId) {
     if (seg[2] === "members" && seg.length === 3 && m === "GET") return json(await listMembers(ctx, wid));
     if (seg[2] === "members" && seg.length === 4 && m === "PATCH") return json(await setMemberRole(ctx, wid, str(seg[3], "member", 80), await body(req)));
     if (seg[2] === "members" && seg.length === 4 && m === "DELETE") return json(await removeMember(ctx, wid, str(seg[3], "member", 80)));
-    if (seg[2] === "import" && seg.length === 3 && m === "POST") return json(await importBackup(ctx, wid, await body(req)), 201);
+    if (seg[2] === "import" && seg.length === 3 && m === "POST") {
+      const raw = await req.text();
+      // Backups embed files as base64; the request cap is 2 MiB (about 1.5 MB of files). Larger projects need a
+      // streamed import (later); say so clearly instead of a generic 413.
+      if (raw.length > 2 * 1024 * 1024) throw new HttpError(413, "backup_too_large", "This backup is larger than 2 MB, the import limit for now. Split the project or remove large files first.");
+      let parsed; try { parsed = raw ? JSON.parse(raw) : {}; } catch { throw new HttpError(400, "invalid_json", "Malformed JSON"); }
+      const k = req.headers.get("idempotency-key");
+      return json(await importBackup(ctx, wid, parsed, k ? idemKey(k) : null), 201);
+    }
     if (seg[2] === "invites" && seg.length === 3 && m === "POST") return json(await createInvite(ctx, wid, await body(req), url.origin), 201);
     if (seg[2] === "invites" && seg.length === 5 && seg[4] === "revoke" && m === "POST") return json(await revokeInvite(ctx, wid, str(seg[3], "invite", 80)));
     throw new HttpError(404, "not_found", "Not found");

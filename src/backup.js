@@ -1,7 +1,7 @@
 import { personalWorkspaceId } from "./tenancy.js";
-import { getBlob, putBlob, readText, storeText } from "./content-store.js";
+import { deleteBlob, getBlob, putBlob, readText, storeText } from "./content-store.js";
 import { requireHuman } from "./auth.js";
-import { tplDate } from "./service.js";
+import { BINARY_TYPES, LIMITS, tplDate } from "./service.js";
 import { requireProjectRole, requireWorkspaceRole, workspaceRoleSql } from "./tenancy.js";
 import { HttpError, int, nowIso, randomId, sha256Hex, str } from "./util.js";
 
@@ -92,7 +92,7 @@ async function restoreBackup(ctx, backup) {
   // Restore is for moving a whole single-owner store: it needs an installation with no projects at all. On a shared
   // (hosted) installation that is never true, so restore is unavailable there by construction.
   // Shared installations (MULTI_USER=1, or several people) refuse restore outright: a restored project id is global
-  // and would squat on, or reveal, another workspace's id. Proposed decision D8.
+  // and would squat on, or reveal, another workspace's id (decision D8 B: use workspace import instead).
   if (ctx.env.MULTI_USER === "1") throw new HttpError(403, "restore_unavailable", "Restore is only available on a single-owner installation");
   if (await DB.prepare("SELECT COUNT(*) AS n FROM principals WHERE kind = 'human'").first("n") > 1) throw new HttpError(403, "restore_unavailable", "Restore is only available on a single-owner installation");
   const existing = await DB.prepare("SELECT COUNT(*) AS n FROM projects").first("n");
@@ -124,11 +124,63 @@ async function restoreBackup(ctx, backup) {
 // comments, file keys), so nothing can collide with or reveal another workspace's ids. Authors inside the backup are
 // not trusted as principals: every version and comment is attributed to the importing person, and the original
 // labels stay in the provenance fields. Admin of an active workspace; works on single-owner installs too.
-async function importBackup(ctx, workspaceId, input) {
+// Field checks import adds on top of validateBackup, so every row is valid before anything is written (no orphaned
+// file bytes from a batch that fails on a constraint) and the project stays within normal per-project limits.
+const IMPORT_KINDS = new Set(["markdown", "html", "json", "csv", "binary"]);
+const VIA_KINDS = new Set(["browser", "human", "oauth", "api_key", "legacy_grant", "publisher", "app_connect"]);
+function checkImportRows(backup) {
+  const bad = (m) => { throw new HttpError(400, "bad_backup", m); };
+  if (backup.artifacts.length > LIMITS.artifactsPerProject) bad(`A project holds at most ${LIMITS.artifactsPerProject} documents and files`);
+  if (backup.revisions.length > 20 * LIMITS.artifactsPerProject || backup.comments.length > 20 * LIMITS.artifactsPerProject || (backup.meta_versions ?? []).length > 20 * LIMITS.artifactsPerProject) bad("Too many versions or comments to import at once");
+  const ids = new Set(), revKeys = new Set(), revIds = new Set();
+  for (const a of backup.artifacts) {
+    if (typeof a.id !== "string" || ids.has(a.id)) bad("Duplicate or missing document id");
+    ids.add(a.id);
+    if (!IMPORT_KINDS.has(a.kind)) bad("Unsupported document kind");
+    str(a.title, "title", 200, { min: 1 }); str(a.folder ?? "", "folder", 200);
+    let tags; try { tags = JSON.parse(a.tags ?? "[]"); } catch { bad("tags must be a JSON list"); }
+    if (!Array.isArray(tags) || tags.some((x) => typeof x !== "string" || x.length > 50) || tags.length > 20) bad("tags must be a list of short strings");
+    if (!Number.isInteger(a.head_rev) || a.head_rev < 1 || !Number.isInteger(a.meta_version) || a.meta_version < 1) bad("Bad document revision numbers");
+    if (typeof a.created_at !== "string" || typeof a.updated_at !== "string") bad("Bad document timestamps");
+  }
+  let binBytes = 0;
+  for (const r of backup.revisions) {
+    if (typeof r.id !== "string" || revIds.has(r.id)) bad("Duplicate or missing version id");
+    revIds.add(r.id);
+    const k = r.artifact_id + ":" + r.rev_no;
+    if (!Number.isInteger(r.rev_no) || r.rev_no < 1 || revKeys.has(k)) bad("Duplicate or bad version number");
+    revKeys.add(k);
+    if (r.via_kind != null && !VIA_KINDS.has(r.via_kind)) bad("Bad version provenance");
+    str(r.via_label ?? "", "via_label", 200); str(r.change_note ?? "", "change_note", 280); str(r.client_info ?? "", "client_info", 500);
+    if (typeof r.created_at !== "string" || typeof r.mime !== "string") bad("Bad version fields");
+    if (r.blob_key !== null) { if (!BINARY_TYPES[r.mime] && r.mime !== "application/octet-stream") bad("Unsupported file type"); binBytes += r.size; }
+  }
+  if (binBytes > LIMITS.projectBinaryBytes) bad("Files exceed the per-project storage limit");
+  for (const a of backup.artifacts) {
+    if (!revKeys.has(a.id + ":" + a.head_rev)) bad("A document's current version is missing");
+    if (!revIds.has(a.head_revision_id)) bad("A document's current version id is missing");
+  }
+  for (const c of backup.comments) {
+    if (typeof c.body !== "string" || c.body.length > LIMITS.commentChars || !Number.isInteger(c.rev_no) || typeof c.created_at !== "string") bad("Bad comment");
+  }
+  for (const v of backup.meta_versions ?? []) {
+    if (!Number.isInteger(v.version) || v.version < 1 || typeof v.created_at !== "string") bad("Bad details version");
+    str(v.title ?? "", "title", 200); str(v.folder ?? "", "folder", 200);
+    if (v.via_kind != null && !VIA_KINDS.has(v.via_kind)) bad("Bad details provenance");
+  }
+}
+
+async function importBackup(ctx, workspaceId, input, idemKeyValue) {
   requireHuman(ctx);
   const backup = input?.backup ?? input;
   await requireWorkspaceRole(ctx, workspaceId, "admin");
+  // Retried import (same Idempotency-Key): return the project created the first time instead of a duplicate.
+  if (idemKeyValue) {
+    const prior = await ctx.env.DB.prepare("SELECT response FROM idempotency WHERE principal_id = ? AND project_id = ? AND op = 'backup.import' AND key = ?").bind(ctx.principal.id, workspaceId, idemKeyValue).first("response");
+    if (prior) return { ...JSON.parse(prior), idempotent_replay: true };
+  }
   const { pid: oldPid, decoded } = await validateBackup(backup);
+  checkImportRows(backup);
   const DB = ctx.env.DB, me = ctx.principal.id, at = nowIso();
   const title = input?.title !== void 0 ? str(input.title, "title", 200, { min: 1 }) : str(String(backup.project?.title ?? "Imported project"), "title", 200, { min: 1 });
   const pid = randomId("prj");
@@ -144,7 +196,12 @@ async function importBackup(ctx, workspaceId, input) {
     return `blobs/${pid}/${artId.get(m[2])}/${m[3]}`;
   };
   const keyMap = new Map([...decoded.keys()].map((k) => [k, newKey(k)]));
-  for (const [k, bytes] of decoded) await putBlob(ctx.env, keyMap.get(k), bytes);
+  // Every check is done; re-check the role right before writing bytes (also checked inside the project INSERT).
+  if (!await DB.prepare(`SELECT ${workspaceRoleSql("?", "admin")} AS ok`).bind(me, workspaceId).first("ok")) throw new HttpError(403, "forbidden", "Needs the admin role in an active workspace");
+  const written = [];
+  const dropBlobs = async () => { for (const k of written) await deleteBlob(ctx.env, k).catch(() => {}); };
+  try { for (const [k, bytes] of decoded) { await putBlob(ctx.env, keyMap.get(k), bytes); written.push(keyMap.get(k)); } }
+  catch (e) { await dropBlobs(); throw e; }
   const stmts = [
     // Gated in-statement: the importer must still be an admin of the active workspace.
     DB.prepare(`INSERT INTO projects (id, owner_id, title, created_at, workspace_id) SELECT ?, COALESCE((SELECT created_by FROM workspaces WHERE id = ?), ?), ?, ?, ? WHERE ${workspaceRoleSql("?", "admin")}`)
@@ -157,20 +214,32 @@ async function importBackup(ctx, workspaceId, input) {
   }
   for (const r of backup.revisions)
     stmts.push(DB.prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, blob_key, size, sha256, mime, restored_from, created_at, via_kind, via_id, via_label, client_info, change_note)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(revId.get(r.id), artId.get(r.artifact_id), pid, r.rev_no, me, r.body === null ? null : storeText(r.body), r.blob_key === null ? null : keyMap.get(r.blob_key), r.size, r.sha256, r.mime, r.restored_from, r.created_at, r.via_kind ?? null, null, r.via_label ?? null, r.client_info ?? null, r.change_note ?? null));
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(revId.get(r.id), artId.get(r.artifact_id), pid, r.rev_no, me, r.body === null ? null : storeText(r.body), r.blob_key === null ? null : keyMap.get(r.blob_key), r.size, r.sha256, r.mime, r.restored_from, r.created_at, r.via_kind ?? null, null, r.via_label ? `${r.via_label} (imported)` : "imported", r.client_info ?? null, r.change_note ?? null));
   for (const v of backup.meta_versions ?? [])
     stmts.push(DB.prepare(`INSERT INTO meta_versions (id, artifact_id, project_id, version, title, folder, tags, trashed, author_id, via_kind, via_id, via_label, client_info, change_note, restored_from, created_at, template_description)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(randomId("mv"), artId.get(v.artifact_id), pid, v.version, v.title, v.folder, v.tags, v.trashed ? 1 : 0, me, v.via_kind ?? null, null, v.via_label ?? null, v.client_info ?? null, v.change_note ?? null, v.restored_from ?? null, v.created_at, v.template_description ?? ""));
   for (const c of backup.comments)
     stmts.push(DB.prepare("INSERT INTO comments (id, project_id, artifact_id, rev_no, author_id, body, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(randomId("cmt"), pid, artId.get(c.artifact_id), c.rev_no, me, storeText(c.body), c.created_at));
-  stmts.push(DB.prepare("INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id, workspace_id) VALUES (?, ?, ?, 'backup.import', ?, 'ok', ?, ?)").bind(at, me, pid, pid, ctx.requestId, workspaceId));
-  try { await DB.batch(stmts); }
+  const result = { project_id: pid, workspace_id: workspaceId, title, artifacts: backup.artifacts.length, revisions: backup.revisions.length, comments: backup.comments.length, blobs: decoded.size };
+  const exists = "EXISTS (SELECT 1 FROM projects WHERE id = ?)";
+  stmts.push(DB.prepare(`INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id, workspace_id) SELECT ?, ?, ?, 'backup.import', ?, 'ok', ?, ? WHERE ${exists}`).bind(at, me, pid, pid, ctx.requestId, workspaceId, pid));
+  if (idemKeyValue) stmts.push(DB.prepare(`INSERT INTO idempotency (principal_id, project_id, op, key, digest, status, response, created_at) SELECT ?, ?, 'backup.import', ?, '', 201, ?, ? WHERE ${exists}`)
+    .bind(me, workspaceId, idemKeyValue, JSON.stringify(result), at, pid));
+  let res;
+  try { res = await DB.batch(stmts); }
   catch (e) {
+    await dropBlobs();
     // The admin check lost a race (no project row): the dependent rows fail their foreign key and nothing is written.
     if (/FOREIGN KEY/i.test(String(e?.message ?? e))) throw new HttpError(403, "forbidden", "Needs the admin role in an active workspace");
+    if (/UNIQUE|PRIMARY KEY/i.test(String(e?.message ?? e)) && idemKeyValue) {
+      const prior = await DB.prepare("SELECT response FROM idempotency WHERE principal_id = ? AND project_id = ? AND op = 'backup.import' AND key = ?").bind(me, workspaceId, idemKeyValue).first("response");
+      if (prior) return { ...JSON.parse(prior), idempotent_replay: true };
+    }
     throw e;
   }
-  return { project_id: pid, workspace_id: workspaceId, title, artifacts: backup.artifacts.length, revisions: backup.revisions.length, comments: backup.comments.length, blobs: decoded.size };
+  // Empty backup and a lost race: no dependent row failed, but no project was created either.
+  if (!res[0].meta.changes) { await dropBlobs(); throw new HttpError(403, "forbidden", "Needs the admin role in an active workspace"); }
+  return result;
 }
 
 export { exportBackup, importBackup, restoreBackup };

@@ -24,7 +24,8 @@ async function validateScope(env, ownerId, raw) {
   // Every project must be visible to the creator, all in one workspace, and read_write needs member or above.
   const roles = await Promise.all(out2.map((s) => projectRole(env, ownerId, s.project_id)));
   if (roles.some((r) => !r || !r.role || r.status === "deleting")) throw new HttpError(404, "not_found", "Project not found");
-  if (out2.some((s, i) => s.can_write && roles[i].status !== "active")) throw readOnlyError();
+  // Suspended (read-only) workspaces: no new, replaced or rescoped keys at all (existing keys keep reading).
+  if (roles.some((r) => r.status !== "active")) throw readOnlyError();
   if (new Set(roles.map((r) => r.workspace_id)).size !== 1) throw new HttpError(400, "invalid_input", "A key covers projects from one workspace");
   if (out2.some((s, i) => s.can_write && ROLE_RANK[roles[i].role] < ROLE_RANK.member)) throw new HttpError(403, "forbidden", "Your role in this workspace is read-only");
   out2.workspaceId = roles[0].workspace_id;

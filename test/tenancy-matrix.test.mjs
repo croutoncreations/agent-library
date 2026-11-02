@@ -236,6 +236,14 @@ test("idempotency replay does not outlive a demotion (API key and OAuth)", async
 });
 
 test("suspension makes the workspace read-only for every credential; refresh keeps working; deleting closes it", async () => {
+  // Before suspending: an upload begun (bytes sent) but not finished, and a key write whose idempotency key is replayed.
+  const ub = ok(await bob.req("POST", `/api/projects/${A.project}/uploads`, { title: "pending", mime: "image/png", size: png.length, sha256: sha256(png) }), 201);
+  assert.equal((await fetch(h.appUi + ub.put_url, { method: "PUT", headers: { cookie: bob.cookie, "x-csrf-token": bob.csrf, "content-type": "application/octet-stream" }, body: png })).status, 200);
+  cred.pendingUpload = ub.upload_id;
+  cred.replayKey = key("rp");
+  assert.equal((await v1(cred.key, "POST", `/v1/projects/${A.project}/files`, { body: { title: "replay me", body: "synthetic" }, idem: cred.replayKey })).status, 201);
+  // The owner registered cred.app in their personal workspace; move it into A for this check (owner is a member of A).
+  sql(`UPDATE app_clients SET workspace_id = '${WSA}' WHERE id = '${cred.app.app_client_id}'`);
   sql(`UPDATE workspaces SET status = 'suspended' WHERE id = '${WSA}'`);
   try {
     // Every read surface keeps working for every credential type (D11 B / D13 A).
@@ -254,6 +262,13 @@ test("suspension makes the workspace read-only for every credential; refresh kee
       ["grant save", () => api(cred.grant, "PUT", `/api/projects/${A.project}/artifacts/${A.doc}`, { body: { expected_revision: rev, body: "x" } })],
       ["grant mcp save", () => mcpCall(cred.grantMcp, "save_markdown", { project_id: A.project, artifact_id: A.doc, expected_revision: rev, body: "x", idempotency_key: key("s") })],
       ["oauth save", () => oc(cred.oauthA, "save_markdown", { project_id: A.project, artifact_id: A.doc, expected_revision: rev, body: "x", idempotency_key: key("s") })],
+      ["session rename", () => session(bob, "PATCH", `/api/projects/${A.project}/artifacts/${A.doc}`, { expected_meta_version: 1, title: "renamed while suspended" })],
+      ["session folder", () => session(bob, "POST", `/api/projects/${A.project}/folders`, { name: "x" })],
+      ["session template", () => session(bob, "POST", `/api/projects/${A.project}/templates`, { artifact_id: A.doc, expected_revision: rev, description: "x" })],
+      ["session restore", () => session(bob, "POST", `/api/projects/${A.project}/artifacts/${A.doc}/restore`, { from_revision: 1, expected_revision: rev })],
+      ["session upload finish", () => session(bob, "POST", `/api/projects/${A.project}/uploads/${cred.pendingUpload}/finish`)],
+      ["key replay", () => v1(cred.key, "POST", `/v1/projects/${A.project}/files`, { body: { title: "replay me", body: "synthetic" }, idem: cred.replayKey })],
+      ["app settings", () => session(owner, "PUT", `/api/app-clients/${cred.app.app_client_id}`, { suggested_project: "x" })],
       ["oauth upload", () => oc(cred.oauthA, "upload_file", { project_id: A.project, title: "x", mime: "image/png", content_base64: png.toString("base64"), change_note: "x", idempotency_key: key("s") })],
     ]) {
       const r = await op();
@@ -273,7 +288,7 @@ test("suspension makes the workspace read-only for every credential; refresh kee
       assert.doesNotMatch(r.text, /zebraAlpha/);
     }
     for (const [label, op] of readOps("session", A)) assert.equal((await op()).status, 404, `session ${label} in a deleting workspace`);
-  } finally { sql(`UPDATE workspaces SET status = 'active' WHERE id = '${WSA}'`); }
+  } finally { sql(`UPDATE workspaces SET status = 'active' WHERE id = '${WSA}'`); sql(`UPDATE app_clients SET workspace_id = NULL WHERE id = '${cred.app.app_client_id}'`); }
   assert.equal((await v1(cred.key, "GET", `/v1/projects/${A.project}/files/${A.doc}`)).status, 200, "back to normal once active");
 });
 

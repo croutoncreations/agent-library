@@ -1,7 +1,7 @@
 // Workspaces, members and roles (docs/workspaces.md) against a real local server: two workspaces, several synthetic
 // people, every human and delegated credential type. Another workspace's things are 404; roles are enforced;
 // removing or demoting someone cuts off the agents they connected on the very next request; a suspended workspace
-// is closed. Synthetic data only.
+// is read-only and a deleting one is closed. Synthetic data only.
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -142,10 +142,10 @@ test("legacy grants and MCP follow the creator's live role", async (t) => {
     assert.equal(sw.status, 403); assert.equal(sw.body.error.code, "workspace_read_only");
     const listed = ok(await bob.req("GET", "/api/projects")).projects.find((p) => p.id === P.team);
     assert.equal(listed.can_write, false); assert.equal(listed.read_only_reason, "workspace_suspended");
-    // Export and revoking still work; new write keys, invites and projects don't.
+    // Export and revoking still work; new keys, invites and projects don't.
     assert.equal((await alice.req("GET", `/api/projects/${P.team}/backup`)).status, 200);
     assert.equal((await alice.req("POST", "/api/api-keys", { label: "rw", projects: [{ project_id: P.team, access: "read_write" }] })).body.error.code, "workspace_read_only");
-    assert.equal((await alice.req("POST", "/api/api-keys", { label: "ro", projects: [{ project_id: P.team, access: "read" }] })).status, 201);
+    assert.equal((await alice.req("POST", "/api/api-keys", { label: "ro", projects: [{ project_id: P.team, access: "read" }] })).body.error.code, "workspace_read_only", "no new keys at all while suspended");
     assert.equal((await alice.req("POST", `/api/workspaces/${WS}/invites`, { email: "x@example.test", role: "member" })).body.error.code, "workspace_read_only");
     assert.equal((await alice.req("POST", "/api/projects", { title: "x", workspace_id: WS })).body.error.code, "workspace_read_only");
     // Deleting: closed to everyone.
@@ -233,6 +233,28 @@ test("import a backup into a workspace (D8 B): new ids, importer as author, admi
   const before = sql(`SELECT COUNT(*) AS n FROM projects`)[0].n;
   assert.equal((await alice.req("POST", `/api/workspaces/${WS}/import`, { backup: bad })).status, 400);
   assert.equal(sql(`SELECT COUNT(*) AS n FROM projects`)[0].n, before);
+  // Rows that would only fail at the database (duplicate version numbers, bad tags, bad kind): 400 before any file
+  // bytes are written, so no orphaned objects.
+  for (const [label, mutate] of [
+    ["duplicate rev_no", (b) => { const r = b.revisions[0]; b.revisions.push({ ...r, id: r.id + "x" }); }],
+    ["bad tags", (b) => { b.artifacts[0].tags = "not json"; }],
+    ["bad kind", (b) => { b.artifacts[0].kind = "exe"; }],
+    ["too many documents", (b) => { b.artifacts = Array.from({ length: 101 }, (_, i) => ({ ...b.artifacts[0], id: "a" + i })); }],
+  ]) {
+    const b = structuredClone(bk); mutate(b);
+    const res = await alice.req("POST", `/api/workspaces/${WS}/import`, { backup: b });
+    assert.equal(res.status, 400, `${label}: ${JSON.stringify(res.body)}`);
+  }
+  assert.equal(sql(`SELECT COUNT(*) AS n FROM projects`)[0].n, before);
+  // Retried import with the same Idempotency-Key returns the first project instead of creating a duplicate.
+  const K = key("imp");
+  const first = await alice.req("POST", `/api/workspaces/${WS}/import`, { backup: bk, title: "Once" }, { idem: K });
+  const again = await alice.req("POST", `/api/workspaces/${WS}/import`, { backup: bk, title: "Once" }, { idem: K });
+  assert.equal(first.status, 201); assert.equal(again.body.project_id, first.body.project_id); assert.equal(again.body.idempotent_replay, true);
+  assert.equal(sql(`SELECT COUNT(*) AS n FROM projects WHERE title = 'Once'`)[0].n, 1);
+  // Over the request cap: a clear backup_too_large.
+  const huge = await alice.req("POST", `/api/workspaces/${WS}/import`, undefined, { raw: JSON.stringify({ backup: bk, pad: "x".repeat(2 * 1024 * 1024) }), headers: { "content-type": "application/json" } });
+  assert.equal(huge.status, 413); assert.equal(huge.body.error.code, "backup_too_large");
   // Suspended workspace: refused.
   sql(`UPDATE workspaces SET status = 'suspended' WHERE id = '${WS}'`);
   try { const s = await alice.req("POST", `/api/workspaces/${WS}/import`, { backup: bk }); assert.equal(s.status, 403); assert.equal(s.body.error.code, "workspace_read_only"); }

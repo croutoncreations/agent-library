@@ -37,8 +37,8 @@ A workspace always has at least one owner. A `project_members` row can narrow on
 5. **Suspended workspaces are read-only; deleting workspaces are closed** (decisions D11 B, D13 A). While suspended
    (e.g. a failed payment), people and agents can still read, download, search, see history and export; OAuth and
    publisher refresh keep working, so connections survive. Every write is refused with 403 `workspace_read_only`:
-   saves, uploads, restores, comments, trash and rename, publishing, new projects and imports, write API keys and
-   Edit grants, invitations, role changes and renaming. Cleanup still works: revoking keys, connections, grants and
+   saves, uploads, restores, comments, trash and rename, folders and templates, publishing, new projects and imports,
+   new or replaced API keys, Edit grants, app settings, invitations, role changes and renaming. Cleanup still works: revoking keys, connections, grants and
    publishers, removing members, leaving and deleting the workspace. A workspace being deleted is closed: people get
    404, agent credentials 401, and refresh is `invalid_grant`, like a revoked connection or a removed creator.
 
@@ -91,7 +91,11 @@ shared workspace exists, or accept this for the rollback window.
   **new** project in that workspace. Every id is new (project, documents, versions, comments, file keys), so nothing
   collides with or reveals another workspace's ids. Authors in the backup aren't trusted as accounts: every version
   and comment is attributed to the importer, keeping the original provenance labels. The workspace page offers it as
-  "Import a project from a backup". (Decision D8 B.)
+  "Import a project from a backup". The whole backup is checked (hashes, kinds, tags, version numbers, the
+  100-document and 100 MB per-project limits) before anything is written, and file bytes are removed again if the
+  database write fails. Requests are capped at 2 MB (`413 backup_too_large`; about 1.5 MB of files, since backups
+  embed files as base64), so larger projects can't be imported yet. Send an `Idempotency-Key` to make retries safe.
+  Imported version labels are marked "(imported)". (Decision D8 B.)
 - `POST /api/restore` (whole-store restore with original ids) works only on a single-owner installation with no
   projects (`MULTI_USER` unset and at most one person); shared installations answer 403 `restore_unavailable`.
 
@@ -110,5 +114,5 @@ show at most 500 projects on the consent page and 1000 in the app.
 and people against a real local server. They cover sessions, API keys (`/v1`), legacy grants (HTTP and MCP), OAuth
 connections (MCP) and publishers: another workspace's projects, documents, content, history and search are 404 or
 absent, roles are enforced, removal and demotion cut off the agents a person connected on the next request, and a
-suspended workspace is closed. `test/tenancy-browser.test.mjs` covers the UI in Chrome (it skips without Chrome, and
+suspended workspace is read-only and a deleting one closed. `test/tenancy-browser.test.mjs` covers the UI in Chrome (it skips without Chrome, and
 a skip is not a pass).

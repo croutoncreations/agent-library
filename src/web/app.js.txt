@@ -594,6 +594,7 @@ async function viewWorkspace(id) {
         e.preventDefault();
         var f = ifile.files && ifile.files[0];
         if (!f) { sectionErr(projMsg, { message: "Choose a backup file (.json) first." }); return; }
+        if (f.size > 2 * 1024 * 1024) { sectionErr(projMsg, { message: "This backup is larger than 2 MB, the import limit for now. Split the project or remove large files first." }); return; }
         ibtn.disabled = true;
         try {
           var backup = JSON.parse(await f.text());
@@ -602,7 +603,7 @@ async function viewWorkspace(id) {
           location.hash = "#/p/" + enc(r.project_id);
         } catch (err) { sectionErr(projMsg, err instanceof SyntaxError ? { message: "That file isn't an Agent Library backup (not valid JSON)." } : err); ibtn.disabled = false; }
       } }, h("strong", { text: "Import a project from a backup" }),
-        h("p", { class: "muted small", text: "Creates a new project in this workspace from a backup file downloaded in Settings. Everything gets new IDs and is attributed to you." }),
+        h("p", { class: "muted small", text: "Creates a new project in this workspace from a backup file downloaded in Settings (up to 2 MB). Everything gets new IDs and is attributed to you." }),
         h("div", { class: "row" }, ifile, ibtn));
       newProj = h("div", null, newProj, importForm);
     }
