@@ -54,8 +54,9 @@ export async function requireHuman(env, token, ip, hostname) {
     throw new HttpError(400, "human_check_failed", "The human check didn't pass or expired. Try again.");
   }
   // The token must have been solved on this site (a key shared with other hostnames can't lend its tokens here).
-  // Cloudflare's test keys report "example.com"; only the loopback test setup accepts that.
-  const testHost = !!env.LOCAL_DEV_LOGIN && j.hostname === "example.com";
+  // Cloudflare's test keys report "example.com". Accepted only in local dev AND with one of Cloudflare's published
+  // test secrets (which never validate real tokens), so a real secret can never use this exception.
+  const testHost = !!env.LOCAL_DEV_LOGIN && /^[123]x0{31}AA$/.test(env.TURNSTILE_SECRET_KEY) && j.hostname === "example.com";
   if (hostname && j.hostname !== hostname && !testHost) {
     console.log("turnstile_wrong_host");
     throw new HttpError(400, "human_check_failed", "The human check didn't pass or expired. Try again.");

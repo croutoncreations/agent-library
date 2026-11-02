@@ -207,3 +207,15 @@ test("Turnstile fails closed on configuration mistakes (never silently off)", as
   } finally { globalThis.fetch = realFetch; console.error = err; }
   assert.ok(logs.some((l) => /turnstile_not_configured bad_site_key/.test(l)));
 });
+
+test("Turnstile: the test-key hostname exception needs local dev AND a Cloudflare test secret", async () => {
+  const T = await loadWorker({ "identity/turnstile.js": ["requireHuman"] });
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({ success: true, hostname: "example.com" }), { headers: { "content-type": "application/json" } });
+  try {
+    const env = (secret, dev) => ({ TURNSTILE_SITE_KEY: "1x00000000000000000000AA", TURNSTILE_SECRET_KEY: secret, ...dev ? { LOCAL_DEV_LOGIN: "1" } : {} });
+    await T.requireHuman(env("1x0000000000000000000000000000000AA", true), "tok", null, "localhost");
+    await assert.rejects(T.requireHuman(env("1x0000000000000000000000000000000AA", false), "tok", null, "localhost"), (e) => e.status === 400);
+    await assert.rejects(T.requireHuman(env("0x4AAAAAAArealsecretsynthetic", true), "tok", null, "localhost"), (e) => e.status === 400);
+  } finally { globalThis.fetch = realFetch; }
+});
