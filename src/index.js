@@ -6459,8 +6459,9 @@ async function reviewProposal(ctx, projectId, proposalId, input, key) {
   const done = "EXISTS (SELECT 1 FROM proposals WHERE id = ? AND status = 'approved' AND review_id = ?)", dp = [p.id, rid];
   const stmts = [
     db(ctx).prepare(`UPDATE proposals SET status = 'approving' WHERE id = ? AND status = 'pending' AND ${rz.sql}
-      AND EXISTS (SELECT 1 FROM artifacts WHERE id = ? AND project_id = ? AND trashed_at IS NULL AND (? IS NULL OR head_rev = ?) AND (? IS NULL OR meta_version = ?))`).bind(
-      p.id, ...rz.params, p.artifact_id, projectId, guardRev, guardRev, guardMeta, guardMeta)
+      AND EXISTS (SELECT 1 FROM artifacts WHERE id = ? AND project_id = ? AND trashed_at IS NULL AND (? IS NULL OR head_rev = ?) AND (? IS NULL OR meta_version = ?))
+      AND (? = 0 OR (SELECT COUNT(*) FROM artifacts WHERE project_id = ? AND publisher_id IS NULL AND pending_review = 0) < ?)`).bind(
+      p.id, ...rz.params, p.artifact_id, projectId, guardRev, guardRev, guardMeta, guardMeta, p.is_new ? 1 : 0, projectId, LIMITS.artifactsPerProject)
   ];
   if (meta && p.is_new) {
     // Title written while the head is still 0 (no feed or search event), then the head moves: one "created" event.
@@ -6504,6 +6505,8 @@ async function rvExplain(ctx, i, p, guardRev = null, guardMeta = null) {
   if (a?.trashed_at) throw new HttpError(409, "trashed", "Artifact is in trash");
   if (a && (guardRev !== null && a.head_rev !== guardRev || guardMeta !== null && a.meta_version !== guardMeta))
     throw new HttpError(409, "proposal_stale", "The document changed since this proposal was made; approve with edits against the current version, or reject it", rvStaleExtra(p, a));
+  if (p.is_new && ((await db(ctx).prepare("SELECT COUNT(*) AS n FROM artifacts WHERE project_id = ? AND publisher_id IS NULL AND pending_review = 0").bind(p.project_id).first("n")) ?? 0) >= LIMITS.artifactsPerProject)
+    throw new HttpError(413, "quota_exceeded", "Artifact limit reached");
   throw new HttpError(403, "review_forbidden", "Review permission no longer valid");
 }
 

@@ -1,9 +1,9 @@
 {
   "base_file_types_sha256": "cea551a7d442927605e0890073072e7bad69968f1fdf6a4a3886d3dc79a6b1cf",
-  "integrated_sha256": "c904a0ab37fc1b9fed6ab69bd522e6797dedc55fe6b6502364ec9b0005777b64",
+  "integrated_sha256": "4dd1f04a317f7e0b449530cfcb1a5e96d128facf5165125d1012732c42ef889d",
   "preserved_outside_patches_sha256": "8542d6597122a3a5a256096a4987ee2041d05bb1597eb43daa7386a824f29822",
   "sources_sha256": {
-    "src/review/service.js": "2b764ac1f4f3c8889d10eda5acce8a50c25c90dfae43cbe05e5d4894d0cef5c5",
+    "src/review/service.js": "66aaa5d16763149e719c5aa57ede9b5ba078fade0945a5a75328f9a0074ed146",
     "src/review/tools.js": "192903fbdd905f4b632a23a22263874502c8691d02a394ddb1596aa8b43d2991",
     "src/review/browser.js": "5c349c632b0f33e8129460e06c07f20fa4171ee85b1528b968a92f3184fa5553",
     "src/review/browser.css": "b6b631c3be24b2b9d2cc9bc2a44ee4c74347315f42d17d4787e041f1335c1fd6"
@@ -14,7 +14,7 @@
       "module": "// src/service.ts",
       "count": 1,
       "find_sha256": "990995796303ae28bc68934e504c2b6e7f0f96c0f983ddbb77909c58bbaead9f",
-      "replace_sha256": "8417710648777e9405c789bad08ccb9cf8c4bdfb4288f0ef931901adba5f99fd"
+      "replace_sha256": "d9d9624f29104bb6cca5086a05a4664a8fa184712f9441495e8227e77888553a"
     },
     {
       "name": "hidden new documents exist only for their proposer (writes) and nobody (reads)",
