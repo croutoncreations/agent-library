@@ -246,11 +246,20 @@ test("import a backup into a workspace (D8 B): new ids, importer as author, admi
     assert.equal(res.status, 400, `${label}: ${JSON.stringify(res.body)}`);
   }
   assert.equal(sql(`SELECT COUNT(*) AS n FROM projects`)[0].n, before);
+  // A version written through a legacy grant (via_kind "grant") imports fine; a head pointing at a missing version
+  // is refused.
+  const viaGrant = structuredClone(bk); viaGrant.revisions[0].via_kind = "grant";
+  const okGrant = await alice.req("POST", `/api/workspaces/${WS}/import`, { backup: viaGrant, title: "Via grant" });
+  assert.equal(okGrant.status, 201, JSON.stringify(okGrant.body));
+  const wrongHead = structuredClone(bk); wrongHead.artifacts[0].head_rev = 99;
+  assert.equal((await alice.req("POST", `/api/workspaces/${WS}/import`, { backup: wrongHead })).status, 400);
   // Retried import with the same Idempotency-Key returns the first project instead of creating a duplicate.
   const K = key("imp");
   const first = await alice.req("POST", `/api/workspaces/${WS}/import`, { backup: bk, title: "Once" }, { idem: K });
   const again = await alice.req("POST", `/api/workspaces/${WS}/import`, { backup: bk, title: "Once" }, { idem: K });
   assert.equal(first.status, 201); assert.equal(again.body.project_id, first.body.project_id); assert.equal(again.body.idempotent_replay, true);
+  const reused = await alice.req("POST", `/api/workspaces/${WS}/import`, { backup: bk, title: "Different" }, { idem: K });
+  assert.equal(reused.status, 422); assert.equal(reused.body.error.code, "idempotency_key_reused");
   assert.equal(sql(`SELECT COUNT(*) AS n FROM projects WHERE title = 'Once'`)[0].n, 1);
   // Over the request cap: a clear backup_too_large.
   const huge = await alice.req("POST", `/api/workspaces/${WS}/import`, undefined, { raw: JSON.stringify({ backup: bk, pad: "x".repeat(2 * 1024 * 1024) }), headers: { "content-type": "application/json" } });

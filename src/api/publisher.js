@@ -168,10 +168,13 @@ var beginView = (g) => ({
 async function assertStillAuthorized(env, p) {
   const row = await env.DB.prepare(`SELECT pb.token_epoch,pb.revoked_at,pb.project_id,pb.folder_id,ac.disabled_at AS client_disabled,
     (SELECT w.status FROM workspaces w WHERE w.id = COALESCE(pj.workspace_id, 'wsp_' || pj.owner_id)) AS ws_status,
-    ${memberRoleSql("pj.id", "member", "COALESCE(pb.created_by, pb.owner_principal_id)")} AS creator_ok,CASE WHEN pb.folder_id IS NULL THEN 1 ELSE EXISTS(SELECT 1 FROM folders f WHERE f.id=pb.folder_id AND f.project_id=pb.project_id) END AS folder_valid
+    ${memberRoleSql("pj.id", "member", "COALESCE(pb.created_by, pb.owner_principal_id)")} AS creator_ok,
+    ${memberRoleSql("pj.id", "member", "COALESCE(pb.created_by, pb.owner_principal_id)", true)} AS creator_ok_suspended,CASE WHEN pb.folder_id IS NULL THEN 1 ELSE EXISTS(SELECT 1 FROM folders f WHERE f.id=pb.folder_id AND f.project_id=pb.project_id) END AS folder_valid
     FROM publishers pb JOIN app_clients ac ON ac.id=pb.app_client_id JOIN projects pj ON pj.id=pb.project_id WHERE pb.id=?`).bind(p.id).first();
   if (!row || row.revoked_at !== null || row.client_disabled !== null || row.token_epoch !== p.token_epoch) throw new HttpError(401, "unauthenticated", "Publisher/client revoked or token superseded; reconnect required");
-  if (row.ws_status === "suspended" && !row.creator_ok) throw readOnlyError();
+  const scopeOk = row.project_id === p.project_id && (row.folder_id ?? null) === (p.folder_id ?? null) && row.folder_valid;
+  // Only a publisher that would otherwise be allowed learns the workspace is suspended.
+  if (row.ws_status === "suspended" && scopeOk && row.creator_ok_suspended) throw readOnlyError();
   if (row.project_id !== p.project_id || (row.folder_id ?? null) !== (p.folder_id ?? null) || !row.creator_ok || !row.folder_valid) throw new HttpError(403, "scope_mismatch", "Publisher destination unavailable or changed");
 }
 async function begin(env, p, req) {

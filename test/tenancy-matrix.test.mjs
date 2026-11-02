@@ -268,6 +268,7 @@ test("suspension makes the workspace read-only for every credential; refresh kee
       ["session restore", () => session(bob, "POST", `/api/projects/${A.project}/artifacts/${A.doc}/restore`, { from_revision: 1, expected_revision: rev })],
       ["session upload finish", () => session(bob, "POST", `/api/projects/${A.project}/uploads/${cred.pendingUpload}/finish`)],
       ["key replay", () => v1(cred.key, "POST", `/v1/projects/${A.project}/files`, { body: { title: "replay me", body: "synthetic" }, idem: cred.replayKey })],
+      ["new key", () => session(bob, "POST", "/api/api-keys", { label: "x", projects: [{ project_id: A.project, access: "read" }] })],
       ["app settings", () => session(owner, "PUT", `/api/app-clients/${cred.app.app_client_id}`, { suggested_project: "x" })],
       ["oauth upload", () => oc(cred.oauthA, "upload_file", { project_id: A.project, title: "x", mime: "image/png", content_base64: png.toString("base64"), change_note: "x", idempotency_key: key("s") })],
     ]) {

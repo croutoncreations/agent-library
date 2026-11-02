@@ -94,7 +94,8 @@ shared workspace exists, or accept this for the rollback window.
   "Import a project from a backup". The whole backup is checked (hashes, kinds, tags, version numbers, the
   100-document and 100 MB per-project limits) before anything is written, and file bytes are removed again if the
   database write fails. Requests are capped at 2 MB (`413 backup_too_large`; about 1.5 MB of files, since backups
-  embed files as base64), so larger projects can't be imported yet. Send an `Idempotency-Key` to make retries safe.
+  embed files as base64), so larger projects can't be imported yet. At most 2,000 versions and 2,000 comments per import. Send an `Idempotency-Key` to make retries safe (reusing
+  it with a different backup is `422 idempotency_key_reused`).
   Imported version labels are marked "(imported)". (Decision D8 B.)
 - `POST /api/restore` (whole-store restore with original ids) works only on a single-owner installation with no
   projects (`MULTI_USER` unset and at most one person); shared installations answer 403 `restore_unavailable`.
