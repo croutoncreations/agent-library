@@ -57,7 +57,8 @@ before(async () => {
       OIDC_ISSUER: IDP, OIDC_CLIENT_ID: CLIENT, OIDC_CLIENT_SECRET: SECRET,
       OIDC_AUTHORIZATION_URL: `${IDP}/authorize`, OIDC_TOKEN_URL: `${IDP}/token`, OIDC_JWKS_URL: `${IDP}/jwks`,
       SIGNUP_ALLOWLIST: "@example.test, invitee-host@example.org", RATE_SIGNIN_PER_MIN: "40",
-      RATE_READS_PER_MIN: "100000", RATE_WRITES_PER_MIN: "100000", RATE_AUTHFAIL_PER_MIN: "100000", OAUTH_RATE_MULTIPLIER: "100" },
+      // Multiplier 1: the sign-in rate limit itself is under test here (OAuth-host limits are ample for this file).
+      RATE_READS_PER_MIN: "100000", RATE_WRITES_PER_MIN: "100000", RATE_AUTHFAIL_PER_MIN: "100000", OAUTH_RATE_MULTIPLIER: "1" },
   });
 });
 after(async () => { await s?.stop(); idp?.close(); });

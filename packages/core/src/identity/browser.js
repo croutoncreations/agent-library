@@ -55,11 +55,13 @@ export function signinChoices(env) {
  */
 export async function limitSigninStart(env, req, email) {
   const ip = req.headers.get("cf-connecting-ip") ?? "local";
-  const n = (v, d) => (v && /^\d{1,6}$/.test(v) ? Number(v) : d);
+  // OAUTH_RATE_MULTIPLIER scales these like the other OAuth-host limits (tests and busy shared egress IPs).
+  const mult = env.OAUTH_RATE_MULTIPLIER && /^\d{1,6}$/.test(env.OAUTH_RATE_MULTIPLIER) ? Number(env.OAUTH_RATE_MULTIPLIER) : 1;
+  const n = (v, d) => (v && /^\d{1,6}$/.test(v) ? Number(v) : d) * mult;
   await rateLimit(env, "signin:" + ip, n(env.RATE_SIGNIN_PER_MIN, 20));
   if (email) {
     await rateLimit(env, "signinmail:" + ip, n(env.RATE_SIGNIN_EMAIL_PER_MIN, 5));
-    await rateLimit(env, "signinmail:" + await sha256Hex(email), Math.min(2, n(env.RATE_SIGNIN_EMAIL_PER_MIN, 5)));
+    await rateLimit(env, "signinmail:" + await sha256Hex(email), Math.min(2 * mult, n(env.RATE_SIGNIN_EMAIL_PER_MIN, 5)));
   }
 }
 
