@@ -19,6 +19,8 @@ const out = process.argv[2] ?? 'smoke.json';
 const t = loadTarget();
 const APP = `https://${t.vars.APP_HOST}`;
 const MCP = `https://${t.vars.MCP_HOST}`;
+// Installations without Cloudflare Access (OIDC self-host, the hosted service) sign people in themselves.
+const viaAccess = !!t.vars.ACCESS_TEAM_DOMAIN;
 const accessLogin = `https://${t.vars.ACCESS_TEAM_DOMAIN}/cdn-cgi/access/login/`;
 const token = process.env.AL_SMOKE_API_TOKEN || '';
 const smokeProject = process.env.AL_SMOKE_PROJECT_ID || '';
@@ -41,17 +43,38 @@ async function check(level, name, fn, { attempts = 3 } = {}) {
 const must = (c, msg) => { if (!c) throw new Error(msg); };
 const auth = { authorization: `Bearer ${token}` };
 
-await check('boundary', 'app host requires Cloudflare Access (login redirect only, not an app check)', async () => {
-  const r = await req(`${APP}/`);
-  const loc = r.headers.get('location') ?? '';
-  must(r.status === 302 && loc.startsWith(accessLogin), `expected 302 to Access login, got ${r.status} ${loc.slice(0, 80)}`);
-  return `302 -> ${accessLogin}`;
-});
-await check('boundary', 'app API requires Cloudflare Access', async () => {
-  const r = await req(`${APP}/api/projects`);
-  must(r.status === 302 && (r.headers.get('location') ?? '').startsWith(accessLogin), `expected Access redirect, got ${r.status}`);
-  return '302 -> Access login';
-});
+if (viaAccess) {
+  await check('boundary', 'app host requires Cloudflare Access (login redirect only, not an app check)', async () => {
+    const r = await req(`${APP}/`);
+    const loc = r.headers.get('location') ?? '';
+    must(r.status === 302 && loc.startsWith(accessLogin), `expected 302 to Access login, got ${r.status} ${loc.slice(0, 80)}`);
+    return `302 -> ${accessLogin}`;
+  });
+  await check('boundary', 'app API requires Cloudflare Access', async () => {
+    const r = await req(`${APP}/api/projects`);
+    must(r.status === 302 && (r.headers.get('location') ?? '').startsWith(accessLogin), `expected Access redirect, got ${r.status}`);
+    return '302 -> Access login';
+  });
+} else {
+  await check('boundary', 'app host serves the app shell from the Worker (no Access in front)', async () => {
+    const r = await req(`${APP}/`);
+    must(r.status === 200 && /text\/html/.test(r.headers.get('content-type') ?? ''), `expected 200 HTML, got ${r.status}`);
+    must(/frame-ancestors 'none'/.test(r.headers.get('content-security-policy') ?? ''), 'missing app CSP');
+    return '200 app shell with CSP';
+  });
+  await check('boundary', 'app API requires a sign-in', async () => {
+    const r = await req(`${APP}/api/projects`);
+    must(r.status === 401, `expected 401, got ${r.status}`);
+    return '401';
+  });
+  await check('boundary', 'sign-in methods are offered by the Worker', async () => {
+    const r = await req(`${APP}/auth/methods`);
+    must(r.status === 200, `status ${r.status}`);
+    const m = await r.json();
+    must(m.redirect === true && Array.isArray(m.choices) && m.choices.length > 0, 'no sign-in choices');
+    return `choices: ${m.choices.map((c) => c.id).join(', ')}`;
+  });
+}
 await check('boundary', 'MCP host serves OAuth authorization-server metadata from the Worker', async () => {
   const r = await req(`${MCP}/.well-known/oauth-authorization-server`);
   must(r.status === 200, `status ${r.status}`);

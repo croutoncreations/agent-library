@@ -842,7 +842,8 @@ function billingButtons(b, msg) {
       } catch (err) { showErr(msg, err); btn.disabled = false; }
     };
     // Back from the provider's page (back/forward cache): usable again.
-    addEventListener("pageshow", function (e) { if (e.persisted) { btn.disabled = false; showMsg(msg, ""); } });
+    // (one listener per click, removed after use, so re-renders don't pile them up)
+    btn.addEventListener("click", function () { addEventListener("pageshow", function (e) { if (e.persisted) { btn.disabled = false; showMsg(msg, ""); } }, { once: true }); });
     return btn;
   });
 }
