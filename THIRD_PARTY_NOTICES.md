@@ -214,7 +214,7 @@ THE SOFTWARE.
 
 ## Lucide-style / Feather-derived inline icons
 
-`src/web/app.js` identifies its inline icon geometry as Lucide-style; the applicable upstream ISC and Feather MIT notices are retained below. Source: https://github.com/lucide-icons/lucide/blob/main/LICENSE (retrieved 2026-10-25).
+`packages/core/src/web/app.js.txt` identifies its inline icon geometry as Lucide-style; the applicable upstream ISC and Feather MIT notices are retained below. Source: https://github.com/lucide-icons/lucide/blob/main/LICENSE (retrieved 2026-10-25).
 
 ```text
 ISC License

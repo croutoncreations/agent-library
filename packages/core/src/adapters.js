@@ -14,7 +14,8 @@ export const noIdentity = {
   multiUser: () => true,
   /** POST /auth/access-login: verified { issuer, subject, email|null } for a person, or throw HttpError. */
   async login() { return null; },
-  /** Every cookie request: the provider's current identity { issuer, subject } (null = no provider check). */
+  /** Every cookie request while enabled(env): the provider's current identity { issuer, subject }. Throw (or return
+   *  null, which core turns into 401) when the provider's token is missing or invalid. Not called when disabled. */
   async session() { return null; },
   /** Every bearer request: a provider gate in front of agents (throws to refuse). */
   async bearer() {}
@@ -40,7 +41,13 @@ const DEFAULTS = Object.freeze({ identity: noIdentity, entitlements: unlimited, 
 
 /** Fill unset adapters (and unset methods) with the defaults. */
 export function resolveAdapters(a = {}) {
-  const out = { routes: Array.isArray(a.routes) ? a.routes : [] };
+  const routes = Array.isArray(a.routes) ? a.routes : [];
+  for (const r of routes) {
+    if (typeof r?.handler !== "function" || !(typeof r.path === "string" || r.path instanceof RegExp)) throw new Error("adapter route needs a path (string or RegExp) and a handler");
+    // A /g or /y RegExp keeps lastIndex between requests, so matches would depend on earlier requests.
+    if (r.path instanceof RegExp && (r.path.global || r.path.sticky)) throw new Error("adapter route RegExp must not use the g or y flag");
+  }
+  const out = { routes: Object.freeze(routes.map((r) => Object.freeze({ ...r }))) };
   for (const k of ["identity", "entitlements", "lifecycle", "mailer"]) out[k] = Object.freeze({ ...DEFAULTS[k], ...(a[k] ?? {}) });
   return Object.freeze(out);
 }
@@ -49,12 +56,27 @@ const RESOLVED_DEFAULTS = resolveAdapters();
 export function withAdapters(env, adapters) {
   return env && env[ADAPTERS] === adapters ? env : { ...env, [ADAPTERS]: adapters };
 }
+/** Fails closed: core code only runs inside createWorker(), so an env without adapters is a wiring bug. */
 export function adapters(env) {
-  return env?.[ADAPTERS] ?? RESOLVED_DEFAULTS;
+  const a = env?.[ADAPTERS];
+  if (!a) throw new Error("Agent Library adapters are not attached; build the Worker with createWorker()");
+  return a;
 }
+/** For tests and tools that call core directly: the default adapters (no sign-in provider, unlimited). */
+export const defaultAdapters = () => RESOLVED_DEFAULTS;
 
-/** Run a lifecycle hook after the change is committed. Hooks never undo or block the core operation. */
+/**
+ * Run a lifecycle hook after the change is committed. Hooks never undo the core operation, and are capped at
+ * HOOK_MS so a slow provider can't hold the response. Arguments can carry secrets (an invitation's one-time link),
+ * so only the error's name is logged.
+ */
+export const HOOK_MS = 5000;
 export async function notify(env, hook, ...args) {
-  try { await adapters(env).lifecycle[hook]?.(env, ...args); }
-  catch (e) { console.error("lifecycle_hook_failed", hook, e?.message ?? String(e)); }
+  const fn = adapters(env).lifecycle[hook];
+  if (typeof fn !== "function") return;
+  let timer;
+  try {
+    await Promise.race([Promise.resolve().then(() => fn(env, ...args)), new Promise((_, rej) => { timer = setTimeout(() => rej(Object.assign(new Error("timeout"), { name: "HookTimeout" })), HOOK_MS); })]);
+  } catch (e) { console.error("lifecycle_hook_failed", hook, e?.name ?? "Error"); }
+  finally { clearTimeout(timer); }
 }

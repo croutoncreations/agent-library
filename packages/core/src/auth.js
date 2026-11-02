@@ -80,8 +80,10 @@ async function authenticateInner(req, env, requestId) {
     ).bind(await sha256Hex(sid)).first();
     if (row && row.revoked_at === null && row.expires_at > nowMs() && row.kind === "human") {
       // The provider's current identity must still be this session's person (self-host: the Access JWT on every request).
-      const id = await adapters(env).identity.session(req, env);
-      if (id) {
+      const identity = adapters(env).identity;
+      if (identity.enabled(env)) {
+        const id = await identity.session(req, env);
+        if (!id) throw new HttpError(401, "unauthenticated", "Sign-in provider identity required");
         const p = await env.DB.prepare("SELECT issuer, subject FROM principals WHERE id = ?").bind(row.id).first();
         if (!p || p.issuer !== id.issuer || p.subject !== id.subject) throw new HttpError(401, "unauthenticated", "Session does not match Access identity");
       }

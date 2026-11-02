@@ -30,7 +30,7 @@ The full suite starts real local Wrangler services and uses the official MCP SDK
 
 ## Changing what ships
 
-The Worker is built from the ES modules under `src/` (entry `src/index.js`) by `npm run build` into `dist/worker/index.js`; nothing generated is committed. Browser assets live in `src/web/*.txt` and are imported as text. `npm run check:bundle` checks the build is reproducible and installation-neutral.
+The Worker is built from the ES modules under `packages/core/src/` (built entry `packages/self-host/src/index.js`) by `npm run build` into `dist/worker/index.js`; nothing generated is committed. Browser assets live in `packages/core/src/web/*.txt` and are imported as text. `npm run check:bundle` checks the build is reproducible and installation-neutral.
 
 ## Pull requests
 

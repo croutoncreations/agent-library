@@ -193,7 +193,7 @@ async function route3(req, env, url, requestId) {
     throw new HttpError(404, "not_found", "Not found");
   }
   if (seg[0] === "publishers" && seg.length === 3 && seg[2] === "revoke" && m === "POST") return json(await revokePublisher(ctx, str(seg[1], "publisher", 64)));
-  if (seg[0] !== "projects") throw new HttpError(404, "not_found", "Not found");
+  if (seg[0] !== "projects") return extraRoute(req, env, url, requestId, ctx);
   if (seg.length === 1) {
     if (m === "GET") return json(await listProjects(ctx));
     if (m === "POST") return json(await createProject(ctx, await body(req)), 201);
@@ -302,16 +302,26 @@ async function extraRoute(req, env, url, requestId, ctx) {
     const hit = typeof r.path === "string" ? r.path === url.pathname : r.path.exec(url.pathname);
     if (!hit) continue;
     if (url.pathname.startsWith("/api/") !== !!ctx) continue;
-    return r.handler(req, env, { url, requestId, ctx, match: hit === true ? null : hit });
+    // /api/ adapter routes are for people unless the route opts in to agent credentials.
+    if (ctx && ctx.principal.kind !== "human" && r.agents !== true) throw new HttpError(403, "forbidden", "People only");
+    const res = await r.handler(req, env, { url, requestId, ctx, match: hit === true ? null : hit });
+    // Adapter responses can't weaken framing or sniffing protection on the app origin.
+    const out = new Response(res.body, res);
+    for (const k of ["x-content-type-options", "x-frame-options", "referrer-policy"]) out.headers.set(k, SEC_HEADERS[k]);
+    if (!/frame-ancestors 'none'/.test(out.headers.get("content-security-policy") ?? "")) out.headers.set("content-security-policy", SEC_HEADERS["content-security-policy"]);
+    return out;
   }
   throw new HttpError(404, "not_found", "Not found");
 }
 /** The Worker for one installation: core plus its adapters (packages/self-host, or the hosted repo). */
 function createWorker(adapterConfig = {}) {
   const A = resolveAdapters(adapterConfig);
+  // Fail closed: Cloudflare Access is configured but this entry has no sign-in provider, so it would not be enforced.
+  const misconfigured = (env) => A.identity.name === "none" && !!(env?.ACCESS_TEAM_DOMAIN || env?.ACCESS_AUD);
+  const refuse = () => new Response(JSON.stringify({ error: { code: "misconfigured", message: "This build has no sign-in provider but Access is configured" } }), { status: 500, headers: { "content-type": "application/json" } });
   return {
     scheduled: (ev, env, ctx) => coreWorker.scheduled(ev, withAdapters(env, A), ctx),
-    fetch: (req, env, ctx) => coreWorker.fetch(req, withAdapters(env, A), ctx)
+    fetch: async (req, env, ctx) => misconfigured(env) ? refuse() : coreWorker.fetch(req, withAdapters(env, A), ctx)
   };
 }
 var coreWorker = {
