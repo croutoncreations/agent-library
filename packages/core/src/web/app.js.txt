@@ -417,7 +417,9 @@ var projectTitles = {};
 // Effective access per project from /api/projects (role in its workspace). The server enforces it; the UI only
 // hides controls a viewer can't use. Unknown = treat as writable (never hide on missing data).
 var projectAccess = {};
-function noteProjects(list) { (list || []).forEach(function (p) { projectTitles[p.id] = p.title; projectAccess[p.id] = { role: p.role || "owner", can_write: p.can_write !== false, workspace_id: p.workspace_id, read_only_reason: p.read_only_reason || null }; }); }
+// Project addresses (<workspace handle>/<project slug>) from /api/projects, for links people copy and share.
+var projectPaths = {};
+function noteProjects(list) { (list || []).forEach(function (p) { if (p.path) projectPaths[p.id] = p.path; projectTitles[p.id] = p.title; projectAccess[p.id] = { role: p.role || "owner", can_write: p.can_write !== false, workspace_id: p.workspace_id, read_only_reason: p.read_only_reason || null }; }); }
 function canWrite(pid) { var a = projectAccess[pid]; return !a || a.can_write; }
 async function ensureProjectAccess(pid) {
   if (projectAccess[pid]) return projectAccess[pid];
@@ -460,6 +462,7 @@ function route() {
   if (p[0] === "apps" || (p[0] === "settings" && p[1] === "apps")) return viewApps();
   if (p[0] === "settings" && p[1] === "tokens") return viewTokens();
   if (p[0] === "settings" && p[1] === "api-keys") return viewApiKeys();
+  if (p[0] === "p" && p[1] && p[1].indexOf("/") > 0) return resolvePathRoute(p);
   if (p[0] === "p" && p[1]) {
     if (p[2] === "a" && p[3]) return viewArtifact(p[1], p[3], p[4] === "edit" ? "edit" : "preview");
     if (p[2] === "trash") return viewList(p[1], true);
@@ -474,6 +477,28 @@ function route() {
   if (p[0] === "invite") return viewInvite(p[1] || "");
   return viewHome();
 }
+
+// "#/p/<workspace>%2F<project>/…" (from an address link): find the project's id among the projects this person can
+// open, then continue on the id route (replacing the history entry). The link itself grants nothing.
+async function resolvePathRoute(p) {
+  var want = p[1], token = ++pathSeq;
+  var find = function () { for (var id in projectPaths) if (projectPaths[id] === want) return id; return null; };
+  var id = find();
+  if (!id) {
+    shell([{ t: "Home", href: "#/" }, { t: "Opening…" }], h("div", { role: "status" }, h("span", { class: "sr", text: "Opening project…" }), h("span", { class: "skel-line wide", "aria-hidden": "true" })));
+    try { noteProjects((await api("GET", "/api/projects")).projects); } catch (e) { if (e.status === 401) return; }
+    if (token !== pathSeq) return;
+    id = find();
+  }
+  if (!id) {
+    shell([{ t: "Home", href: "#/" }, { t: "Not available" }], stateBox("error", "alert", "Project not available",
+      "The link may be out of date (project addresses can change), or this account can't open it.", h("a", { class: "btn secondary", href: "#/projects" }, "All projects")));
+    return;
+  }
+  history.replaceState(null, "", "#/p/" + enc(id) + (p.length > 2 ? "/" + p.slice(2).map(enc).join("/") : "") + (location.hash.indexOf("?") >= 0 ? location.hash.slice(location.hash.indexOf("?")) : ""));
+  route();
+}
+var pathSeq = 0;
 
 async function logout() {
   signingOut = true;
@@ -637,7 +662,7 @@ async function viewWorkspace(id) {
     if (!projects.length) projList.append(h("li", { class: "empty", text: admin ? "No projects yet." : "No projects you can open yet." }));
     projects.forEach(function (p) {
       projList.append(h("li", { class: "link" }, h("span", { class: "ficon-sm", "aria-hidden": "true" }, icon("folder")),
-        h("div", { class: "grow" }, rowLink("#/p/" + enc(p.id), p.title), p.role === "viewer" ? h("small", { class: "muted", text: "View only" }) : null),
+        h("div", { class: "grow" }, rowLink("#/p/" + enc(p.id), p.title), h("small", { class: "muted", text: (p.path ? "/" + p.path : "") + (p.role === "viewer" ? (p.path ? " · " : "") + "View only" : "") })),
         h("span", { class: "chev", "aria-hidden": "true" }, icon("chevron"))));
     });
     var newProj = null;
@@ -718,6 +743,7 @@ async function viewWorkspace(id) {
       sub: ws.personal ? "Only you can see projects here." + (S.multiUser ? " Create a shared workspace to invite people." : "") : "Your role: " + ROLE_LABEL[ws.role] + ". " + ROLE_HELP[ws.role] + "." }),
       suspended ? h("div", { class: "callout", role: "note" }, icon("alert"), h("div", null, h("strong", { text: "This workspace is suspended and read-only. " }),
         "Everyone can still read, download and export its projects, and connected agents can still read. Editing, uploads, new projects, invitations and role changes are paused until it's reactivated." + (owner ? " You can still remove members or delete the workspace." : ""))) : null,
+      ws.handle ? h("p", { class: "proj-addr" }, h("span", { class: "muted small", text: "Address" }), h("code", { text: "/" + ws.handle })) : null,
       h("h2", { id: "projects-h", tabIndex: -1, text: "Projects" }), projMsg, projList, newProj,
       h("h2", { id: "members-h", tabIndex: -1, text: "Members" }), memMsg, members];
 
@@ -753,6 +779,7 @@ async function viewWorkspace(id) {
       });
       parts.push(h("h2", { text: "Invite someone" }), invMsg, inviteForm, linkBox, h("h2", { id: "pending-h", tabIndex: -1, text: "Pending invitations" }), pending);
     }
+    if (owner && !suspended) parts.push(handleForm(ws, function () { focusAfter = "#ws-handle"; load(); }));
     if (owner && !ws.personal) {
       var setMsg = sectionMsg();
       var rename = h("input", { type: "text", value: ws.name, maxLength: 80, required: true, "aria-label": "Workspace name" });
@@ -784,6 +811,57 @@ async function viewWorkspace(id) {
   load();
 }
 var ROLE_RANK_UI = { viewer: 1, member: 2, admin: 3, owner: 4 };
+var ADDR_HINT = "Lower-case letters, digits and hyphens.";
+// Change a workspace's address (handle). Every project link starting with the old address stops working, so say so.
+function handleForm(ws, onDone) {
+  var msg = sectionMsg();
+  var input = h("input", { id: "ws-handle", type: "text", value: ws.handle || "", maxLength: 39, required: true, autocomplete: "off", spellcheck: false,
+    pattern: "[a-z0-9]([a-z0-9-]*[a-z0-9])?", "aria-describedby": "ws-handle-help", title: ADDR_HINT });
+  var btn = h("button", { type: "submit", class: "secondary" }, "Change address");
+  return h("section", { "aria-labelledby": "ws-addr-h" }, h("h2", { id: "ws-addr-h", text: "Workspace address" }), msg,
+    h("form", { class: "card", "aria-label": "Workspace address", onsubmit: async function (e) {
+      e.preventDefault();
+      var v = input.value.trim().toLowerCase(); if (!v || v === ws.handle) return;
+      if (!confirm("Change the address to /" + v + "? Links that use /" + ws.handle + "/… stop working; people and apps with access keep it.")) return;
+      btn.disabled = true;
+      try { var r = await api("PATCH", "/api/workspaces/" + enc(ws.id), { handle: v }); toast("Address changed to /" + r.handle); projectPaths = {}; onDone(); }
+      catch (err) { sectionErr(msg, err); btn.disabled = false; }
+    } }, h("div", { class: "row" }, h("label", { class: "field grow" }, h("span", { text: "Address" }), h("span", { class: "addr-input" }, h("span", { class: "muted", "aria-hidden": "true", text: location.host + "/" }), input)), btn),
+      h("p", { id: "ws-handle-help", class: "muted small", text: ADDR_HINT + " Changing it breaks existing links to this workspace's projects." })));
+}
+// Project settings (admins): title and address (slug). Opened from the project page.
+function toggleProjectSettings(pid, opener) {
+  var box = app.querySelector(".proj-settings");
+  if (box) { box.remove(); opener.setAttribute("aria-expanded", "false"); opener.focus(); return; }
+  var path = projectPaths[pid] || "", handle = path.split("/")[0], slug = path.split("/")[1] || "";
+  var msg = sectionMsg();
+  var title = h("input", { id: "proj-title", type: "text", value: projectTitles[pid] || "", maxLength: 200, required: true });
+  var sl = h("input", { id: "proj-slug", type: "text", value: slug, maxLength: 64, required: true, autocomplete: "off", spellcheck: false,
+    pattern: "[a-z0-9]([a-z0-9-]*[a-z0-9])?", "aria-describedby": "proj-slug-help", title: ADDR_HINT });
+  var save = h("button", { type: "submit" }, "Save");
+  box = h("form", { class: "card proj-settings", "aria-label": "Project settings", onsubmit: async function (e) {
+    e.preventDefault();
+    var b = {}, t = title.value.trim(), s = sl.value.trim().toLowerCase();
+    if (t && t !== projectTitles[pid]) b.title = t;
+    if (s && s !== slug) {
+      if (!confirm("Change the address to /" + handle + "/" + s + "? Links that use /" + path + " stop working.")) return;
+      b.slug = s;
+    }
+    if (!Object.keys(b).length) { box.remove(); opener.setAttribute("aria-expanded", "false"); opener.focus(); return; }
+    save.disabled = true;
+    try {
+      var r = await api("PATCH", "/api/projects/" + enc(pid), b);
+      projectTitles[pid] = r.title; if (r.path) projectPaths[pid] = r.path;
+      toast("Project updated"); route();
+    } catch (err) { sectionErr(msg, err); save.disabled = false; }
+  } }, h("h2", { text: "Project settings" }), msg,
+    h("label", { class: "field" }, h("span", { text: "Title" }), title),
+    h("label", { class: "field" }, h("span", { text: "Address" }), h("span", { class: "addr-input" }, h("span", { class: "muted", "aria-hidden": "true", text: "/" + handle + "/" }), sl)),
+    h("p", { id: "proj-slug-help", class: "muted small", text: ADDR_HINT + " Changing it breaks existing links to this project." }),
+    h("div", { class: "row" }, save, h("button", { type: "button", class: "secondary", onclick: function () { box.remove(); opener.setAttribute("aria-expanded", "false"); opener.focus(); } }, "Cancel")));
+  var addr = app.querySelector(".proj-addr"); addr.after(box);
+  opener.setAttribute("aria-expanded", "true"); title.focus();
+}
 // Shown once after creating an invitation. Like secretBox: copy can fail (plain HTTP, denied permission).
 function inviteLinkBox(box, r, onDone) {
   var note = h("span", { class: "muted small", id: "invite-link-note", text: "Send this link to " + r.email + ". It works once, only for someone signed in as " + r.email + ", until " + fmtDate(r.expires_at) + ". It isn't shown again." });
@@ -1250,7 +1328,7 @@ async function viewProjects() {
 }
 
 async function ensureProjectTitle(pid) {
-  if (projectTitles[pid]) return;
+  if (projectTitles[pid] && projectPaths[pid]) return;
   try { var r = await api("GET", "/api/projects"); noteProjects(r.projects); setCrumbsTitle(pid); } catch (e) {}
 }
 function setCrumbsTitle(pid) {
@@ -1585,10 +1663,20 @@ async function viewList(pid, trash) {
     load(true);
   });
   var titleH1 = h("h1", { text: trash ? "Trash" : (projectTitles[pid] || "Documents"), dataset: { projectTitle: pid } });
+  // The project's address (its link), with copy; admins can change it (and the title) under Project settings.
+  var addr = h("p", { class: "proj-addr", hidden: true });
+  function showAddr() {
+    if (trash || !projectPaths[pid]) return;
+    var acc = projectAccess[pid], admin = acc && (acc.role === "admin" || acc.role === "owner") && acc.can_write;
+    addr.replaceChildren(h("code", { text: "/" + projectPaths[pid], title: projectUrl(pid) }),
+      copyIcon("link", "Copy project link", function () { return projectUrl(pid); }),
+      admin ? h("button", { type: "button", class: "link-btn", "aria-expanded": "false", onclick: function (e) { toggleProjectSettings(pid, e.currentTarget); } }, "Project settings") : null);
+    addr.hidden = false;
+  }
   shell(projCrumbs(pid, trash ? [{ t: "Trash" }] : []),
     pageHead(titleH1, { eyebrow: trash ? (projectTitles[pid] || "Project") : "Project", actions: actions }),
-    panel, h("div", { class: "toolbar" }, projectTabs(pid, trash ? "trash" : "list"), h("label", { class: "search" }, icon("search"), q)), msg, list, empty, more);
-  ensureProjectTitle(pid);
+    addr, panel, h("div", { class: "toolbar" }, projectTabs(pid, trash ? "trash" : "list"), h("label", { class: "search" }, icon("search"), q)), msg, list, empty, more);
+  ensureProjectTitle(pid).then(showAddr);
   if (resumePending && resumePending.hash === location.hash && resumePending.q) q.value = resumePending.q;
   load(true);
   if (!trash) offTouch(pid, null);
@@ -1973,7 +2061,8 @@ async function viewApiKeys() {
 }
 
 // Canonical browser link for a document (same route shape as src/links.ts: /p/:pid/a/:aid).
-function docUrl(pid, aid) { return location.origin + "/p/" + enc(pid) + "/a/" + enc(aid); }
+function projectUrl(pid) { return location.origin + "/" + (projectPaths[pid] ? projectPaths[pid].split("/").map(enc).join("/") : "p/" + enc(pid)); }
+function docUrl(pid, aid) { return projectUrl(pid) + "/a/" + enc(aid); }
 // Quick-copy icons: link, title and (for Markdown) the current editor text; extra icons appended by callers.
 function copyBar(A, getContents, extra) {
   return h("span", { class: "icons" },
@@ -3734,6 +3823,10 @@ if (/[?&]source=pwa\b/.test(location.search)) history.replaceState(null, "", loc
   var inv = /^\/invite\/(inv_[A-Za-z0-9_-]{20,80})$/.exec(location.pathname);
   if (inv) { history.replaceState(null, "", "/#/invite/" + inv[1]); return; }
   var m = /^\/p\/([^/]+)(?:\/a\/([^/]+)(?:\/(preview|edit))?)?\/?$/.exec(location.pathname);
+  // Address links (/<workspace>/<project>[/a/<doc>…]): kept as the project reference "<workspace>/<project>" (URL-encoded
+  // as one segment); the app maps it to the project once signed in (resolvePathRoute).
+  var a = !m && /^\/([a-z0-9][a-z0-9-]{0,38})\/([a-z0-9][a-z0-9-]{0,63})(?:\/a\/([^/]+)(?:\/(preview|edit))?)?\/?$/.exec(location.pathname);
+  if (a) m = [a[0], enc(a[1] + "/" + a[2]), a[3], a[4]];
   if (!m) return;
   var v = m[2] && /[?&]v=([0-9]{1,9})(?:&|$)/.exec(location.search);
   history.replaceState(null, "", "/#/p/" + m[1] + (m[2] ? "/a/" + m[2] + (m[3] ? "/" + m[3] : "") + (v ? "?v=" + v[1] : "") : ""));

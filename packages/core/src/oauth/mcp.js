@@ -3,6 +3,7 @@ import { insufficientScope } from "@cloudflare/workers-oauth-provider";
 import { limitsFor, rateLimit } from "../auth.js";
 import { byteLength } from "../formats.js";
 import { WEB_URL_OUTPUT_SCHEMAS, WEB_URL_TOOL_NOTE, appOrigin, artifactWebUrl, withWebUrls } from "../links.js";
+import { addressLinks, projectPaths, resolveProjectRef } from "../paths.js";
 import { SCOPES, liveConnection } from "./server.js";
 import { __name } from "../runtime.js";
 import { BINARY_TYPES, IMAGE_TYPES, LIMITS, RS_SCHEMA, RT_ID_TOO_LONG, RT_KINDS_ALL, RT_KINDS_DOCS, appConnectEnabled, connectionInfo, createMarkdown, db, diffRevisions, getArtifact, history, listArtifacts, listChanges, loadArtifact, provenance, readRecords, readTextChunk, restoreMetadata, restoreRevision, rsToolReady, rtChunkLimit, rtFit, rtIdBytes, saveMarkdown, searchArtifacts, tplTools } from "../service.js";
@@ -109,8 +110,12 @@ async function handleOAuthMcp(req, env, ctx) {
         const result = connectionInfo("oauth", conn.id, conn.client_name, conn.projects.map((p) => ({ ...p, can_write: projectWrite(p) })), conn.expires_at, conn.last_used_at, { files: conn.file_access === 1 });
         return reply(rpc(msg.id, { content: [{ type: "text", text: JSON.stringify(result) }], structuredContent: result, isError: false }));
       }
+      // A project may be named by its address (<handle>/<slug>) as well as its id.
+      if (typeof args.project_id === "string" && args.project_id.includes("/")) args.project_id = await resolveProjectRef(env, args.project_id);
+      if (Array.isArray(args.project_ids)) args.project_ids = await Promise.all(args.project_ids.map((x) => resolveProjectRef(env, x)));
       if (tool.name === "list_projects") {
-        const result = withWebUrls("list_projects", args, void 0, { projects: conn.projects.map((p) => ({ id: p.id, title: p.title, can_write: projectWrite(p) })) }, appOrigin(env.APP_HOST));
+        const paths = await projectPaths(env, conn.projects.map((p) => p.id));
+        const result = await addressLinks(env, withWebUrls("list_projects", args, void 0, { projects: conn.projects.map((p) => ({ id: p.id, title: p.title, ...paths.has(p.id) ? { path: paths.get(p.id) } : {}, can_write: projectWrite(p) })) }, appOrigin(env.APP_HOST)));
         return reply(rpc(msg.id, { content: [{ type: "text", text: JSON.stringify(result) }], structuredContent: result, isError: false }));
       }
       if (tool.name === "search_artifacts") {
@@ -147,7 +152,7 @@ async function handleOAuthMcp(req, env, ctx) {
         rpcIdBytes: rtIdBytes(msg.id)
       };
       try {
-        const result = withWebUrls(tool.name, toolArgs, proj.id, await tool.run(sctx, proj.id, toolArgs), appOrigin(env.APP_HOST));
+        const result = await addressLinks(env, withWebUrls(tool.name, toolArgs, proj.id, await tool.run(sctx, proj.id, toolArgs), appOrigin(env.APP_HOST)));
         await env.DB.prepare("UPDATE oauth_connections SET last_used_at = ? WHERE id = ?").bind(nowMs(), conn.id).run().catch(() => {
         });
         return reply(rpc(msg.id, { content: ftContent(result, pv), structuredContent: result, isError: false }));
@@ -166,7 +171,7 @@ MCP_TEXT_MAX = 64 * 1024;
 SUPPORTED = ["2025-11-25", "2025-06-18", "2025-03-26"];
 S = (props, required) => ({ type: "object", properties: props, required, additionalProperties: false });
 A = { type: "string", description: "Artifact ID" };
-P = { type: "string", maxLength: 64, description: "Project ID from list_projects. Optional when the connection has exactly one project." };
+P = { type: "string", maxLength: 110, description: "Project ID or path (workspace/project, as shown in list_projects). Optional when the connection has exactly one project." };
 K = { type: "string", description: "Unique key for this change (8-128 chars, e.g. a UUID). Reuse it only when retrying the same change." };
 unwrap = (r) => r && typeof r.status === "number" && "body" in r ? r.body : r;
 RO = { readOnlyHint: true, destructiveHint: false, openWorldHint: false };

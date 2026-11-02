@@ -101,7 +101,7 @@ test("list: documents and files with kind, mime, size and revision; kind and mim
   assert.equal(by["Report.pdf"].size, readFileSync(fx.pdf).length);
   assert.equal(by["Demo.mp4"].mime, "video/mp4");
   assert.equal(by.Notes.kind, "markdown", "documents are still listed");
-  assert.match(by["Chart.png"].web_url, new RegExp(`/p/${P}/a/${ids.png}$`));
+  assert.match(by["Chart.png"].web_url, new RegExp(`/[a-z0-9-]+/[a-z0-9-]+/a/${ids.png}$`), "address link");
   assert.ok(!all.some((a) => a.title === "Elsewhere.png"), "other projects are never listed");
   const imgs = (await sdk.callTool({ name: "list_artifacts", arguments: { mime_prefix: "image/" } })).structuredContent.artifacts;
   assert.deepEqual(imgs.map((a) => a.title), ["Chart.png"]);

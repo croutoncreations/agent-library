@@ -29,36 +29,40 @@ before(async () => {
 });
 after(async () => { await browser?.close(); await m?.close(); await ro?.close(); await s?.stop(); });
 
-const expectDocUrl = (u, pid, aid) => assert.equal(u, `${ORIGIN}/p/${encodeURIComponent(pid)}/a/${encodeURIComponent(aid)}`);
+// Links use each project's address (<workspace handle>/<project slug>, docs/workspaces.md#addresses).
+const PATHS = {};
+const pathOf = async (pid) => PATHS[pid] ??= (await h.req("GET", "/api/projects")).body.projects.find((p) => p.id === pid).path;
+const expectDocUrl = async (u, pid, aid) => assert.equal(u, `${ORIGIN}/${await pathOf(pid)}/a/${encodeURIComponent(aid)}`);
 
 test("create, list, read, history and save the same document: every web_url identifies it", async () => {
   const lp = await m.call("list_projects", {});
-  assert.equal(lp.data.projects[0].web_url, `${ORIGIN}/p/${PID}`);
+  assert.equal(lp.data.projects[0].web_url, `${ORIGIN}/${await pathOf(PID)}`);
+  assert.match(await pathOf(PID), /^owner-[a-z2-9]{4}\/links-project$/, "slug from the title; personal handle with a random suffix");
   const c = await m.call("create_markdown", { project_id: PID, title: "Linked doc", body: "# v1", idempotency_key: key("c") });
   assert.equal(c.isError, false);
   docId = c.data.artifact_id;
-  expectDocUrl(c.data.web_url, PID, docId);
+  await expectDocUrl(c.data.web_url, PID, docId);
   const l = await m.call("list_artifacts", { project_id: PID });
   const row = l.data.artifacts.find((a) => a.id === docId);
-  expectDocUrl(row.web_url, PID, docId);
+  await expectDocUrl(row.web_url, PID, docId);
   const r = await m.call("read_artifact", { project_id: PID, artifact_id: docId });
-  expectDocUrl(r.data.artifact.web_url, PID, docId);
+  await expectDocUrl(r.data.artifact.web_url, PID, docId);
   assert.equal(r.data.web_url_opens, "current_document");
   const sv = await m.call("save_markdown", { project_id: PID, artifact_id: docId, expected_revision: 1, body: "# v2", idempotency_key: key("s") });
   assert.equal(sv.data.revision, 2);
-  expectDocUrl(sv.data.web_url, PID, docId);
+  await expectDocUrl(sv.data.web_url, PID, docId);
   const old = await m.call("read_artifact", { project_id: PID, artifact_id: docId, revision: 1 });
   assert.equal(old.data.body, "# v1");
-  expectDocUrl(old.data.artifact.web_url, PID, docId); // no per-revision browser route: current document, labelled
+  await expectDocUrl(old.data.artifact.web_url, PID, docId); // no per-revision browser route: current document, labelled
   assert.equal(old.data.web_url_opens, "current_document");
   const hi = await m.call("artifact_history", { project_id: PID, artifact_id: docId });
-  expectDocUrl(hi.data.web_url, PID, docId);
+  await expectDocUrl(hi.data.web_url, PID, docId);
   assert.equal(hi.data.web_url_opens, "current_document");
   // Idempotent replay of the create returns the same link
   // (and existing fields are unchanged: additive only)
   assert.deepEqual(Object.keys(c.data).filter((k) => k !== "web_url" && k !== "preview_url").sort(), ["artifact_id", "revision", "revision_id", "sha256"]);
   // preview_url: rendered read-only view, Markdown only, on every result that returns a document link
-  const prev = `${ORIGIN}/p/${PID}/a/${docId}/preview`;
+  const prev = `${ORIGIN}/${await pathOf(PID)}/a/${docId}/preview`;
   for (const u of [c.data.preview_url, row.preview_url, r.data.artifact.preview_url, sv.data.preview_url, old.data.artifact.preview_url]) assert.equal(u, prev);
 });
 
@@ -113,7 +117,9 @@ test("deep-link routes serve only the data-free app shell; data still requires a
     assert.match(t, /<script src="\/app.js"/);
     assert.doesNotMatch(t, /Linked doc|# v2|Links &lt;project|secret other/, "shell has no data");
   }
-  for (const p of [`/p`, `/p/${PID}/a`, `/p/${PID}/a/${docId}/extra`, `/p/${PID}/a/${docId}/preview/x`, `/p/${PID}/grants`, `/x/${PID}`]) assert.equal((await fetch(ORIGIN + p)).status, 404, p);
+  // Address links (/<handle>/<slug>…) are app routes too (the shell, no data); reserved first segments never are.
+  for (const p of [`/${await pathOf(PID)}`, `/${await pathOf(PID)}/a/${docId}/preview`, `/x/${PID}`]) assert.equal((await fetch(ORIGIN + p)).status, 200, p);
+  for (const p of [`/p`, `/p/${PID}/a`, `/p/${PID}/a/${docId}/extra`, `/p/${PID}/a/${docId}/preview/x`, `/p/${PID}/grants`, `/settings/${PID}`, `/x/${PID}/a`, `/x/${PID}/zz/y`]) assert.equal((await fetch(ORIGIN + p)).status, 404, p);
   assert.equal((await fetch(`${ORIGIN}/api/projects/${PID}/artifacts/${docId}`)).status, 401, "API still requires auth");
 });
 
@@ -130,7 +136,8 @@ test("browser: signed-out user keeps the destination through sign-in; authentica
   const page = await browser.newPage();
   await page.goto(url);
   await page.waitForSelector('input[name="passphrase"]', { timeout: 10000 });
-  assert.match(page.url(), new RegExp(`#/p/${PID}/a/${docId}$`), "destination preserved while signed out");
+  // Signed out, the address stays in the hash (it becomes the id route once signed in).
+  assert.ok(page.url().endsWith(`#/p/${encodeURIComponent(await pathOf(PID))}/a/${docId}`), "destination preserved while signed out: " + page.url());
   // Sign in through the real login form (passphrase from the test server)
   const pass = s.passphrase();
   await page.type('input[name="passphrase"]', pass);
@@ -156,7 +163,7 @@ test("browser: preview_url opens the rendered Preview tab directly (also through
   const page = await ctx.newPage();
   await page.goto(url);
   await page.waitForSelector('input[name="passphrase"]', { timeout: 10000 });
-  assert.match(page.url(), new RegExp(`#/p/${PID}/a/${docId}/preview$`), "preview destination preserved while signed out");
+  assert.ok(page.url().endsWith(`#/p/${encodeURIComponent(await pathOf(PID))}/a/${docId}/preview`), "preview destination preserved while signed out: " + page.url());
   await page.type('input[name="passphrase"]', s.passphrase());
   await page.click('button[type="submit"]');
   await page.waitForSelector(".preview h1", { timeout: 10000 });

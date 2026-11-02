@@ -71,15 +71,16 @@ shared workspace exists, or accept this for the rollback window.
 
 - `GET /api/workspaces`: workspaces I belong to, with my role and member count.
 - `POST /api/workspaces` `{name}`: create a shared workspace (I'm its owner). Self-host: allowed for the owner.
-- `PATCH /api/workspaces/:id` `{name}` (owner); `DELETE` marks it `deleting` (owner; not the personal one).
+- `PATCH /api/workspaces/:id` `{name?, handle?}` (owner); `DELETE` marks it `deleting` (owner; not the personal one).
 - `GET /api/workspaces/:id/members`, `PATCH …/members/:principal` `{role}`, `DELETE …/members/:principal`
   (admin+; can't remove or demote the last owner; admins can't change owners; anyone may remove themselves except
   the last owner).
 - `GET|POST /api/workspaces/:id/invites` `{email, role}` (admin+); `POST …/invites/:id/revoke`. Creating an invite
   returns the accept link once (the token is never shown again). Hosted sends it by email; self-host shows it to copy.
 - `POST /api/invites/accept` `{token}`: the signed-in user's verified email must match. Single use, ≤ 14 days.
-- `GET /api/projects` returns projects from every workspace I can see, each with `workspace_id`; `POST /api/projects`
-  takes `workspace_id` (default: my personal workspace).
+- `GET /api/projects` returns projects from every workspace I can see, each with `workspace_id` and `path`;
+  `POST /api/projects` takes `workspace_id` (default: my personal workspace) and optional `slug`;
+  `PATCH /api/projects/:id` `{title?, slug?}` (project admin).
 - Settings lists (`/api/access`, `/api/api-keys`, `/api/app-clients`) show credentials across my workspaces:
   the ones I created, plus, in workspaces where I'm an admin, everyone's. `/api/app-clients` lists the apps I
   registered (while I'm still a member of the app's workspace) or administer, each with `workspace_id`; each app's
@@ -99,6 +100,36 @@ shared workspace exists, or accept this for the rollback window.
   Imported version labels are marked "(imported)". (Decision D8 B.)
 - `POST /api/restore` (whole-store restore with original ids) works only on a single-owner installation with no
   projects (`MULTI_USER` unset and at most one person); shared installations answer 403 `restore_unavailable`.
+
+## Addresses
+
+Decisions D10 B and D14 A. Every workspace has a **handle** that is unique on the installation (`acme`) and every
+project a **slug** that is unique inside its workspace (`notes`), so a project's **path** is `acme/notes` and its link
+is `https://<app>/acme/notes` (documents: `…/acme/notes/a/<id>`, with `/preview` or `/edit`).
+
+- **Storage keys don't change.** Projects keep their `prj_…` id everywhere (tables, R2 keys, API ids). A path is an
+  alias, resolved to the id on each request; authorization then runs on the id as before. A path someone can't open
+  answers exactly like an unknown one (404 `not_found`, same body).
+- **Accepted wherever a project id is**: browser API (`/api/projects/acme%2Fnotes/…`), `/v1` (`/v1/projects/acme%2Fnotes/…`),
+  MCP `project_id` (`"acme/notes"`), and search `project_ids`. `list_projects`, `GET /v1/projects` and
+  `GET /api/projects` return each project's `path`.
+- **Links** (`web_url`, `preview_url`, `version_url`) use the path. Only those generated fields are rewritten; document
+  text is never changed. Old `/p/<id>` links keep working.
+- **Handles**: 1–39 of `a-z 0-9 -`, not starting or ending with `-`, and not a reserved word (app and API routes such
+  as `api`, `p`, `settings`, `auth`, `billing`; see `RESERVED_HANDLES` in `packages/core/src/paths.js`). A shared
+  workspace's handle is chosen at creation (`{handle}`) or derived from its name (`-2`… then a random suffix when
+  taken). A personal workspace's handle is derived from the person's name **with a random suffix** (`alice-k3x9`), so a
+  handle never confirms that someone has an account.
+- **Slugs**: 1–64 of `a-z 0-9 -`; derived from the title (`Q3 Notes!` → `q3-notes`, then `-2`, `-3` … in that
+  workspace) unless one is chosen.
+- **Changing** a handle (workspace owner) or slug (project admin) changes every link that used the old one; those
+  links then answer "not available" (ids still work). The app asks for confirmation. A released handle can be taken by
+  another workspace, which is one reason a path never grants anything by itself. Changes are audited
+  (`workspace.handle`, `project.address`).
+- **Migration 0020** adds `workspaces.handle` (unique) and `projects.slug` (unique per `workspace_id`), both nullable.
+  Rows without them, including rows a rolled-back Worker writes, get them on first use; a project given a slug also
+  gets its `workspace_id` filled in (the personal workspace, as resolved today), so the previous Worker keeps working.
+- **Later**: subdomains (`acme.<domain>`) as an optional alias (D14).
 
 ## OAuth consent
 

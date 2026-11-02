@@ -76,7 +76,7 @@ export const readOnlyError = () => new HttpError(403, "workspace_read_only", "Th
 export async function requireWorkspaceRole(ctx, workspaceId, need, allowSuspended = need === "viewer") {
   if (ctx.principal.kind !== "human") throw new HttpError(403, "forbidden", "People only");
   const ws = await ctx.env.DB.prepare(
-    "SELECT w.id, w.status, w.personal, w.name, m.role FROM workspaces w JOIN workspace_members m ON m.workspace_id = w.id AND m.principal_id = ? WHERE w.id = ?"
+    "SELECT w.id, w.status, w.personal, w.name, w.handle, m.role FROM workspaces w JOIN workspace_members m ON m.workspace_id = w.id AND m.principal_id = ? WHERE w.id = ?"
   ).bind(ctx.principal.id, workspaceId).first();
   if (!ws || ws.status === "deleting") throw new HttpError(404, "not_found", "Workspace not found");
   if (ws.status !== "active" && !allowSuspended) throw readOnlyError();
@@ -116,7 +116,7 @@ export async function requireProjectRole(ctx, projectId, need, allowSuspended = 
  * rows a rolled-back Worker wrote without workspace_id (they belong to the owner's personal workspace).
  */
 export async function visibleProjects(env, principalId) {
-  const cols = `t_p.id, t_p.title, t_p.created_at, t_w.id AS workspace_id, t_w.name AS workspace_name, t_w.personal, t_w.status AS workspace_status, t_w.created_at AS ws_created, t_m.role AS ws_role,
+  const cols = `t_p.id, t_p.title, t_p.slug, t_p.created_at, t_w.id AS workspace_id, t_w.name AS workspace_name, t_w.handle AS workspace_handle, t_w.personal, t_w.status AS workspace_status, t_w.created_at AS ws_created, t_m.role AS ws_role,
        CASE MIN(${rankCase("t_m.role")}, CASE WHEN t_pm.role IS NULL THEN 4 ELSE ${rankCase("t_pm.role")} END)
          WHEN 4 THEN 'owner' WHEN 3 THEN 'admin' WHEN 2 THEN 'member' WHEN 1 THEN 'viewer' ELSE NULL END AS role`;
   const from = (join) => `FROM workspace_members t_m JOIN workspaces t_w ON t_w.id = t_m.workspace_id AND ${statusOk("t_w", true)}

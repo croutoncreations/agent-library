@@ -4,6 +4,9 @@ import { requireHuman } from "./auth.js";
 import { adapters, notify } from "./adapters.js";
 import { ROLES, ROLE_RANK, multiUserInstall, requireWorkspaceRole, workspaceRoleSql } from "./tenancy.js";
 import { HttpError, nowIso, nowMs, randomId, sha256Hex, str } from "./util.js";
+import { checkHandle, ensureHandle } from "./paths.js";
+const isUnique = (e) => /UNIQUE|constraint/i.test(String(e?.message ?? e));
+const handleTaken = () => new HttpError(409, "handle_taken", "That address is already taken; choose another");
 
 export const INVITE_DAYS = 14;
 export const multiUser = multiUserInstall;
@@ -28,39 +31,52 @@ function wsName(v) {
 export async function listWorkspaces(ctx) {
   requireHuman(ctx);
   const r = await ctx.env.DB.prepare(
-    `SELECT w.id, w.name, w.personal, w.status, w.plan, w.created_at, m.role,
+    `SELECT w.id, w.name, w.handle, w.personal, w.status, w.plan, w.created_at, m.role,
        (SELECT COUNT(*) FROM workspace_members x WHERE x.workspace_id = w.id) AS member_count
      FROM workspaces w JOIN workspace_members m ON m.workspace_id = w.id AND m.principal_id = ?
      WHERE w.status <> 'deleting' ORDER BY w.personal DESC, w.created_at LIMIT 200`
   ).bind(ctx.principal.id).all();
-  return { workspaces: r.results.map((w) => ({ ...w, personal: !!w.personal })) };
+  const out = [];
+  for (const w of r.results) out.push({ ...w, personal: !!w.personal, handle: await ensureHandle(ctx.env, { ...w, label: ctx.principal.label }) });
+  return { workspaces: out };
 }
 
 export async function createWorkspace(ctx, input) {
   requireHuman(ctx);
   if (!multiUser(ctx.env)) throw new HttpError(403, "single_user", "This installation has a single user; shared workspaces aren't available");
   const name = wsName(input?.name);
+  // The address (handle) is chosen up front when given; otherwise it's derived from the name.
+  const handle = input?.handle === undefined || input?.handle === "" ? null : checkHandle(input.handle);
   await adapters(ctx.env).entitlements.check(ctx.env, "workspace.create", { principalId: ctx.principal.id });
   const id = randomId("wsp", 12), at = nowIso();
   await ctx.env.DB.batch([
-    ctx.env.DB.prepare("INSERT INTO workspaces (id, name, personal, status, plan, created_by, created_at) VALUES (?, ?, 0, 'active', 'free', ?, ?)").bind(id, name, ctx.principal.id, at),
+    ctx.env.DB.prepare("INSERT INTO workspaces (id, name, personal, status, plan, created_by, created_at, handle) VALUES (?, ?, 0, 'active', 'free', ?, ?, ?)").bind(id, name, ctx.principal.id, at, handle),
     ctx.env.DB.prepare("INSERT INTO workspace_members (workspace_id, principal_id, role, added_by, created_at) VALUES (?, ?, 'owner', ?, ?)").bind(id, ctx.principal.id, ctx.principal.id, at),
     wsAudit(ctx.env, ctx, id, "workspace.create", id, "ok")
-  ]);
+  ]).catch((e) => { if (handle && isUnique(e)) throw handleTaken(); throw e; });
   await notify(ctx.env, "workspaceCreated", { id, name, createdBy: ctx.principal.id });
-  return { id, name, personal: false, status: "active", role: "owner", member_count: 1 };
+  return { id, name, handle: handle ?? await ensureHandle(ctx.env, { id, name, personal: 0 }), personal: false, status: "active", role: "owner", member_count: 1 };
 }
 
+/**
+ * Rename and/or change the address (handle). A new handle changes every link to the workspace's projects; old
+ * address links stop working (id links keep working), so the app asks first.
+ */
 export async function updateWorkspace(ctx, id, input) {
   requireHuman(ctx);
   await requireWorkspaceRole(ctx, id, "owner");
-  const name = wsName(input?.name);
-  const [r] = await ctx.env.DB.batch([
-    ctx.env.DB.prepare(`UPDATE workspaces AS w SET name = ? WHERE w.id = ? AND ${workspaceRoleSql("w.id", "owner")}`).bind(name, id, ctx.principal.id),
-    wsAudit(ctx.env, ctx, id, "workspace.rename", id, "ok", "changes() = 1")
-  ]);
-  if (!r.meta.changes) throw new HttpError(403, "forbidden", "Needs the owner role in this workspace");
-  return { ok: true, id, name };
+  const name = input?.name === undefined ? null : wsName(input.name);
+  const handle = input?.handle === undefined ? null : checkHandle(input.handle);
+  if (name === null && handle === null) throw new HttpError(400, "invalid_input", "Pass name and/or handle");
+  const stmts = [];
+  if (name !== null) stmts.push(ctx.env.DB.prepare(`UPDATE workspaces AS w SET name = ? WHERE w.id = ? AND ${workspaceRoleSql("w.id", "owner")}`).bind(name, id, ctx.principal.id),
+    wsAudit(ctx.env, ctx, id, "workspace.rename", id, "ok", "changes() = 1"));
+  if (handle !== null) stmts.push(ctx.env.DB.prepare(`UPDATE workspaces AS w SET handle = ? WHERE w.id = ? AND ${workspaceRoleSql("w.id", "owner")}`).bind(handle, id, ctx.principal.id),
+    wsAudit(ctx.env, ctx, id, "workspace.handle", id, "ok", "changes() = 1"));
+  const rs = await ctx.env.DB.batch(stmts).catch((e) => { if (isUnique(e)) throw handleTaken(); throw e; });
+  if (!rs[0].meta.changes) throw new HttpError(403, "forbidden", "Needs the owner role in this workspace");
+  const row = await ctx.env.DB.prepare("SELECT name, handle FROM workspaces WHERE id = ?").bind(id).first();
+  return { ok: true, id, name: row.name, handle: row.handle };
 }
 
 /** Marks a shared workspace 'deleting': closed to everyone immediately. Data removal is an operator job (hosted). */
@@ -94,7 +110,7 @@ export async function listMembers(ctx, id) {
      ORDER BY created_at DESC LIMIT 200`
   ).bind(id, nowMs()).all() : { results: [] };
   return {
-    workspace: { id: ws.id, name: ws.name, personal: !!ws.personal, role: ws.role, status: ws.status },
+    workspace: { id: ws.id, name: ws.name, handle: await ensureHandle(ctx.env, { ...ws, label: ctx.principal.label }), personal: !!ws.personal, role: ws.role, status: ws.status },
     // Emails are shown to admins only; everyone sees names and roles.
     members: m.results.map((x) => ({ principal_id: x.principal_id, label: x.label, email: admin ? x.email : null, role: x.role, created_at: x.created_at, me: x.principal_id === ctx.principal.id })),
     invites: inv.results.map((i) => ({ ...i, expires_at: new Date(i.expires_at).toISOString() }))

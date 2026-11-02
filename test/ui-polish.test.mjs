@@ -111,7 +111,8 @@ test("browser: copy link/title/contents; save + details below the document; no '
     await page.waitForFunction((l) => document.querySelector(".toast") && !document.querySelector(".toast").hidden && document.querySelector(".toast").textContent.toLowerCase().startsWith(l.replace("Copy ", "")), { timeout: 5000 }, label);
     return page.evaluate(() => navigator.clipboard.readText());
   };
-  assert.equal(await clip("Copy link"), `${ORIGIN}/p/${PID}/a/${docId}`);
+  const path = await page.evaluate(async () => (await (await fetch("/api/projects")).json()).projects.find((p) => p.id === "ui-polish").path);
+  assert.equal(await clip("Copy link"), `${ORIGIN}/${path}/a/${docId}`);
   assert.equal(await clip("Copy title"), "Polish doc");
   assert.match(await clip("Copy contents"), /^# Doc\n\nInline: !\[A diagram\]/);
   // Layout: editor panel comes before the Save button and the Details card

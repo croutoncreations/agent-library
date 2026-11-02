@@ -10,6 +10,7 @@ import { reconcileUploads } from "./cleanup.js";
 import { EDITOR_JS, EDITOR_JS_SHA256 } from "./editor-bundle.js";
 import { RENDER_CSP, htmlRefs, renderHtmlDocument } from "./html.js";
 import { WEB_ROUTE } from "./links.js";
+import { RESERVED_HANDLES, addressLinksResponse, resolveProjectRef } from "./paths.js";
 import { imageRefs, renderMarkdown } from "./markdown.js";
 import { handleMcp } from "./mcp.js";
 import { listAccess, listConnections, revokeConnection, revokeConnectionById } from "./oauth/connections.js";
@@ -18,7 +19,7 @@ import { handleOAuthHost, originFor } from "./oauth/server.js";
 import { servePwa } from "./pwa.js";
 import { acceptInvite, createInvite, createWorkspace, deleteWorkspace, listMembers, listWorkspaces, multiUser, previewInvite, removeMember, revokeInvite, setMemberRole, updateWorkspace } from "./workspaces.js";
 import { __name } from "./runtime.js";
-import { IMAGE_TYPES, VIDEO_TYPES, addComment, appConnectEnabled, chQuery, cleanupChanges, createFile, createFolder, createFromTemplate, createGrant, createMarkdown, createProject, diffRevisions, getArtifact, history, listArtifacts, listAudit, listChanges, listComments, listFolders, listGrants, listProjects, listTemplates, metaHistory, previewTemplate, readRecords, readTextChunk, requireAppConnect, restoreMetadata, restoreRevision, rsQuery, rsReady, rtQuery, saveAsTemplate, saveFile, saveMarkdown, searchArtifacts, updateGrant, updateMetadata } from "./service.js";
+import { IMAGE_TYPES, VIDEO_TYPES, addComment, appConnectEnabled, chQuery, cleanupChanges, createFile, createFolder, createFromTemplate, createGrant, createMarkdown, createProject, updateProject, diffRevisions, getArtifact, history, listArtifacts, listAudit, listChanges, listComments, listFolders, listGrants, listProjects, listTemplates, metaHistory, previewTemplate, readRecords, readTextChunk, requireAppConnect, restoreMetadata, restoreRevision, rsQuery, rsReady, rtQuery, saveAsTemplate, saveFile, saveMarkdown, searchArtifacts, updateGrant, updateMetadata } from "./service.js";
 import { APP_CSS, APP_HTML, APP_JS } from "./ui.js";
 import { serveContent, uploadBegin, uploadFinish, uploadPut } from "./uploads.js";
 import { HttpError, errorBody, idemKey, json, nowIso, nowMs, randomId, sha256Hex, str } from "./util.js";
@@ -48,6 +49,7 @@ async function projectMedia(env, pid, refs) {
  * The app shell's CSP. With the email-link human check on (TURNSTILE_SITE_KEY) and browser sign-in, Cloudflare's
  * Turnstile script and frame are allowed on the shell only; every other response keeps the strict default.
  */
+var ADDRESS_ROUTE = /^\/[a-z0-9][a-z0-9-]{0,38}\/[a-z0-9][a-z0-9-]{0,63}(?:\/a\/[A-Za-z0-9_-]{1,64}(?:\/(?:preview|edit))?)?\/?$/;
 /** The site key the app's sign-in card renders, only when an email-link option exists (else no widget, no CSP change). */
 function emailTurnstile(env) {
   return browserSignInEnabled(env) && signinChoices(env).some((c) => c.email) ? turnstileSiteKey(env) : null;
@@ -154,7 +156,13 @@ async function route3(req, env, url, requestId) {
   if (origin && origin !== url.origin) throw new HttpError(403, "bad_origin", "Cross-origin requests are not allowed");
   const tm = /^\/api\/transfers\/([A-Za-z0-9_-]+)$/.exec(path);
   if (tm && m === "PUT") return uploadPut(req, env, requestId, tm[1]);
-  if (!path.startsWith("/api/")) return extraRoute(req, env, url, requestId, null);
+  if (!path.startsWith("/api/")) return extraRoute(req, env, url, requestId, null).catch((e) => {
+    // Project addresses (/<handle>/<slug>[/a/<doc>[/preview|edit]]) open the app, unless an installation route
+    // claimed the path first. The app resolves the address (and the server checks access) once signed in.
+    if (e instanceof HttpError && e.status === 404 && m === "GET" && ADDRESS_ROUTE.test(path) && !RESERVED_HANDLES.has(path.split("/")[1]))
+      return new Response(APP_HTML, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", ...appShellCsp(env) } });
+    throw e;
+  });
   const ctx = await authenticate(req, env, requestId);
   if (m !== "GET" && m !== "HEAD") requireCsrf(ctx, req);
   await enforceRate(ctx, m !== "GET" && m !== "HEAD");
@@ -218,8 +226,10 @@ async function route3(req, env, url, requestId) {
     if (m === "GET") return json(await listProjects(ctx));
     if (m === "POST") return json(await createProject(ctx, await body(req)), 201);
   }
-  const pid = str(seg[1], "project", 64);
+  // A project id, or its address <handle>/<slug> sent as one segment (handle%2Fslug).
+  const pid = await resolveProjectRef(env, str(seg[1], "project", 110));
   const rest = seg.slice(2);
+  if (rest.length === 0 && m === "PATCH") return json(await updateProject(ctx, pid, await body(req)));
   if (rest[0] === "grants") {
     if (rest.length === 1 && m === "GET") return json(await listGrants(ctx, pid));
     if (rest.length === 1 && m === "POST") return json(await createGrant(ctx, pid, await body(req)), 201);
@@ -358,13 +368,14 @@ var coreWorker = {
     if (e2.MCP_HOST && host === e2.MCP_HOST.toLowerCase()) {
       const publisherRoute = env.APP_CONNECT_ENABLED === "1" && /^\/v1\/publisher(\/|$)/.test(url.pathname);
       if (url.pathname.startsWith("/files/")) return withSec(await handleFileTransfer(req, env, url));
-      if (isV1Path(url.pathname) && !publisherRoute) return withSec(await handleV1(req, env));
+      if (isV1Path(url.pathname) && !publisherRoute) return withSec(await addressLinksResponse(env, await handleV1(req, env)));
       return withSec(await handleOAuthHost(req, e2, ctx, host));
     }
     if (e2.APP_HOST && host !== e2.APP_HOST.toLowerCase())
       return new Response(JSON.stringify({ error: "not_found" }), { status: 404, headers: { "content-type": "application/json" } });
     try {
-      const res = await route3(req, env, url, requestId);
+      let res = await route3(req, env, url, requestId);
+      if (url.pathname.startsWith("/api/")) res = await addressLinksResponse(env, res);
       res.headers.set?.("x-request-id", requestId);
       return withSec(res);
     } catch (e) {

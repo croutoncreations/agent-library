@@ -2,6 +2,7 @@ import { readOnlyError } from "../tenancy.js";
 import { verifyApiKey } from "./credentials.js";
 import { limitsFor, rateLimit } from "../auth.js";
 import { appOrigin, artifactWebUrl, previewWebUrl, projectWebUrl } from "../links.js";
+import { projectPaths, resolveProjectRef } from "../paths.js";
 import { __name } from "../runtime.js";
 import { RT_KINDS_ALL, RT_KINDS_DOCS, appConnectEnabled, chQuery, connectionInfo, createFile, createFolder, createFromTemplate, createMarkdown, diffRevisions, getArtifact, history, listArtifacts, listChanges, listFolders, listTemplates, metaHistory, readRecords, readTextChunk, requireAppConnect, restoreMetadata, restoreRevision, rsQuery, rtQuery, saveFile, saveMarkdown, searchArtifacts } from "../service.js";
 import { serveContent } from "../uploads.js";
@@ -93,7 +94,11 @@ function withLinks(origin, pid, r) {
 }
 async function route2(req, env, url, requestId) {
   const m = req.method;
-  const path = url.pathname.replace(/\/$/, "");
+  let path = url.pathname.replace(/\/$/, "");
+  // /v1/projects/<handle>%2F<slug>/… names a project by its address; it's mapped to the id before matching (no
+  // authorization here: an address the key can't use answers like an unknown project).
+  const am = /^\/v1\/projects\/([a-z0-9-]{1,39}%2[Ff][a-z0-9-]{1,64})(\/.*)?$/.exec(path);
+  if (am) path = `/v1/projects/${await resolveProjectRef(env, am[1])}${am[2] ?? ""}`;
   if (path === "/v1/_test/redirect" && env.V1_TEST_ENDPOINTS === "1" && /^(127\.0\.0\.1|localhost)(:\d+)?$/.test(url.host)) {
     const code = Number(url.searchParams.get("code"));
     if (![301, 302, 307, 308].includes(code)) throw new HttpError(400, "invalid_input", "code must be 301, 302, 307 or 308");
@@ -126,7 +131,8 @@ async function route2(req, env, url, requestId) {
   }
   if (R2.projects.test(path)) {
     if (m !== "GET") throw new HttpError(405, "method_not_allowed", "Method not allowed");
-    return json({ projects: k.projects.map((p) => ({ id: p.id, title: p.title, access: p.can_write ? "read_write" : "read", ...origin ? { web_url: projectWebUrl(origin, p.id) } : {} })) });
+    const paths = await projectPaths(env, k.projects.map((p) => p.id));
+    return json({ projects: k.projects.map((p) => ({ id: p.id, title: p.title, ...paths.has(p.id) ? { path: paths.get(p.id) } : {}, access: p.can_write ? "read_write" : "read", ...origin ? { web_url: projectWebUrl(origin, p.id) } : {} })) });
   }
   if (g = R2.changes.exec(path)) {
     if (m !== "GET") throw new HttpError(405, "method_not_allowed", "Method not allowed");

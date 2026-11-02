@@ -37,6 +37,19 @@ test("consent lists projects from every workspace; one connection covers one wor
   assert.equal(r.isError, false, JSON.stringify(r.data));
   const w = await agent.call("save_markdown", { project_id: BOBP, artifact_id: h.doc, expected_revision: 1, body: "agent v2", idempotency_key: "ten-oa-1" });
   assert.equal(w.isError, false, JSON.stringify(w.data));
+  // Project paths (workspace/project) work as project_id, list_projects shows them, and links use them.
+  const lp = await agent.call("list_projects", {});
+  const path = lp.data.projects.find((p) => p.id === BOBP).path;
+  assert.match(path, /^bob-s-team\/bob-project$|^bobs-team\/bob-project$|^[a-z0-9-]+\/bob-project$/);
+  assert.ok(lp.data.projects.find((p) => p.id === BOBP).web_url.endsWith("/" + path));
+  const byPath = await agent.call("read_artifact", { project_id: path, artifact_id: h.doc });
+  assert.equal(byPath.isError, false, JSON.stringify(byPath.data));
+  assert.ok(byPath.data.artifact.web_url.endsWith(`/${path}/a/${h.doc}`));
+  // A path outside the connection answers like an unknown project.
+  const own = (await owner.req("GET", "/api/projects")).body.projects.find((p) => p.id === OWN).path;
+  const outside = await agent.call("read_artifact", { project_id: own, artifact_id: h.doc });
+  const unknown = await agent.call("read_artifact", { project_id: "nope/nope", artifact_id: h.doc });
+  assert.equal(outside.isError, true); assert.deepEqual(outside.data, unknown.data);
   // Mixed workspaces in one connection are refused with a fixable message.
   await assert.rejects(h.connectMcpAgent({ [BOBP]: "read", [OWN]: "read" }, { clientName: "Mixed" }), /no interstitial redirect/);
   assert.equal(ok(await owner.req("GET", "/api/access")).connections.some((c) => c.client_name === "Mixed"), false, "nothing created");

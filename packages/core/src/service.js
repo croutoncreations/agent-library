@@ -7,8 +7,9 @@ import { RT_ID_TOO_LONG, RT_KINDS_ALL, RT_KINDS_DOCS, readTextChunk, rtChunkLimi
 import { __name } from "./runtime.js";
 import { RS_SCHEMA, rsQuery, rsReady, rsToolReady, searchArtifacts } from "./search/service.js";
 import { createFromTemplate, listTemplates, previewTemplate, saveAsTemplate, tplAssertMaintenance, tplDate, tplProvenance, tplTools } from "./templates/service.js";
-import { ROLE_RANK, personalWorkspaceId, projectRole, workspaceRoleSql, requireProjectRole, requireWorkspaceRole, visibleProjects } from "./tenancy.js";
+import { ROLE_RANK, memberRoleSql, personalWorkspaceId, projectRole, workspaceRoleSql, requireProjectRole, requireWorkspaceRole, visibleProjects } from "./tenancy.js";
 import { HttpError, int, nowIso, nowMs, randomId, sha256Hex, str } from "./util.js";
+import { checkSlug, ensureHandle, ensureSlug, projectPaths, slugify } from "./paths.js";
 
 function requireAppConnect(ctx) {
   if (!appConnectEnabled(ctx.env)) throw new HttpError(404, "not_found", "Not found");
@@ -82,11 +83,16 @@ async function listProjects(ctx) {
     // sees no project here either.
     const r = credentialGate(ctx, ctx.grant.project_id, "read"), w = credentialGate(ctx, ctx.grant.project_id, "write");
     const p = await db(ctx).prepare(`SELECT id, title, ${w.sql} AS can_write FROM projects WHERE id = ? AND ${r.sql}`).bind(...w.params, ctx.grant.project_id, ...r.params).first();
-    return { projects: p ? [{ id: p.id, title: p.title, can_write: !!p.can_write && !!ctx.grant.can_write }] : [] };
+    const paths = p ? await projectPaths(ctx.env, [p.id]) : new Map();
+    return { projects: p ? [{ id: p.id, title: p.title, ...paths.has(p.id) ? { path: paths.get(p.id) } : {}, can_write: !!p.can_write && !!ctx.grant.can_write }] : [] };
   }
   // Every project in every active workspace I belong to (minus per-project 'none'), with my effective role.
   const ps = await visibleProjects(ctx.env, ctx.principal.id);
-  return { projects: ps.map((p) => ({ id: p.id, title: p.title, workspace_id: p.workspace_id, role: p.role, can_write: ROLE_RANK[p.role] >= ROLE_RANK.member && p.workspace_status === "active",
+  // Addresses: assigned on first use for projects and workspaces that predate them (only where something is missing).
+  const missing = ps.filter((p) => !p.slug || !p.workspace_handle).map((p) => p.id);
+  const fill = missing.length ? await projectPaths(ctx.env, missing) : new Map();
+  const pathOf = (p) => p.slug && p.workspace_handle ? `${p.workspace_handle}/${p.slug}` : fill.get(p.id);
+  return { projects: ps.map((p) => ({ id: p.id, title: p.title, path: pathOf(p), workspace_id: p.workspace_id, role: p.role, can_write: ROLE_RANK[p.role] >= ROLE_RANK.member && p.workspace_status === "active",
     ...p.workspace_status !== "active" ? { read_only_reason: "workspace_suspended" } : {} })) };
 }
 async function createProject(ctx, input) {
@@ -100,19 +106,46 @@ async function createProject(ctx, input) {
   const title = str(input.title, "title", 200, { min: 1 });
   const wsId = input.workspace_id === void 0 ? personalWorkspaceId(ctx.principal.id) : str(input.workspace_id, "workspace_id", 80);
   const ws = await requireWorkspaceRole(ctx, wsId, "admin");
+  // Address inside the workspace: chosen (slug) or derived from the title; a derived one gets -2, -3 … when taken.
+  const chosen = input.slug === void 0 || input.slug === "" ? null : checkSlug(input.slug);
   // owner_id stays the workspace's creator so a rolled-back Worker (owner-only model) still finds it.
   const ownerId = await db(ctx).prepare("SELECT created_by FROM workspaces WHERE id = ?").bind(ws.id).first("created_by");
+  const base = chosen ?? (slugify(title, 58) || "project");
+  let slug = base;
+  for (let i = 2; !chosen && i < 50 && await db(ctx).prepare("SELECT 1 FROM projects WHERE workspace_id = ? AND slug = ?").bind(ws.id, slug).first(); i++) slug = `${base}-${i}`;
   const [ins] = await db(ctx).batch([
-    db(ctx).prepare(`INSERT INTO projects (id, owner_id, title, created_at, workspace_id) SELECT ?, ?, ?, ?, ?
-      WHERE ${workspaceRoleSql("?", "admin")}`).bind(id, ownerId, title, nowIso(), ws.id, ctx.principal.id, ws.id),
+    db(ctx).prepare(`INSERT INTO projects (id, owner_id, title, created_at, workspace_id, slug) SELECT ?, ?, ?, ?, ?, ?
+      WHERE ${workspaceRoleSql("?", "admin")}`).bind(id, ownerId, title, nowIso(), ws.id, slug, ctx.principal.id, ws.id),
     db(ctx).prepare("INSERT INTO audits (at, actor_id, project_id, action, object_id, rev_no, result, request_id, workspace_id) SELECT ?, ?, ?, 'project.create', ?, NULL, 'ok', ?, ? WHERE EXISTS (SELECT 1 FROM projects WHERE id = ? AND workspace_id = ?)")
       .bind(nowIso(), ctx.principal.id, id, id, ctx.requestId, ws.id, id, ws.id)
   ]).catch((e) => {
+    if (/projects\.slug|projects_workspace_slug/i.test(String(e))) throw new HttpError(409, "slug_taken", "That project address is already used in this workspace; choose another");
     if (/UNIQUE|constraint/i.test(String(e))) throw new HttpError(409, "exists", "Project already exists");
     throw e;
   });
   if (!ins.meta.changes) throw new HttpError(403, "forbidden", "Needs the admin role in this workspace");
-  return { id, title, workspace_id: ws.id };
+  const handle = await ensureHandle(ctx.env, { ...ws, label: ctx.principal.label });
+  return { id, title, slug, path: `${handle}/${slug}`, workspace_id: ws.id };
+}
+/** Rename a project and/or change its address (slug). Workspace admins only; old address links stop working. */
+async function updateProject(ctx, projectId, input) {
+  requireHuman(ctx);
+  const r = await requireProjectRole(ctx, projectId, "admin");
+  const title = input?.title === void 0 ? null : str(input.title, "title", 200, { min: 1 });
+  const slug = input?.slug === void 0 ? null : checkSlug(input.slug);
+  if (title === null && slug === null) throw new HttpError(400, "invalid_input", "Pass title and/or slug");
+  const [u] = await db(ctx).batch([
+    db(ctx).prepare(`UPDATE projects SET title = COALESCE(?, title), slug = COALESCE(?, slug), workspace_id = COALESCE(workspace_id, 'wsp_' || owner_id)
+      WHERE id = ? AND ${memberRoleSql("?", "admin")}`).bind(title, slug, projectId, ctx.principal.id, projectId),
+    audit(ctx, projectId, slug !== null ? "project.address" : "project.rename", projectId, null, "ok", "changes() = 1")
+  ]).catch((e) => {
+    if (/UNIQUE|constraint/i.test(String(e))) throw new HttpError(409, "slug_taken", "That project address is already used in this workspace; choose another");
+    throw e;
+  });
+  if (!u.meta.changes) throw new HttpError(403, "forbidden", "Needs the admin role");
+  const p = await db(ctx).prepare("SELECT id, title, slug FROM projects WHERE id = ?").bind(projectId).first();
+  const path = (await projectPaths(ctx.env, [projectId])).get(projectId);
+  return { id: p.id, title: p.title, slug: path ? path.split("/")[1] : p.slug, path, workspace_id: r.workspace_id };
 }
 async function createGrant(ctx, projectId, input) {
   requireHuman(ctx);
@@ -627,4 +660,4 @@ artifactView = (a, appConnect = true) => ({
 });
 ART_COLS = "a.*, (SELECT display_name FROM publishers WHERE id = a.publisher_id) AS pub_name";
 
-export { BINARY_TYPES, IMAGE_TYPES, LIMITS, RS_SCHEMA, RT_ID_TOO_LONG, RT_KINDS_ALL, RT_KINDS_DOCS, VIDEO_TYPES, addComment, appConnectEnabled, assertWritable, audit, auditDenied, chQuery, cleanupChanges, connectionInfo, createFile, createFolder, createFromTemplate, createGrant, createMarkdown, createProject, db, diffRevisions, folderCheck, folderName, getArtifact, history, idemInsert, idemLookup, legacyConnectionInfo, listArtifacts, listAudit, listChanges, listComments, listFolders, listGrants, listProjects, listTemplates, loadArtifact, mdBody, metaHistory, previewTemplate, provenance, publishRevision, readRecords, readTextChunk, requireAppConnect, restoreMetadata, restoreRevision, rsQuery, rsReady, rsToolReady, rtChunkLimit, rtFit, rtIdBytes, rtQuery, rtReadAuthzSql, runBatch, saveAsTemplate, saveFile, saveMarkdown, searchArtifacts, tplDate, tplTools, updateGrant, updateMetadata };
+export { BINARY_TYPES, IMAGE_TYPES, LIMITS, RS_SCHEMA, RT_ID_TOO_LONG, RT_KINDS_ALL, RT_KINDS_DOCS, VIDEO_TYPES, addComment, appConnectEnabled, assertWritable, audit, auditDenied, chQuery, cleanupChanges, connectionInfo, createFile, createFolder, createFromTemplate, createGrant, createMarkdown, createProject, updateProject, db, diffRevisions, folderCheck, folderName, getArtifact, history, idemInsert, idemLookup, legacyConnectionInfo, listArtifacts, listAudit, listChanges, listComments, listFolders, listGrants, listProjects, listTemplates, loadArtifact, mdBody, metaHistory, previewTemplate, provenance, publishRevision, readRecords, readTextChunk, requireAppConnect, restoreMetadata, restoreRevision, rsQuery, rsReady, rsToolReady, rtChunkLimit, rtFit, rtIdBytes, rtQuery, rtReadAuthzSql, runBatch, saveAsTemplate, saveFile, saveMarkdown, searchArtifacts, tplDate, tplTools, updateGrant, updateMetadata };

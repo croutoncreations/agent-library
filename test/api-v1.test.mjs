@@ -89,7 +89,7 @@ test("Muse round trip: list, create, read, update, stale 409, idempotent replay,
   const lp = await call("GET", "/v1/projects", { token: t });
   assert.equal(lp.status, 200);
   assert.deepEqual(lp.json.projects.map((p) => [p.id, p.access]).sort(), [[PA, "read_write"], [PB, "read"]]);
-  assert.equal(lp.json.projects[0].web_url.startsWith(APP + "/p/"), true, "web_url points at the owner host");
+  assert.equal(lp.json.projects[0].web_url, `${APP}/${lp.json.projects[0].path}`, "web_url points at the owner host, by address");
   assert.match(lp.headers.get("content-type"), /^application\/json/);
   assert.equal(lp.headers.get("set-cookie"), null);
 
@@ -98,7 +98,8 @@ test("Muse round trip: list, create, read, update, stale 409, idempotent replay,
   assert.equal(c.status, 201, c.text);
   const fid = c.json.artifact_id;
   assert.equal(c.json.revision, 1);
-  assert.ok(c.json.web_url.endsWith(`/p/${PA}/a/${fid}`) && c.json.preview_url.endsWith("/preview"));
+  const paPath = lp.json.projects.find((p) => p.id === PA).path;
+  assert.ok(c.json.web_url.endsWith(`/${paPath}/a/${fid}`) && c.json.preview_url.endsWith("/preview"));
   const replay = await call("POST", `/v1/projects/${PA}/files`, { token: t, idem: ik, body: { title: "Synthetic note", body: "# Hello\nsynthetic" } });
   assert.equal(replay.status, 201); assert.equal(replay.json.artifact_id, fid); assert.equal(replay.json.idempotent_replay, true);
   const reuse = await call("POST", `/v1/projects/${PA}/files`, { token: t, idem: ik, body: { title: "Different", body: "x" } });

@@ -414,7 +414,8 @@ test("multi-project consent: per-project permissions (A read, B write); project_
   assert.equal(wB.body.result.isError, false, JSON.stringify(wB.body));
   const madeB = (await owner.req("GET", `/api/projects/${PB}/artifacts/${wB.body.result.structuredContent.artifact_id}`));
   assert.equal(madeB.status, 200); assert.equal(madeB.body.artifact.project_id, PB);
-  assert.match(wB.body.result.structuredContent.web_url, new RegExp(`/p/${PB}/a/`));
+  const pbPath = (await owner.req("GET", "/api/projects")).body.projects.find((p) => p.id === PB).path;
+  assert.ok(wB.body.result.structuredContent.web_url.includes(`/${pbPath}/a/`), wB.body.result.structuredContent.web_url);
   const wA = await call(at, "create_markdown", { project_id: PA, title: "Should not exist", body: "x", idempotency_key: key("ma") });
   assert.equal(wA.body.result.structuredContent.error.code, "forbidden");
   const eA = await call(at, "save_markdown", { project_id: PA, artifact_id: aDoc, expected_revision: 1, body: "hijack", idempotency_key: key("sa") });

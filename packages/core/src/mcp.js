@@ -1,5 +1,6 @@
 import { authenticate, enforceRate } from "./auth.js";
 import { WEB_URL_OUTPUT_SCHEMAS, WEB_URL_TOOL_NOTE, appOrigin, withWebUrls } from "./links.js";
+import { addressLinks, resolveProjectRef } from "./paths.js";
 import { __name } from "./runtime.js";
 import { RS_SCHEMA, RT_ID_TOO_LONG, addComment, auditDenied, createMarkdown, diffRevisions, getArtifact, history, legacyConnectionInfo, listArtifacts, listChanges, listComments, listProjects, readTextChunk, restoreMetadata, restoreRevision, rsToolReady, rtChunkLimit, rtFit, rtIdBytes, saveMarkdown, searchArtifacts, tplTools, updateMetadata } from "./service.js";
 import { uploadBegin, uploadFinish } from "./uploads.js";
@@ -7,7 +8,7 @@ import { CHANGE_NOTE_SCHEMA, HttpError, idemKey, mcpClientInfo, rememberClientIn
 
 var SUPPORTED2 = ["2025-11-25", "2025-06-18", "2025-03-26"];
 var S2 = /* @__PURE__ */ __name((props, required) => ({ type: "object", properties: props, required, additionalProperties: false }), "S");
-var P2 = { type: "string", description: "Project ID" };
+var P2 = { type: "string", description: "Project ID or path (workspace/project)" };
 var A2 = { type: "string", description: "Artifact ID" };
 var K2 = { type: "string", description: "Idempotency key (8-128 chars); reuse it when retrying the same request" };
 var unwrap2 = /* @__PURE__ */ __name((r) => r && typeof r.status === "number" && "body" in r ? r.body : r, "unwrap");
@@ -176,8 +177,13 @@ async function handleMcp(req, env, requestId, origin) {
       if (typeof args !== "object" || Array.isArray(args)) return reply(rpcErr2(msg.id, -32602, "arguments must be an object"));
       const allowed = new Set(Object.keys(tool.inputSchema.properties));
       for (const k of Object.keys(args)) if (!allowed.has(k)) return reply(rpcErr2(msg.id, -32602, `Unknown argument ${k}`));
+      // A missing required argument is the caller's mistake (it used to reach the database as undefined: a 500).
+      const missing = (tool.inputSchema.required ?? []).find((k) => args[k] === undefined || args[k] === null);
+      if (missing) return reply(rpcErr2(msg.id, -32602, `Missing argument ${missing}`));
+      if (typeof args.project_id === "string" && args.project_id.includes("/")) args.project_id = await resolveProjectRef(env, args.project_id);
+      if (Array.isArray(args.project_ids)) args.project_ids = await Promise.all(args.project_ids.map((x) => resolveProjectRef(env, x)));
       try {
-        const result = withWebUrls(tool.name, args, args.project_id, await tool.run({ ...ctx, clientInfo: mcpClientInfo(msg.params, ctx.grantClientInfo), rpcIdBytes: rtIdBytes(msg.id) }, args), appOrigin(env.APP_HOST) ?? origin);
+        const result = await addressLinks(env, withWebUrls(tool.name, args, args.project_id, await tool.run({ ...ctx, clientInfo: mcpClientInfo(msg.params, ctx.grantClientInfo), rpcIdBytes: rtIdBytes(msg.id) }, args), appOrigin(env.APP_HOST) ?? origin));
         return reply(rpc2(msg.id, { content: [{ type: "text", text: JSON.stringify(result) }], structuredContent: result, isError: false }));
       } catch (e) {
         if (!(e instanceof HttpError)) throw e;

@@ -7,6 +7,7 @@ import { mayCreateAccount, principalForIdentity } from "../identity/accounts.js"
 import { randomToken } from "../identity/jwt.js";
 import { EMAIL_RE, checkEmailPage, limitSigninStart, startFailure } from "../identity/browser.js";
 import { TURNSTILE_ORIGIN, requireHuman, turnstileSiteKey } from "../identity/turnstile.js";
+import { addressLinksResponse } from "../paths.js";
 import { HttpError } from "../util.js";
 import { __name } from "../runtime.js";
 import { folderName } from "../service.js";
@@ -90,7 +91,7 @@ function servers(origin, appConnect = false) {
       resourceMetadata: { resource: v1Resource, authorization_servers: [origin], bearer_methods_supported: ["header"], resource_name: "Agent Library publisher API" },
       requiredScopes: [SCOPES.publish],
       validateToken: (env) => (res, token) => as.validateToken(res, token, env),
-      handler: { fetch: (req, env, ctx) => handlePublisherApi(req, env, ctx) }
+      handler: { fetch: async (req, env, ctx) => addressLinksResponse(env, await handlePublisherApi(req, env, ctx)) }
     });
   }
   cache.set(cacheKey, s);
