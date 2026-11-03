@@ -444,13 +444,15 @@ function rvNewDocReview(pid, kindOf) {
     .catch(function () { label.replaceChildren("Review", h("span", { class: "muted small", text: "Project default. Couldn't load the options: change it in Details after creating." })); label.classList.remove("rv-wait"); });
   return { label: label, help: help, sync: sync,
     // Sets the chosen mode if creation (project default at that moment, which may have changed since the form loaded) didn't.
-    apply: async function (aid) {
+    // Pinned to the revision this form created: turning on Required vouches for it, so an agent version saved in
+    // between must never be vouched for unseen (the server answers 409 and the owner sets it from Details).
+    apply: async function (aid, rev) {
       if (!s) return;
       var want = sel.value, a = "/api/projects/" + enc(pid) + "/artifacts/" + enc(aid);
       try {
-        var got = await api("GET", a), cur = (got.artifact.review || {}).mode || "off";
-        if (cur !== want) await api("PUT", a + "/review-mode", { mode: want, expected_revision: got.revision.rev });
-      } catch (err) { toast("Created. Review couldn't be set: " + err.message); }
+        var cur = ((await api("GET", a)).artifact.review || {}).mode || "off";
+        if (cur !== want) await api("PUT", a + "/review-mode", { mode: want, expected_revision: rev || 1 });
+      } catch (err) { toast(err.status === 409 ? "Created. The document changed right away, so review wasn't set: set it from Details." : "Created. Review couldn't be set: " + err.message); }
     } };
 }
 var RV_DESC = {

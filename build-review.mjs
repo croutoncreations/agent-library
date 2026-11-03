@@ -228,7 +228,7 @@ const PATCHES = [
   ['ui: new document: review follows the template choice', UI, '    start.addEventListener("change", function () { selectedTemplate = templates[start.value] || null; scheduleTemplatePreview(); });',
     '    start.addEventListener("change", function () { selectedTemplate = templates[start.value] || null; scheduleTemplatePreview(); rvNew.sync(); });'],
   ['ui: new document: apply the review choice', UI, 'try { var r = await api("POST", path, req, { key: pending.key }); pending = null; location.hash',
-    'try { var r = await api("POST", path, req, { key: pending.key }); pending = null; await rvNew.apply(r.artifact_id); location.hash'],
+    'try { var r = await api("POST", path, req, { key: pending.key }); pending = null; await rvNew.apply(r.artifact_id, r.revision); location.hash'],
   ['ui: apps: can review', UI, 'diagnostic: connectionSummary("oauth", c.id, c.client_name, c.projects, c.expires_at, c.last_used_at, c.status, data.checked_at),',
     'diagnostic: h("div", null, rvReviewToggles("oauth", c.id, c.projects, c.status === "active"), connectionSummary("oauth", c.id, c.client_name, c.projects, c.expires_at, c.last_used_at, c.status, data.checked_at)),'],
   ['ui: agent tokens: can review', UI, '      li.append(connectionSummary("legacy_grant", g.id, g.label, [{ project_id: g.project_id, title: g.project_title, access: g.access }], g.expires_at, null, g.status, data.checked_at));',

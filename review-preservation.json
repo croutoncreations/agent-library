@@ -1,11 +1,11 @@
 {
   "base_file_types_sha256": "cea551a7d442927605e0890073072e7bad69968f1fdf6a4a3886d3dc79a6b1cf",
-  "integrated_sha256": "491073e7bc6537bdbeda859802eef32b0c90041a743540c2874cf06bec457f25",
+  "integrated_sha256": "388cf6749fb91a39cd6db5370ecb3f689bc9ceeb1cad81f5568efdc547f929c0",
   "preserved_outside_patches_sha256": "1e09e18cf9a8be3ea84b9c92b92e1bd4522ca8eedf6a738fc55ceb6588399826",
   "sources_sha256": {
     "src/review/service.js": "66aaa5d16763149e719c5aa57ede9b5ba078fade0945a5a75328f9a0074ed146",
     "src/review/tools.js": "192903fbdd905f4b632a23a22263874502c8691d02a394ddb1596aa8b43d2991",
-    "src/review/browser.js": "be0bceb9a19b437a757621ec3c9cec87dc91c01d37b67842d1763410eefd0a73",
+    "src/review/browser.js": "41181a23dfcc13615cd8089e70f411a65191e6aba093c1dbf17839c8b0a809b1",
     "src/review/browser.css": "e429b4eeb7c246b003964470e20770468614b04d7d97dece752c0f0ed663e9bc"
   },
   "patches": [
@@ -500,7 +500,7 @@
       "module": "// src/ui.ts",
       "count": 1,
       "find_sha256": "81bcf3ea5954073fece07463dbbe3470c23d9bf7692c635606fabb17e44ff27a",
-      "replace_sha256": "dc8f840515169da8e1d262b0071f8cb216fecc4c4995f828f225a5c5091573f4"
+      "replace_sha256": "9a5a3d9ca6036a36b9d5963d554082a0babb112e7430ef59ad285efbe23f98e7"
     },
     {
       "name": "ui: review routes",
@@ -626,7 +626,7 @@
       "module": "// src/ui.ts",
       "count": 1,
       "find_sha256": "037a03657196006ab390998f0f2320bbb5553d5e4def039cd12b39fe51df9dd5",
-      "replace_sha256": "f38c04b370b42a21f8c523d0484555c6788bca800ecc05ba78a89be0e323a9d2"
+      "replace_sha256": "98727e509edf516510f5ddcd2e119e96a8c00f22cffe9cec80db33d94c3cf18e"
     },
     {
       "name": "ui: apps: can review",
