@@ -73,7 +73,8 @@ test("service worker serves the cache-first shell and only for app routes", asyn
   const sw = await (await fetch(APP + "/sw.js")).text();
   assert.match(sw, /var SHELL = "al-shell-v3"/);
   assert.match(sw, /\/\^\\\/p\\\/\(\[\^\/\]\+\)/, "deep-link regex survives the template literal");
-  assert.doesNotMatch(sw, /e\.respondWith\(fetch\(e\.request\)\.then/, "no network-first shell");
+  // Ordinary launches answer from the cache first (network-first only for sign-in navigations, tested below).
+  assert.match(sw, /e\.respondWith\(ready\.then\(function \(\) \{ return fromCache\(key\); \}\)/, "cache-first shell");
 });
 
 test("the shell is cached and the app is controlled by the service worker", { skip }, async () => {
@@ -170,4 +171,20 @@ test("sign-in navigations (?al_net=1) bypass the cached shell", { skip }, async 
   await page.waitForSelector("#nav a");
   assert.equal(net.navHits, hits + 1, "the page came from the network");
   assert.equal(await page.evaluate(() => location.search), "", "the marker is dropped from the address bar");
+});
+
+test("a sign-in navigation right after a deploy loads its script from the same (new) version, not the cache", { skip }, async () => {
+  net.deploy = "signindeploy";
+  try {
+    await page.goto("about:blank");
+    await page.goto(APP + "/?al_net=1&t=2#/");
+    await page.waitForSelector("#nav a");
+    const scripts = await page.evaluate(() => performance.getEntriesByType("resource").filter((r) => /\/app\.(js|css)$/.test(r.name)).map((r) => r.name));
+    assert.ok(scripts.length >= 2, "the page loaded its script and styles");
+    // The proxy appends the marker only to the network copy of /app.js for this simulated deploy.
+    const live = await page.evaluate(async () => (await (await fetch("/app.js", { cache: "no-store" })).text()).includes("deploy signindeploy"));
+    assert.equal(live, true, "the page's own requests go to the network");
+    assert.doesNotMatch(await appJs(), /deploy signindeploy/, "the cached shell is unchanged until the next launch swaps it");
+  } finally { net.deploy = null; }
+  await launch(); await launch();
 });

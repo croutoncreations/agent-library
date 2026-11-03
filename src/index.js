@@ -16946,6 +16946,9 @@ var SHELL = ${JSON.stringify(SHELL_CACHE)}, PATHS = ${JSON.stringify(SHELL_PATHS
 // must carry that same version (X-Shell-Version), so a deploy landing mid-download is never stored.
 // A navigation with ?al_net=1 (sign-in through Access) goes to the network first, so Access can show its page.
 var NEXT = SHELL + "-next", VKEY = "/__al-shell-version", updating = null;
+// Pages that came from the network (sign-in navigations): their script and styles come from the network too, so the
+// page and its files are one version even right after a deploy. Keyed by client id; a page's files load at once.
+var netPages = {};
 function noop() {}
 // The shell version a cache holds, or null (no cache, or no complete shell in it).
 function versionOf(name) {
@@ -16999,9 +17002,9 @@ function refresh() {
     .then(function () { updating = null; });
   return updating;
 }
-// Swap in a complete downloaded shell (all PATHS and its version present); an incomplete one is dropped. Only when no
-// other window is open (at most the one navigating), so a page still loading its script and styles never gets a
-// newer version.
+// Swap in a complete downloaded shell (all PATHS and its version present); an incomplete one is dropped. Best effort:
+// skipped while more than one window is listed. A window that already loaded keeps its script and styles in memory,
+// so a swap at the same moment only changes what its later manifest and icon requests see.
 function promote() {
   if (updating) return Promise.resolve();
   var keys = PATHS.concat([VKEY]);
@@ -17038,6 +17041,15 @@ self.addEventListener("fetch", function (e) {
   var key = nav ? "/" : u.pathname;
   if (!nav && PATHS.indexOf(key) < 0) return; // data and everything else: browser default (network)
   if (nav && /[?&]al_net=1(&|$)/.test(u.search)) {
+    var page = e.resultingClientId;
+    e.respondWith(fetch(e.request).then(function (r) {
+      // This app's page from the network (not an Access redirect or sign-in page): load its files from the network too.
+      if (page && r.ok && r.headers.get("x-shell-version")) netPages[page] = true;
+      return r;
+    }).catch(function () { return fromCache(key).then(function (hit) { return hit || offline(); }); }));
+    return;
+  }
+  if (!nav && netPages[e.clientId]) {
     e.respondWith(fetch(e.request).catch(function () { return fromCache(key).then(function (hit) { return hit || offline(); }); }));
     return;
   }
