@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- The installed app opens instantly from a cached app shell, even offline or on a slow connection ([docs/offline.md](docs/offline.md)). If this device has offline copies and signing in takes more than 3 seconds, the saved copies open right away. When the connection comes through, a banner offers the live library. Only the app shell (HTML, script, styles, icons) is cached, never library data. Each launch checks a tiny version endpoint (`/shell-version`). The app downloads in the background only when a deploy changed it, and the update takes effect on the next launch.
 - Optional review per document ([docs/review-gating.md](docs/review-gating.md)). **Required**: edits by OAuth apps, API keys and agent tokens become proposals that the owner, or an agent the owner allows to review, approves, edits and approves, or rejects; everyone else keeps reading the approved version. **Advisory**: edits go live, and versions can be marked reviewed so agents can read `reviewed: true`. A project default can apply to new documents. New MCP tools `list_proposals`, `read_proposal`, `withdraw_proposal`, `review_proposal`, `review_revision`; `/v1` proposal routes; Home "Needs review", a review screen, a project Review tab, review status on documents and History, and per-connection review permission on the Connections pages. Owner edits and App Connect files are never gated. Backups move to `agent-library-backup/3`. Needs migration `0017` (additive; database triggers keep an older Worker fail-closed on required documents).
 
 ## 0.1.0 (2026-10-28)

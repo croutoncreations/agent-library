@@ -83,7 +83,8 @@ before(async () => {
   access = startAccess();
   if (!haveChrome) return;
   browser = await require(PUPPETEER).launch({ executablePath: CHROME, headless: true,
-    args: ["--no-first-run", `--host-resolver-rules=MAP ${HOST} 127.0.0.1`] });
+    // Treat the plain-HTTP test host as secure so the service worker (cached shell) runs, as it does in production.
+    args: ["--no-first-run", `--host-resolver-rules=MAP ${HOST} 127.0.0.1`, `--unsafely-treat-insecure-origin-as-secure=${APP}`] });
   page = await browser.newPage();
   await page.setViewport({ width: 1200, height: 900 });
 });
@@ -179,6 +180,39 @@ test("sign-out with an expired session and a request in flight finishes clearing
   assert.equal(await page.evaluate(() => window.__sameDocument), true, "no reload cut sign-out short");
   assert.equal(await page.evaluate(() => Object.keys(localStorage).filter((k) => k.startsWith("al:draft:")).length), 0, "drafts cleared");
   assert.equal(liveSessions(), 0);
+});
+
+test("cached shell with saved copies: Access expired opens the copies with a sign-in link that reaches Access", { skip }, async () => {
+  await openHome();
+  // The app registers its worker on https (and loopback) only; this plain-HTTP test host registers it directly.
+  await page.evaluate(async () => { await navigator.serviceWorker.register("/sw.js", { scope: "/" }); await navigator.serviceWorker.ready; });
+  await openHome();
+  const pid = "offline-trip";
+  const r = await page.evaluate(async (p) => {
+    const csrf = (await (await fetch("/api/me", { headers: { "x-requested-with": "XMLHttpRequest" } })).json()).csrf;
+    const post = (u, b) => fetch(u, { method: "POST", headers: { "content-type": "application/json", "x-csrf-token": csrf, "idempotency-key": "off-" + Math.random() }, body: JSON.stringify(b) });
+    await post("/api/projects", { id: p, title: "Offline trip" });
+    return (await fetch("/api/projects/" + p + "/artifacts", { method: "POST", headers: { "content-type": "application/json", "x-csrf-token": csrf, "idempotency-key": "off-" + Date.now() }, body: JSON.stringify({ title: "Saved note", body: "# Saved\n\nReadable offline.\n" }) })).json();
+  }, pid);
+  await page.goto(APP + "/#/p/" + pid + "/a/" + r.artifact_id); await page.waitForFunction(() => /Readable offline/.test(document.body.innerText));
+  await page.click('button[aria-label="Make available offline"]');
+  await page.waitForFunction(() => /Available offline/.test(document.body.innerText));
+  await page.evaluate(() => sessionStorage.removeItem("al:signin-reload"));
+  endAppSessions();
+  accessState.expired = true;
+  try {
+    await page.goto("about:blank");
+    const nav = await page.goto(APP + "/");
+    assert.equal(nav.fromServiceWorker(), true, "the shell came from the cache");
+    await page.waitForFunction(() => /Saved note/.test(document.body.innerText) && /Sign in to open the live library/.test(document.body.innerText), { timeout: 10000 });
+    assert.notEqual(await page.title(), SIGNIN_TITLE, "no navigation away from the saved copies");
+    await Promise.all([page.waitForNavigation(), page.evaluate(() => [...document.querySelectorAll("a")].find((a) => a.textContent === "Sign in to open the live library").click())]);
+    assert.equal(await page.title(), SIGNIN_TITLE, "the sign-in link reaches Access, not the cached shell");
+  } finally { accessState.expired = false; }
+  // The background shell refresh ran while Access was signed out: its sign-in page must not have replaced the
+  // cached shell, so the next launch is still the app.
+  await page.goto(APP + "/#/"); await page.waitForSelector("#nav a");
+  assert.notEqual(await page.title(), SIGNIN_TITLE);
 });
 
 test("server: a new Access user ID for the owner email keeps the same owner account and library", async () => {

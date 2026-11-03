@@ -1,6 +1,6 @@
 # Review gating
 
-Status: implemented. Build step `build-review.mjs` (last in `npm run build:design`), migration `0017_review_gating.sql`, sources in `src/review/`, tests in `test/review-gating.test.mjs`.
+Status: implemented. Build step `build-review.mjs` (in `npm run build:design`, before `build-offline-shell.mjs`), migration `0017_review_gating.sql`, sources in `src/review/`, tests in `test/review-gating.test.mjs`.
 
 ## Goal
 
