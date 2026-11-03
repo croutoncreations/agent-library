@@ -106,7 +106,8 @@ Documents in `advisory`/`required` mode, or with pending proposals, carry `revie
 
 - **Home:** a "Needs review" section, shown only when there is at least one pending proposal; otherwise nothing is rendered.
 - **Review screen** (`#/p/:p/review/:proposal`): who proposed what and why, the diff against the version it started from (and against the current version when stale), details changes, image/file preview, and Approve / Edit and approve / Reject with an optional note.
-- **Document:** a banner when drafts are pending; review mode in Details (owner).
-- **History:** "Reviewed" and "Proposed by X · approved by Y" on versions; **Mark as reviewed** on a version in advisory mode.
-- **Project:** a Review tab with the project's pending proposals, the default for new documents (with kinds) and "Apply to existing documents".
+- **Document:** a banner when drafts are pending ("Review edit" opens the only one; with several, "Review edits" opens History); review mode in Details (owner).
+- **History:** pending proposals for the document in a "Waiting for review" group above the versions, each with a direct **Review** link; "Reviewed" and "Proposed by X · approved by Y" on versions; **Mark as reviewed** on a version in advisory mode.
+- **New document:** a Review choice that starts at the project default for the chosen type; a different choice is set right after creating (the owner's first version is never gated).
+- **Project:** a Review tab with the project's pending proposals, the default for new documents (Off / Optional / Required, with kinds) and "Apply to existing documents".
 - **Connections:** a **Can review** toggle per project on apps, API keys and agent tokens.
