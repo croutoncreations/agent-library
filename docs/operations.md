@@ -26,6 +26,8 @@ Limits:
 - Folders and App Connect data aren't included (see above).
 - Cloudflare D1's own point-in-time recovery restores the database but not R2 files, so it isn't a complete backup on its own.
 
+Backups use format `agent-library-backup/3`: documents' review mode, pending and closed proposals (with their files) and review records are included, and the project's default for new documents. Older `/1` and `/2` backups still restore. Restore imports history exactly as it was, including agent versions from before a document required review.
+
 Restoring has no UI yet. Send the backup JSON to `POST /api/restore` from a signed-in owner session (with the CSRF header); `test/a12-durability.test.mjs` shows a full round trip. Restore only into an **empty** library, such as a fresh installation. It refuses a library that already has content, checks every hash and creates no agent access. Reconnect your agents afterwards.
 
 ## Rollback
@@ -34,4 +36,4 @@ Note the current Worker version ID before each upgrade. To roll back the code, r
 
 ## Monitoring
 
-Watch Worker errors and your D1, R2 and KV usage in the Cloudflare dashboard, and check that the 15-minute cleanup job runs. Free tiers cover a typical personal library, but usage above them is billed to your account. Review connected agents now and then, and revoke the ones you no longer use. Never widen your Access policy to work around a sign-in problem.
+Watch Worker errors and your D1, R2 and KV usage in the Cloudflare dashboard, and check that the 15-minute cleanup job runs. That job also deletes the bytes of rejected, withdrawn or superseded file proposals 30 days after the decision (bytes any version uses are never deleted). Free tiers cover a typical personal library, but usage above them is billed to your account. Review connected agents now and then, and revoke the ones you no longer use. Never widen your Access policy to work around a sign-in problem.

@@ -67,6 +67,7 @@ Agent Library is a personal library: one owner, many agents.
 - [Connecting agents](docs/agent-setup.md): MCP (OAuth) and API keys, scopes, revocation.
 - [App Connect](docs/app-connect.md): let your own apps store their data in your library.
 - [Architecture](docs/architecture.md): how the pieces fit, the security model and how the bundle is built.
+- [Review](docs/review-gating.md): optionally require approval before edits by apps and agents go live, or mark versions reviewed so agents can read the reviewed one.
 - [Document templates](docs/templates.md): save a Markdown structure once, then start new documents from it in the app or through MCP and the API.
 - [Changes feed](docs/project-changes.md): checkpoints, incremental polling, retention and resync.
 - [Operations](docs/operations.md): upgrades, backup and restore, rollback.

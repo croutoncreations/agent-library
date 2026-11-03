@@ -56,7 +56,8 @@ The deployable Worker is a committed, byte-pinned bundle. `npm run build:design`
 - `src/web/connect-pages.js`;
 - `src/upload-fixes/*`;
 - `src/oauth-renewal/*`;
-- `src/file-tools/*` (files for OAuth connections, `build-file-tools-fixes.mjs`, the last step).
+- `src/file-tools/*` (files for OAuth connections, `build-file-tools-fixes.mjs`);
+- `src/review/*` (optional review per document, `build-review.mjs`, the last step).
 
 Each step must leave every other byte unchanged and records hashes in a `*-preservation.json` manifest. CI's `npm run check:bundle` rebuilds in a temporary copy and fails on any difference. Because of this, every change to what ships is a reviewable source diff, and the shipped bytes are reproducible.
 
@@ -84,3 +85,7 @@ Project-scoped Markdown templates reuse artifact revisions and metadata history;
 ## File types
 
 File types in the browser UI (`src/file-types/`, integrated by the final `build-file-types.mjs` step): lists label files by their stored MIME type ("PNG image", "MP4 video", "PDF"), Home can filter and sort by type, and list rows show small thumbnails for images and videos. Thumbnails are drawn in the browser from the revision-pinned `/content` URL, lazily and within a per-minute budget, kept as 96px object URLs for the session and dropped on sign-out. The owner list route adds `mime` only with `?include=mime`, and owner search adds it for human sessions only, so MCP, `/v1` and default `/api` shapes are unchanged. No migration.
+
+## Review
+
+Optional review per document (`off`, `advisory`, `required`; `src/review/*`, integrated by the final `build-review.mjs` step, migration `0017`). In required mode, edits by OAuth apps, API keys and agent tokens become **proposals** in their own table: `head_rev` always means the latest approved version, and approving appends an ordinary revision (or details version) carrying `proposal_id` plus a `reviews` row, in one D1 batch that re-checks the reviewer's permission live. Database triggers refuse agent revisions on required documents unless an approval is in progress, so an older Worker on the new schema fails closed. Owner browser edits and App Connect publishers are never gated. Review permission is a separate per-project grant (`review_grants`) set by the owner on the Connections pages. See [Review](review-gating.md).

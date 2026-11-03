@@ -5862,6 +5862,8 @@ async function tplCopy(ctx, projectId, input, key, definition = false) {
   const project = await db(ctx).prepare("SELECT title FROM projects WHERE id = ?").bind(projectId).first();
   if (!definition) tplDate(date, src.body.includes("{{date}}"));
   const body = mdBody(definition ? src.body : tplReplace(src.body, title, project.title, date));
+  if (!definition && await rvNewGated(ctx, projectId, "markdown")) return rvCreateNew(ctx, projectId, "markdown", { title, folder, folderId, body, mime: "text/markdown", sha256: await sha256Hex(body), size: new TextEncoder().encode(body).length }, i, { change_note: note },
+    { cols: ["source_artifact_id", "source_revision", "source_role", "template_date"], vals: [sourceId, revision, "template", date] }, { source_template_id: sourceId, source_template_revision: revision, date });
   const id = randomId("art"), rid = randomId("rev"), now = nowIso(), hash = await sha256Hex(body);
   const az = authzSql(ctx, projectId);
   // All writes share this fence inside a single serialized D1 transaction. The idempotency insert is first,
@@ -5869,7 +5871,7 @@ async function tplCopy(ctx, projectId, input, key, definition = false) {
   const gate = `${az.sql} AND EXISTS (SELECT 1 FROM artifacts WHERE id = ? AND project_id = ? AND kind = 'markdown'
     AND trashed_at IS NULL AND publisher_id IS NULL ${definition ? "" : "AND is_template = 1"})
     AND (? IS NULL OR EXISTS (SELECT 1 FROM folders WHERE id = ? AND project_id = ?))
-    AND (SELECT COUNT(*) FROM artifacts WHERE project_id = ? AND publisher_id IS NULL) < ?`;
+    AND (SELECT COUNT(*) FROM artifacts WHERE project_id = ? AND publisher_id IS NULL AND pending_review = 0) < ?`;
   const gp = [...az.params, sourceId, projectId, folderId, folderId, projectId, projectId, LIMITS.artifactsPerProject];
   const result = { status: 201, body: { artifact_id: id, kind: "markdown", revision: 1, revision_id: rid, sha256: hash,
     ...tplLinks(ctx, projectId, id), source_artifact_id: sourceId, source_revision: revision,
@@ -5893,7 +5895,7 @@ async function tplCopy(ctx, projectId, input, key, definition = false) {
     const replay = await idemLookup(ctx, i); if (replay) return replay;
     await tplSource(ctx, projectId, sourceId, revision, !definition);
     await folderCheck(ctx, projectId, folderId);
-    const n = await db(ctx).prepare("SELECT COUNT(*) AS n FROM artifacts WHERE project_id = ? AND publisher_id IS NULL").bind(projectId).first("n");
+    const n = await db(ctx).prepare("SELECT COUNT(*) AS n FROM artifacts WHERE project_id = ? AND publisher_id IS NULL AND pending_review = 0").bind(projectId).first("n");
     if (n >= LIMITS.artifactsPerProject) throw new HttpError(413, "quota_exceeded", "Artifact limit reached");
     throw new HttpError(403, "forbidden", "Grant no longer valid");
   }
@@ -5945,6 +5947,931 @@ function tplTools(oauth = false) {
   ];
 }
 
+// ---------- review gating (docs/review-gating.md; build-review.mjs; migration 0017_review_gating.sql) ----------
+// One shared implementation for every transport (OAuth MCP, legacy /mcp, /v1, browser API).
+//  - A document's review_mode is off (default), advisory or required. On a required document, agent edits (OAuth
+//    connections, API keys, legacy agent tokens) become proposals; the approved line (artifacts.head_rev) only ever
+//    holds approved, owner-written or pre-review content. App Connect publishers and the owner are never gated.
+//  - "Reviewed" is a review record bound to one exact version, details version or proposal, never a document flag.
+//  - Review is a separate, owner-granted permission per access path and project (review_grants), checked live in the
+//    same statement as every review write. Self-review is refused for agents (same access path as the author).
+//  - The database refuses ungated agent versions of required documents too (triggers in 0017), so a rolled-back
+//    Worker fails closed instead of bypassing review.
+const RV_MODES = ["off", "advisory", "required"];
+const RV_KINDS = ["markdown", "html", "json", "csv", "binary"];
+const RV_STATUSES = ["pending", "approved", "rejected", "superseded", "withdrawn"];
+const RV_PLACEHOLDER = "Pending review";
+// Open new-document proposals one author may have in a project (hidden documents do not count toward the limit).
+const RV_MAX_NEW = 20;
+const RV_PURGE_MS = 30 * 86400000;
+const RV_PAGE = 50;
+const RV_OPEN = "EXISTS (SELECT 1 FROM proposals WHERE id = ? AND status = 'approving')";
+// Extra columns on every artifact row read through ART_COLS: open proposal count and the advisory reviewed version.
+// One definition of "the reviewed version" (newest version whose latest review is not a rejection), shared below.
+const RV_REVIEWED_SQL = `(SELECT MAX(rv.rev_no) FROM reviews rv WHERE rv.artifact_id = a.id AND rv.rev_no IS NOT NULL AND rv.decision <> 'rejected'
+  AND NOT EXISTS (SELECT 1 FROM reviews rx WHERE rx.artifact_id = rv.artifact_id AND rx.rev_no = rv.rev_no AND rx.rowid > rv.rowid))`;
+const RV_ART_COLS = `, (SELECT COUNT(*) FROM proposals WHERE artifact_id = a.id AND status = 'pending') AS rv_pending, CASE WHEN a.review_mode = 'advisory' THEN ${RV_REVIEWED_SQL} END AS rv_reviewed`;
+
+function rvVia(ctx) {
+  const p = provenance(ctx, null);
+  return { kind: p[0], id: p[1], label: p[2], client: p[3] };
+}
+// Agents other than App Connect publishers are gated; the owner (browser) and publishers never are.
+function rvGatedActor(ctx) { return ctx.principal.kind === "agent" && !ctx.publisher; }
+function rvGated(ctx, a) { return rvGatedActor(ctx) && (a.review_mode === "required" || a.pending_review === 1); }
+function rvSelf(ctx, row) {
+  if (ctx.principal.kind === "human") return false;
+  const v = rvVia(ctx);
+  // Agents always carry a connection/key/token id; never treat two id-less agents as the same author.
+  if (!v.id || !row.via_id) return false;
+  return row.via_kind === v.kind && row.via_id === v.id;
+}
+// Self-review: the same connection, or (API keys) any key this key replaced, directly or through earlier replacements.
+// Replacing a key keeps its review permission, so the old key's proposals still count as the caller's own work.
+// Two keys are the same author when their replacement chains meet (old ↔ new, and sibling replacements of one key).
+const RV_KEY_LINEAGE = `WITH RECURSIVE a(id) AS (SELECT ? UNION SELECT k.replaces_id FROM api_credentials k JOIN a ON k.id = a.id WHERE k.replaces_id IS NOT NULL),
+  b(id) AS (SELECT ? UNION SELECT k.replaces_id FROM api_credentials k JOIN b ON k.id = b.id WHERE k.replaces_id IS NOT NULL)`;
+async function rvSelfReview(ctx, row) {
+  if (rvSelf(ctx, row)) return true;
+  if (ctx.principal.kind === "human" || row.via_kind !== "api_key") return false;
+  const v = rvVia(ctx);
+  if (v.kind !== "api_key" || !v.id || !row.via_id) return false;
+  return !!(await db(ctx).prepare(`${RV_KEY_LINEAGE} SELECT 1 AS x FROM a JOIN b ON a.id = b.id LIMIT 1`).bind(v.id, row.via_id).first("x"));
+}
+// Live review permission for this caller and project, as an SQL predicate (also used inside every review batch).
+function rvReviewSql(ctx, projectId) {
+  if (ctx.principal.kind === "human") return authzSql(ctx, projectId);
+  if (ctx.publisher || ctx.principal.kind !== "agent") return { sql: "0", params: [] };
+  const v = rvVia(ctx), rd = rtReadAuthzSql(ctx, projectId);
+  return { sql: `${rd.sql} AND EXISTS (SELECT 1 FROM review_grants WHERE path_kind = ? AND path_id = ? AND project_id = ?)`, params: [...rd.params, v.kind, v.id, projectId] };
+}
+async function rvCanReview(ctx, projectId) {
+  ctx.rvCan ??= {};
+  if (ctx.rvCan[projectId] !== undefined) return ctx.rvCan[projectId];
+  const az = rvReviewSql(ctx, projectId);
+  return (ctx.rvCan[projectId] = !!(await db(ctx).prepare(`SELECT 1 AS x WHERE ${az.sql}`).bind(...az.params).first("x")));
+}
+// Kinds this caller may see (OAuth: files only with file access; JSON/CSV only with App Connect on).
+function rvKinds(ctx) { return ctx.principal.kind === "human" ? RV_KINDS : chKinds(ctx); }
+// A hidden new document (pending_review = 1) exists only for its proposer until it is approved.
+async function rvOwnPending(ctx, a) {
+  if (!rvGatedActor(ctx)) return false;
+  const v = rvVia(ctx);
+  return !!(await db(ctx).prepare("SELECT 1 AS x FROM proposals WHERE artifact_id = ? AND status = 'pending' AND via_kind = ? AND via_id IS ?").bind(a.id, v.kind, v.id).first("x"));
+}
+async function rvProjectDefault(ctx, projectId, kind) {
+  const p = await db(ctx).prepare("SELECT review_default, kinds FROM project_review_settings WHERE project_id = ?").bind(projectId).first();
+  if (!p || p.review_default === "off") return "off";
+  const kinds = p.kinds ? JSON.parse(p.kinds) : null;
+  return !kinds || kinds.includes(kind) ? p.review_default : "off";
+}
+async function rvNewGated(ctx, projectId, kind) {
+  return rvGatedActor(ctx) && (await rvProjectDefault(ctx, projectId, kind)) === "required";
+}
+async function rvNewCap(ctx, projectId) {
+  const v = rvVia(ctx);
+  const n = await db(ctx).prepare("SELECT COUNT(*) AS n FROM proposals WHERE project_id = ? AND is_new = 1 AND status = 'pending' AND via_kind = ? AND via_id IS ?").bind(projectId, v.kind, v.id).first("n");
+  if ((n ?? 0) >= RV_MAX_NEW) throw new HttpError(429, "too_many_pending", `At most ${RV_MAX_NEW} new documents can wait for review per connection; wait for reviews first`);
+}
+const rvResult = (p, status) => ({ status, body: { status: "pending_review", proposal_id: p.id, artifact_id: p.artifact_id, base_revision: p.base_rev, base_meta_version: p.base_meta_version, supersedes: p.supersedes_id ?? null } });
+function rvTagsJson(tags) {
+  if (tags === undefined || tags === null) return "[]";
+  if (typeof tags === "string") return tags;
+  return JSON.stringify(tags);
+}
+
+// Create (or replace) the caller's proposal for an existing or pending new document.
+// s: { content?: {body, blobKey, size, sha256, mime, restoredFrom}, meta?: {title, folder, tags}, expectedRev?, expectedMeta?,
+//      note, status, fence?, uploadId?, extra?(id, body) => statements }
+async function rvPropose(ctx, projectId, a, i, s) {
+  const v = rvVia(ctx);
+  const note = provenance(ctx, { change_note: s.note })[4];
+  const isNew = a.pending_review === 1 ? 1 : 0;
+  const prev = await db(ctx).prepare("SELECT * FROM proposals WHERE artifact_id = ? AND status = 'pending' AND via_kind = ? AND via_id IS ?").bind(a.id, v.kind, v.id).first();
+  let content = s.content ?? null, meta = s.meta ?? null;
+  if (isNew) {
+    if (!prev) throw new HttpError(404, "not_found", "Artifact not found");
+    // A new document needs both: keep the pending part this save doesn't replace.
+    if (!content) content = { body: prev.body ?? void 0, blobKey: prev.blob_key ?? void 0, size: prev.size, sha256: prev.sha256, mime: prev.mime, restoredFrom: null };
+    if (!meta) meta = { title: prev.title, folder: prev.folder, folderId: prev.folder_id, tags: prev.tags };
+    // The shell holds placeholder details: fields the caller omitted keep the pending proposal's values.
+    else if (s.metaInput) {
+      const m = s.metaInput, sameFolder = m.folder === undefined;
+      meta = { title: m.title !== undefined ? meta.title : prev.title, folder: sameFolder ? prev.folder : meta.folder,
+        folderId: sameFolder ? prev.folder_id : meta.folderId, tags: m.tags !== undefined ? meta.tags : prev.tags };
+    }
+    if (s.content && s.expectedRev !== 0) throw new HttpError(409, "revision_conflict", "This document is waiting for review; save it with expected_revision 0", { current_revision: 0, expected_revision: s.expectedRev });
+    if (s.meta && s.expectedMeta !== a.meta_version) throw new HttpError(409, "metadata_conflict", "Expected metadata version is stale", { current_meta_version: a.meta_version });
+  } else {
+    if (content && s.expectedRev !== a.head_rev)
+      throw new HttpError(409, "revision_conflict", "Expected revision is stale", { current_revision: a.head_rev, expected_revision: s.expectedRev });
+    if (meta && s.expectedMeta !== a.meta_version) throw new HttpError(409, "metadata_conflict", "Expected metadata version is stale", { current_meta_version: a.meta_version });
+  }
+  const id = randomId("prp");
+  const p = { id, artifact_id: a.id, base_rev: isNew ? 0 : a.head_rev, base_meta_version: a.meta_version, supersedes_id: prev?.id ?? null };
+  const result = rvResult(p, s.status ?? 200);
+  const azBase = authzSql(ctx, projectId), cw = content ? contentWriteSql(ctx, a.id) : protectSql(ctx, a.id);
+  const az = { sql: `${azBase.sql} AND ${cw.sql}${s.fence ? " AND " + s.fence.sql : ""}`, params: [...azBase.params, ...cw.params, ...s.fence?.params ?? []] };
+  // Only the parts this proposal changes must still be at its base (a new document: both).
+  const checkRev = !!(content && s.content) || !!isNew, checkMeta = !!(meta && s.meta) || !!isNew;
+  const guard = { sql: `EXISTS (SELECT 1 FROM artifacts WHERE id = ? AND project_id = ? AND trashed_at IS NULL AND (? = 0 OR head_rev = ?) AND (? = 0 OR meta_version = ?) AND pending_review = ?)`,
+    params: [a.id, projectId, checkRev ? 1 : 0, a.head_rev, checkMeta ? 1 : 0, a.meta_version, isNew] };
+  const now = nowIso();
+  const created = "EXISTS (SELECT 1 FROM proposals WHERE id = ?)";
+  const stmts = [];
+  if (prev) stmts.push(db(ctx).prepare(`UPDATE proposals SET status = 'superseded', decided_at = ? WHERE id = ? AND status = 'pending' AND ${az.sql} AND ${guard.sql}`).bind(now, prev.id, ...az.params, ...guard.params));
+  stmts.push(
+    db(ctx).prepare(`INSERT INTO proposals (id, artifact_id, project_id, kind, status, is_new, supersedes_id, base_rev, base_meta_version,
+        has_content, body, blob_key, size, sha256, mime, restored_from, has_meta, title, folder, folder_id, tags, meta_restored_from,
+        author_id, via_kind, via_id, via_label, client_info, change_note, created_at, upload_id)
+      SELECT ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${az.sql} AND ${guard.sql}`).bind(
+      id, a.id, projectId, a.kind, isNew, prev?.id ?? null, p.base_rev, p.base_meta_version,
+      content ? 1 : 0, content?.body ?? null, content?.blobKey ?? null, content ? content.size : null, content?.sha256 ?? null, content?.mime ?? null, content?.restoredFrom ?? null,
+      meta ? 1 : 0, meta?.title ?? null, meta ? meta.folder ?? "" : null, meta?.folderId ?? null, meta ? rvTagsJson(meta.tags) : null, s.metaRestoredFrom ?? null,
+      ctx.principal.id, v.kind, v.id ?? null, v.label, v.client, note, now, s.uploadId ?? (content?.blobKey && prev?.blob_key === content.blobKey ? prev.upload_id : null),
+      ...az.params, ...guard.params),
+    idemInsert(ctx, i, result.status, result.body, created, [id]),
+    audit(ctx, projectId, "proposal.create", a.id, p.base_rev, "ok", created, [id]),
+    ...s.extra ? s.extra(id, result.body) : []
+  );
+  const out = await runBatch(ctx, stmts, i);
+  if (!Array.isArray(out)) return out;
+  if (!out[prev ? 1 : 0].meta.changes) {
+    const replay = await idemLookup(ctx, i);
+    if (replay) return replay;
+    const cur = await db(ctx).prepare("SELECT head_rev, meta_version, trashed_at FROM artifacts WHERE id = ? AND project_id = ?").bind(a.id, projectId).first();
+    if (cur?.trashed_at) throw new HttpError(409, "trashed", "Artifact is in trash");
+    if (cur && checkRev && cur.head_rev !== a.head_rev) throw new HttpError(409, "revision_conflict", "Expected revision is stale", { current_revision: cur.head_rev, expected_revision: s.expectedRev });
+    if (cur && checkMeta && cur.meta_version !== a.meta_version) throw new HttpError(409, "metadata_conflict", "Expected metadata version is stale", { current_meta_version: cur.meta_version });
+    const pub = await db(ctx).prepare("SELECT publisher_id, is_template FROM artifacts WHERE id = ?").bind(a.id).first();
+    if (pub?.publisher_id || pub?.is_template) throw new HttpError(403, "protected_source", "This document cannot be modified here");
+    throw new HttpError(403, "forbidden", "Grant no longer valid");
+  }
+  return result;
+}
+// Content edits (save, data-file save, restore): null when the write goes straight to the version line.
+async function rvGateContent(ctx, projectId, a, i, expected, rev) {
+  if (!rvGated(ctx, a)) return null;
+  return rvPropose(ctx, projectId, a, i, { content: rev, expectedRev: expected, note: rev.change_note, status: 200 });
+}
+async function rvGateMeta(ctx, projectId, a, i, expected, input, v, restoredFrom) {
+  if (!rvGated(ctx, a)) return null;
+  if (input.trashed !== undefined) throw new HttpError(403, "review_required", "This document requires review; only the owner can move it to or from the trash");
+  return rvPropose(ctx, projectId, a, i, { meta: { title: v.title, folder: v.folder, tags: v.tags }, metaInput: input, expectedMeta: expected, note: input.change_note ?? (restoredFrom ? "Restored details from version " + restoredFrom : void 0), metaRestoredFrom: restoredFrom, status: 200 });
+}
+// upload_finish: the gate is evaluated at finish, so a mode change after upload_begin is honored.
+async function rvGateUpload(ctx, projectId, u, i, rev, fence, token) {
+  if (!rvGatedActor(ctx)) return null;
+  const a = await db(ctx).prepare("SELECT * FROM artifacts WHERE id = ? AND project_id = ?").bind(u.artifact_id, projectId).first();
+  if (!a || !rvGated(ctx, a)) return null;
+  let meta = null;
+  if (a.pending_review === 1 && u.base_rev === 0 && u.review_meta) {
+    const m = JSON.parse(u.review_meta);
+    meta = { title: m.title, folder: m.folder ?? "", tags: "[]" };
+  }
+  const isFirst = a.pending_review === 1 && !!meta;
+  const s = { content: rev, expectedRev: u.base_rev, note: u.change_note ?? void 0, status: 200, fence, uploadId: u.id,
+    extra: (id, body) => [db(ctx).prepare(`UPDATE uploads SET state = 'published', result = ?, finalize_token = NULL, finalize_until = NULL
+      WHERE id = ? AND state = 'sealed' AND finalize_token = ? AND EXISTS (SELECT 1 FROM proposals WHERE id = ?)`).bind(JSON.stringify({ status: 200, body }), u.id, token, id)] };
+  if (isFirst) return rvProposeNewFromUpload(ctx, projectId, a, i, s, meta);
+  return rvPropose(ctx, projectId, a, i, s);
+}
+// The first proposal of a gated new file: the shell was created by upload_begin (placeholder title).
+async function rvProposeNewFromUpload(ctx, projectId, a, i, s, meta) {
+  const v = rvVia(ctx);
+  const note = provenance(ctx, { change_note: s.note })[4];
+  const id = randomId("prp");
+  const p = { id, artifact_id: a.id, base_rev: 0, base_meta_version: a.meta_version, supersedes_id: null };
+  const result = rvResult(p, 200);
+  const azBase = authzSql(ctx, projectId);
+  const az = { sql: `${azBase.sql} AND ${s.fence.sql}`, params: [...azBase.params, ...s.fence.params] };
+  const created = "EXISTS (SELECT 1 FROM proposals WHERE id = ?)";
+  const c = s.content;
+  const out = await runBatch(ctx, [
+    db(ctx).prepare(`INSERT INTO proposals (id, artifact_id, project_id, kind, status, is_new, base_rev, base_meta_version, has_content, blob_key, size, sha256, mime,
+        has_meta, title, folder, tags, author_id, via_kind, via_id, via_label, client_info, change_note, created_at, upload_id)
+      SELECT ?, ?, ?, 'binary', 'pending', 1, 0, ?, 1, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+      WHERE ${az.sql} AND EXISTS (SELECT 1 FROM artifacts WHERE id = ? AND head_rev = 0 AND pending_review = 1)`).bind(
+      id, a.id, projectId, a.meta_version, c.blobKey, c.size, c.sha256, c.mime, meta.title, meta.folder, meta.tags,
+      ctx.principal.id, v.kind, v.id ?? null, v.label, v.client, note, nowIso(), s.uploadId, ...az.params, a.id),
+    idemInsert(ctx, i, 200, result.body, created, [id]),
+    audit(ctx, projectId, "proposal.create", a.id, 0, "ok", created, [id]),
+    ...s.extra(id, result.body)
+  ], i);
+  if (!Array.isArray(out)) return out;
+  if (!out[0].meta.changes) {
+    const replay = await idemLookup(ctx, i);
+    if (replay) return replay;
+    throw new HttpError(403, "forbidden", "Grant no longer valid");
+  }
+  return result;
+}
+// New documents in a project whose default makes them required: a hidden document plus its first proposal.
+// f: { title, folder, folderId, schema, body, mime, sha256, size }; extra: optional artifact columns (templates).
+async function rvCreateNew(ctx, projectId, kind, f, i, input, extra = { cols: [], vals: [] }, more = {}) {
+  await rvNewCap(ctx, projectId);
+  const v = rvVia(ctx);
+  const note = provenance(ctx, input)[4];
+  const artId = randomId("art"), id = randomId("prp"), now = nowIso();
+  const p = { id, artifact_id: artId, base_rev: 0, base_meta_version: 1, supersedes_id: null };
+  const result = rvResult(p, 201);
+  Object.assign(result.body, more);
+  const az = authzSql(ctx, projectId);
+  const made = "EXISTS (SELECT 1 FROM artifacts WHERE id = ?)";
+  const cols = extra.cols.length ? ", " + extra.cols.join(", ") : "", qs = extra.cols.map(() => ", ?").join("");
+  // The per-author cap is re-checked inside the batch, so concurrent creates can't exceed it.
+  const cap = `(SELECT COUNT(*) FROM proposals WHERE project_id = ? AND is_new = 1 AND status = 'pending' AND via_kind = ? AND via_id IS ?) < ${RV_MAX_NEW}`;
+  const out = await runBatch(ctx, [
+    db(ctx).prepare(`INSERT INTO artifacts (id, project_id, kind, title, folder, folder_id, schema_id, head_rev, head_revision_id, created_at, updated_at, review_mode, pending_review${cols})
+      SELECT ?, ?, ?, ?, '', NULL, ?, 0, NULL, ?, ?, 'required', 1${qs} WHERE ${az.sql} AND ${cap}
+        AND (? IS NULL OR EXISTS (SELECT 1 FROM folders WHERE id = ? AND project_id = ?))`).bind(artId, projectId, kind, RV_PLACEHOLDER, f.schema ?? null, now, now, ...extra.vals, ...az.params,
+      projectId, v.kind, v.id ?? null, f.folderId ?? null, f.folderId ?? null, projectId),
+    db(ctx).prepare(`INSERT INTO proposals (id, artifact_id, project_id, kind, status, is_new, base_rev, base_meta_version, has_content, body, size, sha256, mime,
+        has_meta, title, folder, folder_id, tags, author_id, via_kind, via_id, via_label, client_info, change_note, created_at)
+      SELECT ?, ?, ?, ?, 'pending', 1, 0, 1, 1, ?, ?, ?, ?, 1, ?, ?, ?, '[]', ?, ?, ?, ?, ?, ?, ? WHERE ${made}`).bind(
+      id, artId, projectId, kind, f.body, f.size, f.sha256, f.mime, f.title, f.folder ?? "", f.folderId ?? null,
+      ctx.principal.id, v.kind, v.id ?? null, v.label, v.client, note, now, artId),
+    // Stored only when the document was really created: a refused create (cap, folder, access) never replays as 201.
+    idemInsert(ctx, i, 201, result.body, made, [artId]),
+    audit(ctx, projectId, "proposal.create", artId, 0, "ok", made, [artId])
+  ], i);
+  if (!Array.isArray(out)) return out;
+  if (!out[0].meta.changes) {
+    if (f.folderId) await folderCheck(ctx, projectId, f.folderId);
+    await rvNewCap(ctx, projectId);
+    throw new HttpError(403, "forbidden", "Grant no longer valid");
+  }
+  return result;
+}
+
+// ---------- proposals: list, read, withdraw ----------
+async function rvLoadProposal(ctx, projectId, proposalId) {
+  str(proposalId, "proposal_id", 64, { min: 1 });
+  const p = await db(ctx).prepare(`SELECT p.*, a.title AS doc_title, a.head_rev AS cur_rev, a.meta_version AS cur_meta, a.trashed_at AS doc_trashed, a.review_mode AS doc_mode,
+      a.folder AS doc_folder, a.tags AS doc_tags, a.schema_id AS doc_schema, a.pending_review AS doc_pending
+    FROM proposals p JOIN artifacts a ON a.id = p.artifact_id AND a.project_id = p.project_id WHERE p.id = ? AND p.project_id = ?`).bind(proposalId, projectId).first();
+  if (!p || !rvKinds(ctx).includes(p.kind)) throw new HttpError(404, "not_found", "Proposal not found");
+  if (p.doc_trashed && ctx.principal.kind !== "human") throw new HttpError(404, "not_found", "Proposal not found");
+  return p;
+}
+function rvStale(p) {
+  if (p.status !== "pending") return false;
+  if (p.is_new) return false;
+  return !!(p.has_content && p.cur_rev !== p.base_rev || p.has_meta && p.cur_meta !== p.base_meta_version);
+}
+function rvView(ctx, p, full) {
+  const me = ctx.principal.kind === "human" ? ctx.principal.id : null;
+  const v = {
+    proposal_id: p.id, artifact_id: p.artifact_id, project_id: p.project_id, kind: p.kind, status: p.status, is_new: !!p.is_new,
+    // What a proposal changes is the proposer's and reviewers' business: others only learn that an edit is pending.
+    ...full ? { changes: [p.has_content ? "content" : null, p.has_meta ? "details" : null].filter(Boolean) } : {},
+    base_revision: p.base_rev, base_meta_version: p.base_meta_version, created_at: p.created_at, decided_at: p.decided_at ?? null,
+    who: whoLabel(p, me), via: { kind: p.via_kind, id: p.via_id, label: p.via_label }, mine: rvSelf(ctx, p),
+    document_title: p.is_new ? null : p.doc_title
+  };
+  if (!full) return v;
+  return { ...v, document_title: p.is_new ? p.title : p.doc_title, client_info: p.client_info, change_note: p.change_note, stale: rvStale(p),
+    current_revision: p.cur_rev, current_meta_version: p.cur_meta, supersedes: p.supersedes_id ?? null,
+    result_revision: p.result_rev ?? null, result_meta_version: p.result_meta_version ?? null,
+    proposed: {
+      ...p.has_content ? { size: p.size, sha256: p.sha256, mime: p.mime, restored_from: p.restored_from ?? null } : {},
+      ...p.has_meta ? { title: p.title, folder: p.folder, tags: JSON.parse(p.tags ?? "[]") } : {}
+    } };
+}
+async function listProposals(ctx, projectId, q = {}) {
+  tplDenyPublisher(ctx);
+  await authorizeProject(ctx, projectId, false);
+  const reviewer = await rvCanReview(ctx, projectId);
+  const status = q.status === undefined || q.status === null || q.status === "" ? "pending" : str(q.status, "status", 20);
+  if (status !== "all" && !RV_STATUSES.includes(status)) throw new HttpError(400, "invalid_input", "status must be one of " + RV_STATUSES.join(", ") + " or all");
+  const aid = q.artifact_id ? str(q.artifact_id, "artifact_id", 64) : "";
+  const offset = q.cursor ? int(Number(q.cursor), "cursor", 0, 1e5) : 0;
+  const v = ctx.principal.kind === "human" ? { kind: "browser", id: null } : rvVia(ctx);
+  // Reviewers see everything; others see their own proposals in full and only that others' pending edits exist.
+  const r = await db(ctx).prepare(`SELECT p.*, a.title AS doc_title, a.head_rev AS cur_rev, a.meta_version AS cur_meta
+    FROM proposals p JOIN artifacts a ON a.id = p.artifact_id AND a.project_id = p.project_id
+    WHERE p.project_id = ? AND (? = '' OR p.artifact_id = ?) AND (? = 'all' OR p.status = ?) AND p.status <> 'approving'
+      AND p.kind IN (SELECT value FROM json_each(?)) AND (? = 1 OR a.trashed_at IS NULL)
+      AND (? = 1 OR (p.via_kind = ? AND p.via_id IS ?) OR (p.status = 'pending' AND p.is_new = 0))
+    ORDER BY p.created_at DESC, p.id LIMIT ? OFFSET ?`).bind(projectId, aid, aid, status, status, JSON.stringify(rvKinds(ctx)), ctx.principal.kind === "human" ? 1 : 0,
+    reviewer ? 1 : 0, v.kind, v.id ?? null, RV_PAGE + 1, offset).all();
+  const rows = r.results.slice(0, RV_PAGE);
+  return { can_review: reviewer, proposals: rows.map((p) => rvView(ctx, p, reviewer || rvSelf(ctx, p))), next_cursor: r.results.length > RV_PAGE ? String(offset + RV_PAGE) : null };
+}
+// Owner's queue across all projects (Home "Needs review").
+async function reviewQueue(ctx) {
+  requireHuman(ctx);
+  const r = await db(ctx).prepare(`SELECT p.*, a.title AS doc_title, a.head_rev AS cur_rev, a.meta_version AS cur_meta, pj.title AS project_title
+    FROM proposals p JOIN artifacts a ON a.id = p.artifact_id JOIN projects pj ON pj.id = p.project_id
+    WHERE pj.owner_id = ? AND p.status = 'pending' AND a.trashed_at IS NULL ORDER BY p.created_at DESC LIMIT 101`).bind(ctx.principal.id).all();
+  const rows = r.results.slice(0, 100);
+  return { proposals: rows.map((p) => ({ ...rvView(ctx, p, true), project_title: p.project_title })), more: r.results.length > 100 };
+}
+async function rvRevBody(ctx, projectId, artifactId, revNo) {
+  if (!revNo) return null;
+  return db(ctx).prepare("SELECT rev_no, body, blob_key, size, sha256, mime FROM revisions WHERE artifact_id = ? AND project_id = ? AND rev_no = ?").bind(artifactId, projectId, revNo).first();
+}
+function rvDiff(from, toBody, toSha) {
+  if (!from || typeof from.body !== "string" || typeof toBody !== "string") return null;
+  if (from.sha256 === toSha) return { from_revision: from.rev_no, identical: true, added: 0, removed: 0, hunks: [], truncated: false };
+  return { from_revision: from.rev_no, identical: false, ...lineDiff(from.body, toBody) };
+}
+async function readProposal(ctx, projectId, proposalId, opts = {}) {
+  tplDenyPublisher(ctx);
+  await authorizeProject(ctx, projectId, false);
+  const p = await rvLoadProposal(ctx, projectId, proposalId);
+  const full = rvSelf(ctx, p) || await rvCanReview(ctx, projectId);
+  if (!full) throw new HttpError(404, "not_found", "Proposal not found");
+  const out = { proposal: rvView(ctx, p, true), can_review: await rvCanReview(ctx, projectId) && !await rvSelfReview(ctx, p) };
+  if (p.has_content) {
+    const text = p.blob_key === null && typeof p.body === "string";
+    if (text) out.body = p.body;
+    else out.content_path = opts.contentPath ?? null;
+    const base = await rvRevBody(ctx, projectId, p.artifact_id, p.base_rev);
+    out.diff_from_base = text ? rvDiff(base, p.body, p.sha256) : base ? { from_revision: base.rev_no, binary: true, identical: base.sha256 === p.sha256, from: { size: base.size, sha256: base.sha256, mime: base.mime } } : null;
+    if (!p.is_new && p.cur_rev !== p.base_rev) {
+      const cur = await rvRevBody(ctx, projectId, p.artifact_id, p.cur_rev);
+      out.diff_from_current = text ? rvDiff(cur, p.body, p.sha256) : cur ? { from_revision: cur.rev_no, binary: true, identical: cur.sha256 === p.sha256 } : null;
+    }
+  }
+  if (p.has_meta) out.details = { current: { title: p.is_new ? null : p.doc_title, folder: p.is_new ? null : p.doc_folder, tags: p.is_new ? [] : JSON.parse(p.doc_tags ?? "[]") }, proposed: { title: p.title, folder: p.folder, tags: JSON.parse(p.tags ?? "[]") } };
+  const rv = p.review_id ? await db(ctx).prepare("SELECT * FROM reviews WHERE id = ?").bind(p.review_id).first() : null;
+  if (rv) out.review = rvReviewView(ctx, rv);
+  return out;
+}
+// OAuth MCP: a reviewer (or the proposer) gets the proposed file's bytes the same way read_file gives a version's: a
+// short-lived transfer link (re-checked live on use) and, for images up to the inline limit, the image itself.
+async function rvOauthProposalFile(c, projectId, out) {
+  const p = out.proposal;
+  if (!c.ftConn || c.ftConn.file_access !== 1 || p.kind !== "binary" || !p.changes?.includes("content")) return out;
+  const row = await db(c).prepare("SELECT blob_key, blob_purged_at, mime, size FROM proposals WHERE id = ? AND project_id = ?").bind(p.proposal_id, projectId).first();
+  if (!row?.blob_key || row.blob_purged_at) return out;
+  const token = randomId("ft", 32), expires = nowMs() + FT_DOWNLOAD_TTL_MS;
+  await db(c).prepare("INSERT INTO transfer_links (token_hash, kind, connection_id, project_id, artifact_id, rev_no, upload_id, expires_at, created_at, proposal_id) VALUES (?, 'download', ?, ?, ?, NULL, NULL, ?, ?, ?)")
+    .bind(await sha256Hex(token), c.ftConn.id, projectId, p.artifact_id, expires, nowIso(), p.proposal_id).run();
+  const url = `${c.ftOrigin}/files/d/${token}`;
+  const blocks = [];
+  if (IMAGE_TYPES.includes(row.mime) && row.size <= FT_INLINE_IMAGE_BYTES) {
+    const obj = await c.env.BLOBS.get(row.blob_key);
+    if (obj) blocks.push({ type: "image", data: ftBase64(new Uint8Array(await obj.arrayBuffer())), mimeType: row.mime });
+  }
+  blocks.push({ type: "resource_link", uri: url, name: p.document_title ?? "Proposed file", mimeType: row.mime, size: row.size, description: "Short-lived download link for the proposed file (expires in minutes; not a share link)" });
+  const result = { ...out, download_url: url, download_expires_at: new Date(expires).toISOString(), image_inline: blocks.length > 1 };
+  Object.defineProperty(result, FT_BLOCKS, { value: blocks, enumerable: true });
+  return result;
+}
+async function serveProposalContent(ctx, req, projectId, proposalId) {
+  tplDenyPublisher(ctx);
+  await authorizeProject(ctx, projectId, false);
+  const p = await rvLoadProposal(ctx, projectId, proposalId);
+  if (!(rvSelf(ctx, p) || await rvCanReview(ctx, projectId)) || !p.has_content) throw new HttpError(404, "not_found", "Proposal not found");
+  if (p.blob_purged_at) throw new HttpError(410, "purged", "The file of this closed proposal was removed after 30 days");
+  const inline2 = new URL(req.url).searchParams.get("download") !== "1" && (IMAGE_TYPES.includes(p.mime) || VIDEO_TYPES.includes(p.mime));
+  // Text proposals are served as plain text and binaries by their checked type: never rendered as HTML here.
+  const headers = {
+    "content-type": p.blob_key === null ? "text/plain; charset=utf-8" : CONTENT_TYPE[p.mime] ?? "application/octet-stream", "x-content-type-options": "nosniff", "cache-control": "private, no-store",
+    "content-security-policy": "default-src 'none'; img-src 'self'; media-src 'self'; frame-ancestors 'self'; sandbox", "cross-origin-resource-policy": "same-origin",
+    etag: `"${p.sha256}"`, "content-disposition": `${inline2 ? "inline" : "attachment"}; filename="proposal-${p.id.slice(4, 16)}"`, "content-length": String(p.size)
+  };
+  if (req.method === "HEAD") return new Response(null, { status: 200, headers });
+  if (p.blob_key === null) return new Response(new TextEncoder().encode(p.body ?? ""), { status: 200, headers });
+  const obj2 = await ctx.env.BLOBS.get(p.blob_key);
+  if (!obj2) throw new HttpError(500, "blob_missing", "Stored bytes missing");
+  return new Response(obj2.body, { status: 200, headers });
+}
+async function withdrawProposal(ctx, projectId, proposalId, key) {
+  tplDenyPublisher(ctx);
+  await authorizeProject(ctx, projectId, true);
+  const i = { op: "proposal.withdraw:" + proposalId, key, projectId, digest: await sha256Hex(proposalId) };
+  const prior = await idemLookup(ctx, i);
+  if (prior) return prior;
+  const p = await rvLoadProposal(ctx, projectId, proposalId);
+  if (!rvSelf(ctx, p)) throw new HttpError(404, "not_found", "Proposal not found");
+  if (p.status !== "pending") throw new HttpError(409, "proposal_closed", "This proposal is already " + p.status, { proposal_status: p.status });
+  const az = authzSql(ctx, projectId);
+  const body = { proposal_id: p.id, status: "withdrawn" };
+  const gate = "EXISTS (SELECT 1 FROM proposals WHERE id = ? AND status = 'withdrawn')";
+  const out = await runBatch(ctx, [
+    db(ctx).prepare(`UPDATE proposals SET status = 'withdrawn', decided_at = ? WHERE id = ? AND status = 'pending' AND ${az.sql}`).bind(nowIso(), p.id, ...az.params),
+    idemInsert(ctx, i, 200, body, gate, [p.id]),
+    audit(ctx, projectId, "proposal.withdraw", p.artifact_id, null, "ok", gate, [p.id])
+  ], i);
+  if (!Array.isArray(out)) return out;
+  if (!out[0].meta.changes) {
+    const cur = await db(ctx).prepare("SELECT status FROM proposals WHERE id = ?").bind(p.id).first("status");
+    if (cur !== "pending") throw new HttpError(409, "proposal_closed", "This proposal is already " + cur, { proposal_status: cur });
+    throw new HttpError(403, "forbidden", "Grant no longer valid");
+  }
+  return { status: 200, body };
+}
+
+// ---------- review: approve, approve with edits, reject ----------
+function rvReviewView(ctx, rv) {
+  const me = ctx.principal.kind === "human" ? ctx.principal.id : null;
+  return { review_id: rv.id, decision: rv.decision, who: whoLabel(rv, me), via: rv.via_kind ? { kind: rv.via_kind, id: rv.via_id, label: rv.via_label } : null,
+    note: rv.note, created_at: rv.created_at, proposal_id: rv.proposal_id ?? null, revision: rv.rev_no ?? null, meta_version: rv.meta_version ?? null };
+}
+async function rvAssertReviewer(ctx, projectId) {
+  if (ctx.publisher) throw new HttpError(404, "not_found", "Not found");
+  await authorizeProject(ctx, projectId, false);
+  if (!(await rvCanReview(ctx, projectId))) throw new HttpError(403, "review_forbidden", "This connection cannot review in this project; the owner grants review on the Connections page");
+}
+function rvNote(v) {
+  if (v === undefined || v === null) return null;
+  if (typeof v !== "string") throw new HttpError(400, "invalid_input", "note must be a string");
+  if (v.length > CHANGE_NOTE_MAX) throw new HttpError(413, "too_large", `note exceeds ${CHANGE_NOTE_MAX} characters`);
+  return v.replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, " ").trim() || null;
+}
+async function reviewProposal(ctx, projectId, proposalId, input, key) {
+  await rvAssertReviewer(ctx, projectId);
+  const decision = input?.decision;
+  if (decision !== "approve" && decision !== "reject") throw new HttpError(400, "invalid_input", "decision must be approve or reject");
+  const note = rvNote(input.note);
+  const editBody = input.body !== undefined && input.body !== null;
+  const editMeta = ["title", "folder", "tags"].some((k) => input[k] !== undefined && input[k] !== null);
+  const expRev = input.expected_revision === undefined || input.expected_revision === null ? null : int(input.expected_revision, "expected_revision", 0);
+  const expMeta = input.expected_meta_version === undefined || input.expected_meta_version === null ? null : int(input.expected_meta_version, "expected_meta_version", 1);
+  const i = { op: "proposal.review:" + proposalId, key, projectId,
+    digest: await sha256Hex(JSON.stringify([decision, note, editBody ? input.body : null, input.title ?? null, input.folder ?? null, input.tags ?? null, expRev, expMeta])) };
+  const prior = await idemLookup(ctx, i);
+  if (prior) return prior;
+  const p = await rvLoadProposal(ctx, projectId, proposalId);
+  if (await rvSelfReview(ctx, p)) throw new HttpError(403, "self_review", "A proposal can't be reviewed by the connection that wrote it");
+  if (p.status !== "pending") throw new HttpError(409, "proposal_closed", "This proposal is already " + p.status, { proposal_status: p.status });
+  if (p.doc_trashed) throw new HttpError(409, "trashed", "Artifact is in trash");
+  const rz = rvReviewSql(ctx, projectId);
+  const rv = rvVia(ctx);
+  const rid = randomId("rvw"), now = nowIso();
+  if (decision === "reject") {
+    if (editBody || editMeta) throw new HttpError(400, "invalid_input", "A rejection takes only a note");
+    const body = { proposal_id: p.id, status: "rejected", decision: "rejected", review_id: rid, artifact_id: p.artifact_id };
+    const gate = "EXISTS (SELECT 1 FROM proposals WHERE id = ? AND status = 'rejected' AND review_id = ?)", gp = [p.id, rid];
+    const out = await runBatch(ctx, [
+      db(ctx).prepare(`UPDATE proposals SET status = 'rejected', decided_at = ?, review_id = ? WHERE id = ? AND status = 'pending' AND ${rz.sql}`).bind(now, rid, p.id, ...rz.params),
+      db(ctx).prepare(`INSERT INTO reviews (id, artifact_id, project_id, proposal_id, decision, author_id, via_kind, via_id, via_label, client_info, note, created_at)
+        SELECT ?, ?, ?, ?, 'rejected', ?, ?, ?, ?, ?, ?, ? WHERE ${gate}`).bind(rid, p.artifact_id, projectId, p.id, ctx.principal.id, rv.kind, rv.id ?? null, rv.label, rv.client, note, now, ...gp),
+      idemInsert(ctx, i, 200, body, gate, gp),
+      audit(ctx, projectId, "proposal.reject", p.artifact_id, null, "ok", gate, gp)
+    ], i);
+    if (!Array.isArray(out)) return out;
+    if (!out[0].meta.changes) return rvExplain(ctx, i, p);
+    return { status: 200, body };
+  }
+  // Approve (optionally with the reviewer's edits).
+  const a = await db(ctx).prepare("SELECT * FROM artifacts WHERE id = ? AND project_id = ?").bind(p.artifact_id, projectId).first();
+  if (editBody && p.kind === "binary") throw new HttpError(400, "approve_with_edits_unsupported", "Files can be approved or rejected, not edited; reject with a note instead");
+  if (editBody && !p.has_content && !p.is_new) throw new HttpError(400, "invalid_input", "This proposal changes details only");
+  if (editMeta && !p.has_meta) throw new HttpError(400, "invalid_input", "This proposal changes content only");
+  const edited = editBody || editMeta;
+  let content = null;
+  if (p.has_content) {
+    if (editBody) {
+      let body;
+      if (p.kind === "json" || p.kind === "csv") { checkFile(p.kind, input.body, a.schema_id); body = input.body; }
+      else body = mdBody(input.body, p.kind);
+      content = { body, blobKey: null, size: new TextEncoder().encode(body).length, sha256: await sha256Hex(body), mime: p.mime, restoredFrom: null };
+    } else content = { body: p.body, blobKey: p.blob_key, size: p.size, sha256: p.sha256, mime: p.mime, restoredFrom: p.restored_from };
+  }
+  let meta = null;
+  if (p.has_meta) {
+    meta = { title: p.title, folder: p.folder ?? "", tags: p.tags ?? "[]" };
+    if (input.title !== undefined && input.title !== null) meta.title = str(input.title, "title", 200, { min: 1 });
+    if (input.folder !== undefined && input.folder !== null) meta.folder = str(input.folder, "folder", 200);
+    if (input.tags !== undefined && input.tags !== null) {
+      if (!Array.isArray(input.tags) || input.tags.length > 20) throw new HttpError(400, "invalid_input", "tags must be an array (max 20)");
+      meta.tags = JSON.stringify(input.tags.map((t) => str(t, "tag", 40, { min: 1 })));
+    }
+  }
+  // Plain approval requires the document to still be at the proposal's base; edits may reconcile onto the current one.
+  const guardRev = content ? p.is_new ? 0 : editBody && expRev !== null ? expRev : p.base_rev : null;
+  const guardMeta = meta && !p.is_new ? editMeta && expMeta !== null ? expMeta : p.base_meta_version : null;
+  if (guardRev !== null && a.head_rev !== guardRev || guardMeta !== null && a.meta_version !== guardMeta)
+    throw new HttpError(409, "proposal_stale", "The document changed since this proposal was made; approve with edits against the current version, or reject it", rvStaleExtra(p, a));
+  // Who each part is attributed to: the reviewer for the part the reviewer changed, the proposer for the rest.
+  const reviewerBy = { author: ctx.principal.id, kind: rv.kind, id: rv.id ?? null, label: rv.label, client: rv.client, note: note ?? p.change_note };
+  const proposerBy = { author: p.author_id, kind: p.via_kind, id: p.via_id, label: p.via_label, client: p.client_info, note: p.change_note };
+  const byContent = editBody ? reviewerBy : proposerBy, by = editMeta ? reviewerBy : proposerBy;
+  const newRev = content ? guardRev + 1 : null, revId = randomId("rev");
+  const newMeta = meta && !p.is_new ? guardMeta + 1 : null;
+  const dec = edited ? "approved_with_edits" : "approved";
+  const body = { proposal_id: p.id, status: "approved", decision: dec, review_id: rid, artifact_id: p.artifact_id, revision: newRev ?? a.head_rev, ...newMeta ? { meta_version: newMeta } : {} };
+  const og = [p.id];
+  const done = "EXISTS (SELECT 1 FROM proposals WHERE id = ? AND status = 'approved' AND review_id = ?)", dp = [p.id, rid];
+  const stmts = [
+    db(ctx).prepare(`UPDATE proposals SET status = 'approving' WHERE id = ? AND status = 'pending' AND ${rz.sql}
+      AND EXISTS (SELECT 1 FROM artifacts WHERE id = ? AND project_id = ? AND trashed_at IS NULL AND (? IS NULL OR head_rev = ?) AND (? IS NULL OR meta_version = ?))
+      AND (? = 0 OR (SELECT COUNT(*) FROM artifacts WHERE project_id = ? AND publisher_id IS NULL AND pending_review = 0) < ?)`).bind(
+      p.id, ...rz.params, p.artifact_id, projectId, guardRev, guardRev, guardMeta, guardMeta, p.is_new ? 1 : 0, projectId, LIMITS.artifactsPerProject)
+  ];
+  if (meta && p.is_new) {
+    // Title written while the head is still 0 (no feed or search event), then the head moves: one "created" event.
+    stmts.push(db(ctx).prepare(`UPDATE artifacts SET title = ?, folder = ?, folder_id = ?, tags = ?, pending_review = 0, updated_at = ? WHERE id = ? AND head_rev = 0 AND pending_review = 1 AND ${RV_OPEN}`)
+      .bind(meta.title, meta.folder, p.folder_id ?? null, meta.tags, now, p.artifact_id, ...og));
+  } else if (meta) {
+    stmts.push(
+      db(ctx).prepare(`UPDATE artifacts SET title = ?, folder = ?, tags = ?, meta_version = ?, meta_request_id = ?, updated_at = ? WHERE id = ? AND meta_version = ? AND ${RV_OPEN}`)
+        .bind(meta.title, meta.folder, meta.tags, newMeta, ctx.requestId, now, p.artifact_id, guardMeta, ...og),
+      metaBaselineInsert(ctx, a, RV_OPEN, og),
+      db(ctx).prepare(`INSERT INTO meta_versions (id, artifact_id, project_id, version, title, folder, tags, trashed, template_description, author_id, via_kind, via_id, via_label, client_info, change_note, restored_from, created_at, proposal_id)
+        SELECT ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${RV_OPEN}`).bind(randomId("mv"), p.artifact_id, projectId, newMeta, meta.title, meta.folder, meta.tags,
+        a.template_description ?? "", by.author, by.kind, by.id, by.label, by.client, by.note, editMeta ? null : p.meta_restored_from ?? null, now, p.id, ...og));
+  }
+  if (content) stmts.push(
+    db(ctx).prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, blob_key, size, sha256, mime, restored_from, created_at, via_kind, via_id, via_label, client_info, change_note, proposal_id)
+      SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${RV_OPEN} AND EXISTS (SELECT 1 FROM artifacts WHERE id = ? AND head_rev = ?)`).bind(
+      revId, p.artifact_id, projectId, newRev, byContent.author, content.body ?? null, content.blobKey ?? null, content.size, content.sha256, content.mime, content.restoredFrom ?? null, now,
+      byContent.kind, byContent.id, byContent.label, byContent.client, byContent.note, p.id, ...og, p.artifact_id, guardRev),
+    db(ctx).prepare(`UPDATE artifacts SET head_rev = ?, head_revision_id = ?, updated_at = ? WHERE id = ? AND head_rev = ? AND ${RV_OPEN}`).bind(newRev, revId, now, p.artifact_id, guardRev, ...og));
+  stmts.push(
+    db(ctx).prepare(`INSERT INTO reviews (id, artifact_id, project_id, rev_no, meta_version, proposal_id, decision, author_id, via_kind, via_id, via_label, client_info, note, created_at)
+      SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${RV_OPEN}`).bind(rid, p.artifact_id, projectId, newRev, newMeta, p.id, dec, ctx.principal.id, rv.kind, rv.id ?? null, rv.label, rv.client, note, now, ...og),
+    db(ctx).prepare("UPDATE proposals SET status = 'approved', decided_at = ?, result_rev = ?, result_meta_version = ?, review_id = ? WHERE id = ? AND status = 'approving'").bind(now, newRev, newMeta, rid, p.id),
+    idemInsert(ctx, i, 200, body, done, dp),
+    audit(ctx, projectId, edited ? "proposal.approve_with_edits" : "proposal.approve", p.artifact_id, newRev, "ok", done, dp));
+  const out = await runBatch(ctx, stmts, i);
+  if (!Array.isArray(out)) return out;
+  if (!out[0].meta.changes) return rvExplain(ctx, i, p, guardRev, guardMeta);
+  return { status: 200, body };
+}
+function rvStaleExtra(p, a) {
+  return { base_revision: p.base_rev, current_revision: a.head_rev, base_meta_version: p.base_meta_version, current_meta_version: a.meta_version };
+}
+async function rvExplain(ctx, i, p, guardRev = null, guardMeta = null) {
+  const replay = await idemLookup(ctx, i);
+  if (replay) return replay;
+  const cur = await db(ctx).prepare("SELECT status FROM proposals WHERE id = ?").bind(p.id).first("status");
+  if (cur !== "pending") throw new HttpError(409, "proposal_closed", "This proposal is already " + cur, { proposal_status: cur });
+  const a = await db(ctx).prepare("SELECT head_rev, meta_version, trashed_at FROM artifacts WHERE id = ?").bind(p.artifact_id).first();
+  if (a?.trashed_at) throw new HttpError(409, "trashed", "Artifact is in trash");
+  if (a && (guardRev !== null && a.head_rev !== guardRev || guardMeta !== null && a.meta_version !== guardMeta))
+    throw new HttpError(409, "proposal_stale", "The document changed since this proposal was made; approve with edits against the current version, or reject it", rvStaleExtra(p, a));
+  if (p.is_new && ((await db(ctx).prepare("SELECT COUNT(*) AS n FROM artifacts WHERE project_id = ? AND publisher_id IS NULL AND pending_review = 0").bind(p.project_id).first("n")) ?? 0) >= LIMITS.artifactsPerProject)
+    throw new HttpError(413, "quota_exceeded", "Artifact limit reached");
+  throw new HttpError(403, "review_forbidden", "Review permission no longer valid");
+}
+
+// ---------- advisory: mark one existing version reviewed ----------
+async function reviewRevision(ctx, projectId, artifactId, revNo, input, key) {
+  await rvAssertReviewer(ctx, projectId);
+  const rev = int(revNo, "revision", 1);
+  const decision = input?.decision ?? "approved";
+  if (decision !== "approved" && decision !== "rejected") throw new HttpError(400, "invalid_input", "decision must be approved or rejected");
+  const note = rvNote(input?.note);
+  const i = { op: "revision.review:" + artifactId + ":" + rev, key, projectId, digest: await sha256Hex(JSON.stringify([decision, note])) };
+  const prior = await idemLookup(ctx, i);
+  if (prior) return prior;
+  const a = await loadArtifact(ctx, projectId, artifactId);
+  if (!rvKinds(ctx).includes(a.kind)) throw new HttpError(404, "not_found", "Artifact not found");
+  if (a.review_mode !== "advisory") throw new HttpError(409, "review_mode", a.review_mode === "required" ? "Every version of this document is already reviewed (review required)" : "Review is off for this document");
+  const r = await db(ctx).prepare("SELECT rev_no, via_kind, via_id FROM revisions WHERE artifact_id = ? AND project_id = ? AND rev_no = ?").bind(artifactId, projectId, rev).first();
+  if (!r) throw new HttpError(404, "not_found", "Revision not found");
+  if (await rvSelfReview(ctx, r)) throw new HttpError(403, "self_review", "A version can't be reviewed by the connection that wrote it");
+  const rz = rvReviewSql(ctx, projectId), v = rvVia(ctx), rid = randomId("rvw");
+  const gate = "EXISTS (SELECT 1 FROM reviews WHERE id = ?)";
+  const body = { review_id: rid, artifact_id: artifactId, revision: rev, decision };
+  const out = await runBatch(ctx, [
+    db(ctx).prepare(`INSERT INTO reviews (id, artifact_id, project_id, rev_no, decision, author_id, via_kind, via_id, via_label, client_info, note, created_at)
+      SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${rz.sql} AND EXISTS (SELECT 1 FROM artifacts WHERE id = ? AND project_id = ? AND review_mode = 'advisory' AND trashed_at IS NULL)`).bind(
+      rid, artifactId, projectId, rev, decision, ctx.principal.id, v.kind, v.id ?? null, v.label, v.client, note, nowIso(), ...rz.params, artifactId, projectId),
+    idemInsert(ctx, i, 200, body, gate, [rid]),
+    audit(ctx, projectId, "revision.review", artifactId, rev, "ok:" + decision, gate, [rid])
+  ], i);
+  if (!Array.isArray(out)) return out;
+  if (!out[0].meta.changes) {
+    const replay = await idemLookup(ctx, i);
+    if (replay) return replay;
+    throw new HttpError(409, "review_mode", "Review settings changed; reload and try again");
+  }
+  body.reviewed_revision = await rvReviewedOf(ctx, artifactId, "advisory", a.head_rev);
+  return { status: 200, body };
+}
+// Latest version whose latest review is an approval (advisory); in required mode every version is reviewed.
+async function rvReviewedOf(ctx, artifactId, mode, head) {
+  if (mode === "required") return head;
+  return (await db(ctx).prepare(`SELECT ${RV_REVIEWED_SQL} AS n FROM artifacts a WHERE a.id = ?`).bind(artifactId).first("n")) ?? null;
+}
+// read_artifact {reviewed: true} / ?rev=reviewed
+async function rvResolveRev(ctx, a, revNo) {
+  if (a.pending_review === 1) throw new HttpError(404, "pending_review", "This document is waiting for review; read your proposal with read_proposal");
+  if (revNo !== "reviewed") return revNo ?? a.head_rev;
+  const n = await rvReviewedOf(ctx, a.id, a.review_mode, a.head_rev);
+  if (!n) throw new HttpError(404, "no_reviewed_version", "No version of this document has been reviewed yet");
+  return n;
+}
+async function rvReviewedRev(ctx, projectId, artifactId) {
+  await authorizeProject(ctx, projectId, false);
+  return rvResolveRev(ctx, await loadArtifact(ctx, projectId, artifactId), "reviewed");
+}
+function rvArtifactReview(a) {
+  const mode = a.review_mode ?? "off", pending = a.rv_pending ?? 0;
+  if (mode === "off" && !pending && (a.rv_reviewed === undefined || a.rv_reviewed === null)) return {};
+  return { review: { mode, reviewed_revision: mode === "required" ? a.head_rev : a.rv_reviewed ?? null, pending_proposals: pending } };
+}
+// History: who reviewed each version and details version (and who proposed an edited approval).
+async function rvDecorateHistory(ctx, projectId, artifactId, out) {
+  const revs = out.revisions.map((v) => v.rev);
+  if (!revs.length && !out.meta_versions?.length) return out;
+  const r = await db(ctx).prepare(`SELECT rv.*, p.via_kind AS p_kind, p.via_id AS p_id, p.via_label AS p_label, p.author_id AS p_author FROM reviews rv
+    LEFT JOIN proposals p ON p.id = rv.proposal_id WHERE rv.artifact_id = ? AND rv.project_id = ? ORDER BY rv.rowid`).bind(artifactId, projectId).all();
+  const me = ctx.principal.kind === "human" ? ctx.principal.id : null;
+  const byRev = new Map(), byMeta = new Map();
+  for (const rv of r.results) {
+    // The latest decision wins: a later rejection withdraws an earlier approval.
+    if (rv.decision === "rejected") {
+      if (rv.rev_no !== null) byRev.delete(rv.rev_no);
+      if (rv.meta_version !== null) byMeta.delete(rv.meta_version);
+      continue;
+    }
+    const view = { ...rvReviewView(ctx, rv), ...rv.decision === "approved_with_edits" && rv.p_kind ? { proposed_by: whoLabel({ via_kind: rv.p_kind, via_id: rv.p_id, via_label: rv.p_label, author_id: rv.p_author }, me) } : {} };
+    if (rv.rev_no !== null) byRev.set(rv.rev_no, view);
+    if (rv.meta_version !== null) byMeta.set(rv.meta_version, view);
+  }
+  out.revisions = out.revisions.map((v) => byRev.has(v.rev) ? { ...v, review: byRev.get(v.rev) } : v);
+  if (out.meta_versions) out.meta_versions = out.meta_versions.map((m) => byMeta.has(m.version) ? { ...m, review: byMeta.get(m.version) } : m);
+  return out;
+}
+
+// ---------- owner settings: document mode, project default, review permission ----------
+async function setReviewMode(ctx, projectId, artifactId, input) {
+  requireHuman(ctx);
+  await authorizeProject(ctx, projectId, true);
+  const mode = input?.mode;
+  if (!RV_MODES.includes(mode)) throw new HttpError(400, "invalid_input", "mode must be off, advisory or required");
+  const expected = int(input.expected_revision, "expected_revision", 1);
+  const a = await loadArtifact(ctx, projectId, artifactId);
+  if (a.publisher_id) throw new HttpError(409, "publisher_file", "Files kept by a publishing app can't require review");
+  if (a.head_rev !== expected) throw new HttpError(409, "revision_conflict", "The document changed; review the current version before changing review", { current_revision: a.head_rev, expected_revision: expected });
+  if (a.review_mode === mode) return { artifact_id: artifactId, review_mode: mode, reviewed_revision: await rvReviewedOf(ctx, artifactId, mode, a.head_rev) };
+  // Turning on required vouches for the version the owner saw; leaving required for advisory keeps it reviewed.
+  const vouch = mode === "required" || mode === "advisory" && a.review_mode === "required";
+  const az = authzSql(ctx, projectId), rid = randomId("rvw"), now = nowIso();
+  const res = await db(ctx).batch([
+    db(ctx).prepare(`UPDATE artifacts SET review_mode = ? WHERE id = ? AND project_id = ? AND head_rev = ? AND review_mode = ? AND trashed_at IS NULL AND pending_review = 0 AND ${az.sql}`)
+      .bind(mode, artifactId, projectId, expected, a.review_mode, ...az.params),
+    ...vouch ? [db(ctx).prepare(`INSERT INTO reviews (id, artifact_id, project_id, rev_no, decision, author_id, via_kind, note, created_at)
+      SELECT ?, ?, ?, ?, 'approved', ?, 'browser', ?, ? WHERE changes() = 1 AND EXISTS (SELECT 1 FROM artifacts WHERE id = ? AND review_mode = ? AND head_rev = ?)`).bind(
+      rid, artifactId, projectId, expected, ctx.principal.id, mode === "required" ? "Review required turned on" : "Kept reviewed when review became optional", now, artifactId, mode, expected)] : [],
+    audit(ctx, projectId, "artifact.review_mode", artifactId, expected, "ok:" + mode, "EXISTS (SELECT 1 FROM artifacts WHERE id = ? AND review_mode = ?)", [artifactId, mode])
+  ]);
+  if (!res[0].meta.changes) {
+    const cur = await db(ctx).prepare("SELECT head_rev FROM artifacts WHERE id = ?").bind(artifactId).first("head_rev");
+    throw new HttpError(409, "revision_conflict", "The document changed; review the current version before changing review", { current_revision: cur, expected_revision: expected });
+  }
+  return { artifact_id: artifactId, review_mode: mode, reviewed_revision: await rvReviewedOf(ctx, artifactId, mode, expected) };
+}
+async function getReviewSettings(ctx, projectId) {
+  requireHuman(ctx);
+  await authorizeProject(ctx, projectId, false);
+  const p = await db(ctx).prepare("SELECT review_default, kinds FROM project_review_settings WHERE project_id = ?").bind(projectId).first() ?? { review_default: "off", kinds: null };
+  const c = await db(ctx).prepare("SELECT review_mode, COUNT(*) AS n FROM artifacts WHERE project_id = ? AND publisher_id IS NULL AND pending_review = 0 AND head_rev > 0 AND trashed_at IS NULL GROUP BY review_mode").bind(projectId).all();
+  const pend = await db(ctx).prepare("SELECT COUNT(*) AS n FROM proposals WHERE project_id = ? AND status = 'pending'").bind(projectId).first("n");
+  const out = { default: p.review_default, kinds: p.kinds ? JSON.parse(p.kinds) : null,
+    documents: Object.fromEntries(RV_MODES.map((m) => [m, c.results.find((r) => r.review_mode === m)?.n ?? 0])), pending_proposals: pend ?? 0 };
+  Object.defineProperty(out, "kindsRaw", { value: p.kinds ?? null, enumerable: false });
+  return out;
+}
+async function setReviewSettings(ctx, projectId, input) {
+  requireHuman(ctx);
+  await authorizeProject(ctx, projectId, true);
+  const mode = input?.default;
+  if (!RV_MODES.includes(mode)) throw new HttpError(400, "invalid_input", "default must be off, advisory or required");
+  let kinds = null;
+  if (input.kinds !== undefined && input.kinds !== null) {
+    if (!Array.isArray(input.kinds) || !input.kinds.length || input.kinds.some((k) => !RV_KINDS.includes(k))) throw new HttpError(400, "invalid_input", "kinds must list some of " + RV_KINDS.join(", "));
+    kinds = JSON.stringify([...new Set(input.kinds)]);
+  }
+  await db(ctx).batch([
+    db(ctx).prepare(`INSERT INTO project_review_settings (project_id, review_default, kinds) SELECT ?, ?, ? WHERE EXISTS (SELECT 1 FROM projects WHERE id = ? AND owner_id = ?)
+      ON CONFLICT (project_id) DO UPDATE SET review_default = excluded.review_default, kinds = excluded.kinds`).bind(projectId, mode, kinds, projectId, ctx.principal.id),
+    audit(ctx, projectId, "project.review_default", projectId, null, "ok:" + mode)
+  ]);
+  return getReviewSettings(ctx, projectId);
+}
+// Apply the project default to existing documents. Returns the exact versions it vouched for.
+// input.expected_default (required): the setting the owner saw, so a stale page never applies a different one.
+async function applyReviewSettings(ctx, projectId, input) {
+  requireHuman(ctx);
+  await authorizeProject(ctx, projectId, true);
+  const s = await getReviewSettings(ctx, projectId);
+  if (!RV_MODES.includes(input?.expected_default)) throw new HttpError(400, "invalid_input", "expected_default must be the saved setting (off, advisory or required)");
+  const same = (x, y) => JSON.stringify(x ? [...x].sort() : null) === JSON.stringify(y ? [...y].sort() : null);
+  if (input.expected_default !== s.default || input.expected_kinds !== undefined && !same(input.expected_kinds, s.kinds))
+    throw new HttpError(409, "settings_changed", "The project review setting changed; reload and check it before applying", { default: s.default, kinds: s.kinds });
+  const r = await db(ctx).prepare(`SELECT id, kind, head_rev, review_mode FROM artifacts WHERE project_id = ? AND publisher_id IS NULL AND pending_review = 0 AND head_rev > 0
+    AND trashed_at IS NULL AND review_mode <> ? AND (? IS NULL OR kind IN (SELECT value FROM json_each(?)))`).bind(projectId, s.default, s.kinds ? JSON.stringify(s.kinds) : null, s.kinds ? JSON.stringify(s.kinds) : null).all();
+  const now = nowIso(), stmts = [], plan = [], az = authzSql(ctx, projectId);
+  for (const a of r.results) {
+    const vouch = s.default === "required" || s.default === "advisory" && a.review_mode === "required";
+    plan.push({ a, idx: stmts.length });
+    // Live: owner access, not trashed, and the project setting still the one being applied (default and kinds).
+    stmts.push(db(ctx).prepare(`UPDATE artifacts SET review_mode = ? WHERE id = ? AND project_id = ? AND head_rev = ? AND review_mode = ? AND pending_review = 0 AND trashed_at IS NULL AND ${az.sql}
+      AND COALESCE((SELECT review_default || '|' || COALESCE(kinds, '') FROM project_review_settings WHERE project_id = ?), 'off|') = ?`)
+      .bind(s.default, a.id, projectId, a.head_rev, a.review_mode, ...az.params, projectId, s.default + "|" + (s.kindsRaw ?? "")));
+    if (vouch) stmts.push(db(ctx).prepare(`INSERT INTO reviews (id, artifact_id, project_id, rev_no, decision, author_id, via_kind, note, created_at)
+      SELECT ?, ?, ?, ?, 'approved', ?, 'browser', ?, ? WHERE changes() = 1`).bind(randomId("rvw"), a.id, projectId, a.head_rev, ctx.principal.id, "Project review setting applied", now));
+  }
+  const res = stmts.length ? await db(ctx).batch(stmts) : [];
+  const updated = [], changed = [];
+  for (const { a, idx } of plan) (res[idx].meta.changes ? updated : changed).push({ artifact_id: a.id, revision: a.head_rev });
+  await audit(ctx, projectId, "project.review_apply", projectId, null, "ok:" + s.default + ":" + updated.length).run();
+  return { mode: s.default, updated, skipped_changed: changed };
+}
+// Active (not revoked, not expired) connections with this project in scope; the last parameter is "now" (ms).
+const RV_PATHS = {
+  oauth: `SELECT 1 FROM oauth_connections oc JOIN oauth_connection_projects cp ON cp.connection_id = oc.id WHERE oc.id = ? AND cp.project_id = ? AND oc.owner_principal_id = ? AND oc.revoked_at IS NULL AND oc.expires_at > ?`,
+  api_key: `SELECT 1 FROM api_credentials ac JOIN api_credential_projects acp ON acp.credential_id = ac.id WHERE ac.id = ? AND acp.project_id = ? AND ac.owner_principal_id = ? AND ac.revoked_at IS NULL AND ac.expires_at > ?`,
+  grant: `SELECT 1 FROM grants g JOIN projects pj ON pj.id = g.project_id WHERE g.id = ? AND g.project_id = ? AND pj.owner_id = ? AND g.revoked_at IS NULL AND g.expires_at > ?`
+};
+async function listReviewGrants(ctx) {
+  requireHuman(ctx);
+  const r = await db(ctx).prepare(`SELECT rg.path_kind, rg.path_id, rg.project_id, rg.created_at FROM review_grants rg JOIN projects p ON p.id = rg.project_id WHERE p.owner_id = ?`).bind(ctx.principal.id).all();
+  return { review_grants: r.results };
+}
+async function setReviewGrant(ctx, input) {
+  requireHuman(ctx);
+  const kind = input?.path_kind;
+  if (!RV_PATHS[kind]) throw new HttpError(400, "invalid_input", "path_kind must be oauth, api_key or grant");
+  const pathId = str(input.path_id, "path_id", 80, { min: 1 }), projectId = str(input.project_id, "project_id", 64, { min: 1 });
+  if (typeof input.can_review !== "boolean") throw new HttpError(400, "invalid_input", "can_review must be true or false");
+  await authorizeProject(ctx, projectId, true);
+  // Owner-only, and the path must be active with this project in scope at the moment of the write (one statement).
+  const own = "EXISTS (SELECT 1 FROM projects WHERE id = ? AND owner_id = ?)";
+  const has = "EXISTS (SELECT 1 FROM review_grants WHERE path_kind = ? AND path_id = ? AND project_id = ?)";
+  if (input.can_review) {
+    await db(ctx).batch([
+      db(ctx).prepare(`INSERT OR IGNORE INTO review_grants (path_kind, path_id, project_id, created_at) SELECT ?, ?, ?, ? WHERE ${own} AND EXISTS (${RV_PATHS[kind]})`)
+        .bind(kind, pathId, projectId, nowIso(), projectId, ctx.principal.id, pathId, projectId, ctx.principal.id, nowMs()),
+      audit(ctx, projectId, "review_grant.add", pathId, null, "ok:" + kind, has, [kind, pathId, projectId])
+    ]);
+    if (!(await db(ctx).prepare(`SELECT 1 AS x WHERE ${has}`).bind(kind, pathId, projectId).first("x")))
+      throw new HttpError(404, "not_found", "Active connection with access to this project not found");
+  } else await db(ctx).batch([
+    db(ctx).prepare(`DELETE FROM review_grants WHERE path_kind = ? AND path_id = ? AND project_id = ? AND ${own}`).bind(kind, pathId, projectId, projectId, ctx.principal.id),
+    audit(ctx, projectId, "review_grant.remove", pathId, null, "ok:" + kind, own, [projectId, ctx.principal.id])
+  ]);
+  return { path_kind: kind, path_id: pathId, project_id: projectId, can_review: input.can_review };
+}
+// Replacing an API key keeps its review permission (the new key has the same scope).
+async function rvCarryReview(env, oldId, newId) {
+  await env.DB.prepare(`INSERT OR IGNORE INTO review_grants (path_kind, path_id, project_id, created_at)
+    SELECT 'api_key', ?, rg.project_id, ? FROM review_grants rg JOIN api_credential_projects acp ON acp.credential_id = ? AND acp.project_id = rg.project_id
+    WHERE rg.path_kind = 'api_key' AND rg.path_id = ?`).bind(newId, nowIso(), newId, oldId).run();
+}
+// Projects where this path may review (MCP tools/list).
+async function rvAnyReview(env, kind, id) {
+  return !!(await env.DB.prepare("SELECT 1 AS x FROM review_grants WHERE path_kind = ? AND path_id = ? LIMIT 1").bind(kind, id).first("x"));
+}
+
+// ---------- storage: bytes of closed binary proposals ----------
+// Only bytes an upload created for that proposal, referenced by no version and no other proposal, 30 days after
+// the decision (owner decision: 2026-11). Restore proposals reuse history bytes and are never purged.
+// Every proposal that shares the bytes (a details-only re-save of a pending new file keeps them) must be closed
+// for 30 days; then all of them are marked purged in one statement, re-checking references, before the delete.
+// Bytes no version references (history, including bytes a restore proposal reused, is always referenced by its
+// revision), shared only by proposals closed 30+ days ago. No uploads row is required: restored proposals have none.
+const RV_PURGEABLE = `p.blob_key IS NOT NULL AND p.blob_purged_at IS NULL
+  AND NOT EXISTS (SELECT 1 FROM revisions r WHERE r.blob_key = p.blob_key)
+  AND NOT EXISTS (SELECT 1 FROM proposals q WHERE q.blob_key = p.blob_key AND (q.status NOT IN ('rejected','superseded','withdrawn') OR q.decided_at IS NULL OR q.decided_at >= ?))`;
+async function rvPurge(env, now, limit, projectId) {
+  const before = new Date(now - RV_PURGE_MS).toISOString();
+  const r = await env.DB.prepare(`SELECT DISTINCT p.blob_key FROM proposals p WHERE ${RV_PURGEABLE} AND (? IS NULL OR p.project_id = ?) LIMIT ?`).bind(before, projectId ?? null, projectId ?? null, limit).all();
+  let n = 0;
+  for (const { blob_key } of r.results) {
+    const c = await env.DB.prepare(`UPDATE proposals AS p SET blob_purged_at = ? WHERE p.blob_key = ? AND ${RV_PURGEABLE}`).bind(new Date(now).toISOString(), blob_key, before).run();
+    if (!c.meta.changes) continue;
+    try { await env.BLOBS.delete(blob_key); }
+    catch (e) {
+      // Not deleted: unmark, so the bytes stay counted and the next run tries again.
+      await env.DB.prepare("UPDATE proposals SET blob_purged_at = NULL WHERE blob_key = ? AND blob_purged_at = ?").bind(blob_key, new Date(now).toISOString()).run();
+      continue;
+    }
+    await env.DB.prepare("UPDATE uploads SET final_purged_at = ? WHERE final_key = ? AND final_purged_at IS NULL").bind(now, blob_key).run();
+    n++;
+  }
+  return n;
+}
+
+// ---------- backup ----------
+async function rvBackupExport(ctx, projectId, blobs) {
+  const DB = ctx.env.DB;
+  const [proj, props, revs] = await DB.batch([
+    DB.prepare("SELECT review_default, kinds FROM project_review_settings WHERE project_id = ?").bind(projectId),
+    DB.prepare("SELECT * FROM proposals WHERE project_id = ?").bind(projectId),
+    DB.prepare("SELECT * FROM reviews WHERE project_id = ?").bind(projectId)
+  ]);
+  const modes = await DB.prepare("SELECT id, review_mode, pending_review FROM artifacts WHERE project_id = ? AND (review_mode <> 'off' OR pending_review = 1)").bind(projectId).all();
+  const p = proj.results[0] ?? { review_default: "off", kinds: null };
+  if (!props.results.length && !revs.results.length && !modes.results.length && p.review_default === "off") return null;
+  for (const x of props.results) {
+    if (!x.blob_key || x.blob_purged_at || blobs[x.blob_key]) continue;
+    const o = await ctx.env.BLOBS.get(x.blob_key);
+    if (!o) throw new HttpError(500, "blob_missing", "Referenced blob missing during export");
+    const bytes = new Uint8Array(await o.arrayBuffer());
+    const sha2 = await sha256Hex(bytes);
+    if (sha2 !== x.sha256) throw new HttpError(500, "blob_corrupt", "Stored blob hash mismatch");
+    blobs[x.blob_key] = { sha256: sha2, data: b64(bytes) };
+  }
+  return { review: { default: p.review_default, kinds: p.kinds, modes: modes.results, proposals: props.results, reviews: revs.results } };
+}
+// Validates the review section and adds proposal blobs to the restore set (before any write).
+async function rvRestorePrepare(backup, blobs, decoded, pid) {
+  const r = backup.review;
+  if (r === undefined || r === null) return;
+  if (typeof r !== "object" || !Array.isArray(r.modes) || !Array.isArray(r.proposals) || !Array.isArray(r.reviews)) throw new HttpError(400, "bad_backup", "Invalid review section");
+  if (!RV_MODES.includes(r.default)) throw new HttpError(400, "bad_backup", "Invalid review default");
+  if (r.kinds !== undefined && r.kinds !== null) {
+    let k = null; try { k = JSON.parse(r.kinds); } catch {}
+    if (!Array.isArray(k) || !k.length || k.some((x) => !RV_KINDS.includes(x))) throw new HttpError(400, "bad_backup", "Invalid review kinds");
+  }
+  const ids = new Set((backup.artifacts ?? []).map((a) => a.id));
+  for (const m of r.modes) if (!ids.has(m.id) || !RV_MODES.includes(m.review_mode)) throw new HttpError(400, "bad_backup", "Invalid review mode");
+  for (const x of r.proposals) {
+    if (!ids.has(x.artifact_id) || !["pending", "approved", "rejected", "superseded", "withdrawn"].includes(x.status) || !RV_KINDS.includes(x.kind)) throw new HttpError(400, "bad_backup", "Invalid proposal");
+    // Every stored-bytes key must belong to this project, purged or not; open proposals can't be purged.
+    if (x.blob_key !== undefined && x.blob_key !== null && !new RegExp(`^blobs/${pid}/[A-Za-z0-9_-]+/[A-Za-z0-9_-]+$`).test(x.blob_key)) throw new HttpError(400, "bad_backup", "Bad blob key");
+    if (x.blob_purged_at && x.status === "pending") throw new HttpError(400, "bad_backup", "A pending proposal can't have purged bytes");
+    if (x.blob_key && !x.blob_purged_at) {
+      if (!new RegExp(`^blobs/${pid}/[A-Za-z0-9_-]+/[A-Za-z0-9_-]+$`).test(x.blob_key)) throw new HttpError(400, "bad_backup", "Bad blob key");
+      const b = blobs[x.blob_key];
+      if (!b) throw new HttpError(400, "bad_backup", "Missing blob");
+      const bytes = decoded.get(x.blob_key) ?? unb64(b.data);
+      if (await sha256Hex(bytes) !== x.sha256 || bytes.length !== x.size) throw new HttpError(400, "bad_backup", `Blob for ${x.id} hash/size mismatch`);
+      decoded.set(x.blob_key, bytes);
+    } else if (x.has_content && x.blob_key === null && (typeof x.body !== "string" || await sha256Hex(x.body) !== x.sha256)) throw new HttpError(400, "bad_backup", `Proposal ${x.id} hash mismatch`);
+  }
+  for (const v of r.reviews) if (!ids.has(v.artifact_id) || !["approved", "approved_with_edits", "rejected"].includes(v.decision)) throw new HttpError(400, "bad_backup", "Invalid review");
+}
+const RV_PROPOSAL_COLS = ["id", "artifact_id", "kind", "status", "is_new", "supersedes_id", "base_rev", "base_meta_version", "has_content", "body", "blob_key", "size", "sha256", "mime", "restored_from",
+  "has_meta", "title", "folder", "folder_id", "tags", "meta_restored_from", "author_id", "via_kind", "via_id", "via_label", "client_info", "change_note", "created_at", "decided_at",
+  "result_rev", "result_meta_version", "review_id", "blob_purged_at"];
+const RV_REVIEW_COLS = ["id", "artifact_id", "rev_no", "meta_version", "proposal_id", "decision", "author_id", "via_kind", "via_id", "via_label", "client_info", "note", "created_at"];
+function rvRestoreStatements(DB, backup, pid) {
+  const r = backup.review;
+  if (!r) return [];
+  const out = r.default === "off" ? [] : [DB.prepare("INSERT INTO project_review_settings (project_id, review_default, kinds) VALUES (?, ?, ?)").bind(pid, r.default, r.kinds ?? null)];
+  for (const m of r.modes) out.push(DB.prepare("UPDATE artifacts SET review_mode = ?, pending_review = ? WHERE id = ? AND project_id = ?").bind(m.review_mode, m.pending_review ? 1 : 0, m.id, pid));
+  for (const x of r.proposals) out.push(DB.prepare(`INSERT INTO proposals (project_id, ${RV_PROPOSAL_COLS.join(", ")}) VALUES (?, ${RV_PROPOSAL_COLS.map(() => "?").join(", ")})`)
+    .bind(pid, ...RV_PROPOSAL_COLS.map((c) => x[c] ?? (["is_new", "has_content", "has_meta"].includes(c) ? 0 : null))));
+  for (const v of r.reviews) out.push(DB.prepare(`INSERT INTO reviews (project_id, ${RV_REVIEW_COLS.join(", ")}) VALUES (?, ${RV_REVIEW_COLS.map(() => "?").join(", ")})`)
+    .bind(pid, ...RV_REVIEW_COLS.map((c) => v[c] ?? null)));
+  return out;
+}
+function rvRestoreAuthors(backup) {
+  const r = backup.review;
+  return r ? [...r.proposals, ...r.reviews].map((x) => x.author_id) : [];
+}
+
+// Review tools for both MCP endpoints (OAuth MCP: oauth = true, project_id optional; legacy /mcp: project_id required).
+// write: withdraw is an edit of the caller's own proposal (needs edit access). review: needs the owner-granted
+// review permission (checked live by the service), not edit access; charged to the write rate bucket.
+const RV_REVIEWED_ARG = { type: "boolean", description: "Read the latest reviewed version instead of the current one (documents whose review is advisory or required)" };
+function rvTools(oauth = false) {
+  const project = { type: "string", maxLength: 64, description: oauth ? "Project ID from list_projects. Optional when the connection has exactly one project." : "Project ID" };
+  const id = { type: "string", maxLength: 64 };
+  const keyArg = { type: "string", minLength: 8, maxLength: 128, description: "Unique key for this change (8-128 chars, e.g. a UUID). Reuse it only when retrying the same change." };
+  const note = { type: "string", maxLength: 280, description: "One line for the author and the owner: why you approved, edited or rejected it" };
+  const schema = (properties, required) => ({ type: "object", properties: { project_id: project, ...properties }, required: oauth ? required : ["project_id", ...required], additionalProperties: false });
+  const ro = { readOnlyHint: true, destructiveHint: false, openWorldHint: false };
+  const rw = { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false };
+  const call = (fn) => oauth ? fn : (c, a) => fn(c, a.project_id, a);
+  const unwrapR = (r) => r && typeof r.status === "number" && "body" in r ? r.body : r;
+  return [
+    { name: "list_proposals", title: "List proposed edits", write: false, annotations: ro,
+      description: "List edits waiting for review (status pending by default; or approved, rejected, superseded, withdrawn, all) in a project, optionally for one document. Documents whose review is required keep agent edits as proposals until a reviewer approves them. You see your own proposals in full and, for other authors, only that an edit is pending. Reviewers see all. can_review says whether you may review here.",
+      inputSchema: schema({ artifact_id: id, status: { type: "string", enum: ["pending", "approved", "rejected", "superseded", "withdrawn", "all"] }, cursor: { type: "string", maxLength: 12 } }, []),
+      run: call((c, p, a) => listProposals(c, p, a)) },
+    { name: "read_proposal", title: "Read a proposed edit", write: false, annotations: ro,
+      description: "Read one proposal (your own, or any if you can review): its text or file details, title/folder/tag changes, status, the reviewer's decision and note, and line diffs against the version it started from and the current version (when the document changed since). stale=true means the document moved on: a plain approve will fail; approve with edits against the current version, or reject.",
+      inputSchema: schema({ proposal_id: id }, ["proposal_id"]),
+      run: call(async (c, p, a) => oauth ? rvOauthProposalFile(c, p, await readProposal(c, p, a.proposal_id)) : readProposal(c, p, a.proposal_id, { contentPath: `/api/projects/${p}/proposals/${a.proposal_id}/content` })) },
+    { name: "withdraw_proposal", title: "Withdraw your proposed edit", write: true, annotations: rw,
+      description: "Withdraw one of your own pending proposals. To change it instead, just save again: a new save replaces your pending proposal.",
+      inputSchema: schema({ proposal_id: id, idempotency_key: keyArg }, ["proposal_id", "idempotency_key"]),
+      run: call(async (c, p, a) => unwrapR(await withdrawProposal(c, p, a.proposal_id, idemKey(a.idempotency_key)))) },
+    { name: "review_proposal", title: "Review a proposed edit", write: false, review: true, annotations: rw,
+      description: "Approve or reject another author's proposal (needs review permission, granted by the owner). decision approve publishes it as a new version (and/or new title, folder and tags) exactly as proposed; it fails with proposal_stale if the document changed since. To approve with edits, also pass body (text documents only; files can only be approved or rejected) and/or title, folder, tags, with expected_revision / expected_meta_version of the current document: your text becomes the new version, which reconciles a stale proposal. decision reject closes it with your note. Always set note.",
+      inputSchema: schema({ proposal_id: id, decision: { type: "string", enum: ["approve", "reject"] }, note,
+        body: { type: "string", description: "Approve with edits: the full text to publish instead of the proposed text" },
+        title: { type: "string", minLength: 1, maxLength: 200 }, folder: { type: "string", maxLength: 200 }, tags: { type: "array", maxItems: 20, items: { type: "string", maxLength: 40 } },
+        expected_revision: { type: "integer", minimum: 0, description: "With body: the document's current revision" },
+        expected_meta_version: { type: "integer", minimum: 1, description: "With title/folder/tags: the document's current meta_version" },
+        idempotency_key: keyArg }, ["proposal_id", "decision", "idempotency_key"]),
+      run: call(async (c, p, a) => unwrapR(await reviewProposal(c, p, a.proposal_id, a, idemKey(a.idempotency_key)))) },
+    { name: "review_revision", title: "Mark a version reviewed", write: false, review: true, annotations: rw,
+      description: "For documents whose review is advisory: record that one exact version was reviewed (decision approved, the default) or rejected. Readers can then ask read_artifact for reviewed=true. A later edit is not reviewed until someone reviews it. Needs review permission; you can't review a version you wrote.",
+      inputSchema: schema({ artifact_id: id, revision: { type: "integer", minimum: 1 }, decision: { type: "string", enum: ["approved", "rejected"] }, note, idempotency_key: keyArg }, ["artifact_id", "revision", "idempotency_key"]),
+      run: call(async (c, p, a) => unwrapR(await reviewRevision(c, p, a.artifact_id, a.revision, a, idemKey(a.idempotency_key)))) }
+  ];
+}
+// read_artifact {reviewed: true}: resolve to the reviewed revision number (never combined with revision or cursor).
+async function rvReviewedArgs(c, p, a) {
+  if (a.reviewed !== true) return a;
+  if (a.revision != null || a.cursor != null) throw new HttpError(400, "invalid_input", "Pass reviewed or revision/cursor, not both");
+  // Resolved once (the OAuth read_artifact wrapper resolves it before the document/file split; inner tools see a revision).
+  const { reviewed: _r, ...rest } = a;
+  return { ...rest, revision: await rvReviewedRev(c, p, a.artifact_id) };
+}
+
 function requireAppConnect(ctx) {
   if (!appConnectEnabled(ctx.env)) throw new HttpError(404, "not_found", "Not found");
 }
@@ -5982,6 +6909,7 @@ async function runBatch(ctx, stmts, i) {
   try {
     return await db(ctx).batch(stmts);
   } catch (e) {
+    if (/review_required/.test(String(e?.message ?? e))) throw new HttpError(409, "review_mode_changed", "Review settings of this document changed; read it again and retry");
     if (/UNIQUE|PRIMARY KEY|constraint/i.test(String(e?.message ?? e))) {
       const prior = await idemLookup(ctx, i);
       if (prior) return prior;
@@ -6074,6 +7002,7 @@ async function updateGrant(ctx, projectId, grantId, input) {
   let res;
   if (input.revoke === true) {
     res = await db(ctx).prepare("UPDATE grants SET revoked_at = ? WHERE id = ? AND project_id = ? AND revoked_at IS NULL").bind(nowMs(), grantId, projectId).run();
+    await db(ctx).prepare("DELETE FROM review_grants WHERE path_kind = 'grant' AND path_id = ?").bind(grantId).run();
   } else if (typeof input.can_write === "boolean") {
     res = await db(ctx).prepare("UPDATE grants SET can_write = ? WHERE id = ? AND project_id = ? AND revoked_at IS NULL").bind(input.can_write ? 1 : 0, grantId, projectId).run();
   } else throw new HttpError(400, "invalid_input", "Specify revoke:true or can_write");
@@ -6083,7 +7012,8 @@ async function updateGrant(ctx, projectId, grantId, input) {
 }
 async function loadArtifact(ctx, projectId, artifactId, opts = {}) {
   const a = await db(ctx).prepare(`SELECT ${ART_COLS} FROM artifacts a WHERE a.id = ? AND a.project_id = ?`).bind(artifactId, projectId).first();
-  if (!a || a.head_rev === 0 && a.kind === "binary" && !opts.allowTrashed) throw new HttpError(404, "not_found", "Artifact not found");
+  if (!a || a.head_rev === 0 && a.kind === "binary" && !opts.allowTrashed && !(opts.pendingOk && a.pending_review === 1)) throw new HttpError(404, "not_found", "Artifact not found");
+  if (a.pending_review === 1 && !(opts.pendingOk && await rvOwnPending(ctx, a))) throw new HttpError(404, "not_found", "Artifact not found");
   if (a.trashed_at && !opts.allowTrashed) throw new HttpError(404, "not_found", "Artifact not found");
   return a;
 }
@@ -6211,12 +7141,13 @@ function rtHexBytes(hx) {
 // Query-string options for the HTTP routes (?revision=&cursor=&max_bytes=).
 function rtQuery(sp) {
   const n = (k) => sp.get(k) === null ? void 0 : Number(sp.get(k));
-  return { revision: n("revision"), cursor: sp.get("cursor") ?? void 0, maxBytes: n("max_bytes") };
+  return { revision: sp.get("revision") === "reviewed" ? "reviewed" : n("revision"), cursor: sp.get("cursor") ?? void 0, maxBytes: n("max_bytes") };
 }
 async function readTextChunk(ctx, projectId, artifactId, opts = {}) {
   await authorizeProject(ctx, projectId, false);
   const mcp = opts.encoding === "mcp";
   const maxBytes = opts.maxBytes === void 0 || opts.maxBytes === null ? RT_DEFAULT_MAX : int(opts.maxBytes, "max_bytes", RT_MIN_MAX, RT_MAX_MAX);
+  if (opts.revision === "reviewed") opts = { ...opts, revision: await rvReviewedRev(ctx, projectId, artifactId) };
   let rev = opts.revision === void 0 || opts.revision === null ? null : int(opts.revision, "revision", 1);
   let pin = null;
   if (opts.cursor !== void 0 && opts.cursor !== null) {
@@ -6757,7 +7688,7 @@ async function cleanupChanges(env) {
 async function getArtifact(ctx, projectId, artifactId, revNo) {
   await authorizeProject(ctx, projectId, false);
   const a = await loadArtifact(ctx, projectId, artifactId);
-  const rev = await db(ctx).prepare("SELECT * FROM revisions WHERE artifact_id = ? AND project_id = ? AND rev_no = ?").bind(artifactId, projectId, revNo ?? a.head_rev).first();
+  const rev = await db(ctx).prepare("SELECT * FROM revisions WHERE artifact_id = ? AND project_id = ? AND rev_no = ?").bind(artifactId, projectId, await rvResolveRev(ctx, a, revNo)).first();
   if (!rev) throw new HttpError(404, "not_found", "Revision not found");
   return {
     artifact: { ...artifactView(a, appConnectEnabled(ctx.env)), ...await tplProvenance(ctx, projectId, a) },
@@ -6768,7 +7699,7 @@ async function getArtifact(ctx, projectId, artifactId, revNo) {
 async function history(ctx, projectId, artifactId, opts = {}) {
   await authorizeProject(ctx, projectId, false);
   await loadArtifact(ctx, projectId, artifactId, { allowTrashed: ctx.principal.kind === "human" });
-  return historyPage(ctx, projectId, artifactId, opts);
+  return rvDecorateHistory(ctx, projectId, artifactId, await historyPage(ctx, projectId, artifactId, opts));
 }
 function mdBody(v, kind = "markdown") {
   const body2 = str(v, "body", LIMITS.markdownBytes);
@@ -6810,8 +7741,9 @@ async function createMarkdown(ctx, projectId, input, key, kind = "markdown") {
   const i = { op: "artifact.create", key, projectId, digest: await sha256Hex(JSON.stringify(digestParts)) };
   const prior = await idemLookup(ctx, i);
   if (prior) return prior;
-  const count = await db(ctx).prepare("SELECT COUNT(*) AS n FROM artifacts WHERE project_id = ? AND publisher_id IS NULL").bind(projectId).first("n");
+  const count = await db(ctx).prepare("SELECT COUNT(*) AS n FROM artifacts WHERE project_id = ? AND publisher_id IS NULL AND pending_review = 0").bind(projectId).first("n");
   if ((count ?? 0) >= LIMITS.artifactsPerProject) throw new HttpError(413, "quota_exceeded", "Artifact limit reached");
+  if (await rvNewGated(ctx, projectId, kind)) return rvCreateNew(ctx, projectId, kind, { title, folder, folderId, schema, body: body2, mime, sha256: await sha256Hex(body2), size: new TextEncoder().encode(body2).length }, i, input);
   const artId = randomId("art");
   const revId = randomId("rev");
   const sha2 = await sha256Hex(body2);
@@ -6833,6 +7765,11 @@ async function createMarkdown(ctx, projectId, input, key, kind = "markdown") {
   return result;
 }
 async function publishRevision(ctx, projectId, artifactId, expected, i, rev, extra = [], action = "artifact.save") {
+  if (rvGatedActor(ctx) && !rev.fence) {
+    const ga = await db(ctx).prepare("SELECT * FROM artifacts WHERE id = ? AND project_id = ?").bind(artifactId, projectId).first();
+    const g = ga && await rvGateContent(ctx, projectId, ga, i, expected, rev);
+    if (g) return g;
+  }
   const revId = rev.revId ?? randomId("rev");
   const next = expected + 1;
   const azBase = authzSql(ctx, projectId);
@@ -6887,12 +7824,12 @@ async function publishRevision(ctx, projectId, artifactId, expected, i, rev, ext
 }
 async function saveMarkdown(ctx, projectId, artifactId, input, key) {
   await authorizeProject(ctx, projectId, true);
-  const expected = int(input.expected_revision, "expected_revision", 1);
+  const expected = int(input.expected_revision, "expected_revision", 0);
   const body2 = mdBody(input.body);
   const i = { op: "artifact.save:" + artifactId, key, projectId, digest: await sha256Hex(JSON.stringify([expected, body2])) };
   const prior = await idemLookup(ctx, i);
   if (prior) return prior;
-  const a = await loadArtifact(ctx, projectId, artifactId);
+  const a = await loadArtifact(ctx, projectId, artifactId, { pendingOk: rvGatedActor(ctx) });
   if (a.kind !== "markdown" && a.kind !== "html") throw new HttpError(400, "invalid_input", "Not a Markdown or HTML document");
   assertWritable(ctx, a, "content");
   if (a.kind === "html") mdBody(body2, "html");
@@ -6908,13 +7845,13 @@ async function saveMarkdown(ctx, projectId, artifactId, input, key) {
 async function saveFile(ctx, projectId, artifactId, input, key) {
   if (!appConnectEnabled(ctx.env)) return saveMarkdown(ctx, projectId, artifactId, input, key);
   await authorizeProject(ctx, projectId, true);
-  const expected = int(input.expected_revision, "expected_revision", 1);
+  const expected = int(input.expected_revision, "expected_revision", 0);
   const text = input.body ?? input.content;
   if (typeof text === "string") {
     const prior = await idemLookup(ctx, { op: "artifact.save:" + artifactId, key, projectId, digest: await sha256Hex(JSON.stringify([expected, text])) });
     if (prior) return prior;
   }
-  const a = await loadArtifact(ctx, projectId, artifactId);
+  const a = await loadArtifact(ctx, projectId, artifactId, { pendingOk: rvGatedActor(ctx) });
   assertWritable(ctx, a, "content");
   if (a.kind === "markdown" || a.kind === "html") return saveMarkdown(ctx, projectId, artifactId, { expected_revision: input.expected_revision, body: text, change_note: input.change_note }, key);
   if (a.kind !== "json" && a.kind !== "csv") throw new HttpError(422, "unsupported_kind", "Binary files are replaced through uploads");
@@ -6961,7 +7898,7 @@ async function updateMetadata(ctx, projectId, artifactId, input, key, internal) 
   const i = { op: restoredFrom ? "artifact.meta_restore:" + artifactId : "artifact.meta:" + artifactId, key, projectId, digest: await sha256Hex(JSON.stringify(restoredFrom ? [expected, restoredFrom] : digestInput)) };
   const prior = await idemLookup(ctx, i);
   if (prior) return prior;
-  const a = await loadArtifact(ctx, projectId, artifactId, { allowTrashed: true });
+  const a = await loadArtifact(ctx, projectId, artifactId, { allowTrashed: true, pendingOk: rvGatedActor(ctx) });
   // Agents can't restore a trashed document's details (the trash takes it away from them). Checked after the
   // idempotency lookup, so a same-key retry of a restore that already succeeded still replays.
   if (restoredFrom && ctx.principal.kind !== "human" && a.trashed_at) throw new HttpError(404, "not_found", "Artifact not found");
@@ -6978,6 +7915,10 @@ async function updateMetadata(ctx, projectId, artifactId, input, key, internal) 
   let trashed = a.trashed_at;
   if (input.trashed === true) trashed = trashed ?? nowIso();
   if (input.trashed === false) trashed = null;
+  {
+    const g = await rvGateMeta(ctx, projectId, a, i, expected, input, { title, folder, tags }, restoredFrom);
+    if (g) return g;
+  }
   const az0 = authzSql(ctx, projectId), pr = protectSql(ctx, artifactId);
   const az = { sql: `${az0.sql} AND ${pr.sql}`, params: [...az0.params, ...pr.params] };
   const next = expected + 1;
@@ -7427,9 +8368,10 @@ var init_service = __esm({
         folder_id: a.folder_id ?? null,
         schema: a.schema_id ?? null,
         publisher: a.publisher_id ? { id: a.publisher_id, display_name: a.pub_name ?? null, protected: true } : null
-      } : {}
+      } : {},
+      ...rvArtifactReview(a)
     }), "artifactView");
-    ART_COLS = "a.*, (SELECT display_name FROM publishers WHERE id = a.publisher_id) AS pub_name";
+    ART_COLS = "a.*, (SELECT display_name FROM publishers WHERE id = a.publisher_id) AS pub_name" + RV_ART_COLS;
     __name(listArtifacts, "listArtifacts");
     __name(getArtifact, "getArtifact");
     __name(history, "history");
@@ -7592,11 +8534,12 @@ async function handleOAuthMcp(req, env, ctx) {
   if (rtLim?.idTooLong) return reply(RT_ID_TOO_LONG, 400);
   const pv = req.headers.get("mcp-protocol-version");
   if (pv && !SUPPORTED.includes(pv)) return reply(rpcErr(null, -32600, "Unsupported protocol version"), 400);
+  const rvListReview = msg.method === "tools/list" && await rvAnyReview(env, "oauth", conn.id);
   const searchReady = await rsToolReady(env,msg);
   const tool = msg.method === "tools/call" ? ftToolsFor(env, conn).filter(t => t.name !== "search_artifacts" || searchReady).find((t) => t.name === msg.params?.name) : void 0;
   if (tool?.write && !tokenScopes.has(SCOPES.write)) return insufficientScope(ctx.auth, [SCOPES.read, SCOPES.write]);
   try {
-    await rateLimit(env, `${tool?.write ? "w" : "r"}:oauth:${conn.id}`, tool?.write ? 20 : 60);
+    await rateLimit(env, `${tool?.write || tool?.review ? "w" : "r"}:oauth:${conn.id}`, tool?.write || tool?.review ? 20 : 60);
   } catch (e) {
     return ftRateLimited(msg, tool, !!tool?.write, e, rtLim);
   }
@@ -7614,7 +8557,7 @@ async function handleOAuthMcp(req, env, ctx) {
     case "ping":
       return reply(rpc(msg.id, {}));
     case "tools/list":
-      return reply(rpc(msg.id, { tools: ftToolsFor(env, conn).filter((t) => (t.name !== "search_artifacts" || searchReady) && (anyWrite || !t.write)).map(({ name, title, description, inputSchema, annotations }) => ({
+      return reply(rpc(msg.id, { tools: ftToolsFor(env, conn).filter((t) => (t.name !== "search_artifacts" || searchReady) && (anyWrite || !t.write) && (!t.review || rvListReview)).map(({ name, title, description, inputSchema, annotations }) => ({
         name,
         title,
         description: WEB_URL_OUTPUT_SCHEMAS[name] ? description + WEB_URL_TOOL_NOTE : description,
@@ -7710,6 +8653,7 @@ var init_mcp = __esm({
     TOOLS = [
       { name: "connection_info", title: "Check connection access", description: "Identify this authenticated connection and its current effective project access. No document reads or writes. Compare the safe ID in Connections.", inputSchema: S({}, []), annotations: RO, write: false },
       ...tplTools(true),
+      ...rvTools(true),
       { name: "list_changes", title: "List project changes", description: "Poll published changes in one explicit project. WITHOUT cursor establishes a current checkpoint and returns NO history (initialized=true). Store next_cursor; follow has_more, then poll again. At-least-once: deduplicate by event_id. Cursors expire after 30 days; checkpoint BEFORE reconciling current content. Publishers excluded. No bodies or push notifications.", inputSchema: S({ project_id: { type: "string", maxLength: 64 }, cursor: { type: "string", maxLength: 2048 }, limit: { type: "integer", minimum: 1, maximum: 50 } }, ["project_id"]), annotations: RO, write: false, run: (c,p,a) => listChanges(c,p,a) },
       { name: "search_artifacts", title: "Search library", description: "Ranked lexical search across currently readable projects. All words must match stored title/text; punctuation separates words. Returns bounded plain-text excerpts and revision-pinned links. Live pagination expires after 15 minutes.", inputSchema: RS_SCHEMA, annotations: RO, write: false, run: (c, p, a) => searchArtifacts(c,a,"mcp") },
       {
@@ -7744,10 +8688,11 @@ var init_mcp = __esm({
         name: "read_artifact",
         title: "Read document",
         description: "Read a Markdown or HTML document (current or a given revision). Returns body (source text), kind, revision and sha256. For long documents pass max_bytes (4096-524288) to get one bounded chunk, then pass next_cursor until eof: every chunk comes from the same version (revision + sha256), so concurrent edits never mix in; a revision_changed error means start again. Chunks return text, offset, content_bytes, eof and next_cursor.",
-        inputSchema: S({ project_id: P, artifact_id: A, revision: { type: "integer", minimum: 1 }, cursor: RT_CURSOR, max_bytes: RT_MAXB }, ["artifact_id"]),
+        inputSchema: S({ project_id: P, artifact_id: A, revision: { type: "integer", minimum: 1 }, reviewed: RV_REVIEWED_ARG, cursor: RT_CURSOR, max_bytes: RT_MAXB }, ["artifact_id"]),
         annotations: RO,
         write: false,
         run: /* @__PURE__ */ __name(async (c, p, a) => {
+          a = await rvReviewedArgs(c, p, a);
           if (a.cursor != null || a.max_bytes != null) return readTextChunk(c, p, a.artifact_id, { revision: a.revision, cursor: a.cursor, maxBytes: a.max_bytes, encoding: "mcp", kinds: appConnectEnabled(c.env) ? RT_KINDS_ALL : RT_KINDS_DOCS });
           const r = await getArtifact(c, p, a.artifact_id, a.revision);
           if ((r.artifact.kind === "json" || r.artifact.kind === "csv") && appConnectEnabled(c.env)) {
@@ -7814,11 +8759,11 @@ var init_mcp = __esm({
         name: "save_markdown",
         title: "Edit document",
         description: "Save a new revision of a Markdown or HTML document (the format is kept). expected_revision must be the revision you read; on revision_conflict re-read and merge. Every save is kept as an immutable version the owner can compare and restore. Always set change_note to one line on why you made the change; the owner reads it in History.",
-        inputSchema: S({ project_id: P, artifact_id: A, expected_revision: { type: "integer", minimum: 1 }, body: { type: "string" }, change_note: NOTE, idempotency_key: K }, ["artifact_id", "expected_revision", "body", "idempotency_key"]),
+        inputSchema: S({ project_id: P, artifact_id: A, expected_revision: { type: "integer", minimum: 0, description: "The revision you read (0 to revise your own new document while it waits for review)" }, body: { type: "string" }, change_note: NOTE, idempotency_key: K }, ["artifact_id", "expected_revision", "body", "idempotency_key"]),
         annotations: RW,
         write: true,
         run: /* @__PURE__ */ __name(async (c, p, a) => {
-          const cur = await getArtifact(c, p, a.artifact_id);
+          const cur = { artifact: await loadArtifact(c, p, a.artifact_id, { pendingOk: rvGatedActor(c) }) };
           if (cur.artifact.kind !== "markdown" && cur.artifact.kind !== "html") throw new HttpError(415, "unsupported_kind", "Only Markdown and HTML documents can be edited");
           return unwrap(await saveMarkdown(c, p, a.artifact_id, { expected_revision: a.expected_revision, body: a.body, change_note: a.change_note }, idemKey(a.idempotency_key)));
         }, "run")
@@ -7991,7 +8936,7 @@ async function ftUploadBegin(c, p, a, opts = {}) {
   const uc = await ftUploadCtx(c, true);
   const key = idemKey(a.idempotency_key);
   if (!isNew) {
-    const cur = await loadArtifact(c, p, str(a.artifact_id, "artifact_id", 64));
+    const cur = await loadArtifact(c, p, str(a.artifact_id, "artifact_id", 64), { pendingOk: rvGatedActor(c) });
     if (cur.kind !== "binary") throw new HttpError(415, "unsupported_kind", "Not a file; use save_markdown for documents");
     // Fail early on a stale revision, except when retrying a begin that already succeeded (it replays below).
     const retry = await db(c).prepare("SELECT 1 AS x FROM idempotency WHERE principal_id = ? AND project_id = ? AND op = 'upload.begin' AND key = ?").bind(uc.principal.id, p, key).first("x");
@@ -8110,7 +9055,7 @@ function ftToolsFor(env, conn) {
         title: { type: "string", minLength: 1, maxLength: 200, description: "Title of a new file" },
         folder: { type: "string", maxLength: 200 },
         artifact_id: { ...A, description: "File to add a new version to" },
-        expected_revision: { type: "integer", minimum: 1, description: "Current revision of artifact_id" },
+        expected_revision: { type: "integer", minimum: 0, description: "Current revision of artifact_id (0 for your own new file while it waits for review)" },
         mime: { type: "string", enum: Object.keys(BINARY_TYPES) },
         size: { type: "integer", minimum: 1, maximum: LIMITS.binaryBytes },
         sha256: { type: "string", pattern: "^[0-9a-f]{64}$", description: "SHA-256 of the bytes, lowercase hex" },
@@ -8130,7 +9075,7 @@ function ftToolsFor(env, conn) {
         title: { type: "string", minLength: 1, maxLength: 200, description: "Title of a new file" },
         folder: { type: "string", maxLength: 200 },
         artifact_id: { ...A, description: "File to add a new version to" },
-        expected_revision: { type: "integer", minimum: 1, description: "Current revision of artifact_id" },
+        expected_revision: { type: "integer", minimum: 0, description: "Current revision of artifact_id (0 for your own new file while it waits for review)" },
         mime: { type: "string", enum: Object.keys(BINARY_TYPES) },
         content_base64: { type: "string", maxLength: FT_INLINE_B64_MAX + 4, contentEncoding: "base64", description: "The file's bytes, standard base64" },
         change_note: NOTE,
@@ -8174,6 +9119,7 @@ function ftToolsFor(env, conn) {
         description: "Read a document (Markdown, HTML, JSON, CSV: returns its text, revision and sha256) or a file (image, PDF, video: same result as read_file), current or a given revision.",
         inputSchema: S({ ...t.inputSchema.properties, include_image: { type: "boolean", description: "For images: return them inline (default true)" } }, t.inputSchema.required),
         run: /* @__PURE__ */ __name(async (c, p, a) => {
+          a = await rvReviewedArgs(c, p, a);
           const { include_image: _x, ...rest } = a;
           try {
             return await t.run(c, p, rest);
@@ -8220,6 +9166,7 @@ async function handleFileTransfer(req, env, url) {
     };
     if (kind === "download") {
       await rateLimit(env, `dl:oauth:${conn.id}`, 300);
+      if (row.proposal_id) return await serveProposalContent({ ...ctx, ftConn: conn }, req, row.project_id, row.proposal_id);
       return await serveContent(ctx, req, row.project_id, row.artifact_id, String(row.rev_no));
     }
     if (!canWrite) throw new HttpError(403, "forbidden", "This connection is read-only for this project");
@@ -10238,7 +11185,7 @@ async function exportBackup(ctx, projectId) {
   const pubFiles = await DB.prepare("SELECT COUNT(*) AS n FROM artifacts WHERE project_id = ? AND publisher_id IS NOT NULL").bind(projectId).first("n").catch(() => 0);
   if (pubFiles) throw new HttpError(409, "backup_unsupported", "This project contains app exports; backup of App Connect projects is not supported yet");
   const [arts, revs, comments] = await DB.batch([
-    DB.prepare("SELECT id, kind, title, folder, tags, head_rev, head_revision_id, meta_version, trashed_at, created_at, updated_at, is_template, template_description, source_artifact_id, source_revision, source_role, template_date FROM artifacts WHERE project_id = ? AND head_rev > 0").bind(projectId),
+    DB.prepare("SELECT id, kind, title, folder, tags, head_rev, head_revision_id, meta_version, trashed_at, created_at, updated_at, is_template, template_description, source_artifact_id, source_revision, source_role, template_date FROM artifacts WHERE project_id = ? AND (head_rev > 0 OR pending_review = 1)").bind(projectId),
     DB.prepare("SELECT id, artifact_id, rev_no, author_id, body, blob_key, size, sha256, mime, restored_from, created_at, via_kind, via_id, via_label, client_info, change_note FROM revisions WHERE project_id = ?").bind(projectId),
     DB.prepare("SELECT id, artifact_id, rev_no, author_id, body, created_at FROM comments WHERE project_id = ?").bind(projectId),
     DB.prepare("SELECT id, artifact_id, version, title, folder, tags, trashed, author_id, via_kind, via_id, via_label, client_info, change_note, restored_from, created_at, template_description FROM meta_versions WHERE project_id = ?").bind(projectId)
@@ -10253,9 +11200,10 @@ async function exportBackup(ctx, projectId) {
     if (sha2 !== r.sha256) throw new HttpError(500, "blob_corrupt", "Stored blob hash mismatch");
     blobs[r.blob_key] = { sha256: sha2, data: b64(bytes) };
   }
+  const rvSection = await rvBackupExport(ctx, projectId, blobs);
   await DB.prepare("INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id) VALUES (?, ?, ?, 'backup.export', ?, 'ok', ?)").bind(nowIso(), ctx.principal.id, projectId, projectId, ctx.requestId).run();
   return {
-    schema: arts.results.some(a => a.is_template || a.source_artifact_id) ? "agent-library-backup/2" : SCHEMA,
+    schema: rvSection ? "agent-library-backup/3" : arts.results.some(a => a.is_template || a.source_artifact_id) ? "agent-library-backup/2" : SCHEMA,
     features: ["document_templates/1"],
     exported_at: nowIso(),
     project: { id: p.id, title: p.title, created_at: p.created_at },
@@ -10263,6 +11211,7 @@ async function exportBackup(ctx, projectId) {
     revisions: revs.results,
     comments: comments.results,
     meta_versions: metaVersionsExport,
+    ...rvSection ?? {},
     blobs
   };
 }
@@ -10270,7 +11219,7 @@ __name(exportBackup, "exportBackup");
 async function restoreBackup(ctx, backup) {
   requireHuman(ctx);
   const DB = ctx.env.DB;
-  if (backup?.schema !== SCHEMA && backup?.schema !== "agent-library-backup/2") throw new HttpError(400, "bad_backup", "Unsupported backup schema");
+  if (backup?.schema !== SCHEMA && backup?.schema !== "agent-library-backup/2" && backup?.schema !== "agent-library-backup/3") throw new HttpError(400, "bad_backup", "Unsupported backup schema");
   const existing = await DB.prepare("SELECT COUNT(*) AS n FROM projects").first("n");
   if (existing) throw new HttpError(409, "store_not_empty", "Restore targets an empty isolated store only");
   const pid = String(backup.project?.id ?? "");
@@ -10301,12 +11250,14 @@ async function restoreBackup(ctx, backup) {
     if (await sha256Hex(bytes) !== r.sha256 || bytes.length !== r.size) throw new HttpError(400, "bad_backup", `Blob for ${r.id} hash/size mismatch`);
     decoded.set(r.blob_key, bytes);
   }
+  await rvRestorePrepare(backup, blobs, decoded, pid);
   for (const [k, bytes] of decoded) await ctx.env.BLOBS.put(k, bytes);
   if (backup.meta_versions !== void 0 && !Array.isArray(backup.meta_versions)) throw new HttpError(400, "bad_backup", "meta_versions must be a list");
-  const authors = new Set([...backup.revisions, ...backup.comments, ...backup.meta_versions ?? []].map((x) => x.author_id));
+  const authors = new Set([...backup.revisions, ...backup.comments, ...backup.meta_versions ?? []].map((x) => x.author_id).concat(rvRestoreAuthors(backup)));
   const stmts = [];
   for (const a of authors) if (a !== ctx.principal.id)
     stmts.push(DB.prepare("INSERT OR IGNORE INTO principals (id, kind, issuer, subject, label, created_at) VALUES (?, 'agent', 'restored', ?, ?, ?)").bind(a, a, "restored " + a, nowIso()));
+  stmts.push(DB.prepare("INSERT OR IGNORE INTO review_restore_context (id) VALUES (1)"));
   stmts.push(DB.prepare("INSERT INTO projects (id, owner_id, title, created_at) VALUES (?, ?, ?, ?)").bind(pid, ctx.principal.id, backup.project.title, backup.project.created_at));
   for (const a of backup.artifacts)
     stmts.push(DB.prepare(`INSERT INTO artifacts (id, project_id, kind, title, folder, tags, head_rev, head_revision_id, meta_version, trashed_at, created_at, updated_at, is_template, template_description, source_artifact_id, source_revision, source_role, template_date)
@@ -10320,6 +11271,7 @@ async function restoreBackup(ctx, backup) {
   for (const c of backup.comments)
     stmts.push(DB.prepare("INSERT INTO comments (id, project_id, artifact_id, rev_no, author_id, body, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(c.id, pid, c.artifact_id, c.rev_no, c.author_id, c.body, c.created_at));
   stmts.push(DB.prepare("INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id) VALUES (?, ?, ?, 'backup.restore', ?, 'ok', ?)").bind(nowIso(), ctx.principal.id, pid, pid, ctx.requestId));
+  stmts.push(...rvRestoreStatements(DB, backup, pid), DB.prepare("DELETE FROM review_restore_context"));
   await DB.batch(stmts);
   return { restored_project: pid, artifacts: backup.artifacts.length, revisions: backup.revisions.length, blobs: decoded.size, grants: 0 };
 }
@@ -10351,12 +11303,13 @@ async function reconcileUploads(env, opts = {}) {
     purgedStaging += r.meta.changes ? 1 : 0;
   }
   const fi = await DB.prepare(`SELECT id, final_key FROM uploads u WHERE final_key IS NOT NULL AND final_purged_at IS NULL AND state IN ('failed','conflict') AND final_writes = 0
-      AND NOT EXISTS (SELECT 1 FROM revisions r WHERE r.blob_key = u.final_key)${pf.replace("project_id", "u.project_id")} LIMIT ?`).bind(...pp, limit).all();
+      AND NOT EXISTS (SELECT 1 FROM revisions r WHERE r.blob_key = u.final_key) AND NOT EXISTS (SELECT 1 FROM proposals pr WHERE pr.blob_key = u.final_key)${pf.replace("project_id", "u.project_id")} LIMIT ?`).bind(...pp, limit).all();
   for (const u of fi.results) {
     await env.BLOBS.delete(u.final_key);
     const r = await DB.prepare("UPDATE uploads SET final_purged_at = ? WHERE id = ? AND final_purged_at IS NULL").bind(now, u.id).run();
     purgedFinal += r.meta.changes ? 1 : 0;
   }
+  await rvPurge(env, now, limit, opts.projectId ?? null);
   await DB.prepare("DELETE FROM rate_counters WHERE win < ?").bind(Math.floor(now / 6e4) - 2).run();
   await DB.prepare("DELETE FROM transfer_links WHERE expires_at < ?").bind(now).run().catch(() => {
   });
@@ -10466,6 +11419,7 @@ async function revokeConnection(ctx, projectId, connectionId) {
   const r = await ctx.env.DB.prepare(`UPDATE oauth_connections SET revoked_at = ? WHERE id = ? AND owner_principal_id = ? AND revoked_at IS NULL
       AND EXISTS (SELECT 1 FROM oauth_connection_projects cp WHERE cp.connection_id = oauth_connections.id AND cp.project_id = ?)`).bind(nowMs(), connectionId, ctx.principal.id, projectId).run();
   if (!r.meta.changes) throw new HttpError(404, "not_found", "Active connection not found");
+  await ctx.env.DB.prepare("DELETE FROM review_grants WHERE path_kind = 'oauth' AND path_id = ?").bind(connectionId).run();
   await ctx.env.DB.prepare("INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id) VALUES (?, ?, ?, 'oauth.revoke', ?, 'ok', ?)").bind(nowIso(), ctx.principal.id, projectId, connectionId, ctx.requestId).run();
   const env = ctx.env;
   let kv = "skipped";
@@ -10503,7 +11457,9 @@ var quotaUsedSql = /* @__PURE__ */ __name((now) => `(SELECT COALESCE(SUM(size),0
   + (SELECT COALESCE(SUM(expected_size),0) FROM uploads WHERE project_id = ?1 AND staging_purged_at IS NULL
        AND (state IN ('failed','conflict') OR (state IN ('pending','received') AND expires_at <= ${Math.trunc(now)})))
   + (SELECT COALESCE(SUM(expected_size),0) FROM uploads WHERE project_id = ?1 AND final_key IS NOT NULL AND final_purged_at IS NULL
-       AND state IN ('failed','conflict'))`, "quotaUsedSql");
+       AND state IN ('failed','conflict'))
+  + (SELECT COALESCE(SUM(size),0) FROM (SELECT DISTINCT blob_key, size FROM proposals pq WHERE project_id = ?1 AND blob_key IS NOT NULL AND blob_purged_at IS NULL
+       AND NOT EXISTS (SELECT 1 FROM revisions rq WHERE rq.blob_key = pq.blob_key)))`, "quotaUsedSql");
 async function purgeStaging(env, u) {
   try {
     await env.BLOBS.delete(u.staging_key);
@@ -10527,20 +11483,24 @@ async function uploadBegin(ctx, projectId, input, key) {
   const limits = limitsFor(ctx.env);
   let artifactId;
   let baseRev;
+  let rvMeta = null;
   const stmts = [];
   const az = authzSql(ctx, projectId);
   if (input.artifact_id) {
     artifactId = str(input.artifact_id, "artifact_id", 64);
-    const a = await loadArtifact(ctx, projectId, artifactId);
+    const a = await loadArtifact(ctx, projectId, artifactId, { pendingOk: rvGatedActor(ctx) });
     assertWritable(ctx, a, "content");
     if (a.kind !== "binary") throw new HttpError(400, "invalid_input", "Not a binary artifact");
-    baseRev = int(input.expected_revision, "expected_revision", 1);
+    baseRev = int(input.expected_revision, "expected_revision", a.pending_review === 1 ? 0 : 1);
   } else {
     const title = str(input.title, "title", 200, { min: 1 });
     artifactId = randomId("art");
     baseRev = 0;
-    stmts.push(db2(ctx).prepare(`INSERT INTO artifacts (id, project_id, kind, title, folder, head_rev, created_at, updated_at)
-      SELECT ?, ?, 'binary', ?, ?, 0, ?, ? WHERE ${az.sql}`).bind(artifactId, projectId, title, str(input.folder, "folder", 200, { optional: true }), nowIso(), nowIso(), ...az.params));
+    const folder = str(input.folder, "folder", 200, { optional: true });
+    rvMeta = await rvNewGated(ctx, projectId, "binary") ? JSON.stringify({ title, folder }) : null;
+    if (rvMeta) await rvNewCap(ctx, projectId);
+    stmts.push(db2(ctx).prepare(`INSERT INTO artifacts (id, project_id, kind, title, folder, head_rev, created_at, updated_at, review_mode, pending_review)
+      SELECT ?, ?, 'binary', ?, ?, 0, ?, ?, ?, ? WHERE ${az.sql}`).bind(artifactId, projectId, rvMeta ? RV_PLACEHOLDER : title, rvMeta ? "" : folder, nowIso(), nowIso(), rvMeta ? "required" : "off", rvMeta ? 1 : 0, ...az.params));
   }
   const uploadId = randomId("upl", 18);
   const expires = nowMs() + limits.uploadTtlMs;
@@ -10564,6 +11524,7 @@ async function uploadBegin(ctx, projectId, input, key) {
       SELECT ?, ?, ?, ?, ?, 201, ?, ? WHERE ${gate}`).bind(ctx.principal.id, projectId, i.op, i.key, i.digest, JSON.stringify(body2), nowIso(), uploadId),
     audit(ctx, projectId, "upload.begin", artifactId, baseRev, "ok", gate, [uploadId])
   );
+  if (rvMeta) stmts.push(db2(ctx).prepare("UPDATE uploads SET review_meta = ? WHERE id = ?").bind(rvMeta, uploadId));
   const res = await db2(ctx).batch(stmts).catch(async (e) => {
     const p = await idemLookup(ctx, i);
     if (p) return p;
@@ -10727,7 +11688,7 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
     // Deleted only when the upload is terminal (so no new write can start) and no write is in flight (so none can
     // re-create it afterwards); otherwise cleanup purges it once the last write settles.
     const dropUnpublished = /* @__PURE__ */ __name(async () => {
-      const idle = await db2(ctx).prepare("SELECT 1 AS x FROM uploads u WHERE id = ? AND state IN ('failed','conflict') AND final_writes = 0 AND final_purged_at IS NULL AND NOT EXISTS (SELECT 1 FROM revisions r WHERE r.blob_key = u.final_key)").bind(uploadId).first("x");
+      const idle = await db2(ctx).prepare("SELECT 1 AS x FROM uploads u WHERE id = ? AND state IN ('failed','conflict') AND final_writes = 0 AND final_purged_at IS NULL AND NOT EXISTS (SELECT 1 FROM revisions r WHERE r.blob_key = u.final_key) AND NOT EXISTS (SELECT 1 FROM proposals pr WHERE pr.blob_key = u.final_key)").bind(uploadId).first("x");
       if (!idle) return;
       await ctx.env.BLOBS.delete(finalKey);
       await db2(ctx).prepare("UPDATE uploads SET final_purged_at = ? WHERE id = ? AND final_purged_at IS NULL").bind(nowMs(), uploadId).run();
@@ -10766,6 +11727,11 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
     const ok2 = { artifact_id: u.artifact_id, revision: u.base_rev + 1, revision_id: revId, sha256: sha2, size: bytes.length };
     const gate = "EXISTS (SELECT 1 FROM revisions WHERE id = ?)";
     try {
+      const gated = await rvGateUpload(ctx, projectId, u, i, { blobKey: finalKey, size: bytes.length, sha256: sha2, mime: u.mime }, { sql: fenced, params: [uploadId, token] }, token);
+      if (gated) {
+        if (!gated.body?.idempotent_replay) await purgeStaging(ctx.env, u);
+        return gated;
+      }
       const res = await publishRevision(
         ctx,
         projectId,
@@ -10803,7 +11769,7 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
 async function serveContent(ctx, req, projectId, artifactId, revParam) {
   await authorizeProject(ctx, projectId, false);
   const a = await loadArtifact(ctx, projectId, artifactId);
-  const revNo = revParam ? int(Number(revParam), "rev", 1) : a.head_rev;
+  const revNo = revParam === "reviewed" ? await rvResolveRev(ctx, a, "reviewed") : revParam ? int(Number(revParam), "rev", 1) : a.head_rev;
   const r = await db2(ctx).prepare("SELECT * FROM revisions WHERE artifact_id = ? AND project_id = ? AND rev_no = ?").bind(artifactId, projectId, revNo).first();
   if (!r) throw new HttpError(404, "not_found", "Revision not found");
   const sp = new URL(req.url).searchParams;
@@ -10893,6 +11859,7 @@ var unwrap2 = /* @__PURE__ */ __name((r) => r && typeof r.status === "number" &&
 var TOOLS2 = [
   { name: "connection_info", description: "Identify this authenticated grant and current project access. Read-only; compare the safe ID in Connections.", inputSchema: S2({}, []), annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }, run: (c) => legacyConnectionInfo(c) },
   ...tplTools(false),
+  ...rvTools(false),
   { name: "list_changes", description: "Poll published changes in one explicit project. WITHOUT cursor establishes a current checkpoint and returns NO history (initialized=true). Store next_cursor; follow has_more, then poll again. At-least-once: deduplicate by event_id. Cursors expire after 30 days; checkpoint BEFORE reconciling current content. Publishers excluded. No bodies or push notifications.", inputSchema: S2({ project_id: { type: "string", maxLength: 64 }, cursor: { type: "string", maxLength: 2048 }, limit: { type: "integer", minimum: 1, maximum: 50 } }, ["project_id"]), run: (c,a) => listChanges(c,a.project_id,a) },
   { name: "search_artifacts", description: "Ranked lexical search of currently readable projects, with excerpts and revision-pinned links. All words must match. Live pagination.", inputSchema: RS_SCHEMA, annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }, run: (c,a) => searchArtifacts(c,a,"mcp") },
   { name: "list_projects", description: "List projects this identity may access.", inputSchema: S2({}, []), run: /* @__PURE__ */ __name((c) => listProjects(c), "run") },
@@ -10905,8 +11872,8 @@ var TOOLS2 = [
   {
     name: "read_artifact",
     description: "Read an artifact's current (or given) revision. Markdown returns body; binaries return metadata and an authenticated content_url. For long documents pass max_bytes (4096-524288) to get one bounded chunk, then pass next_cursor until eof: every chunk comes from the same version (revision + sha256), so concurrent edits never mix in; a revision_changed error means start again.",
-    inputSchema: S2({ project_id: P2, artifact_id: A2, revision: { type: "integer" }, cursor: { type: "string", maxLength: 512 }, max_bytes: { type: "integer", minimum: 4096, maximum: 524288 } }, ["project_id", "artifact_id"]),
-    run: /* @__PURE__ */ __name((c, a) => a.cursor != null || a.max_bytes != null ? readTextChunk(c, a.project_id, a.artifact_id, { revision: a.revision, cursor: a.cursor, maxBytes: a.max_bytes, encoding: "mcp" }) : getArtifact(c, a.project_id, a.artifact_id, a.revision), "run")
+    inputSchema: S2({ project_id: P2, artifact_id: A2, revision: { type: "integer" }, reviewed: RV_REVIEWED_ARG, cursor: { type: "string", maxLength: 512 }, max_bytes: { type: "integer", minimum: 4096, maximum: 524288 } }, ["project_id", "artifact_id"]),
+    run: /* @__PURE__ */ __name(async (c, a0) => { const a = await rvReviewedArgs(c, a0.project_id, a0); return a.cursor != null || a.max_bytes != null ? readTextChunk(c, a.project_id, a.artifact_id, { revision: a.revision, cursor: a.cursor, maxBytes: a.max_bytes, encoding: "mcp" }) : getArtifact(c, a.project_id, a.artifact_id, a.revision); }, "run")
   },
   {
     name: "artifact_history",
@@ -11018,7 +11985,7 @@ async function handleMcp(req, env, requestId, origin) {
   if (msg.id === void 0) return new Response(null, { status: 202 });
   const rtLim = rtChunkLimit(msg);
   if (rtLim?.idTooLong) return new Response(JSON.stringify(RT_ID_TOO_LONG), { status: 400, headers: hdr });
-  const MUTATING = /* @__PURE__ */ new Set(["create_markdown", "save_markdown", "add_comment", "upload_begin", "upload_finish", "trash_artifact", "restore_revision", "restore_metadata", "create_from_template"]);
+  const MUTATING = /* @__PURE__ */ new Set(["create_markdown", "save_markdown", "add_comment", "upload_begin", "upload_finish", "trash_artifact", "restore_revision", "restore_metadata", "create_from_template", "withdraw_proposal", "review_proposal", "review_revision"]);
   try {
     await enforceRate(ctx, msg.method === "tools/call" && MUTATING.has(msg.params?.name));
   } catch (e) {
@@ -11026,6 +11993,7 @@ async function handleMcp(req, env, requestId, origin) {
     throw e;
   }
   const reply = /* @__PURE__ */ __name((body2) => new Response(rtFit(body2, rtLim), { status: 200, headers: hdr }), "reply");
+  const rvListReview = msg.method === "tools/list" && !!ctx.grant?.id && await rvAnyReview(env, "grant", ctx.grant.id);
   const searchReady = await rsToolReady(env,msg);
   switch (msg.method) {
     case "initialize": {
@@ -11041,7 +12009,7 @@ async function handleMcp(req, env, requestId, origin) {
     case "ping":
       return reply(rpc2(msg.id, {}));
     case "tools/list":
-      return reply(rpc2(msg.id, { tools: TOOLS2.filter(t => (t.name !== "search_artifacts" || searchReady) && (!t.write || !!ctx.grant?.can_write)).map(({ name, description, inputSchema, annotations }) => ({
+      return reply(rpc2(msg.id, { tools: TOOLS2.filter(t => (t.name !== "search_artifacts" || searchReady) && (!t.write || !!ctx.grant?.can_write) && (!t.review || rvListReview)).map(({ name, description, inputSchema, annotations }) => ({
         annotations,
         name,
         description: WEB_URL_OUTPUT_SCHEMAS[name] ? description + WEB_URL_TOOL_NOTE : description,
@@ -11601,7 +12569,57 @@ var APP_HTML = `<!doctype html>
 </body>
 </html>
 `;
-var APP_CSS = `/* File type thumbnails: the media covers the type icon once it has loaded. */
+var APP_CSS = `/* review gating (src/review/browser.js) */
+.rv-home{margin:0 0 18px}
+.rv-home-head{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin:0 0 6px}
+.rv-home-head h2{margin:0;display:flex;align-items:center;gap:8px}
+.rv-row .rv-note{display:block;font-size:13px;color:var(--muted);font-style:italic;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.rv-who{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:0 0 8px}
+.rv-why{margin:0 0 16px;padding:8px 12px;border-left:3px solid var(--accent-line);background:var(--accent-soft);border-radius:0 var(--r2) var(--r2) 0;overflow-wrap:anywhere}
+.rv-sec{margin:0 0 20px}
+.rv-sec h2{margin:0 0 8px}
+.rv-sec .tabs{margin:0 0 8px;flex-wrap:wrap}
+.rv-files{display:flex;gap:16px;flex-wrap:wrap;margin:0 0 8px}
+.rv-files figure{margin:0;max-width:min(320px,100%)}
+.rv-files img{max-width:100%;max-height:260px;border:1px solid var(--line);border-radius:var(--r2);background:var(--sunk)}
+.rv-files figcaption{font-size:12.5px;color:var(--muted);margin-top:4px}
+.rv-meta{border-collapse:collapse;font-size:14px}
+.rv-meta th,.rv-meta td{text-align:left;padding:4px 14px 4px 0;vertical-align:top;overflow-wrap:anywhere}
+.rv-meta tbody th{color:var(--muted);font-weight:500}
+.rv-decide{position:sticky;bottom:12px;display:flex;flex-direction:column;gap:10px;box-shadow:var(--shadow)}
+.rv-decide.editing{position:static;box-shadow:none}
+.rv-field{display:flex;flex-direction:column;align-items:stretch;gap:4px;font-size:13px;color:var(--muted)}
+.rv-field > input,.rv-field > textarea{color:var(--fg)}
+.rv-ref{max-height:240px;overflow:auto;margin-top:6px}
+.rv-stale{color:var(--warn);font-weight:500}
+.rv-decide .row{flex-wrap:wrap}
+.rv-edit{display:flex;flex-direction:column;gap:10px}
+.rv-text{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;min-height:200px}
+.rv-settings{margin-top:20px}
+.rv-settings h2{margin:0 0 4px}
+.rv-kinds{border:0;padding:0;margin:8px 0;display:flex;flex-wrap:wrap;gap:6px 14px}
+.rv-kinds legend{padding:0;margin-bottom:4px}
+.rv-kind{display:inline-flex;align-items:center;gap:6px}
+.rv-banner{align-items:center}
+.rv-banner > span{flex:1 1 auto}
+.rv-badge{gap:4px}
+.rv-badge svg{width:12px;height:12px;stroke:currentColor;fill:none;stroke-width:2.4}
+.rv-hist{display:block;font-size:13px;color:var(--muted)}
+.rv-grants{width:100%}
+.rv-grants-d summary{font-size:13px;color:var(--muted);cursor:pointer}
+.rv-grant{display:flex;align-items:center;gap:8px;font-size:13.5px;margin:4px 0}
+.rv-chip-row{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:6px 0 0}
+.rv-chip{display:inline-flex;align-items:center;gap:6px;font-size:13px;color:var(--ok);margin:6px 0 0}
+.rv-chip-row .rv-chip{margin:0}
+.rv-chip.warn{color:var(--warn)}
+.rv-chip svg{width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:2.2}
+.rv-docmode{border:0;padding:10px 0 0;margin:12px 0 0;border-top:1px solid var(--line);display:flex;flex-direction:column;gap:6px}
+.rv-docmode legend{font-weight:600;padding:0}
+.rv-radio{display:flex;align-items:flex-start;gap:8px;min-height:44px;cursor:pointer}
+.rv-radio > span{display:flex;flex-direction:column}
+@media (pointer:coarse){.rv-grant,.rv-kind{min-height:44px}}
+@media (max-width:760px){.rv-decide{bottom:calc(var(--tab-h) + 8px + env(safe-area-inset-bottom,0px))}.rv-decide .spacer{display:none}}
+/* File type thumbnails: the media covers the type icon once it has loaded. */
 .ficon-sm{position:relative;overflow:hidden}
 .ficon-sm > .thumb{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:0;pointer-events:none;background:var(--sunk)}
 .ficon-sm.has-thumb > .thumb{opacity:1}
@@ -12451,6 +13469,8 @@ function route() {
   if (p[0] === "p" && p[1]) {
     if (p[2] === "a" && p[3]) return viewArtifact(p[1], p[3], p[4] === "edit" ? "edit" : "preview");
     if (p[2] === "trash") return viewList(p[1], true);
+    if (p[2] === "review" && p[3]) return viewProposal(p[1], p[3]);
+    if (p[2] === "review") return viewProjectReview(p[1]);
     if (p[2] === "grants") { location.replace("#/settings/tokens"); return; }
     return viewList(p[1], false);
   }
@@ -12752,6 +13772,428 @@ function offlineThumb(it) {
   }
   return box;
 }
+// ---------- review gating (docs/review-gating.md; src/review) ----------
+// Home shows "Needs review" only when something waits for review (nothing otherwise). The review screen shows who proposed
+// what and why, the diff against the version it started from (and the current one when the document moved on), details
+// changes and file previews, with Approve / Edit and approve / Reject. Everything is built from text nodes.
+var RV_MODES_UI = ["off", "advisory", "required"];
+var RV_MODE_LABELS = { off: "Off", advisory: "Optional (mark versions reviewed)", required: "Required (agent edits wait for approval)" };
+function rvChanges(p) {
+  var parts = [];
+  if (p.is_new) parts.push("new " + (p.kind === "binary" ? "file" : "document"));
+  else {
+    if (p.changes.indexOf("content") >= 0) parts.push(p.kind === "binary" ? "new file version" : p.proposed && p.proposed.restored_from ? "restore of v" + p.proposed.restored_from : "edit");
+    if (p.changes.indexOf("details") >= 0) parts.push("title, folder or tags");
+  }
+  return parts.join(" + ");
+}
+function rvAgo(s) {
+  var t = Date.parse(s); if (isNaN(t)) return "";
+  var d = (Date.now() - t) / 1000;
+  return d < 60 ? "just now" : d < 3600 ? Math.round(d / 60) + " min ago" : d < 86400 ? Math.round(d / 3600) + " h ago" : fmtDate(s);
+}
+function rvCap(s) { return s ? s.charAt(0).toUpperCase() + s.slice(1) : s; }
+function rvTitle(p) { return p.document_title || (p.proposed && p.proposed.title) || "Untitled"; }
+function rvRow(p, showProject) {
+  var href = "#/p/" + enc(p.project_id) + "/review/" + enc(p.proposal_id);
+  return h("li", { class: "link rv-row", dataset: { proposal: p.proposal_id } },
+    h("span", { class: "ficon-sm", "aria-hidden": "true" }, icon(p.kind === "binary" ? "file" : "doc")),
+    h("div", { class: "grow" }, rowLink(href, rvTitle(p)),
+      h("span", { class: "meta" }, p.stale ? h("span", { class: "rv-stale", text: "Outdated: document changed · " }) : null,
+        [rvCap(rvChanges(p)) + " by " + p.who, showProject ? p.project_title : null, rvAgo(p.created_at)].filter(Boolean).join(" · ")),
+      p.change_note ? h("span", { class: "rv-note" }, "“" + p.change_note + "”") : null),
+    h("span", { class: "chev", "aria-hidden": "true" }, icon("chevron")));
+}
+// Home: one compact section, rendered only when the queue is not empty.
+// box.refresh() reloads it (Home's Refresh and returning to the tab).
+function rvHomeSection() {
+  var box = h("section", { class: "rv-home", hidden: true, "aria-labelledby": "rv-home-h" }), all = false, last = null;
+  function draw() {
+    var r = last;
+    if (!r || !r.proposals.length) { box.hidden = true; box.replaceChildren(); return; }
+    var shown = all ? r.proposals : r.proposals.slice(0, 5), n = r.proposals.length + (r.more ? "+" : "");
+    box.replaceChildren(
+      h("div", { class: "rv-home-head" }, h("h2", { id: "rv-home-h" }, "Needs review ", h("span", { class: "badge accent", text: String(n) })),
+        r.proposals.length > shown.length ? h("button", { type: "button", class: "ghost small", onclick: function () { all = true; draw(); } }, r.more ? "Show newest " + r.proposals.length : "Show all " + n) : null),
+      h("ul", { class: "list", "aria-label": "Edits waiting for review" }, shown.map(function (p) { return rvRow(p, true); })));
+    box.hidden = false;
+  }
+  // Best effort: an extra section never takes over the page (a failure, even an ended session, just leaves it as is).
+  box.refresh = function () {
+    return api("GET", "/api/review-queue", undefined, { noAuthRedirect: true }).then(function (r) { if (box.isConnected || !last) { last = r; draw(); } }).catch(function () {});
+  };
+  box.refresh();
+  return box;
+}
+// Project → Review tab: pending proposals, then the project's default for new documents.
+async function viewProjectReview(pid) {
+  var base = "/api/projects/" + enc(pid);
+  var msg = h("p", { class: "msg", role: "status", "aria-live": "polite" });
+  var list = h("ul", { class: "list", "aria-label": "Edits waiting for review" }), empty = h("div", { hidden: true });
+  var settings = h("div", { class: "card rv-settings" });
+  shell(projCrumbs(pid, [{ t: "Review" }]), pageHead(projectTitles[pid] || pid, { sub: "Edits by apps and agents that wait for your approval before anyone else sees them." }), projectTabs(pid, "review"), msg, list, empty, settings);
+  ensureProjectTitle(pid);
+  skeletonRows(list, 2);
+  try {
+    var r = await api("GET", base + "/proposals");
+    doneLoading(list); list.replaceChildren(); r.proposals.forEach(function (p) { list.append(rvRow(p, false)); });
+    list.hidden = !r.proposals.length; empty.hidden = !!r.proposals.length;
+    if (!r.proposals.length) empty.replaceChildren(stateBox("", "check", "Nothing to review", "When a document requires review, edits by apps and agents wait here until you approve them."));
+    var cursor = r.next_cursor;
+    if (cursor) {
+      var more = h("button", { type: "button", class: "secondary", onclick: async function () {
+        more.disabled = true;
+        try { var n = await api("GET", base + "/proposals?cursor=" + enc(cursor)); n.proposals.forEach(function (p) { list.append(rvRow(p, false)); }); cursor = n.next_cursor; more.hidden = !cursor; }
+        catch (err) { showErr(msg, err); } finally { more.disabled = false; }
+      } }, "Load more");
+      list.after(more);
+    }
+  } catch (err) { doneLoading(list); list.hidden = true; showErr(msg, err); }
+  drawSettings();
+  async function drawSettings() {
+    var s;
+    try { s = await api("GET", base + "/review-settings"); } catch (err) { settings.replaceChildren(h("p", { class: "msg error", text: "Review settings couldn't load: " + err.message })); return; }
+    var mode = h("select", { "aria-label": "Review for new documents" }, ["off", "advisory", "required"].map(function (m) { return h("option", { value: m, text: RV_MODE_LABELS[m], selected: s.default === m }); }));
+    var kinds = [["markdown", "Docs"], ["html", "Pages"], ["json", "JSON"], ["csv", "CSV"], ["binary", "Files (images, PDFs, other uploads)"]].map(function (k) {
+      return h("label", { class: "rv-kind" }, h("input", { type: "checkbox", value: k[0], checked: !s.kinds || s.kinds.indexOf(k[0]) >= 0 }), k[1]);
+    });
+    var kindBox = h("fieldset", { class: "rv-kinds", hidden: s.default === "off" }, h("legend", { class: "small muted", text: "Applies to" }), kinds);
+    var smsg = h("p", { class: "msg", role: "status", "aria-live": "polite" });
+    function chosen() { var ks = kinds.map(function (l) { return l.firstChild; }).filter(function (c) { return c.checked; }).map(function (c) { return c.value; }); return ks.length === kinds.length ? null : ks; }
+    async function persist() {
+      var ks = chosen(); if (ks && !ks.length) { showMsg(smsg, "Pick at least one type, or turn review off."); return false; }
+      s = await api("PUT", base + "/review-settings", { default: mode.value, kinds: ks });
+      return true;
+    }
+    var save = h("button", { type: "button", onclick: async function () {
+      save.disabled = true;
+      try { if (await persist()) showMsg(smsg, "Saved. New documents use this setting; existing ones keep theirs.", true); }
+      catch (err) { showErr(smsg, err); } finally { save.disabled = false; }
+    } }, "Save");
+    // Applies exactly what the page shows (saving it first), and says what it will change before it does.
+    var applyBtn = h("button", { type: "button", class: "secondary", onclick: async function () {
+      var target = mode.value, docs = s.documents || {}, others = RV_MODES_UI.filter(function (m) { return m !== target; })
+        .map(function (m) { return docs[m] ? (chosen() ? "documents" : plural(docs[m], "document")) + " currently " + (m === "off" ? "without review" : m === "required" ? "requiring review" : "with optional review") : null; }).filter(Boolean);
+      if (!others.length) { showMsg(smsg, "Every document already uses this setting.", true); return; }
+      var what = target === "off" ? "Turn review off for " : "Set review to " + RV_MODE_LABELS[target].split(" (")[0].toLowerCase() + " for ";
+      if (!confirm(what + others.join(" and ") + " (" + kindNames() + ")?" + (target === "required" ? " Their current versions count as reviewed." : "") + (target === "off" && docs.required ? " Agent edits will go live without approval." : "") + " Edits already waiting stay pending.")) return;
+      applyBtn.disabled = true;
+      try {
+        if (!await persist()) return;
+        var a = await api("POST", base + "/review-settings/apply", { expected_default: target, expected_kinds: s.kinds });
+        showMsg(smsg, "Updated " + plural(a.updated.length, "document") + (a.skipped_changed.length ? "; " + plural(a.skipped_changed.length, "document") + " changed while applying and kept their setting" : "") + ".", true);
+        s = await api("GET", base + "/review-settings");
+      } catch (err) { showErr(smsg, err); } finally { applyBtn.disabled = false; }
+    } }, "Save and apply to existing documents");
+    function kindNames() { var ks = chosen(); return ks ? kinds.filter(function (l) { return l.firstChild.checked; }).map(function (l) { return l.textContent; }).join(", ") : "all types"; }
+    mode.addEventListener("change", function () { kindBox.hidden = mode.value === "off"; });
+    settings.replaceChildren(h("h2", { text: "Review for new documents" }),
+      h("p", { class: "muted small", text: "Your own edits never wait for review. Files from publishing apps are never gated. Change one document from its Details." }),
+      h("div", { class: "row" }, h("label", { class: "row" }, "New documents", mode)), kindBox, h("div", { class: "row" }, save, applyBtn), smsg);
+  }
+}
+// One proposal: what changed and why, then the decision.
+async function viewProposal(pid, prp) {
+  var base = "/api/projects/" + enc(pid), path = base + "/proposals/" + enc(prp);
+  shell(projCrumbs(pid, [{ t: "Review", href: "#/p/" + enc(pid) + "/review" }, { t: "Loading…" }]), h("div", { class: "doc-loading", "aria-busy": "true" }, h("span", { class: "skel-line wide" }), h("div", { class: "skel-block" })));
+  ensureProjectTitle(pid);
+  var d;
+  try { d = await api("GET", path); }
+  catch (err) {
+    shell(projCrumbs(pid, [{ t: "Review", href: "#/p/" + enc(pid) + "/review" }, { t: "Not available" }]), stateBox("error", "alert", err.status === 404 ? "This proposal isn't available" : "Couldn't load this proposal", err.message, h("a", { class: "btn secondary", href: "#/p/" + enc(pid) + "/review" }, "Back to Review")));
+    return;
+  }
+  var p = d.proposal, docHref = "#/p/" + enc(pid) + "/a/" + enc(p.artifact_id);
+  var msg = h("p", { class: "msg", role: "status", "aria-live": "polite" });
+  var head = pageHead(rvTitle(p), { eyebrow: p.is_new ? "New " + (p.kind === "binary" ? "file" : "document") + " · waiting for review" : "Proposed " + rvChanges(p),
+    actions: p.is_new ? null : h("a", { class: "btn secondary", href: docHref }, "Open document") });
+  var who = h("p", { class: "rv-who" }, h("strong", { text: p.who }), p.via && p.via.kind === "oauth" ? h("span", { class: "badge", text: "connected app" }) : p.via && p.via.kind === "api_key" ? h("span", { class: "badge", text: "API key" }) : p.via && p.via.kind === "grant" ? h("span", { class: "badge", text: "agent token" }) : null,
+    h("span", { class: "muted small", text: (p.client_info ? " via " + p.client_info : "") + " · " + rvAgo(p.created_at) + (p.is_new ? "" : " · based on v" + p.base_revision) }));
+  var why = p.change_note ? h("blockquote", { class: "rv-why" }, p.change_note) : h("p", { class: "muted small", text: "No note given." });
+  var status = p.status !== "pending" ? h("div", { class: "callout " + (p.status === "approved" ? "info" : "warn") }, icon(p.status === "approved" ? "check" : "alert"),
+    h("span", null, h("strong", { text: { approved: "Approved", rejected: "Rejected", superseded: "Replaced by a newer proposal", withdrawn: "Withdrawn by its author" }[p.status] || p.status }),
+      d.review ? " by " + d.review.who + (d.review.note ? ": “" + d.review.note + "”" : "") : "",
+      p.status === "approved" && p.result_revision ? h("span", null, " · ", h("a", { href: docHref + "?v=" + p.result_revision, text: "version " + p.result_revision })) : null)) : null;
+  var stale = p.status === "pending" && p.stale ? h("div", { class: "callout warn", id: "rv-stale" }, icon("alert"), h("span", null, h("strong", { text: "The document changed since this was proposed" }),
+    p.kind === "binary" && p.changes.indexOf("content") >= 0
+      ? " (now v" + p.current_revision + "). A file can't be merged: reject it and ask " + p.who + " to upload again, or upload the file yourself."
+      : " (now v" + p.current_revision + "). It can't be approved as is: use Edit and approve to bring its changes into the current version, or reject it.")) : null;
+  var sections = [];
+  // Content: text diff, or file preview.
+  var bodyText = typeof d.body === "string" ? d.body : null;
+  if (p.changes.indexOf("content") >= 0) {
+    if (p.kind === "binary") {
+      var url = path + "/content";
+      var prev = p.proposed && /^image\//.test(p.proposed.mime || "") && !p.is_new ? h("figure", null, h("img", { src: base + "/artifacts/" + enc(p.artifact_id) + "/content?rev=" + p.current_revision, alt: "Current version", loading: "lazy" }), h("figcaption", { text: "Current (v" + p.current_revision + ")" })) : null;
+      var next = p.proposed && /^image\//.test(p.proposed.mime || "") ? h("figure", null, h("img", { src: url, alt: "Proposed file", loading: "lazy" }), h("figcaption", { text: "Proposed" })) : null;
+      sections.push(h("section", { class: "rv-sec" }, h("h2", { text: "File" }),
+        prev || next ? h("div", { class: "rv-files" }, prev, next) : null,
+        h("p", { class: "muted small", text: (p.proposed.mime || "file") + " · " + fmtBytes(p.proposed.size) + " · SHA-256 " + String(p.proposed.sha256).slice(0, 16) + "…" +
+          (d.diff_from_current && d.diff_from_current.identical || !d.diff_from_current && d.diff_from_base && d.diff_from_base.identical ? " · identical to the current version" : "") }),
+        h("a", { class: "btn secondary", href: downloadUrl(url) }, icon("download"), "Download proposed file")));
+    } else {
+      var diffBox = h("div");
+      var tabs = h("div", { class: "tabs", role: "group", "aria-label": "Compare with" });
+      function tabBtn(label, diff, sel) { var b = h("button", { type: "button", "aria-pressed": String(!!sel), onclick: function () { tabs.querySelectorAll("button").forEach(function (x) { x.setAttribute("aria-pressed", String(x === b)); }); rvDrawDiff(diffBox, diff, bodyText); } }, label); return b; }
+      if (d.diff_from_current) tabs.append(tabBtn("Vs current (v" + d.diff_from_current.from_revision + ")", d.diff_from_current, true));
+      if (d.diff_from_base) tabs.append(tabBtn("Its changes (from v" + d.diff_from_base.from_revision + ")", d.diff_from_base, !d.diff_from_current));
+      tabs.append(tabBtn("Full text", null, !d.diff_from_base && !d.diff_from_current));
+      sections.push(h("section", { class: "rv-sec" }, h("h2", { text: p.is_new ? "Content" : "Changes" }), tabs.children.length > 1 ? tabs : null, diffBox));
+      rvDrawDiff(diffBox, d.diff_from_current || d.diff_from_base, bodyText);
+    }
+  }
+  if (d.details) {
+    var c = d.details.current, n = d.details.proposed;
+    var rows = [["Title", c.title, n.title], ["Folder", c.folder || "—", n.folder || "—"], ["Tags", (c.tags || []).join(", ") || "—", (n.tags || []).join(", ") || "—"]].filter(function (r) { return p.is_new || r[1] !== r[2]; });
+    sections.push(h("section", { class: "rv-sec" }, h("h2", { text: "Title, folder and tags" }),
+      h("table", { class: "rv-meta" }, h("thead", null, h("tr", null, h("th", { scope: "col" }, h("span", { class: "sr", text: "Field" })), p.is_new ? null : h("th", { scope: "col", text: "Now" }), h("th", { scope: "col", text: "Proposed" }))),
+        h("tbody", null, rows.map(function (r) { return h("tr", null, h("th", { scope: "row", text: r[0] }), p.is_new ? null : h("td", { text: r[1] || "—" }), h("td", { text: r[2] || "—" })); })))));
+  }
+  // Decision.
+  var decide = null;
+  if (p.status === "pending" && d.can_review) {
+    var note = h("input", { type: "text", maxLength: 280, placeholder: "Optional, up to 280 characters", "aria-label": "Review note", class: "full-w" });
+    var dmsg = h("p", { class: "msg", id: "rv-dmsg", role: "status", "aria-live": "polite" });
+    var staleNow = !!p.stale;
+    var attempt = null, busy = false;
+    var editor = null, fTitle = null, fFolder = null, fTags = null;
+    var approve = h("button", { type: "button", onclick: function () { send("approve", false); } }, icon("check"), "Approve");
+    function markStale() { approve.disabled = staleNow; if (staleNow) approve.setAttribute("aria-describedby", document.getElementById("rv-stale") ? "rv-stale" : "rv-dmsg"); }
+    markStale();
+    var canEdit = p.kind !== "binary" || d.details;
+    var editBtn = canEdit ? h("button", { type: "button", class: "secondary", onclick: openEditor }, "Edit and approve…") : null;
+    var reject = h("button", { type: "button", class: "danger", onclick: function () { send("reject", false); } }, "Reject");
+    var editArea = h("div", { class: "rv-edit", hidden: true });
+    function openEditor() {
+      editArea.hidden = false; editBtn.hidden = true; approve.hidden = true;
+      var parts = [h("p", { class: "muted small", text: "Your version is published instead of the proposed one; you'll be shown as its author, with " + p.who + " credited." })];
+      if (p.kind !== "binary" && bodyText !== null) {
+        editor = h("textarea", { class: "full-w rv-text", rows: 14, "aria-label": "Text to publish", spellcheck: "true" });
+        editor.value = bodyText;
+        if (staleNow && !p.is_new) {
+          // Stale: start from the current version (nothing newer is lost) and bring the proposal's changes in by hand,
+          // with its changes shown right here; or start from the proposed text.
+          var fromCur = h("button", { type: "button", "aria-pressed": "true" }, "Current version (v" + p.current_revision + ")");
+          var fromProp = h("button", { type: "button", "aria-pressed": "false" }, "Proposed text");
+          var pick = async function (cur) {
+            var set = function () { fromCur.setAttribute("aria-pressed", String(cur)); fromProp.setAttribute("aria-pressed", String(!cur)); };
+            if (!cur) { editor.value = bodyText; set(); return; }
+            editor.readOnly = true;
+            try { var r = await api("GET", base + "/artifacts/" + enc(p.artifact_id) + "?rev=" + p.current_revision); editor.value = r.body; set(); }
+            catch (err) { showErr(dmsg, err); fromCur.setAttribute("aria-pressed", "false"); fromProp.setAttribute("aria-pressed", "true"); }
+            finally { editor.readOnly = false; }
+          };
+          fromProp.setAttribute("aria-pressed", "true"); fromCur.setAttribute("aria-pressed", "false");
+          fromCur.addEventListener("click", function () { pick(true); }); fromProp.addEventListener("click", function () { pick(false); });
+          var ref = h("div", { class: "rv-ref" });
+          rvDrawDiff(ref, d.diff_from_base, bodyText);
+          parts.push(h("div", { class: "row small" }, h("span", { class: "muted", text: "Start from" }), h("div", { class: "tabs", role: "group", "aria-label": "Start from" }, fromCur, fromProp)),
+            h("details", { open: true }, h("summary", { text: "The proposal's changes (from v" + p.base_revision + ")" }), ref));
+          pick(true);
+        }
+        parts.push(h("label", { class: "rv-field" }, "Text to publish", editor));
+      }
+      if (d.details) {
+        fTitle = h("input", { type: "text", maxLength: 200, value: d.details.proposed.title || "" });
+        fFolder = h("input", { type: "text", maxLength: 200, value: d.details.proposed.folder || "" });
+        fTags = h("input", { type: "text", value: (d.details.proposed.tags || []).join(", ") });
+        parts.push(h("div", { class: "grid2" }, h("label", { class: "rv-field" }, "Title", fTitle), h("label", { class: "rv-field" }, "Folder", fFolder), h("label", { class: "rv-field" }, "Tags (comma separated)", fTags)));
+      }
+      parts.push(h("div", { class: "row" }, h("button", { type: "button", onclick: function () { send("approve", true); } }, icon("check"), "Publish my version"),
+        h("button", { type: "button", class: "secondary", onclick: closeEditor }, "Cancel")));
+      editArea.replaceChildren.apply(editArea, parts);
+      decideCard.classList.add("editing"); reject.hidden = true;
+      editArea.onkeydown = function (e) {
+        if (e.key === "Escape") { e.preventDefault(); closeEditor(); }
+        else if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); send("approve", true); }
+      };
+      (editor || fTitle).focus();
+    }
+    function closeEditor() { editArea.hidden = true; editBtn.hidden = false; approve.hidden = false; reject.hidden = false; decideCard.classList.remove("editing"); editBtn.focus(); }
+    async function send(decision, edited) {
+      if (busy) return;
+      if (decision === "reject" && !confirm("Reject this proposal?" + (note.value.trim() ? " " + p.who + " will see your note." : " You can add a note for " + p.who + " first."))) return;
+      var req = { decision: decision, note: note.value.trim() || undefined };
+      if (edited) {
+        if (editor) { req.body = editor.value; req.expected_revision = p.is_new ? 0 : p.current_revision; }
+        if (fTitle) { req.title = fTitle.value.trim(); req.folder = fFolder.value.trim(); req.tags = fTags.value.split(",").map(function (s) { return s.trim(); }).filter(Boolean); if (!p.is_new) req.expected_meta_version = p.current_meta_version; }
+      }
+      var sig = JSON.stringify(req);
+      if (!attempt || attempt.sig !== sig) attempt = { sig: sig, key: uuid() };
+      busy = true; [approve, reject, editBtn].forEach(function (b) { if (b) b.disabled = true; });
+      try {
+        var r = await api("POST", path + "/review", req, { key: attempt.key });
+        toast(r.status === "approved" ? "Approved · now version " + r.revision : "Rejected");
+        location.hash = await rvNextHash(pid, p.proposal_id, r.status === "approved" ? docHref : "#/p/" + enc(pid) + "/review");
+      } catch (err) {
+        busy = false; [reject, editBtn].forEach(function (b) { if (b) b.disabled = false; });
+        var code = ((err.data || {}).error || {}).code, reload = h("button", { type: "button", class: "secondary", onclick: function () { route(); } }, "Reload");
+        if (code === "proposal_stale") { staleNow = true; showMsg(dmsg, "The document changed while you were reviewing (now v" + ((err.data.error || {}).current_revision || "?") + "). Reload to see it, then use Edit and approve."); dmsg.append(" ", reload); }
+        else if (code === "proposal_closed") { staleNow = true; showMsg(dmsg, "This proposal was already " + ((err.data.error || {}).proposal_status || "closed") + "."); dmsg.append(" ", reload); }
+        else showErr(dmsg, err);
+        markStale();
+      }
+    }
+    var decideCard = decide = h("section", { class: "card rv-decide", "aria-label": "Decision" }, h("label", { class: "rv-field" }, "Note for " + p.who, note), editArea,
+      h("div", { class: "row" }, approve, editBtn, h("span", { class: "spacer" }), reject), dmsg);
+  } else if (p.status === "pending" && p.mine) {
+    decide = h("div", { class: "row" }, h("button", { type: "button", class: "secondary", onclick: async function (e) {
+      e.target.disabled = true;
+      try { await api("POST", path + "/withdraw", {}, { key: uuid() }); toast("Withdrawn"); location.hash = "#/p/" + enc(pid) + "/review"; }
+      catch (err) { showErr(msg, err); e.target.disabled = false; }
+    } }, "Withdraw"));
+  }
+  shell(projCrumbs(pid, [{ t: "Review", href: "#/p/" + enc(pid) + "/review" }, { t: rvTitle(p) }]), head, who, why, status, stale, msg, sections, decide);
+}
+// After a decision: the next waiting edit (in this project), else where it makes sense to land.
+async function rvNextHash(pid, done, fallback) {
+  try {
+    var r = await api("GET", "/api/projects/" + enc(pid) + "/proposals");
+    var next = r.proposals.filter(function (x) { return x.proposal_id !== done; })[0];
+    if (next) return "#/p/" + enc(pid) + "/review/" + enc(next.proposal_id);
+  } catch (e) {}
+  return fallback;
+}
+function rvDrawDiff(into, d, full) {
+  if (!d) { into.replaceChildren(h("pre", { class: "raw", tabindex: "0", text: full || "" })); return; }
+  if (d.identical) { into.replaceChildren(h("p", { class: "muted", text: "No text changes." })); return; }
+  if (d.too_many_lines) { into.replaceChildren(h("p", { class: "muted small", text: "Too many lines to compare here." }), h("pre", { class: "raw", tabindex: "0", text: full || "" })); return; }
+  var cap = h("p", { class: "muted small", text: d.added + " added, " + d.removed + " removed" + (d.truncated ? " (large change: partly shown)" : "") });
+  var pre = h("div", { class: "vh-diff", role: "group", tabindex: "0", "aria-label": "Proposed changes" });
+  d.hunks.forEach(function (hk, i) {
+    if (i) pre.append(h("div", { class: "vh-gap", "aria-hidden": "true", text: "⋯" }));
+    var a = hk.a_start, b = hk.b_start;
+    hk.lines.forEach(function (l) {
+      var op = l[0], t = l.slice(1), cls = op === "+" ? "add" : op === "-" ? "del" : "ctx";
+      pre.append(h("div", { class: "vh-line " + cls },
+        h("span", { class: "vh-ln", "aria-hidden": "true", text: op === "+" ? "" : String(a) }),
+        h("span", { class: "vh-ln", "aria-hidden": "true", text: op === "-" ? "" : String(b) }),
+        h("span", { class: "vh-mark", "aria-hidden": "true", text: op === "+" ? "+" : op === "-" ? "−" : "" }),
+        h("span", { class: "sr", text: op === "+" ? "added: " : op === "-" ? "removed: " : "" }),
+        h("span", { class: "vh-t", text: t || " " })));
+      if (op !== "+") a++; if (op !== "-") b++;
+    });
+  });
+  into.replaceChildren(cap, pre);
+}
+// Document page: banner when edits wait (linked straight to the edit when there is one), a status chip by the title,
+// and the review setting in Details (owner): chosen, explained, then saved explicitly.
+function rvDocumentUi(A, pid, aid, details, reload) {
+  var rv = A.meta.review || null, out = { banner: null, chip: null };
+  if (rv && rv.pending_proposals) {
+    var link = h("a", { class: "btn secondary", href: "#/p/" + enc(pid) + "/review" }, "Review");
+    out.banner = h("div", { class: "callout info rv-banner" }, icon("doc"),
+      h("span", null, h("strong", { text: plural(rv.pending_proposals, "edit") + " waiting for review." }), " Readers keep seeing the approved version."), link);
+    if (rv.pending_proposals === 1) api("GET", "/api/projects/" + enc(pid) + "/proposals?artifact_id=" + enc(aid)).then(function (r) {
+      if (r.proposals.length === 1) link.href = "#/p/" + enc(pid) + "/review/" + enc(r.proposals[0].proposal_id);
+    }).catch(function () {});
+  }
+  // Status chip: one container, redrawn from A.meta.review and A.rev after any change (mode save, mark, reload, autosave).
+  out.chip = h("div", { class: "rv-chip-row", "aria-live": "polite" });
+  out.redraw = function () {
+    var r = A.meta.review;
+    if (!r || r.mode === "off") { out.chip.replaceChildren(); out.chip.hidden = true; return; }
+    var rr = r.reviewed_revision, behind = r.mode === "advisory" && rr !== A.rev, rev = A.rev;
+    var parts = [h("span", { class: "rv-chip" + (behind ? " warn" : "") }, icon(behind ? "alert" : "check"),
+      r.mode === "required" ? "Review required" : !behind ? "Reviewed (v" + rr + ")" : rr ? "Reviewed: v" + rr + " · current v" + rev + " not reviewed" : "Not reviewed yet")];
+    if (behind && !A.meta.publisher) {
+      var mk = h("button", { type: "button", class: "ghost small", onclick: async function () {
+        mk.disabled = true;
+        try {
+          var x = await api("POST", A.base + "/revisions/" + rev + "/review", { decision: "approved" }, { key: uuid() });
+          A.meta.review.reviewed_revision = x.reviewed_revision != null ? x.reviewed_revision : rev;
+          toast("Version " + rev + " marked as reviewed"); out.redraw();
+        } catch (err) { mk.disabled = false; toast("Couldn't mark it reviewed: " + err.message); }
+      } }, "Mark v" + rev + " as reviewed");
+      parts.push(mk);
+    }
+    out.chip.replaceChildren.apply(out.chip, parts); out.chip.hidden = false;
+  };
+  out.redraw();
+  A.rvRedraw = out.redraw;
+  if (A.meta.publisher) return out;
+  var cur = rv ? rv.mode : "off", name = "rv-mode-" + aid;
+  var radios = RV_MODES_UI.map(function (m) {
+    var r = h("input", { type: "radio", name: name, value: m, checked: cur === m });
+    r.addEventListener("change", sync);
+    return h("label", { class: "rv-radio" }, r, h("span", null, h("strong", { text: RV_MODE_LABELS[m].split(" (")[0] }), h("span", { class: "muted small", text: RV_DESC[m] })));
+  });
+  var rmsg = h("p", { class: "msg", role: "status", "aria-live": "polite" });
+  var save = h("button", { type: "button", hidden: true, onclick: async function () {
+    var want = picked();
+    if (want === "required" && !confirm("Require review? Version " + A.rev + " counts as reviewed; later edits by apps and agents wait for your approval.")) return;
+    if (cur === "required" && want !== "required" && !confirm("Stop requiring review? Edits by apps and agents will go live without approval; edits already waiting stay pending.")) return;
+    save.disabled = true;
+    try {
+      var r = await api("PUT", A.base + "/review-mode", { mode: want, expected_revision: A.rev });
+      A.meta.review = r.review_mode === "off" && !(rv && rv.pending_proposals) ? undefined : { mode: r.review_mode, reviewed_revision: r.reviewed_revision, pending_proposals: rv ? rv.pending_proposals : 0 };
+      rv = A.meta.review || null; cur = r.review_mode; sync(); out.redraw();
+      showMsg(rmsg, "Review is now " + RV_MODE_LABELS[r.review_mode].split(" (")[0].toLowerCase() + "." + (r.review_mode === "off" && rv && rv.pending_proposals ? " Edits already waiting stay pending until you review them." : ""), true);
+      if (reload) reload();
+    } catch (err) {
+      if (err.status === 409) { showMsg(rmsg, "The document changed (now v" + (((err.data || {}).error || {}).current_revision || "?") + "). Reloaded; check it and try again."); if (reload) reload(); }
+      else showErr(rmsg, err);
+    } finally { save.disabled = false; }
+  } }, "Save review setting");
+  function picked() { var c = radios.map(function (l) { return l.firstChild; }).filter(function (x) { return x.checked; })[0]; return c ? c.value : cur; }
+  function sync() { save.hidden = picked() === cur; }
+  details.append(h("fieldset", { class: "rv-docmode" }, h("legend", { text: "Review" }), radios, h("div", { class: "row" }, save), rmsg));
+  return out;
+}
+var RV_DESC = {
+  off: "Edits go live as usual.",
+  advisory: "Edits go live as usual. Mark versions reviewed; agents can ask for the reviewed version.",
+  required: "Edits by apps and agents wait for your approval; everyone else keeps reading the approved version."
+};
+// History: review marks on versions, and "Mark as reviewed" for advisory documents.
+function rvHistoryBits(A, v, onDone) {
+  var parts = [];
+  if (v.review) parts.push(h("span", { class: "badge active rv-badge", title: "Reviewed by " + v.review.who + (v.review.note ? ": " + v.review.note : "") }, icon("check"), "Reviewed"));
+  return parts;
+}
+function rvHistoryWho(v) {
+  if (!v.review) return null;
+  return h("span", { class: "meta rv-hist" }, (v.review.proposed_by ? "Edited from " + v.review.proposed_by + "'s proposal · " : "") + "approved by " + (v.review.who === "You" ? "you" : v.review.who) + (v.review.note ? " · “" + v.review.note + "”" : ""));
+}
+function rvMarkButton(A, v, done) {
+  var rv = A.meta.review;
+  // Only versions newer than the reviewed one: agents read the newest reviewed version, so marking an older one changes nothing.
+  if (!rv || rv.mode !== "advisory" || (v.review && v.review.decision !== "rejected") || rv.reviewed_revision && v.rev <= rv.reviewed_revision) return null;
+  return h("button", { type: "button", class: "secondary", onclick: async function (e) {
+    e.target.disabled = true;
+    try { var r = await api("POST", A.base + "/revisions/" + v.rev + "/review", { decision: "approved" }, { key: uuid() }); A.meta.review.reviewed_revision = r.reviewed_revision; toast("Version " + v.rev + " marked as reviewed"); done(); }
+    catch (err) { e.target.disabled = false; toast("Couldn't mark it reviewed: " + err.message); }
+  } }, icon("check"), "Mark as reviewed");
+}
+// Connections: "Can review" per project on apps, API keys and agent tokens (owner-granted, separate from edit).
+// One request per Connections page, shared by its cards (not reused across pages: grants may have changed since).
+var rvGrantCache = null, rvGrantAt = 0;
+async function rvGrants(force) {
+  if (Date.now() - rvGrantAt > 3000) force = true;
+  if (!rvGrantCache || force) rvGrantAt = Date.now(), rvGrantCache = api("GET", "/api/review-grants", undefined, { noAuthRedirect: true }).then(function (r) { return r.review_grants; }).catch(function () { rvGrantCache = null; return null; });
+  return rvGrantCache;
+}
+function rvReviewToggles(kind, id, projects, active) {
+  var box = h("div", { class: "rv-grants" });
+  if (!active || !projects.length) return box;
+  rvGrants().then(function (gs) {
+    if (!gs) { box.replaceChildren(h("p", { class: "muted small", text: "Couldn't load review permission. Reload to try again." })); return; }
+    var rows = projects.map(function (p) {
+      var on = gs.some(function (g) { return g.path_kind === kind && g.path_id === id && g.project_id === p.id; });
+      var cb = h("input", { type: "checkbox", checked: on });
+      cb.addEventListener("change", async function () {
+        cb.disabled = true;
+        try { await api("PUT", "/api/review-grants", { path_kind: kind, path_id: id, project_id: p.id, can_review: cb.checked }); await rvGrants(true); toast(cb.checked ? "Can review " + p.title : "Can no longer review " + p.title); }
+        catch (err) { cb.checked = !cb.checked; toast(err.message); }
+        finally { cb.disabled = false; }
+      });
+      return h("label", { class: "rv-grant" }, cb, "Can review " + p.title);
+    });
+    box.replaceChildren(h("details", { class: "rv-grants-d" }, h("summary", { text: "Review permission" + (rows.some(function (r) { return r.firstChild.checked; }) ? " · on" : "") }),
+      h("p", { class: "muted small", text: "Lets this connection approve or reject other authors' edits in documents that require review. It never approves its own." }), rows));
+  });
+  return box;
+}
 // ---------- home: authorized recents and browser-local personal favorites ----------
 function favoriteButton(pid, aid, changed, title) {
   var uid = S.me && S.me.id;
@@ -12776,6 +14218,7 @@ async function viewHome() {
   var pref = HOME.read(uid), tab = pref.tab, mode = pref.sort, ftype = pref.type, typing = typeFilterSelect(pref.type);
   var msg = h("p", { class: "msg", role: "status", "aria-live": "polite" });
   var list = h("ul", { class: "list home-list", "aria-label": "Home documents" }), empty = h("div", { hidden: true });
+  var rvHome = rvHomeSection();
   // A filter over one list (not separate panels): a labelled group of toggle buttons with aria-pressed.
   var recent = h("button", { type: "button", "aria-pressed": "false" }, "Recently edited"), favorites = h("button", { type: "button", "aria-pressed": "false" }, "Favorites");
   var homeTabs = h("div", { class: "tabs", role: "group", "aria-label": "Show" }, recent, favorites);
@@ -12813,6 +14256,7 @@ async function viewHome() {
   async function load(quiet) {
     quiet = quiet === true;
     var my = ++seq; refresh.disabled = true; showMsg(msg, ""); markFilter();
+    if (seq > 1) rvHome.refresh();
     if (!quiet) { rows = []; failed = 0; partial = false; visible = HOME.EARLY; list.hidden = false; empty.hidden = true; more.hidden = true; skeletonRows(list, 4); }
     try {
       var result = await HOME.load(api, function () { return current(my); }, function (early) {
@@ -12856,6 +14300,7 @@ async function viewHome() {
   S.cleanups.push(function () { alive = false; ++seq; window.removeEventListener("storage", changed); document.removeEventListener("visibilitychange", foreground); });
   shell([{ t: "Home" }], pageHead("Home", { sub: "Recently edited documents across your projects. Favorites are saved for your account on this device.",
       actions: [searchEntry(), h("a", { class: "btn secondary", href: "#/projects" }, icon("folder"), "All projects")] }),
+    rvHome,
     h("div", { class: "toolbar" }, homeTabs, h("span", { class: "spacer" }),
       h("label", { class: "row small muted" }, "Type", typing), h("label", { class: "row small muted" }, "Sort", sorting), refresh),
     msg, list, empty, more);
@@ -12922,7 +14367,7 @@ function setCrumbsTitle(pid) {
 }
 
 function projectTabs(pid, active) {
-  var tabs = [["list", "Documents", "#/p/" + enc(pid)], ["trash", "Trash", "#/p/" + enc(pid) + "/trash"]];
+  var tabs = [["list", "Documents", "#/p/" + enc(pid)], ["review", "Review", "#/p/" + enc(pid) + "/review"], ["trash", "Trash", "#/p/" + enc(pid) + "/trash"]];
   return linkTabs("Project views", tabs, active);
 }
 
@@ -13311,7 +14756,7 @@ async function viewApps() {
         catch (err) { showErr(msg, err); e.target.disabled = false; }
       } }, "Disconnect") : null;
       conns.append(connCard({ name: c.client_name, sub: "Reader app · returns to " + c.redirect_host, status: statusBadge(c.status), inactive: c.status !== "active",
-        diagnostic: connectionSummary("oauth", c.id, c.client_name, c.projects, c.expires_at, c.last_used_at, c.status, data.checked_at),
+        diagnostic: h("div", null, rvReviewToggles("oauth", c.id, c.projects, c.status === "active"), connectionSummary("oauth", c.id, c.client_name, c.projects, c.expires_at, c.last_used_at, c.status, data.checked_at)),
         accessLabel: c.status === "active" ? "Can currently use:" : "Had access to (no longer active):",
         access: c.projects.map(function (p) { return { title: p.title, access: accessText(p.access) }; }),
         foot: [c.files === false && c.status === "active" ? "Documents only: reconnect to include files" : null, c.last_used_at ? "Last used " + fmtDate(c.last_used_at) : "Not used yet", "Connected " + fmtDate(c.created_at), c.status === "active" ? (new Date(c.expires_at).getUTCFullYear() >= 9000 ? "Until you disconnect" : "Expires " + fmtDate(c.expires_at)) : null].filter(Boolean),
@@ -13411,6 +14856,7 @@ async function viewTokens() {
         try { await api("PATCH", "/api/projects/" + enc(g.project_id) + "/grants/" + enc(g.id), { revoke: true }); toast("Revoked " + g.label); load(); }
         catch (err) { showErr(msg, err); e.target.disabled = false; }
       } }, "Revoke"));
+      li.append(rvReviewToggles("grant", g.id, [{ id: g.project_id, title: g.project_title }], g.status === "active"));
       li.append(connectionSummary("legacy_grant", g.id, g.label, [{ project_id: g.project_id, title: g.project_title, access: g.access }], g.expires_at, null, g.status, data.checked_at));
       list.append(li);
     });
@@ -13523,6 +14969,7 @@ async function viewApiKeys() {
           h("small", { text: k.projects.map(function (p) { return p.title + " (" + (p.access === "read_write" ? "read & edit" : "read") + ")"; }).join(", ") || "no projects" }),
           h("small", { class: "muted" + (k.status === "active" && left <= 14 ? " warn" : ""), text: exp + " · " + (k.last_used_at ? "last used " + fmtDate(k.last_used_at) : "never used") + (k.replaces_id ? " · replacement key" : "") })),
         statusBadge(k.status));
+      li.append(rvReviewToggles("api_key", k.id, k.projects.map(function (p) { return { id: p.project_id, title: p.title }; }), k.status === "active"));
       if (k.status === "active") {
         var editHost = h("div", { class: "card", hidden: true });
         li.append(h("span", { class: "row" },
@@ -13650,7 +15097,7 @@ async function viewArtifact(pid, aid, initialTab) {
     titleEl.textContent = A.meta.title;
     setCrumbs(projCrumbs(pid, [{ t: A.meta.title }]));
   }
-  async function reloadMeta() { try { var r = await api("GET", base); A.meta = r.artifact; fillMeta(); } catch (e) {} }
+  async function reloadMeta() { try { var r = await api("GET", base); A.meta = r.artifact; fillMeta(); if (A.rvRedraw) A.rvRedraw(); } catch (e) {} }
   async function patchMeta(fields, okText) {
     try {
       var r = await api("PATCH", base, Object.assign({ expected_meta_version: A.meta.meta_version }, fields), { key: uuid() });
@@ -13712,6 +15159,7 @@ async function viewArtifact(pid, aid, initialTab) {
     details.append(templateForm);
   }
   fillMeta();
+  var rvUi = rvDocumentUi(A, pid, aid, details, reloadMeta);
 
   // shared panels
   var panels = {}, tabBtns = {};
@@ -13798,7 +15246,8 @@ async function viewArtifact(pid, aid, initialTab) {
         h("span", { class: "grow" },
           whoLine(v),
           h("span", { class: "meta" }, ago(v.created_at) + (delta(v, prev) ? " · " + delta(v, prev) : "") + (v.restored_from ? " · restored from v" + v.restored_from : "")),
-          note(v)),
+          note(v), rvHistoryWho(v)),
+        rvHistoryBits(A, v),
         current ? h("span", { class: "badge accent", text: "current" }) : null,
         h("button", { type: "button", class: "secondary vh-open", onclick: function () { open(v.rev); } }, current ? "View" : "Compare", h("span", { class: "sr", text: " version " + v.rev })));
     }
@@ -13885,6 +15334,8 @@ async function viewArtifact(pid, aid, initialTab) {
         h("span", { class: "icons" }, copyIcon("link", "Copy link to this version", function () { return link(n); })));
       var body = h("div", { class: "vh-body" });
       var actions = h("div", { class: "row" });
+      var rvMark = rvMarkButton(A, v, function () { load(); });
+      if (rvMark) actions.append(rvMark);
       if (n !== A.rev) actions.append(h("button", { type: "button", onclick: function (e) { restoreRev(n, e.currentTarget); } }, "Restore this version"));
       if (n > 1) actions.append(h("button", { type: "button", class: "secondary", onclick: function () { showDiff(n - 1, n, body); } }, "What changed in v" + n));
       if (n !== A.rev) actions.append(h("button", { type: "button", class: "secondary", onclick: function () { showDiff(n, A.rev, body); } }, "Compare with current"));
@@ -14083,6 +15534,8 @@ async function viewArtifact(pid, aid, initialTab) {
   panels.history.append(VH.root);
   addTab("comments", "Comments", loadComments);
   panels.comments.append(comList, comForm, comMsg);
+  if (rvUi.banner) app.insertBefore(rvUi.banner, tabNav);
+  if (rvUi.chip) { var rvAt = app.querySelector(".titlebar + .doc-meta") || app.querySelector(".titlebar"); if (rvAt) rvAt.after(rvUi.chip); }
   for (var k in panels) app.append(panels[k]);
   app.append(below);
   // Documents open on the rendered view; Edit is one tap away (and /edit deep links open the editor).
@@ -14613,7 +16066,7 @@ function renderMarkdownEditor(A, data, ui) {
     statusEl.dataset.state = state; statusEl.textContent = text;
     saveBtn.classList.toggle("secondary", !(state === "dirty" || state === "error"));
   }
-  function setSaved() { setStatus("saved", "Saved - rev " + A.rev); }
+  function setSaved() { setStatus("saved", "Saved - rev " + A.rev); if (A.rvRedraw) A.rvRedraw(); }
   function showBanner(t) { banner.textContent = t; banner.hidden = !t; }
   function persistDraft(body) { writeDraft(pid, aid, A.rev, body); }
   A.isBusy = function () { return isDirty() || D.saving || !!D.conflict; };
@@ -15551,7 +17004,9 @@ async function replaceApiKey(ctx, id, input) {
     "SELECT acp.project_id, acp.can_write FROM api_credential_projects acp JOIN projects p ON p.id = acp.project_id WHERE acp.credential_id = ? AND p.owner_id = ?"
   ).bind(id, ctx.principal.id).all();
   if (!scope.results.length) throw new HttpError(409, "empty_scope", "Key has no projects left");
-  return insertKey(ctx, old.label, lifetime(input?.lifetime_days), scope.results.map((r) => ({ project_id: r.project_id, can_write: !!r.can_write })), id);
+  const made = await insertKey(ctx, old.label, lifetime(input?.lifetime_days), scope.results.map((r) => ({ project_id: r.project_id, can_write: !!r.can_write })), id);
+  await rvCarryReview(ctx.env, id, made.id);
+  return made;
 }
 __name(replaceApiKey, "replaceApiKey");
 async function setApiKeyScope(ctx, id, input) {
@@ -15574,6 +17029,7 @@ async function setApiKeyScope(ctx, id, input) {
     );
   await env.DB.batch([
     env.DB.prepare("DELETE FROM api_credential_projects WHERE credential_id = ?").bind(id),
+    env.DB.prepare("DELETE FROM review_grants WHERE path_kind = 'api_key' AND path_id = ? AND project_id NOT IN (SELECT value FROM json_each(?))").bind(id, JSON.stringify(scope.map((s) => s.project_id))),
     ...scope.map((s) => env.DB.prepare("INSERT INTO api_credential_projects (credential_id, project_id, can_write) VALUES (?, ?, ?)").bind(id, s.project_id, s.can_write ? 1 : 0)),
     ...scope.map((s) => auditStmt(env, ctx, s.project_id, "apikey.scope", id, s.can_write ? "ok:read_write" : "ok:read"))
   ]);
@@ -15635,6 +17091,11 @@ var R2 = {
   search: /^\/v1\/search$/,
   projects: /^\/v1\/projects$/,
   changes: new RegExp(`^/v1/projects/${SEG}/changes$`),
+  proposals: new RegExp(`^/v1/projects/${SEG}/proposals$`),
+  proposal: new RegExp(`^/v1/projects/${SEG}/proposals/${SEG}$`),
+  proposalContent: new RegExp(`^/v1/projects/${SEG}/proposals/${SEG}/content$`),
+  proposalAction: new RegExp(`^/v1/projects/${SEG}/proposals/${SEG}/(withdraw|review)$`),
+  revisionReview: new RegExp(`^/v1/projects/${SEG}/files/${SEG}/revisions/([0-9]{1,9})/review$`),
   templates: new RegExp(`^/v1/projects/${SEG}/templates$`),
   templateCreate: new RegExp(`^/v1/projects/${SEG}/files/from-template$`),
   files: new RegExp(`^/v1/projects/${SEG}/files$`),
@@ -15706,7 +17167,7 @@ var P1_FIELDS = ["id", "project_id", "kind", "title", "folder", "tags", "revisio
 function fileView2(origin, a, env) {
   const base = appConnectEnabled(env) ? a : Object.fromEntries(P1_FIELDS.map((k) => [k, a[k]]));
   const linkable = appConnectEnabled(env) ? ["markdown", "html", "json", "csv"].includes(a.kind) : a.kind === "markdown" || a.kind === "html";
-  return { ...base, ...a.is_template ? { is_template: true, template_description: a.template_description } : {}, ...a.source ? { source: a.source } : {}, ...origin ? { web_url: artifactWebUrl(origin, a.project_id, a.id), ...linkable ? { preview_url: previewWebUrl(origin, a.project_id, a.id) } : {} } : {} };
+  return { ...base, ...a.review ? { review: a.review } : {}, ...a.is_template ? { is_template: true, template_description: a.template_description } : {}, ...a.source ? { source: a.source } : {}, ...origin ? { web_url: artifactWebUrl(origin, a.project_id, a.id), ...linkable ? { preview_url: previewWebUrl(origin, a.project_id, a.id) } : {} } : {} };
 }
 __name(fileView2, "fileView");
 function withLinks(origin, pid, r) {
@@ -15755,6 +17216,35 @@ async function route2(req, env, url, requestId) {
     if (m !== "GET") throw new HttpError(405, "method_not_allowed", "Method not allowed");
     return json(await listChanges(projectCtx(env,k,requestId,g[1]),g[1],chQuery(url.searchParams)));
   }
+  if (g = R2.proposals.exec(path)) {
+    if (m !== "GET") throw new HttpError(405, "method_not_allowed", "Method not allowed");
+    const pid = g[1];
+    return json(await listProposals(projectCtx(env, k, requestId, pid), pid, { artifact_id: url.searchParams.get("artifact_id"), status: url.searchParams.get("status"), cursor: url.searchParams.get("cursor") }));
+  }
+  if (g = R2.proposal.exec(path)) {
+    if (m !== "GET") throw new HttpError(405, "method_not_allowed", "Method not allowed");
+    const [, pid, prp] = g;
+    return json(await readProposal(projectCtx(env, k, requestId, pid), pid, prp, { contentPath: `/v1/projects/${pid}/proposals/${prp}/content` }));
+  }
+  if (g = R2.proposalContent.exec(path)) {
+    if (m !== "GET" && m !== "HEAD") throw new HttpError(405, "method_not_allowed", "Method not allowed");
+    const [, pid, prp] = g;
+    return serveProposalContent(projectCtx(env, k, requestId, pid), new Request(`${url.origin}${url.pathname}`, { method: m, headers: req.headers }), pid, prp);
+  }
+  if (g = R2.proposalAction.exec(path)) {
+    if (m !== "POST") throw new HttpError(405, "method_not_allowed", "Method not allowed");
+    const [, pid, prp, action] = g;
+    const key = idemKey(req.headers.get("idempotency-key"));
+    if (action === "withdraw") writeAllowed(k, pid);
+    const r = action === "withdraw" ? await withdrawProposal(projectCtx(env, k, requestId, pid), pid, prp, key) : await reviewProposal(projectCtx(env, k, requestId, pid), pid, prp, await readJson(req), key);
+    return json(r.body, r.status);
+  }
+  if (g = R2.revisionReview.exec(path)) {
+    if (m !== "POST") throw new HttpError(405, "method_not_allowed", "Method not allowed");
+    const [, pid, fid, n] = g;
+    const r = await reviewRevision(projectCtx(env, k, requestId, pid), pid, fid, Number(n), await readJson(req), idemKey(req.headers.get("idempotency-key")));
+    return json(r.body, r.status);
+  }
   if (g = R2.templates.exec(path)) {
     if (m !== "GET") throw new HttpError(405, "method_not_allowed", "Method not allowed");
     const pid = g[1];
@@ -15799,7 +17289,7 @@ async function route2(req, env, url, requestId) {
     const [, pid, fid] = g;
     if (m === "GET") {
       const revQ = url.searchParams.get("revision");
-      const r = await getArtifact(projectCtx(env, k, requestId, pid), pid, fid, revQ !== null ? int(Number(revQ), "revision", 1) : void 0);
+      const r = await getArtifact(projectCtx(env, k, requestId, pid), pid, fid, revQ === "reviewed" ? "reviewed" : revQ !== null ? int(Number(revQ), "revision", 1) : void 0);
       const { content_url: _drop, artifact, ...rest } = r;
       return json({
         ...rest,
@@ -16192,6 +17682,9 @@ async function route3(req, env, url, requestId) {
     if (seg.length === 2 && m === "PUT") return json(await updateAppClient(ctx, str(seg[1], "app", 64), await body(req)));
     throw new HttpError(404, "not_found", "Not found");
   }
+  if (seg[0] === "review-queue" && seg.length === 1 && m === "GET") return json(await reviewQueue(ctx));
+  if (seg[0] === "review-grants" && seg.length === 1 && m === "GET") return json(await listReviewGrants(ctx));
+  if (seg[0] === "review-grants" && seg.length === 1 && m === "PUT") return json(await setReviewGrant(ctx, await body(req)));
   if (seg[0] === "publishers" && seg.length === 3 && seg[2] === "revoke" && m === "POST") return json(await revokePublisher(ctx, str(seg[1], "publisher", 64)));
   if (seg[0] !== "projects") throw new HttpError(404, "not_found", "Not found");
   if (seg.length === 1) {
@@ -16218,6 +17711,14 @@ async function route3(req, env, url, requestId) {
     await listGrants(ctx, pid);
     return json(await reconcileUploads(env, { projectId: pid, limit: 100 }));
   }
+  if (rest[0] === "proposals" && rest.length === 1 && m === "GET") return json(await listProposals(ctx, pid, { artifact_id: url.searchParams.get("artifact_id"), status: url.searchParams.get("status"), cursor: url.searchParams.get("cursor") }));
+  if (rest[0] === "proposals" && rest.length === 2 && m === "GET") return json(await readProposal(ctx, pid, rest[1], { contentPath: `/api/projects/${pid}/proposals/${rest[1]}/content` }));
+  if (rest[0] === "proposals" && rest.length === 3 && rest[2] === "content" && (m === "GET" || m === "HEAD")) return serveProposalContent(ctx, req, pid, rest[1]);
+  if (rest[0] === "proposals" && rest.length === 3 && rest[2] === "withdraw" && m === "POST") return out(await withdrawProposal(ctx, pid, rest[1], key()));
+  if (rest[0] === "proposals" && rest.length === 3 && rest[2] === "review" && m === "POST") return out(await reviewProposal(ctx, pid, rest[1], await body(req), key()));
+  if (rest[0] === "review-settings" && rest.length === 1 && m === "GET") return json(await getReviewSettings(ctx, pid));
+  if (rest[0] === "review-settings" && rest.length === 1 && m === "PUT") return json(await setReviewSettings(ctx, pid, await body(req)));
+  if (rest[0] === "review-settings" && rest[1] === "apply" && rest.length === 2 && m === "POST") return json(await applyReviewSettings(ctx, pid, await body(req)));
   if (rest[0] === "templates" && rest.length === 1) {
     if (m === "GET") return json(await listTemplates(ctx, pid, { cursor: url.searchParams.get("cursor"), limit: url.searchParams.get("limit") }));
     if (m === "POST") return out(await saveAsTemplate(ctx, pid, await body(req), key()));
@@ -16245,7 +17746,7 @@ async function route3(req, env, url, requestId) {
     const sub = rest[2];
     const revQ = url.searchParams.get("rev");
     if (!sub && m === "GET") {
-      const r = await getArtifact(ctx, pid, aid, revQ ? Number(revQ) : void 0);
+      const r = await getArtifact(ctx, pid, aid, revQ === "reviewed" ? "reviewed" : revQ ? Number(revQ) : void 0);
       return json(r, 200, { etag: `"${r.revision.sha256}"` });
     }
     if (!sub && m === "PUT") return out(appConnectEnabled(env) ? await saveFile(ctx, pid, aid, await body(req), key()) : await saveMarkdown(ctx, pid, aid, await body(req), key()));
@@ -16286,6 +17787,8 @@ async function route3(req, env, url, requestId) {
     if (sub === "meta-history" && m === "GET") return json(await metaHistory(ctx, pid, aid, false, url.searchParams.get("cursor") ?? void 0));
     if (sub === "meta-restore" && m === "POST") return out(await restoreMetadata(ctx, pid, aid, await body(req), key()));
     if (sub === "restore" && m === "POST") return out(await restoreRevision(ctx, pid, aid, await body(req), key()));
+    if (sub === "review-mode" && rest.length === 3 && m === "PUT") return json(await setReviewMode(ctx, pid, aid, await body(req)));
+    if (sub === "revisions" && rest.length === 5 && rest[4] === "review" && m === "POST") return out(await reviewRevision(ctx, pid, aid, Number(rest[3]), await body(req), key()));
     if (sub === "comments" && m === "GET") return json(await listComments(ctx, pid, aid));
     if (sub === "comments" && m === "POST") return out(await addComment(ctx, pid, aid, await body(req), key()));
   }
