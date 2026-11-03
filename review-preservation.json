@@ -1,12 +1,12 @@
 {
   "base_file_types_sha256": "cea551a7d442927605e0890073072e7bad69968f1fdf6a4a3886d3dc79a6b1cf",
-  "integrated_sha256": "4dd1f04a317f7e0b449530cfcb1a5e96d128facf5165125d1012732c42ef889d",
-  "preserved_outside_patches_sha256": "8542d6597122a3a5a256096a4987ee2041d05bb1597eb43daa7386a824f29822",
+  "integrated_sha256": "2729e5aaaf529055baaacf4c0c968cc8987c80518ed5152618b79a8fc5a046d6",
+  "preserved_outside_patches_sha256": "1e09e18cf9a8be3ea84b9c92b92e1bd4522ca8eedf6a738fc55ceb6588399826",
   "sources_sha256": {
     "src/review/service.js": "66aaa5d16763149e719c5aa57ede9b5ba078fade0945a5a75328f9a0074ed146",
     "src/review/tools.js": "192903fbdd905f4b632a23a22263874502c8691d02a394ddb1596aa8b43d2991",
-    "src/review/browser.js": "5c349c632b0f33e8129460e06c07f20fa4171ee85b1528b968a92f3184fa5553",
-    "src/review/browser.css": "b6b631c3be24b2b9d2cc9bc2a44ee4c74347315f42d17d4787e041f1335c1fd6"
+    "src/review/browser.js": "1a36bce90adf34a903f0437dc8322bb532210180fe2c961b45d83f1cea76231e",
+    "src/review/browser.css": "94fd970f3ce04787a42cec71bec169d341f487a974358cf9abe815af6f70ace5"
   },
   "patches": [
     {
@@ -493,14 +493,14 @@
       "module": "// src/ui.ts",
       "count": 1,
       "find_sha256": "dbf4cdd569563992bd40313f20a86bcb55703a554eed9585301382dce9e6ee4e",
-      "replace_sha256": "c602bf8ee36639e6e7e3740ddb847d10bb8e6599a43235970f7417261a46681e"
+      "replace_sha256": "314d30184bf4207d3bc3fe3e93893d2c669fa56b8bbb4c68b4fd95198b10120c"
     },
     {
       "name": "ui: review views and helpers",
       "module": "// src/ui.ts",
       "count": 1,
       "find_sha256": "81bcf3ea5954073fece07463dbbe3470c23d9bf7692c635606fabb17e44ff27a",
-      "replace_sha256": "bc39932ad56e2eb89a4922a742386af99885cc9e21e44befd93e1fbd33dfaa30"
+      "replace_sha256": "ccbeece7eb43df14b629e500fe6d4b8ee316daf08dab33055e1ff5bdafdbb69b"
     },
     {
       "name": "ui: review routes",
@@ -569,8 +569,29 @@
       "name": "ui: history row review mark",
       "module": "// src/ui.ts",
       "count": 1,
-      "find_sha256": "c0e99987ca5b3925f9ccc724f8384106cf16ad9dfe5c4d9769b3859d761ba175",
-      "replace_sha256": "1b914ba39c936db004376c50d925b7d9fa81f8c268458735478bf8b8f0303ea7"
+      "find_sha256": "90620f52f47b0fd1fac48bae4d7bb27e53b7d444b1f7e75a93d6da7e91b4f552",
+      "replace_sha256": "12a0465125ed40e9abbeb60c0704e856ead7bbd609a2074c6db19287eb4773dc"
+    },
+    {
+      "name": "ui: history burst row: badge and toggle grouped",
+      "module": "// src/ui.ts",
+      "count": 1,
+      "find_sha256": "7e31bdc47688fae0ad92a0c612d972c8b12f8a99c31cd583e0c9d0c1a200492a",
+      "replace_sha256": "51c428f7f014ac5e47e313a4043d03a72cbe8cf569d600ba21d0eaf808dfbdb4"
+    },
+    {
+      "name": "ui: history lists edits waiting for review",
+      "module": "// src/ui.ts",
+      "count": 1,
+      "find_sha256": "85530fa32bdbe43c4dd05ec2b8aeb43cfda3d4a71cb666770a624a0cc443981c",
+      "replace_sha256": "9b16ce4e9b84471fbc8973666b7fbe668587c1eb45f48b8ff39506ca44a3186c"
+    },
+    {
+      "name": "ui: history loads waiting edits with the first page",
+      "module": "// src/ui.ts",
+      "count": 1,
+      "find_sha256": "17bd355ba99387a2811e4c84d75540e3634819a8f4a063f822f5a80e8f74b945",
+      "replace_sha256": "17e0474846620361376cf603ad0db62902469f1a13e8cc39741cbf8d2bc8ff6e"
     },
     {
       "name": "ui: history: mark a version reviewed (advisory)",
@@ -578,6 +599,34 @@
       "count": 1,
       "find_sha256": "1c0a297a5655439ed5c3c9b4a22e49aebfc574390ba07fd3a6c530848c42d514",
       "replace_sha256": "86c62d6ca1d5fdbb80a84242e9ed27993ee5d947661f61608a795f24798f274d"
+    },
+    {
+      "name": "ui: new document: review choice",
+      "module": "// src/ui.ts",
+      "count": 1,
+      "find_sha256": "15fbb9a5532c2fa041beb5373e90ca47f1fd43cd6ba3f74ffa94af104069551f",
+      "replace_sha256": "e60e3f56f6e68aa2a75d9e93cff598db13e1348747b3e86606e7670091501ee9"
+    },
+    {
+      "name": "ui: new document: review field",
+      "module": "// src/ui.ts",
+      "count": 1,
+      "find_sha256": "eca4ddc7cc4a8154e30570a0ad5b9ae1eac0b41520386be4245207174e8aec09",
+      "replace_sha256": "59117948f4ef3238693140f23c4786b65d11e63be2cd26ec37e1290a3574d15d"
+    },
+    {
+      "name": "ui: new document: review follows the template choice",
+      "module": "// src/ui.ts",
+      "count": 1,
+      "find_sha256": "fda6f4d01e23c7abbf4079ec16fad5dd4d618828f95e53776a5039446153b7ef",
+      "replace_sha256": "c39bfb3653f175dbaf515d1f50a2d51313c9ea4d1fbcc089e0d75ad570ade847"
+    },
+    {
+      "name": "ui: new document: apply the review choice",
+      "module": "// src/ui.ts",
+      "count": 1,
+      "find_sha256": "037a03657196006ab390998f0f2320bbb5553d5e4def039cd12b39fe51df9dd5",
+      "replace_sha256": "f38c04b370b42a21f8c523d0484555c6788bca800ecc05ba78a89be0e323a9d2"
     },
     {
       "name": "ui: apps: can review",
