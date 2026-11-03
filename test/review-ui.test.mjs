@@ -137,13 +137,16 @@ test("Chrome: Home hides Needs review when empty and shows it when an edit waits
     // Project Review tab: empty state and the default for new documents.
     await page.waitForSelector(".rv-settings .rv-radio");
     assert.match(await page.$eval("main", (e) => e.innerText), /Nothing to review/);
-    await page.click('.rv-settings input[value="required"]');
+    // On a phone the radio can sit under the bottom tab bar: pick it in the page (like the other clicks here), then check it took.
+    const pick = (v) => page.evaluate((x) => { const r = document.querySelector(`.rv-settings input[value="${x}"]`); r.click(); return r.checked; }, v);
+    assert.equal(await pick("required"), true);
     await page.evaluate(() => [...document.querySelectorAll(".rv-settings button")].find((b) => b.textContent === "Save").click());
-    await page.waitForFunction(() => /Saved/.test(document.querySelector(".rv-settings .msg").textContent));
+    await page.waitForFunction(() => /Saved|error|couldn't/i.test(document.querySelector(".rv-settings .msg")?.textContent || ""));
+    assert.match(await page.$eval(".rv-settings .msg", (e) => e.textContent), /Saved/);
     assert.equal((await owner.req("GET", base + "/review-settings")).body.default, "required");
     await shot(page, "project-review-mobile");
     // Apply uses what the page shows (not a stale saved value), and says what it changes before it does.
-    await page.click('.rv-settings input[value="off"]');
+    assert.equal(await pick("off"), true);
     let applyMsg = ""; page.once("dialog", (d) => { applyMsg = d.message(); d.dismiss(); });
     await page.evaluate(() => [...document.querySelectorAll(".rv-settings button")].find((b) => b.textContent.startsWith("Save and apply")).click());
     await new Promise((r) => setTimeout(r, 300));
