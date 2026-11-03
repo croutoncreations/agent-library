@@ -1,0 +1,121 @@
+{
+  "base_review_sha256": "4dd1f04a317f7e0b449530cfcb1a5e96d128facf5165125d1012732c42ef889d",
+  "integrated_sha256": "b6ec4268f40f77a73d4e2b3533e8c77f61ae939b8c77491036d495195c1d3e36",
+  "sources_sha256": {
+    "google.js": "60d71820088940494d28a83cdbf7d7160423338237af31991a7e4594b00aeb93",
+    "service.js": "937847c617fc11ff3456ec642e49923e66b8d8b2d8f617d5c7d13e7dd48b2466",
+    "ui.js": "29c51a57b3e04adf6e508dff87ebce9be8b4c207a3eefda1a5fbd900e529baab",
+    "ui.css": "c6903188561154d320b556a25c598019bc2e315b0a0ddc40615d1a2a1e89fd07"
+  },
+  "patches": [
+    {
+      "name": "import owner UI helpers",
+      "find_sha256": "61073a9b8673aa05b4fade648f7b645ce42dedf5bc246433f7f44502019e0b1e"
+    },
+    {
+      "name": "import owner UI entry",
+      "find_sha256": "d5c7b07c1a56a48bac5c2001272fb1a7c9a2e0788d2b5ca508ee195818034c37"
+    },
+    {
+      "name": "source provenance in owner details",
+      "find_sha256": "420405defbe0452238eb9d2ebe431c57fb78f25cf73023fd99d7c8b53da6de04"
+    },
+    {
+      "name": "visible source on binary card",
+      "find_sha256": "ab15c9c15486d94a432ecf9478add84371b1b5921c64522fca7dd5ce7a3a68b8"
+    },
+    {
+      "name": "import UI styles",
+      "find_sha256": "dbf4cdd569563992bd40313f20a86bcb55703a554eed9585301382dce9e6ee4e"
+    },
+    {
+      "name": "maintained importer",
+      "find_sha256": "04f7b068a5eec8e086ee9a139e6df64718c8e506e8997bfa7e4ffb091bf72327"
+    },
+    {
+      "name": "owner routes",
+      "find_sha256": "a3e99257b5bf657f6c5c982cd24b3ab21deac1c13e048083c7b9deb18d7ceb97"
+    },
+    {
+      "name": "provenance for authenticated artifact reads",
+      "find_sha256": "f7c3d7873194ea4238d5f0abcc24a21446c04d0bd6d363949d10bcd1c6997316"
+    },
+    {
+      "name": "text creation publication hook",
+      "find_sha256": "a883f285bbf6f87f86e5f0c90a3b70d43bcbf0ff9379b126cfa05569b61eb199"
+    },
+    {
+      "name": "text import publication fence",
+      "find_sha256": "06037bb4b49d453d8fbd7c560dc6088476cbf60f20b52ced114af0d3431c28f2"
+    },
+    {
+      "name": "binary import publication fence",
+      "find_sha256": "b4abd623504a73972447035d580e7c18a1c79d5387a17c24f8beb1cb9fbdbc9e"
+    },
+    {
+      "name": "binary atomic mapping",
+      "find_sha256": "da59641c0fbafa8e82a034c5880219d53c874e1f01e9e935518cb06197214a9b"
+    },
+    {
+      "name": "atomic text artifact count",
+      "find_sha256": "b85072550637f307ab0effbdcf667647bc48116882850b24c3d01d663743f0e8"
+    },
+    {
+      "name": "atomic creation idempotency quota gate",
+      "find_sha256": "c8901ab8aa0bcd12e429448869302cc3b10ec0c8a9c9ad9467b4543f526b7051"
+    },
+    {
+      "name": "creation quota error after race",
+      "find_sha256": "7f0efeaa4768c71f7cc83f443335bfb42f52fdf3777746640fc3d722ec046804"
+    },
+    {
+      "name": "atomic binary count",
+      "find_sha256": "0465e956412b2807bcd37c26935e84162068980f328ce30f10d287ee0d9550ad"
+    },
+    {
+      "name": "track import upload in reservation transaction",
+      "find_sha256": "1030efa5251ee1234a1bfbfbafa7e188d4860033045266a7c2521d6b11f76a14"
+    },
+    {
+      "name": "import artifact limit error",
+      "find_sha256": "a7c52b37ffa8684d6d03bf8f125f3be791313111ca4af2b9b0b25a663335d297"
+    },
+    {
+      "name": "import upload result index",
+      "find_sha256": "bb87ab93bc95fc7796755062d4e6cb5e80d4c23329895d0cc3241d2be506f663"
+    },
+    {
+      "name": "preserve Office download extension",
+      "find_sha256": "21af6da521aa6a8b460684a25ee15523a4be8baeee251ffc8b3069cc1b0fabfa"
+    },
+    {
+      "name": "import reservation quota transition",
+      "find_sha256": "d1d4d2dd40163fd783654085c2af33739e18194cd86066139ee9e05c77edb6da"
+    },
+    {
+      "name": "charge private import staging",
+      "find_sha256": "d08eb589e21fdced455ea2711e08d1e8cb7b45b7a8f2a82e14d667827676eb99"
+    },
+    {
+      "name": "owner UI document CSP",
+      "find_sha256": "80b85dd1901ee8650a712d74662f1ea7eaa94dcbce9f0686a9b7883b7f473c7d"
+    },
+    {
+      "name": "cleanup cron",
+      "find_sha256": "55efc92d360925be244f56a3fb44a2cdee18050de995dc05a0b49a1f2e5431b7"
+    },
+    {
+      "name": "backup provenance",
+      "find_sha256": "2eaf6d93e7c52cf683b9d39779423ce0c3aa1e4c7d7ae36e0cf1a02989739e99"
+    },
+    {
+      "name": "restore provenance validation",
+      "find_sha256": "0a5b8e09197bc734fcd6bdf1abb27c8495804b9bead49ed53c4c519368626735"
+    },
+    {
+      "name": "restore detached provenance",
+      "find_sha256": "a9d3ca8ab7a267c2d5e85b4d94c4eec74a19ef6b01c7f48c46c173e5afc046f3"
+    }
+  ],
+  "unchanged_outside_patches": true
+}

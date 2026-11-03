@@ -7691,6 +7691,7 @@ async function getArtifact(ctx, projectId, artifactId, revNo) {
   const rev = await db(ctx).prepare("SELECT * FROM revisions WHERE artifact_id = ? AND project_id = ? AND rev_no = ?").bind(artifactId, projectId, await rvResolveRev(ctx, a, revNo)).first();
   if (!rev) throw new HttpError(404, "not_found", "Revision not found");
   return {
+    source: await gdProvenance(ctx, projectId, artifactId),
     artifact: { ...artifactView(a, appConnectEnabled(ctx.env)), ...await tplProvenance(ctx, projectId, a) },
     revision: { rev: rev.rev_no, id: rev.id, size: rev.size, sha256: rev.sha256, mime: rev.mime, created_at: rev.created_at, author_id: rev.author_id },
     ...a.kind === "markdown" || a.kind === "html" ? { body: rev.body } : a.kind === "json" || a.kind === "csv" ? { content: rev.body, content_url: `/api/projects/${projectId}/artifacts/${artifactId}/content?rev=${rev.rev_no}` } : { content_url: `/api/projects/${projectId}/artifacts/${artifactId}/content?rev=${rev.rev_no}` }
@@ -7747,21 +7748,28 @@ async function createMarkdown(ctx, projectId, input, key, kind = "markdown") {
   const artId = randomId("art");
   const revId = randomId("rev");
   const sha2 = await sha256Hex(body2);
-  const az = authzSql(ctx, projectId);
+  const az0 = authzSql(ctx, projectId), gf = gdFence(ctx);
+  const az = { sql: `${az0.sql} AND ${gf.sql}`, params: [...az0.params, ...gf.params] };
   const now = nowIso();
   const result = { status: 201, body: kind === "markdown" && folderId === null ? { artifact_id: artId, revision: 1, revision_id: revId, sha256: sha2 } : { artifact_id: artId, kind, folder_id: folderId, schema, revision: 1, revision_id: revId, sha256: sha2 } };
   const out2 = await runBatch(ctx, [
     // Idempotency row first: a duplicate concurrent retry fails here and rolls back the whole batch.
-    idemInsert(ctx, i, 201, result.body, az.sql, az.params),
+    idemInsert(ctx, i, 201, result.body, `${az.sql} AND (SELECT COUNT(*) FROM artifacts WHERE project_id=? AND publisher_id IS NULL AND pending_review = 0) < ?`, [...az.params, projectId, LIMITS.artifactsPerProject]),
     db(ctx).prepare(`INSERT INTO artifacts (id, project_id, kind, title, folder, folder_id, schema_id, head_rev, head_revision_id, created_at, updated_at)
       SELECT ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ? WHERE ${az.sql}
-        AND (? IS NULL OR EXISTS (SELECT 1 FROM folders WHERE id = ? AND project_id = ?))`).bind(artId, projectId, kind, title, folder, folderId, schema, revId, now, now, ...az.params, folderId, folderId, projectId),
+        AND (? IS NULL OR EXISTS (SELECT 1 FROM folders WHERE id = ? AND project_id = ?))
+        AND (SELECT COUNT(*) FROM artifacts WHERE project_id=? AND publisher_id IS NULL AND pending_review = 0) < ?`).bind(artId, projectId, kind, title, folder, folderId, schema, revId, now, now, ...az.params, folderId, folderId, projectId, projectId, LIMITS.artifactsPerProject),
     db(ctx).prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, size, sha256, mime, created_at, via_kind, via_id, via_label, client_info, change_note)
       SELECT ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM artifacts WHERE id = ?)`).bind(revId, artId, projectId, ctx.principal.id, body2, new TextEncoder().encode(body2).length, sha2, mime, now, ...provenance(ctx, input), artId),
-    audit(ctx, projectId, "artifact.create", artId, 1, "ok", "EXISTS (SELECT 1 FROM artifacts WHERE id = ?)", [artId])
+    audit(ctx, projectId, "artifact.create", artId, 1, "ok", "EXISTS (SELECT 1 FROM artifacts WHERE id = ?)", [artId]),
+    ...gdPublication(ctx, artId, revId)
   ], i);
   if (!Array.isArray(out2)) return out2;
-  if (!out2[1].meta.changes) throw new HttpError(403, "forbidden", "Grant no longer valid");
+  if (!out2[1].meta.changes) {
+    const countNow = await db(ctx).prepare("SELECT COUNT(*) AS n FROM artifacts WHERE project_id = ? AND publisher_id IS NULL AND pending_review = 0").bind(projectId).first("n");
+    if (countNow >= LIMITS.artifactsPerProject) throw new HttpError(413, "quota_exceeded", "Artifact limit reached");
+    throw new HttpError(403, "forbidden", "Grant no longer valid");
+  }
   return result;
 }
 async function publishRevision(ctx, projectId, artifactId, expected, i, rev, extra = [], action = "artifact.save") {
@@ -7772,7 +7780,8 @@ async function publishRevision(ctx, projectId, artifactId, expected, i, rev, ext
   }
   const revId = rev.revId ?? randomId("rev");
   const next = expected + 1;
-  const azBase = authzSql(ctx, projectId);
+  const az0 = authzSql(ctx, projectId), gf = gdFence(ctx);
+  const azBase = { sql: `${az0.sql} AND ${gf.sql}`, params: [...az0.params, ...gf.params] };
   const cw = contentWriteSql(ctx, artifactId);
   const az = { sql: `${azBase.sql} AND ${cw.sql}${rev.fence ? " AND " + rev.fence.sql : ""}`, params: [...azBase.params, ...cw.params, ...rev.fence?.params ?? []] };
   const now = nowIso();
@@ -7803,7 +7812,8 @@ async function publishRevision(ctx, projectId, artifactId, expected, i, rev, ext
     db(ctx).prepare(`UPDATE artifacts SET head_rev = ?, head_revision_id = ?, updated_at = ? WHERE id = ? AND project_id = ? AND head_rev = ? AND ${gate}`).bind(next, revId, now, artifactId, projectId, expected, revId),
     idemInsert(ctx, i, 200, body2, gate, [revId]),
     audit(ctx, projectId, action, artifactId, next, "ok", gate, [revId]),
-    ...extra.map((s) => s)
+    ...extra.map((s) => s),
+    ...gdPublication(ctx, artifactId, revId)
     // callers gate their own extra statements on the same predicate
   ], i);
   if (!Array.isArray(out2)) return out2;
@@ -11212,6 +11222,7 @@ async function exportBackup(ctx, projectId) {
     comments: comments.results,
     meta_versions: metaVersionsExport,
     ...rvSection ?? {},
+    sources: (await DB.prepare("SELECT artifact_id,provenance FROM artifact_sources WHERE project_id=?").bind(projectId).all()).results,
     blobs
   };
 }
@@ -11236,6 +11247,7 @@ async function restoreBackup(ctx, backup) {
     if (a.template_date != null) tplDate(a.template_date, true);
   }
   for (const v of Array.isArray(backup.meta_versions) ? backup.meta_versions : []) str(v.template_description ?? "", "template_description", 280);
+  const sourceRestore = gdRestoreSources(ctx, backup, pid);
   const blobs = backup.blobs ?? {};
   const decoded = /* @__PURE__ */ new Map();
   for (const r of backup.revisions) {
@@ -11268,6 +11280,7 @@ async function restoreBackup(ctx, backup) {
   for (const v of backup.meta_versions ?? [])
     stmts.push(DB.prepare(`INSERT INTO meta_versions (id, artifact_id, project_id, version, title, folder, tags, trashed, author_id, via_kind, via_id, via_label, client_info, change_note, restored_from, created_at, template_description)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(v.id, v.artifact_id, pid, v.version, v.title, v.folder, v.tags, v.trashed ? 1 : 0, v.author_id, v.via_kind ?? null, v.via_id ?? null, v.via_label ?? null, v.client_info ?? null, v.change_note ?? null, v.restored_from ?? null, v.created_at, v.template_description ?? ""));
+  stmts.push(...sourceRestore);
   for (const c of backup.comments)
     stmts.push(DB.prepare("INSERT INTO comments (id, project_id, artifact_id, rev_no, author_id, body, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(c.id, pid, c.artifact_id, c.rev_no, c.author_id, c.body, c.created_at));
   stmts.push(DB.prepare("INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id) VALUES (?, ?, ?, 'backup.restore', ?, 'ok', ?)").bind(nowIso(), ctx.principal.id, pid, pid, ctx.requestId));
@@ -11459,7 +11472,8 @@ var quotaUsedSql = /* @__PURE__ */ __name((now) => `(SELECT COALESCE(SUM(size),0
   + (SELECT COALESCE(SUM(expected_size),0) FROM uploads WHERE project_id = ?1 AND final_key IS NOT NULL AND final_purged_at IS NULL
        AND state IN ('failed','conflict'))
   + (SELECT COALESCE(SUM(size),0) FROM (SELECT DISTINCT blob_key, size FROM proposals pq WHERE project_id = ?1 AND blob_key IS NOT NULL AND blob_purged_at IS NULL
-       AND NOT EXISTS (SELECT 1 FROM revisions rq WHERE rq.blob_key = pq.blob_key)))`, "quotaUsedSql");
+       AND NOT EXISTS (SELECT 1 FROM revisions rq WHERE rq.blob_key = pq.blob_key)))
+  + (SELECT COALESCE(SUM(t.size),0) FROM drive_import_items t JOIN drive_import_jobs j ON j.id=t.job_id WHERE j.project_id=?1 AND t.kind='binary' AND t.stage_key IS NOT NULL AND t.stage_purged=0 AND NOT EXISTS(SELECT 1 FROM uploads u WHERE u.id=t.upload_id))`, "quotaUsedSql");
 async function purgeStaging(env, u) {
   try {
     await env.BLOBS.delete(u.staging_key);
@@ -11500,7 +11514,7 @@ async function uploadBegin(ctx, projectId, input, key) {
     rvMeta = await rvNewGated(ctx, projectId, "binary") ? JSON.stringify({ title, folder }) : null;
     if (rvMeta) await rvNewCap(ctx, projectId);
     stmts.push(db2(ctx).prepare(`INSERT INTO artifacts (id, project_id, kind, title, folder, head_rev, created_at, updated_at, review_mode, pending_review)
-      SELECT ?, ?, 'binary', ?, ?, 0, ?, ?, ?, ? WHERE ${az.sql}`).bind(artifactId, projectId, rvMeta ? RV_PLACEHOLDER : title, rvMeta ? "" : folder, nowIso(), nowIso(), rvMeta ? "required" : "off", rvMeta ? 1 : 0, ...az.params));
+      SELECT ?, ?, 'binary', ?, ?, 0, ?, ?, ?, ? WHERE ${az.sql} AND (? = 0 OR (SELECT COUNT(*) FROM artifacts WHERE project_id=? AND publisher_id IS NULL AND pending_review = 0) < ?)`).bind(artifactId, projectId, rvMeta ? RV_PLACEHOLDER : title, rvMeta ? "" : folder, nowIso(), nowIso(), rvMeta ? "required" : "off", rvMeta ? 1 : 0, ...az.params, ctx.driveImport ? 1 : 0, projectId, LIMITS.artifactsPerProject));
   }
   const uploadId = randomId("upl", 18);
   const expires = nowMs() + limits.uploadTtlMs;
@@ -11514,12 +11528,13 @@ async function uploadBegin(ctx, projectId, input, key) {
     instructions: "PUT the raw file bytes to put_url with the same Authorization, then call upload_finish."
   };
   const gate = "EXISTS (SELECT 1 FROM uploads WHERE id = ?)";
+  if (ctx.driveImport) stmts.push(db2(ctx).prepare("UPDATE drive_import_items SET upload_id=? WHERE id=?").bind(uploadId, ctx.driveImport.item.id));
   stmts.push(
     // Reservation: inserted only if the project quota still has room, evaluated in the same statement.
     // The partial unique index uploads_one_active rejects a second concurrent active upload outright.
     db2(ctx).prepare(`INSERT INTO uploads (id, project_id, artifact_id, principal_id, base_rev, expected_size, expected_sha256, mime, state, staging_key, expires_at, created_at)
       SELECT ?2, ?1, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', ?9, ?10, ?11
-      WHERE ${quotaUsedSql(nowMs())} + ?6 <= ?12 AND ${az.sql}`).bind(projectId, uploadId, artifactId, ctx.principal.id, baseRev, size, sha2, mime, `staging/${projectId}/${uploadId}`, expires, nowIso(), limits.projectBinaryBytes, ...az.params),
+      WHERE ${gdUploadQuota(ctx, nowMs())} + ?6 <= ?12 AND ${az.sql} AND EXISTS(SELECT 1 FROM artifacts WHERE id=?3)`).bind(projectId, uploadId, artifactId, ctx.principal.id, baseRev, size, sha2, mime, `staging/${projectId}/${uploadId}`, expires, nowIso(), limits.projectBinaryBytes, ...az.params),
     db2(ctx).prepare(`INSERT INTO idempotency (principal_id, project_id, op, key, digest, status, response, created_at)
       SELECT ?, ?, ?, ?, ?, 201, ?, ? WHERE ${gate}`).bind(ctx.principal.id, projectId, i.op, i.key, i.digest, JSON.stringify(body2), nowIso(), uploadId),
     audit(ctx, projectId, "upload.begin", artifactId, baseRev, "ok", gate, [uploadId])
@@ -11533,12 +11548,14 @@ async function uploadBegin(ctx, projectId, input, key) {
     throw e;
   });
   if (!Array.isArray(res)) return res;
-  const uploadRow = res[input.artifact_id ? 0 : 1];
+  const uploadRow = res[(input.artifact_id ? 0 : 1) + (ctx.driveImport ? 1 : 0)];
   if (!uploadRow.meta.changes) {
     if (!input.artifact_id) await db2(ctx).prepare("DELETE FROM artifacts WHERE id = ? AND head_rev = 0 AND NOT EXISTS (SELECT 1 FROM uploads WHERE artifact_id = ?)").bind(artifactId, artifactId).run();
     const used = await db2(ctx).prepare(`SELECT ${quotaUsedSql(nowMs())} AS n`).bind(projectId).first("n");
     if ((used ?? 0) + size > limits.projectBinaryBytes)
       throw new HttpError(413, "quota_exceeded", "Project binary storage quota exceeded", { used_bytes: used, limit_bytes: limits.projectBinaryBytes });
+    if (ctx.driveImport && !input.artifact_id && !res[0].meta.changes && ((await db2(ctx).prepare("SELECT COUNT(*) AS n FROM artifacts WHERE project_id = ? AND publisher_id IS NULL AND pending_review = 0").bind(projectId).first("n")) ?? 0) >= LIMITS.artifactsPerProject)
+      throw new HttpError(413, "quota_exceeded", "Artifact limit reached");
     throw new HttpError(403, "forbidden", "Grant no longer valid");
   }
   return { status: 201, body: body2 };
@@ -11804,6 +11821,7 @@ async function serveContent(ctx, req, projectId, artifactId, revParam) {
     "text/csv": ".csv"
   };
   let safeName = a.title.replace(/[^A-Za-z0-9._ -]/g, "_").slice(0, 100) || "download";
+  if (r.mime === "application/octet-stream" && a.title.length > 100 && /\.(xlsx|pptx)$/i.test(a.title)) safeName = a.title.replace(/[^A-Za-z0-9._ -]/g, "_").slice(0,90) + a.title.slice(-5).toLowerCase();
   if (ext[r.mime] && !safeName.toLowerCase().endsWith(ext[r.mime])) safeName += ext[r.mime];
   const headers = {
     // JSON/CSV: data, never rendered by the browser (always attachment, sandbox CSP, nosniff).
@@ -12569,7 +12587,9 @@ var APP_HTML = `<!doctype html>
 </body>
 </html>
 `;
-var APP_CSS = `/* review gating (src/review/browser.js) */
+var APP_CSS = `.drive-import{margin-top:16px;overflow-wrap:anywhere}.drive-import article{margin:12px 0}.drive-import pre{max-height:280px;overflow:auto;white-space:pre-wrap}.drive-import .row{flex-wrap:wrap}.drive-import button{margin:4px}.drive-import select{max-width:100%}
+
+/* review gating (src/review/browser.js) */
 .rv-home{margin:0 0 18px}
 .rv-home-head{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin:0 0 6px}
 .rv-home-head h2{margin:0;display:flex;align-items:center;gap:8px}
@@ -13068,6 +13088,115 @@ main > .tabs,main > nav.tabs{margin:16px 0 12px}
 @media(max-width:600px){.template-form .row>label{flex:1 1 100%}.template-preview{max-height:240px;padding:12px}}
 `;
 var APP_JS = String.raw`(function () {
+// One-time Google Drive import. Google access tokens live only in this view's closure.
+function driveImportPanel(pid, onDone) {
+  var root=h('section',{class:'card drive-import',hidden:true,'aria-label':'Google Drive import'}), msg=h('p',{role:'status','aria-live':'polite'}), list=h('div'), controls=h('div',{class:'row'}), account=h('p'), folder=h('select',{'aria-label':'Destination folder'}), jobs=h('div');
+  var cfg, token=null, session=null, job=null, state=null, alive=true, busy=false, cancelled=false;
+  var audience=h('p',{class:'muted small'});
+  var base='/api/projects/'+enc(pid)+'/drive-import';
+  S.cleanups.push(function(){alive=false;token=null;session=null;});
+  // A 401 is either Google authorization (handled in place, library session kept) or the library session
+  // itself (renew once, then the normal sign-in flow). The retry reuses the same idempotency key.
+  async function call(method,path,body,key){
+    var opt={key:key||uuid(),noAuthRedirect:true}, send=function(){return api(method,base+path,body,Object.assign({headers:token?{'x-google-access-token':token}:{}},opt));};
+    try{return await send();}
+    catch(e){
+      if(e.status!==401)throw e;
+      if(e.code==='needs_reauthorization'){token=null;session=null;e.message='Google authorization expired. Choose “Authorize / resume same Google account” to continue.';throw e;}
+      if(await renewSession())return send();
+      onUnauthenticated();throw e;
+    }
+  }
+  async function loadScript(src){
+    await new Promise(function(resolve,reject){var s=document.createElement('script');s.src=src;s.onload=resolve;s.onerror=function(){reject(Error('Google scripts could not load. Check your connection and retry.'));};document.head.append(s);});
+  }
+  async function authorize(){
+    if(!navigator.onLine)throw Error('Offline. Reconnect to authorize Google Drive.');
+    if(!window.google?.accounts?.oauth2)await loadScript('https://accounts.google.com/gsi/client');
+    var r=await new Promise(function(resolve,reject){
+      var c=google.accounts.oauth2.initTokenClient({client_id:cfg.client_id,scope:'https://www.googleapis.com/auth/drive.file',include_granted_scopes:false,callback:function(v){v.error?reject(Error(v.error)):resolve(v);},error_callback:function(){reject(Error('Google authorization was closed or blocked; try again.'));}});c.requestAccessToken({prompt:'select_account'});
+    });
+    if(!alive)return;
+    token=r.access_token;
+    session=await call('POST','/sessions',{});
+    account.textContent='Google account: '+session.account+' · Destination: '+(projectTitles[pid]||pid);
+    if(job)await call('POST','/jobs/'+enc(job)+'/resume',{session_id:session.session_id});
+  }
+  async function choose(){
+    if(!token)await authorize();
+    if(!alive)return;
+    if(!window.gapi)await loadScript('https://apis.google.com/js/api.js');
+    await new Promise(function(resolve,reject){gapi.load('picker',{callback:resolve,onerror:function(){reject(Error('Google Picker unavailable'));}});});
+    var ids=await new Promise(function(resolve){
+      new google.picker.PickerBuilder().addView(new google.picker.DocsView().setIncludeFolders(false)).enableFeature(google.picker.Feature.MULTISELECT_ENABLED).setMaxItems(25).setOAuthToken(token).setDeveloperKey(cfg.api_key).setAppId(cfg.app_id).setOrigin(location.origin).setCallback(function(d){if(d.action===google.picker.Action.PICKED)resolve(d.docs.map(function(f){return f.id;}));else if(d.action===google.picker.Action.CANCEL)resolve([]);}).build().setVisible(true);
+    });
+    if(!ids.length||!alive)return;
+    var r=await call('POST','/jobs',{session_id:session.session_id,file_ids:ids,folder_id:folder.value||null});job=r.job_id;cancelled=false;await inspect();
+  }
+  async function read(){
+    var s=await call('GET','/jobs/'+enc(job)), cursor=s.next_cursor;while(cursor){var p=await call('GET','/jobs/'+enc(job)+'?cursor='+enc(cursor));s.items.push.apply(s.items,p.items);cursor=p.next_cursor;}state=s;draw();return s;
+  }
+  async function inspect(){
+    await read();
+    while(alive&&!cancelled&&state.state==='review'&&state.items.some(function(t){return ['selected','inspecting'].includes(t.state);})){await call('POST','/jobs/'+enc(job)+'/process',{});await read();}
+  }
+  function button(text,fn){return h('button',{type:'button',class:'secondary',onclick:function(){run(fn);}},text);}
+  async function run(fn){
+    if(busy)return;busy=true;msg.textContent='Working…';root.setAttribute('aria-busy','true');
+    try{await fn();msg.textContent='Review the file outcomes below.';}catch(e){msg.textContent=(e.status===0?'Offline. Reconnect and resume. ':e.message||String(e))+' Your selection and completed copies are saved.';}
+    finally{busy=false;root.setAttribute('aria-busy','false');}
+  }
+  async function edit(t,opts){await call('POST','/jobs/'+enc(job)+'/edit',Object.assign({item_id:t.id,manifest_version:state.manifest_version},opts));await inspect();}
+  function draw(){
+    if(!alive)return;
+    account.textContent='Google account: '+state.account+' · Destination: '+(projectTitles[pid]||pid)+' · '+state.state;
+    list.replaceChildren();
+    state.items.forEach(function(t){
+      var card=h('article',{class:'card'},h('strong',{text:t.title||t.source?.name||t.source_id}),h('p',{text:t.state+' · '+(t.size===null?'Checking size':fmtBytes(t.size))+' · '+(t.mime||'Checking format')}));
+      if(t.source)card.append(h('a',{href:t.source.url,target:'_blank',rel:'noopener noreferrer'},'Open source in Google Drive'),h('p',{class:'muted small',text:t.source.mimeType+(t.source.native_snapshot?' · Exported snapshot; conversion may lose formatting or features.':'')}));
+      if(t.kind==='markdown')card.append(h('p',{class:'muted small',text:'Google Markdown conversion can change tables, images, footnotes and links. Linked files and images are not copied.'}));
+      if(t.preview)card.append(h('details',null,h('summary',{text:'Markdown source preview (up to 8,000 characters)'}),h('pre',{class:'raw',text:t.preview,tabIndex:0})));
+      if(t.mime==='application/octet-stream')card.append(h('p',{text:'Downloadable Office file. Preview unavailable — download or open the source.'}));
+      if(t.error_message)card.append(h('p',{text:t.error_message}));
+      if(t.library_url)card.append(h('a',{href:t.library_url},'Open library copy'));
+      if(state.state==='review'&&!['imported','cancelled'].includes(t.state)){
+        card.append(button('Remove',function(){return edit(t,{remove:true});}));
+        if(['already_imported','association_unavailable'].includes(t.error_code))card.append(button('Import another copy',function(){return edit(t,{another_copy:true});}));
+      }
+      list.append(card);
+    });
+    controls.replaceChildren();
+    if(state.state==='cancelled')return;
+    controls.append(button('Authorize / resume same Google account',async function(){await authorize();await inspect();}),button('Retry failed files',async function(){await call('POST','/jobs/'+enc(job)+'/retry',{});await inspect();}),h('button',{type:'button',class:'secondary',onclick:async function(){cancelled=true;try{await call('POST','/jobs/'+enc(job)+'/cancel',{});token=null;session=null;await read();msg.textContent='Cancelled unfinished work. Published copies remain.';}catch(e){cancelled=false;msg.textContent=e.message;}}},'Cancel remaining files'));
+    if(state.state==='review'&&state.items.some(function(t){return t.state==='ready';})&&!state.items.some(function(t){return ['selected','inspecting','needs_reauthorization'].includes(t.state);})){controls.append(button('Confirm import',async function(){await call('POST','/jobs/'+enc(job)+'/confirm',{manifest_version:state.manifest_version});await publish();}));}
+    if(state.state==='confirmed'&&state.items.some(function(t){return ['ready','publishing'].includes(t.state);})){controls.append(button('Continue import',publish));}
+  }
+  async function publish(){
+    await read();while(alive&&!cancelled&&state.state==='confirmed'&&state.items.some(function(t){return ['ready','publishing'].includes(t.state);})){await call('POST','/jobs/'+enc(job)+'/process',{});await read();}onDone();
+    if(!state.items.some(function(t){return ['ready','publishing','needs_reauthorization','failed'].includes(t.state);})&&session){await call('DELETE','/sessions/'+enc(session.session_id));token=null;session=null;}
+  }
+  root.append(h('h2',{text:'Import from Google Drive'}),account,audience,h('p',{text:'These files will be copied into this project. Agents with project access can read the copies. Drive changes will not update them automatically.'}),h('p',{class:'muted small',text:'Library permissions apply independently of Drive. Source links stay unchanged. Copies remain after disconnecting Google. Select up to 25 files within the remaining project quota. No folders or shortcuts.'}),msg,folder,jobs,list,controls);
+  root.open=function(){root.hidden=!root.hidden;if(root.hidden)return;run(async function(){
+    cfg=await call('GET','');
+    if(!cfg.configured){msg.textContent='Google Drive import needs setup: configure GOOGLE_DRIVE_CLIENT_ID, GOOGLE_PICKER_API_KEY and GOOGLE_PICKER_APP_ID, enable the Drive and Picker APIs, and register this app origin in Google Cloud. See docs/google-drive-import.md.';return;}
+    // Load provider libraries before the next click, preserving popup user activation.
+    if(!window.google?.accounts?.oauth2)await loadScript('https://accounts.google.com/gsi/client');
+    if(!window.gapi)await loadScript('https://apis.google.com/js/api.js');
+    var labels=[];
+    cfg.connections.connections.filter(function(c){return c.status==='active'&&c.projects.some(function(p){return p.id===pid;});}).forEach(function(c){labels.push(c.client_name);});
+    cfg.connections.grants.filter(function(g){return g.project_id===pid&&g.status==='active';}).forEach(function(g){labels.push(g.label);});
+    cfg.api_keys.keys.filter(function(k){return k.status==='active'&&k.projects.some(function(p){return p.project_id===pid;});}).forEach(function(k){labels.push(k.label);});
+    audience.textContent='Agent connections with project access: '+(labels.join(', ')||'None currently')+'. Access is checked again on every library read.';
+    folder.replaceChildren(h('option',{value:'',text:'Project root'}));(cfg.folders.folders||[]).forEach(function(f){folder.append(h('option',{value:f.id,text:f.title||f.name}));});
+    controls.replaceChildren(button('Select files with Google Picker',choose));
+    jobs.replaceChildren();cfg.jobs.forEach(function(j){jobs.append(button('Resume '+j.account_label+' · '+fmtDate(j.created_at),async function(){job=j.id;await read();}));});
+    msg.textContent='Select files or reopen a saved import. Closing the page pauses unfinished work; authorize the same Google account to resume.';
+  });};return root;
+}
+function driveSourceCard(source){
+  return source?h('div',{class:'callout'},h('span',null,h('a',{href:source.source_url,target:'_blank',rel:'noopener noreferrer'},'Open source in Google Drive'),h('p',{text:'Imported '+fmtDate(source.imported_at)+' · One-time copy; automatic updates are off.'}))):null;
+}
+
 "use strict";
 var S = { me: null, csrf: null, cleanups: [], offline: false };
 var EDITOR_URL = "/editor.${EDITOR_JS_SHA256.slice(0, 16)}.js";
@@ -14672,8 +14801,10 @@ async function viewList(pid, trash) {
     });
     newDocBtn = h("button", { type: "button", "aria-expanded": "false", onclick: function () { upload.hidden = true; uploadBtn.setAttribute("aria-expanded", "false"); newDoc.hidden = !newDoc.hidden; newDocBtn.setAttribute("aria-expanded", String(!newDoc.hidden)); if (!newDoc.hidden) dtitle.focus(); } }, icon("plus"), "New document");
     uploadBtn = h("button", { type: "button", class: "secondary", "aria-expanded": "false", onclick: function () { newDoc.hidden = true; newDocBtn.setAttribute("aria-expanded", "false"); upload.hidden = !upload.hidden; uploadBtn.setAttribute("aria-expanded", String(!upload.hidden)); } }, icon("upload"), "Upload file");
-    actions = [newDocBtn, uploadBtn, keepBtn];
-    panel = [newDoc, upload];
+    var drivePanel = driveImportPanel(pid, function () { load(true); });
+    var driveBtn = h("button", {type:"button",class:"secondary",onclick:function(){drivePanel.open();}}, "Import → Google Drive");
+    actions = [newDocBtn, uploadBtn, driveBtn, keepBtn];
+    panel = [newDoc, upload, drivePanel];
   }
   var titleH1 = h("h1", { text: trash ? "Trash" : (projectTitles[pid] || "Documents"), dataset: { projectTitle: pid } });
   shell(projCrumbs(pid, trash ? [{ t: "Trash" }] : []),
@@ -15504,6 +15635,7 @@ async function viewArtifact(pid, aid, initialTab) {
       else showErr(histMsg, err);
     }
   }
+  if (data.source) details.append(driveSourceCard(data.source));
   // comments
   var comMsg = h("p", { class: "msg", role: "status" }), comList = h("ul", { class: "list" }), comText = h("textarea", { class: "half", maxLength: 4000, placeholder: "Comment on the current revision" });
   var comPending = null;
@@ -15691,7 +15823,7 @@ function renderBinary(A, data, ui) {
   }
   A.reload = async function () { draw(await api("GET", A.base)); };
   draw(data);
-  shell(projCrumbs(A.pid, [{ t: A.meta.title }]), h("div", { class: "titlebar" }, ui.titleEl, copyBar(A, null, offlineToggle(A))), info, ui.tabNav);
+  shell(projCrumbs(A.pid, [{ t: A.meta.title }]), h("div", { class: "titlebar" }, ui.titleEl, copyBar(A, null, offlineToggle(A))), info, driveSourceCard(data.source), ui.tabNav);
   ui.below.append(ui.details);
   ui.addTab("preview", "Preview", null);
   ui.panels.preview.append(holder);
@@ -17538,6 +17670,349 @@ async function revokePublisher(ctx, id) {
 }
 __name(revokePublisher, "revokePublisher");
 
+// Only this adapter talks to Google. No arbitrary URLs, redirects, writes or stored tokens.
+const GD_DOC = 'application/vnd.google-apps.document';
+const GD_SHEET = 'application/vnd.google-apps.spreadsheet';
+const GD_SLIDES = 'application/vnd.google-apps.presentation';
+const GD_XLSX = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+const GD_PPTX = 'application/vnd.openxmlformats-officedocument.presentationml.presentation';
+function gdError(status, code, message) { return new HttpError(status, code, message); }
+function gdId(id) {
+  if (typeof id !== 'string' || !/^[A-Za-z0-9_-]{1,200}$/.test(id)) throw gdError(400,'invalid_source_id','Select a valid Drive file');
+  return id;
+}
+async function gdFetch(ctx, token, path) {
+  if (typeof token !== 'string' || token.length > 4096 || !token.length) throw gdError(401,'needs_reauthorization','Authorize Google Drive to continue');
+  let base = 'https://www.googleapis.com/drive/v3/';
+  // Explicit local synthetic harness only. Cannot redirect production Google traffic.
+  if (ctx.env.LOCAL_DEV_LOGIN && ctx.env.GOOGLE_DRIVE_TEST_ORIGIN && ['localhost','127.0.0.1'].includes(new URL(ctx.importOrigin).hostname)) {
+    const u = new URL(ctx.env.GOOGLE_DRIVE_TEST_ORIGIN);
+    if (u.protocol !== 'http:' || !['localhost','127.0.0.1'].includes(u.hostname)) throw gdError(500,'test_config','Invalid local fixture origin');
+    base = u.origin + '/drive/v3/';
+  }
+  let r;
+  try { r = await fetch(base + path, {headers:{authorization:'Bearer '+token},redirect:'manual',signal:AbortSignal.timeout(20000)}); }
+  catch { throw gdError(503,'google_unavailable','Google Drive is unavailable; retry'); }
+  if (!r.ok) {
+    await r.body?.cancel();
+    if (r.status===401) throw gdError(401,'needs_reauthorization','Google authorization expired or was revoked');
+    if (r.status===403 || r.status===404) throw gdError(403,'source_access','Cannot download this selected file; check source permission and download capability');
+    if (r.status===429) throw gdError(429,'source_rate_limit','Google rate limit; retry later');
+    throw gdError(502,'google_error','Google could not read the file');
+  }
+  return r;
+}
+async function gdAccount(ctx, token) {
+  const r = await gdFetch(ctx, token, 'about?fields=user(permissionId,emailAddress,displayName)');
+  const u = (await r.json()).user;
+  if (!u || typeof u.permissionId !== 'string' || u.permissionId.length>200) throw gdError(401,'needs_reauthorization','Google account identity unavailable');
+  return {id:u.permissionId,label:String(u.emailAddress || u.displayName || 'Google account').slice(0,200)};
+}
+async function gdMeta(ctx, token, id) {
+  const r = await gdFetch(ctx, token, 'files/'+gdId(id)+'?supportsAllDrives=true&fields=id,name,mimeType,size,version,modifiedTime,driveId,trashed,capabilities(canDownload)');
+  const m = await r.json();
+  if (m.id!==id || m.trashed || m.capabilities?.canDownload!==true) throw gdError(403,'source_access','Source is unavailable or downloading is disabled');
+  return {id:m.id,name:String(m.name||'Untitled').slice(0,200),mimeType:m.mimeType,size:m.size??null,version:m.version??null,modifiedTime:m.modifiedTime??null,driveId:m.driveId??null,url:'https://drive.google.com/file/d/'+id+'/view'};
+}
+function gdProfile(m) {
+  const native = {[GD_DOC]:['markdown','text/markdown','.md'],[GD_SHEET]:['binary',GD_XLSX,'.xlsx'],[GD_SLIDES]:['binary',GD_PPTX,'.pptx']}[m.mimeType];
+  if (native) return {kind:native[0],exportMime:native[1],mime:native[0]==='markdown'?'text/markdown':'application/octet-stream',title:m.name.replace(/\.(md|xlsx|pptx)$/i,'').slice(0,190)+native[2],native:true};
+  if (m.mimeType==='text/markdown' || m.mimeType==='text/x-markdown' || (m.mimeType==='text/plain' && /\.md$/i.test(m.name))) return {kind:'markdown',mime:'text/markdown',title:m.name,native:false};
+  if ([GD_XLSX,GD_PPTX].includes(m.mimeType) || (m.mimeType==='application/octet-stream' && /\.(xlsx|pptx)$/i.test(m.name))) return {kind:'binary',mime:'application/octet-stream',title:m.name,native:false};
+  if (m.mimeType!=='application/octet-stream' && BINARY_TYPES[m.mimeType]) return {kind:'binary',mime:m.mimeType,title:m.name,native:false};
+  throw gdError(415,'unsupported_type','Unsupported type, folder or shortcut; skipped without following links');
+}
+function gdSame(a,b) { return ['id','name','mimeType','version','modifiedTime','size'].every(k=>a[k]===b[k]); }
+async function gdBytes(ctx, token, m, p) {
+  const cap = p.kind==='markdown'?LIMITS.markdownBytes:LIMITS.binaryBytes;
+  if (m.size && Number(m.size)>cap) throw gdError(413,'too_large','Source exceeds the library file limit');
+  const path='files/'+gdId(m.id)+(p.native?'/export?mimeType='+encodeURIComponent(p.exportMime):'?alt=media&supportsAllDrives=true');
+  const r=await gdFetch(ctx,token,path), reader=r.body.getReader(), chunks=[]; let n=0;
+  try {
+    for (;;) { const v=await reader.read(); if(v.done)break; n+=v.value.length; if(n>cap)throw gdError(413,'too_large','Export exceeds the library file limit'); chunks.push(v.value); }
+  } finally { await reader.cancel(); }
+  if (!p.native && m.size!==null && n!==Number(m.size)) throw gdError(422,'integrity_mismatch','Truncated source download');
+  const bytes=new Uint8Array(n); let o=0; for(const c of chunks){bytes.set(c,o);o+=c.length;}
+  if(p.kind==='markdown') {
+    let text; try { text=new TextDecoder('utf-8',{fatal:true,ignoreBOM:true}).decode(bytes); } catch {throw gdError(422,'invalid_utf8','Markdown must be valid UTF-8');}
+    mdBody(text); // validation only; preserve the exact exported bytes
+  } else if(!n || !BINARY_TYPES[p.mime](bytes)) throw gdError(415,'signature_mismatch','File signature does not match its type');
+  const after=await gdMeta(ctx,token,m.id);
+  if(!gdSame(m,after))throw gdError(409,'source_changed','Source changed during reading; inspect again');
+  return bytes;
+}
+
+// Client-driven, one item per request. Jobs survive browser closure; tokens never enter storage.
+function gdFence(ctx) {
+  const d=ctx.driveImport;
+  return d ? {sql:"EXISTS (SELECT 1 FROM drive_import_jobs WHERE id=? AND state='confirmed' AND lease=? AND lease_until>?)",params:[d.job.id,d.lease,nowMs()]} : {sql:'1',params:[]};
+}
+function gdPublication(ctx, aid, rid) {
+  const d=ctx.driveImport;if(!d)return [];
+  const {job:j,item:t}=d, m=JSON.parse(t.metadata), gate='EXISTS (SELECT 1 FROM revisions WHERE id=?)';
+  const provenance={provider:'google-drive',account_id:j.account_id,source_id:t.source_id,source_title:m.name,source_mime:m.mimeType,source_url:m.url,drive_id:m.driveId,source_version:m.version,source_modified_time:m.modifiedTime,export_mime:m.exportMime??m.mimeType,conversion_profile:m.exportMime?'google-native-export/1':'drive-original-bytes/1',imported_sha256:t.sha256,baseline_revision:1,baseline_sha256:t.sha256,baseline_title:t.title,baseline_meta_version:1,import_owner:j.owner_id,imported_at:nowIso(),job_id:j.id,item_id:t.id,role:'primary',state:'detached',sync_enabled:false};
+  return [ctx.env.DB.prepare(`INSERT INTO artifact_sources(id,project_id,artifact_id,account_id,source_id,is_primary,provenance) SELECT ?,?,?,?,?,?,? WHERE ${gate}`).bind(randomId('src'),j.project_id,aid,j.account_id,t.source_id,t.another_copy?0:1,JSON.stringify(provenance),rid),
+    ctx.env.DB.prepare(`UPDATE drive_import_items SET state='imported',artifact_id=?,error_code=NULL,error_message=NULL WHERE id=? AND ${gate}`).bind(aid,t.id,rid),
+    ctx.env.DB.prepare(`UPDATE artifacts SET folder_id=? WHERE id=? AND ${gate}`).bind(j.folder_id,aid,rid)];
+}
+// Agents, OAuth apps and API keys see where a copy came from, not who imported it or from which account.
+const GD_OWNER_ONLY=['account_id','account_label','import_owner','job_id','item_id'];
+async function gdProvenance(ctx,pid,aid) {
+  await authorizeProject(ctx,pid,false);await loadArtifact(ctx,pid,aid);
+  const r=await ctx.env.DB.prepare('SELECT provenance FROM artifact_sources WHERE project_id=? AND artifact_id=? LIMIT 1').bind(pid,aid).first('provenance');
+  if(!r)return null;
+  const p=JSON.parse(r);
+  if(ctx.principal?.kind!=='human')for(const k of GD_OWNER_ONLY)delete p[k];
+  return p;
+}
+function gdConfigured(env) { return !!(env.GOOGLE_DRIVE_CLIENT_ID&&env.GOOGLE_PICKER_API_KEY&&env.GOOGLE_PICKER_APP_ID); }
+// Google sources are admitted only on the owner UI document, and only when import is configured.
+// API, content, transfer and render responses keep the strict SEC_HEADERS policy.
+const GD_CSP={'script-src':'https://accounts.google.com/gsi/client https://apis.google.com/js/api.js https://apis.google.com/_/scs/','style-src':'https://accounts.google.com/gsi/style','connect-src':'https://accounts.google.com/gsi/','frame-src':'https://accounts.google.com/gsi/ https://docs.google.com'};
+function gdDocumentCsp(env) {
+  if(!gdConfigured(env))return {};
+  const seen=new Set(), csp=SEC_HEADERS['content-security-policy'].split(';').map(d=>d.trim()).filter(Boolean).map(d=>{const n=d.split(/\s+/)[0];if(!GD_CSP[n])return d;seen.add(n);return d+' '+GD_CSP[n];});
+  if(seen.size!==Object.keys(GD_CSP).length)return {}; // fail closed: keep the strict policy
+  return {'content-security-policy':csp.join('; ')};
+}
+// Retire this item's unfinished upload so a stale snapshot can never be resumed, and so the owner's
+// single active-upload slot is released. A sealed upload with a live finalizer lease is left alone.
+const GD_RETIRED=JSON.stringify({status:409,code:'source_changed',message:'Source changed; import upload retired'});
+async function gdRetireUpload(DB,uploadId) {
+  if(!uploadId)return;
+  await DB.prepare("UPDATE uploads SET state='failed',result=?,finalize_token=NULL,finalize_until=NULL WHERE id=? AND (state IN ('pending','received') OR (state='sealed' AND (finalize_until IS NULL OR finalize_until<=?) AND NOT EXISTS (SELECT 1 FROM revisions r WHERE r.id=uploads.final_revision_id)))").bind(GD_RETIRED,uploadId,nowMs()).run();
+}
+async function gdJob(ctx,pid,id) {
+  requireHuman(ctx);await authorizeProject(ctx,pid,true);
+  const j=await ctx.env.DB.prepare('SELECT * FROM drive_import_jobs WHERE id=? AND project_id=? AND owner_id=?').bind(id,pid,ctx.principal.id).first();
+  if(!j)throw gdError(404,'not_found','Import job not found');return j;
+}
+async function gdSession(ctx,id,token,accountId) {
+  const s=await ctx.env.DB.prepare('SELECT * FROM drive_import_sessions WHERE id=? AND owner_id=? AND expires_at>?').bind(id,ctx.principal.id,nowMs()).first();
+  if(!s)throw gdError(401,'needs_reauthorization','Authorize Google Drive to resume this job');
+  const a=await gdAccount(ctx,token);
+  if(a.id!==s.account_id || (accountId && a.id!==accountId))throw gdError(409,'wrong_account','Resume using the original Google account');
+  return s;
+}
+async function gdState(ctx,j,offset=0) {
+  const rows=await ctx.env.DB.prepare('SELECT * FROM drive_import_items WHERE job_id=? ORDER BY id LIMIT 10 OFFSET ?').bind(j.id,offset).all();
+  return {job_id:j.id,project_id:j.project_id,folder_id:j.folder_id,account:j.account_label,state:j.state,manifest_version:j.manifest_version,confirmed_version:j.confirmed_version,
+    items:rows.results.map(t=>({id:t.id,source_id:t.source_id,state:t.state,source:t.metadata?JSON.parse(t.metadata):null,title:t.title,mime:t.mime,kind:t.kind,size:t.size,sha256:t.sha256,preview:t.preview,another_copy:!!t.another_copy,artifact_id:t.artifact_id,library_url:t.artifact_id?artifactWebUrl(ctx.importOrigin||appOrigin(ctx.env),j.project_id,t.artifact_id):null,error_code:t.error_code,error_message:t.error_message})),next_cursor:rows.results.length===10?String(offset+10):null};
+}
+async function gdMutation(ctx,pid,op,key,input,fn) {
+  const i={projectId:pid,op:'drive.'+op,key,digest:await sha256Hex(JSON.stringify(input))};
+  const prior=await idemLookup(ctx,i);if(prior)return prior;
+  // The closure returns SQL and a result, all stored transactionally with idempotency.
+  const {statements,result}=await fn();
+  let r;
+  try { r=await runBatch(ctx,[...statements,audit(ctx,pid,'drive.import.'+op.split(':')[0],result.job_id??null,null,'ok'),idemInsert(ctx,i,200,result,'1',[])],i); }
+  catch(e) { if(/malformed JSON/.test(String(e.message)))throw gdError(409,'manifest_changed','Import changed; reload and review');throw e; }
+  return Array.isArray(r)?{status:200,body:result}:r;
+}
+async function gdInspect(ctx,j,t,token,lease) {
+  const DB=ctx.env.DB;
+  try {
+    const m=await gdMeta(ctx,token,t.source_id), p=gdProfile(m);
+    const existing=await DB.prepare('SELECT s.artifact_id,a.trashed_at,a.head_rev FROM artifact_sources s LEFT JOIN artifacts a ON a.id=s.artifact_id AND a.project_id=s.project_id WHERE s.account_id=? AND s.source_id=? AND s.project_id=? AND s.is_primary=1').bind(j.account_id,t.source_id,j.project_id).first();
+    if(existing && !t.another_copy) {
+      const good=existing.head_rev>0&&!existing.trashed_at;
+      await DB.prepare("UPDATE drive_import_items SET state=?,artifact_id=?,metadata=?,error_code=?,error_message=? WHERE id=?").bind(good?'skipped':'failed',good?existing.artifact_id:null,JSON.stringify(m),good?'already_imported':'association_unavailable',good?'Already imported':'Previous copy is trashed or unavailable; explicitly import another copy',t.id).run();
+      return;
+    }
+    const bytes=await gdBytes(ctx,token,m,p), sha=await sha256Hex(bytes);
+    const metadata=JSON.stringify({...m,exportMime:p.exportMime??null,native_snapshot:p.native});
+    const stage=t.stage_key||('drive-stage/'+j.id+'/'+t.id);
+    // Reserve staging space before the R2 write. Repeated inspection keeps one tracked key.
+    const used=gdUploadQuota({...ctx,driveImport:{item:t}},nowMs());
+    const reserve=await DB.prepare(`UPDATE drive_import_items SET stage_key=?2,size=?3,sha256=?4,kind=?5,mime=?6,title=?7,metadata=?8,stage_writes=stage_writes+1,stage_purged=0
+      WHERE id=?9 AND stage_writes=0 AND EXISTS(SELECT 1 FROM drive_import_jobs WHERE id=?10 AND lease=?11 AND state='review')
+      AND (${used}) + ?12 <= ?13`).bind(j.project_id,stage,bytes.length,sha,p.kind,p.mime,p.title.slice(0,200),metadata,t.id,j.id,lease,p.kind==='binary'?bytes.length:0,limitsFor(ctx.env).projectBinaryBytes).run();
+    if(!reserve.meta.changes)throw gdError(413,'quota_exceeded','Staging quota exhausted or work is still in progress');
+    try { await ctx.env.BLOBS.put(stage,bytes,{httpMetadata:{contentType:'application/octet-stream'},sha256:sha}); }
+    finally { await DB.prepare('UPDATE drive_import_items SET stage_writes=stage_writes-1 WHERE id=? AND stage_writes>0').bind(t.id).run(); }
+    const text=p.kind==='markdown'?new TextDecoder('utf-8',{ignoreBOM:true}).decode(bytes):null;
+    await DB.prepare("UPDATE drive_import_items SET state='ready',preview=?,error_code=NULL,error_message=NULL WHERE id=? AND EXISTS(SELECT 1 FROM drive_import_jobs WHERE id=? AND state='review' AND lease=?)").bind(text?.slice(0,8000)??null,t.id,j.id,lease).run();
+  } catch(e) {
+    await DB.prepare('UPDATE drive_import_items SET state=?,error_code=?,error_message=? WHERE id=? AND state NOT IN (\'imported\',\'cancelled\')').bind(e.code==='needs_reauthorization'?'needs_reauthorization':e.code==='unsupported_type'?'skipped':'failed',e.code||'import_failed',e instanceof HttpError?e.message:'Import failed; retry',t.id).run();
+  }
+}
+async function gdPublish(ctx,j,t,token,lease,req) {
+  const DB=ctx.env.DB;
+  const dctx={...ctx,driveImport:{job:j,item:t,lease}};
+  try {
+    const m=JSON.parse(t.metadata), current=await gdMeta(ctx,token,t.source_id);
+    if(!gdSame(m,current))throw gdError(409,'source_changed','Source changed since review; review the refreshed manifest');
+    const existing=await DB.prepare('SELECT s.artifact_id,a.trashed_at,a.head_rev FROM artifact_sources s JOIN artifacts a ON a.id=s.artifact_id WHERE s.project_id=? AND s.account_id=? AND s.source_id=? AND s.is_primary=1').bind(j.project_id,j.account_id,t.source_id).first();
+    if(existing&&!t.another_copy){
+      if(existing.trashed_at||!existing.head_rev)throw gdError(409,'association_unavailable','Previous copy is trashed; explicitly import another copy');
+      await DB.prepare("UPDATE drive_import_items SET state='skipped',artifact_id=?,error_code='already_imported',error_message='Already imported' WHERE id=? AND state<>'cancelled'").bind(existing.artifact_id,t.id).run();return;
+    }
+    const o=await ctx.env.BLOBS.get(t.stage_key);
+    if(!o)throw gdError(409,'staging_expired','Staged content unavailable; inspect again');
+    const bytes=new Uint8Array(await o.arrayBuffer());
+    if(bytes.length!==t.size || await sha256Hex(bytes)!==t.sha256)throw gdError(422,'integrity_mismatch','Staged content failed integrity verification');
+    if(t.kind==='markdown') {
+      await createMarkdown(dctx,j.project_id,{title:t.title,body:new TextDecoder('utf-8',{fatal:true,ignoreBOM:true}).decode(bytes),folder_id:j.folder_id,change_note:'One-time Google Drive import'},t.id+'-'+t.attempt+'-create');
+    } else {
+      const u=await uploadBegin(dctx,j.project_id,{title:t.title,mime:t.mime,size:t.size,sha256:t.sha256},t.id+'-'+t.attempt+'-begin');
+      const uploadId=u.body.upload_id;
+      const row=await DB.prepare('SELECT state FROM uploads WHERE id=?').bind(uploadId).first();
+      if(row.state==='pending') {
+        const headers=new Headers(req.headers);headers.delete('content-length');headers.set('content-type','application/octet-stream');
+        await uploadPut(new Request(ctx.importOrigin+u.body.put_url,{method:'PUT',headers,body:bytes}),ctx.env,ctx.requestId,uploadId);
+      }
+      await uploadFinish(dctx,j.project_id,uploadId,t.id+'-'+t.attempt+'-finish');
+    }
+  } catch(e) {
+    // A concurrent mapping winner causes the entire publication batch to roll back.
+    const imported=await DB.prepare("SELECT 1 AS x FROM drive_import_items WHERE id=? AND state='imported'").bind(t.id).first();
+    if(imported)return;
+    if(e.code==='source_changed') {
+      const cur=await DB.prepare('SELECT upload_id FROM drive_import_items WHERE id=?').bind(t.id).first('upload_id');
+      await gdRetireUpload(DB,cur);
+      await DB.prepare("UPDATE drive_import_jobs SET state='review',confirmed_version=NULL,manifest_version=manifest_version+1 WHERE id=? AND lease=?").bind(j.id,lease).run();
+    }
+    await DB.prepare('UPDATE drive_import_items SET state=?,error_code=?,error_message=? WHERE id=? AND state NOT IN (\'imported\',\'cancelled\')').bind(e.code==='needs_reauthorization'?'needs_reauthorization':'failed',e.code||'publish_failed',e instanceof HttpError?e.message:'Publication failed; retry',t.id).run();
+  }
+}
+async function gdCleanup(env) {
+  const DB=env.DB, now=nowMs();
+  await DB.prepare('DELETE FROM drive_import_sessions WHERE id IN (SELECT id FROM drive_import_sessions WHERE expires_at<=? LIMIT 50)').bind(now).run();
+  const rows=await DB.prepare(`SELECT t.id,t.stage_key FROM drive_import_items t JOIN drive_import_jobs j ON j.id=t.job_id WHERE t.stage_key IS NOT NULL AND t.stage_purged=0 AND t.stage_writes=0 AND j.lease_until<? AND (j.expires_at<? OR j.state='cancelled' OR t.state IN ('imported','skipped','cancelled')) LIMIT 25`).bind(now,now).all();
+  for(const t of rows.results){await env.BLOBS.delete(t.stage_key);await DB.prepare('UPDATE drive_import_items SET stage_purged=1,preview=NULL WHERE id=? AND stage_writes=0').bind(t.id).run();}
+  return {purged:rows.results.length};
+}
+async function gdRoute(ctx,req,pid,parts,url,key) {
+  requireHuman(ctx);await authorizeProject(ctx,pid,true);ctx.importOrigin=url.origin;
+  const DB=ctx.env.DB, method=req.method, token=req.headers.get('x-google-access-token');
+  const configured=gdConfigured(ctx.env);
+  if(parts.length===0&&method==='GET') {
+    const jobs=await DB.prepare('SELECT id,state,created_at,account_label FROM drive_import_jobs WHERE project_id=? AND owner_id=? ORDER BY created_at DESC LIMIT 20').bind(pid,ctx.principal.id).all();
+    return json({configured,client_id:ctx.env.GOOGLE_DRIVE_CLIENT_ID||null,api_key:ctx.env.GOOGLE_PICKER_API_KEY||null,app_id:ctx.env.GOOGLE_PICKER_APP_ID||null,max_files:25,jobs:jobs.results,connections:await listAccess(ctx),api_keys:await listApiKeys(ctx),folders:appConnectEnabled(ctx.env)?await listFolders(ctx,pid):{folders:[]}});
+  }
+  if(parts[0]==='sessions'&&method==='POST') {
+    const a=await gdAccount(ctx,token);
+    return out(await gdMutation(ctx,pid,'session',key(),{account:a.id},async()=>{
+      const id=randomId('gis'),expires=nowMs()+3600000;
+      return {result:{session_id:id,account:a.label,expires_at:expires},statements:[DB.prepare('INSERT INTO drive_import_sessions VALUES(?,?,?,?,?)').bind(id,ctx.principal.id,a.id,a.label,expires)]};
+    }));
+  }
+  if(parts[0]==='sessions'&&parts.length===2&&method==='DELETE') {
+    return out(await gdMutation(ctx,pid,'disconnect',key(),{id:parts[1]},async()=>({result:{ok:true},statements:[DB.prepare('DELETE FROM drive_import_sessions WHERE id=? AND owner_id=?').bind(parts[1],ctx.principal.id)]})));
+  }
+  if(parts[0]!=='jobs')throw gdError(404,'not_found','Not found');
+  if(parts.length===1&&method==='POST') {
+    const b=await body(req), s=await gdSession(ctx,b.session_id,token);
+    const active=await DB.prepare("SELECT COUNT(*) AS n FROM drive_import_jobs WHERE owner_id=? AND expires_at>? AND state IN ('review','confirmed') AND EXISTS(SELECT 1 FROM drive_import_items WHERE job_id=drive_import_jobs.id AND state NOT IN ('imported','skipped','cancelled'))").bind(ctx.principal.id,nowMs()).first('n');
+    if(active>=20)throw gdError(429,'too_many_jobs','Cancel an earlier import before starting another');
+    if(!Array.isArray(b.file_ids)||!b.file_ids.length||b.file_ids.length>25||new Set(b.file_ids).size!==b.file_ids.length)throw gdError(400,'invalid_selection','Select 1–25 distinct files');
+    b.file_ids.forEach(gdId);const folder=await folderCheck(ctx,pid,b.folder_id);
+    const count=await DB.prepare('SELECT COUNT(*) AS n FROM artifacts WHERE project_id=? AND publisher_id IS NULL AND pending_review = 0').bind(pid).first('n');
+    if(b.file_ids.length>LIMITS.artifactsPerProject-count)throw gdError(413,'quota_exceeded','Selection exceeds remaining project capacity');
+    return out(await gdMutation(ctx,pid,'create',key(),{session:s.id,ids:b.file_ids,folder},async()=>{
+      const id=randomId('gjob'),statements=[DB.prepare('INSERT INTO drive_import_jobs(id,project_id,owner_id,session_id,account_id,account_label,folder_id,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?)').bind(id,pid,ctx.principal.id,s.id,s.account_id,s.account_label,folder,nowIso(),nowMs()+86400000)];
+      for(const source of b.file_ids)statements.push(DB.prepare('INSERT INTO drive_import_items(id,job_id,source_id) VALUES(?,?,?)').bind(randomId('gitem'),id,source));
+      return {statements,result:{job_id:id}};
+    }));
+  }
+  let j=await gdJob(ctx,pid,parts[1]);
+  if(parts.length===2&&method==='GET')return json(await gdState(ctx,j,int(Number(url.searchParams.get('cursor')||0),'cursor',0,25)));
+  if(method!=='POST')throw gdError(404,'not_found','Not found');
+  const b=await body(req), action=parts[2];
+  if(action==='cancel') {
+    const result=await gdMutation(ctx,pid,'cancel:'+j.id,key(),{},async()=>({result:{ok:true},statements:[DB.prepare("UPDATE drive_import_jobs SET state='cancelled' WHERE id=?").bind(j.id),DB.prepare("UPDATE drive_import_items SET state='cancelled',preview=NULL WHERE job_id=? AND state NOT IN ('imported','skipped')").bind(j.id),DB.prepare('DELETE FROM drive_import_sessions WHERE id=? AND owner_id=?').bind(j.session_id,ctx.principal.id)]}));
+    await gdCleanup(ctx.env);return out(result);
+  }
+  if(j.state==='cancelled'||j.expires_at<=nowMs())throw gdError(410,'job_expired','Job cancelled or expired; create a new import');
+  if(action==='resume') {
+    const s=await gdSession(ctx,b.session_id,token,j.account_id);
+    return out(await gdMutation(ctx,pid,'resume:'+j.id,key(),{session:s.id},async()=>({result:{ok:true},statements:[DB.prepare('UPDATE drive_import_jobs SET session_id=? WHERE id=?').bind(s.id,j.id),DB.prepare("UPDATE drive_import_items SET state=CASE WHEN stage_key IS NULL OR sha256 IS NULL THEN 'selected' ELSE 'ready' END,error_code=NULL,error_message=NULL WHERE job_id=? AND state='needs_reauthorization'").bind(j.id)]})));
+  }
+  if(action==='confirm') {
+    const version=int(b.manifest_version,'manifest_version',1);
+    if(j.lease_until>nowMs())throw gdError(409,'import_busy','Wait for the current file to finish');
+    return out(await gdMutation(ctx,pid,'confirm:'+j.id,key(),{version},async()=>{
+      const pending=await DB.prepare("SELECT COUNT(*) AS n FROM drive_import_items WHERE job_id=? AND state IN ('selected','inspecting','needs_reauthorization')").bind(j.id).first('n');
+      if(j.manifest_version!==version||pending)throw gdError(409,'manifest_changed','Finish inspecting and review the current manifest');
+      return {result:{ok:true,manifest_version:version},statements:[gdAssert(DB,"EXISTS(SELECT 1 FROM drive_import_jobs WHERE id=? AND manifest_version=? AND lease_until<=? AND state IN ('review','confirmed'))",[j.id,version,nowMs()]),DB.prepare("UPDATE drive_import_jobs SET state='confirmed',confirmed_version=? WHERE id=? AND manifest_version=? AND lease_until<=? AND state IN ('review','confirmed')").bind(version,j.id,version,nowMs())]};
+    }));
+  }
+  if(action==='edit') {
+    if(j.state!=='review'||j.lease_until>nowMs()||b.manifest_version!==j.manifest_version)throw gdError(409,'manifest_changed','Reload the current manifest');
+    const t=await DB.prepare('SELECT * FROM drive_import_items WHERE id=? AND job_id=?').bind(b.item_id,j.id).first();
+    if(!t||t.state==='imported')throw gdError(409,'item_state','Item cannot be changed');
+    return out(await gdMutation(ctx,pid,'edit:'+j.id,key(),b,async()=>({result:{ok:true},statements:[gdAssert(DB,"EXISTS(SELECT 1 FROM drive_import_jobs WHERE id=? AND manifest_version=? AND lease_until<=? AND state='review')",[j.id,b.manifest_version,nowMs()]),DB.prepare("UPDATE drive_import_items SET state=?,another_copy=? WHERE id=? AND state<>'imported'").bind(b.remove?'cancelled':'selected',b.another_copy===true?1:t.another_copy,t.id),DB.prepare('UPDATE drive_import_jobs SET manifest_version=manifest_version+1,confirmed_version=NULL WHERE id=?').bind(j.id)]})));
+  }
+  if(action!=='process'&&action!=='retry')throw gdError(404,'not_found','Not found');
+  // Each process key identifies a durable bounded operation, never a fire-and-forget task.
+  const ik=key(), ii={projectId:pid,op:'drive.'+action+':'+j.id,key:ik,digest:await sha256Hex(JSON.stringify(b))};
+  const prior=await idemLookup(ctx,ii);if(prior)return out(prior);
+  try { await gdSession(ctx,j.session_id,token,j.account_id); } catch(e) {
+    if(e.code==='needs_reauthorization') await DB.prepare("UPDATE drive_import_items SET state='needs_reauthorization' WHERE job_id=? AND state IN ('selected','ready')").bind(j.id).run();
+    throw e;
+  }
+  const lease=randomId('gl'), claimed=await DB.prepare('UPDATE drive_import_jobs SET lease=?,lease_until=? WHERE id=? AND lease_until<=? AND state IN (\'review\',\'confirmed\')').bind(lease,nowMs()+120000,j.id,nowMs()).run();
+  if(!claimed.meta.changes)throw gdError(409,'import_busy','Another request is processing; retry shortly');
+  try {
+    if(action==='retry') {
+      // Re-inspection invalidates confirmation. Successful items are never revisited.
+      // A changed source must be re-read: retire any upload still holding the old snapshot first.
+      const stale=await DB.prepare("SELECT upload_id FROM drive_import_items WHERE job_id=? AND state='failed' AND error_code='source_changed' AND upload_id IS NOT NULL").bind(j.id).all();
+      for(const r of stale.results)await gdRetireUpload(DB,r.upload_id);
+      await DB.batch([
+        gdAssert(DB,"EXISTS(SELECT 1 FROM drive_import_jobs WHERE id=? AND lease=? AND state IN ('review','confirmed'))",[j.id,lease]),
+        DB.prepare("UPDATE drive_import_items SET state='selected',upload_id=NULL,attempt=attempt+1,error_code=NULL,error_message=NULL WHERE job_id=? AND state='failed' AND (upload_id IS NULL OR EXISTS(SELECT 1 FROM uploads WHERE id=drive_import_items.upload_id AND state IN ('failed','conflict')))").bind(j.id),
+        DB.prepare("UPDATE drive_import_items SET state='ready',error_code=NULL,error_message=NULL WHERE job_id=? AND state='failed' AND upload_id IS NOT NULL AND COALESCE(error_code,'')<>'source_changed'").bind(j.id),
+        DB.prepare("UPDATE drive_import_jobs SET state='review',manifest_version=manifest_version+1,confirmed_version=NULL WHERE id=?").bind(j.id)]);
+
+    } else {
+      const t=await DB.prepare("SELECT * FROM drive_import_items WHERE job_id=? AND state IN ('selected','inspecting','ready','publishing') ORDER BY id LIMIT 1").bind(j.id).first();
+      if(t){
+        if(j.state==='review'){
+          const selected=await DB.prepare("SELECT * FROM drive_import_items WHERE job_id=? AND state IN ('selected','inspecting') ORDER BY id LIMIT 1").bind(j.id).first();
+          if(selected){await DB.prepare("UPDATE drive_import_items SET state='inspecting' WHERE id=? AND state='selected'").bind(selected.id).run();await gdInspect(ctx,j,selected,token,lease);}
+        } else {
+          await DB.prepare("UPDATE drive_import_items SET state='publishing' WHERE id=? AND state='ready'").bind(t.id).run();
+          await gdPublish(ctx,j,t,token,lease,req);
+        }
+      }
+    }
+    j=await gdJob(ctx,pid,j.id);const result=await gdState(ctx,j);
+    await DB.batch([idemInsert(ctx,ii,200,result,'1',[]),audit(ctx,pid,'drive.import.'+action,j.id,null,'ok')]);return json(result);
+  } finally {
+    await DB.prepare('UPDATE drive_import_jobs SET lease=NULL,lease_until=0 WHERE id=? AND lease=?').bind(j.id,lease).run();
+    await gdCleanup(ctx.env);
+  }
+}
+
+function gdUploadQuota(ctx, now) {
+  let sql=quotaUsedSql(now);
+  if(ctx.driveImport) {
+    const id=ctx.driveImport.item.id;
+    if(!/^gitem_[A-Za-z0-9_-]+$/.test(id))throw gdError(500,'item_state','Invalid internal import item');
+    sql=sql.replace("WHERE j.project_id=?1 AND t.kind='binary'", "WHERE t.id<>'"+id+"' AND j.project_id=?1 AND t.kind='binary'");
+  }
+  return sql;
+}
+function gdRestoreSources(ctx, backup, pid) {
+  const rows=backup.sources??[];
+  if(!Array.isArray(rows)||rows.length>100)throw gdError(400,'bad_backup','Invalid source provenance');
+  return rows.map(row=>{
+    let p;try{p=typeof row.provenance==='string'?JSON.parse(row.provenance):null;}catch{throw gdError(400,'bad_backup','Invalid source provenance JSON');}
+    const a=backup.artifacts.find(a=>a.id===row.artifact_id);
+    const r=backup.revisions.find(r=>r.artifact_id===row.artifact_id&&r.rev_no===p?.baseline_revision);
+    if(!a||!p||p.provider!=='google-drive'||!r||r.sha256!==p.baseline_sha256||p.imported_sha256!==r.sha256||JSON.stringify(p).length>12000)throw gdError(400,'bad_backup','Invalid source baseline');
+    const detached={provider:'google-drive',account_id:str(p.account_id,'account',200),source_id:gdId(p.source_id),source_title:str(p.source_title,'source title',200),source_mime:str(p.source_mime,'source type',200),source_url:'https://drive.google.com/file/d/'+gdId(p.source_id)+'/view',drive_id:p.drive_id??null,source_version:p.source_version??null,source_modified_time:p.source_modified_time??null,export_mime:p.export_mime,conversion_profile:str(p.conversion_profile,'conversion profile',100),imported_sha256:r.sha256,baseline_revision:r.rev_no,baseline_sha256:r.sha256,baseline_title:a.title,baseline_meta_version:1,imported_at:p.imported_at,state:'detached',sync_enabled:false,role:'primary',restored:true};
+    return ctx.env.DB.prepare('INSERT INTO artifact_sources(id,project_id,artifact_id,account_id,source_id,is_primary,provenance) VALUES(?,?,?,?,?,0,?)').bind(randomId('src'),pid,a.id,detached.account_id,detached.source_id,JSON.stringify(detached));
+  });
+}
+
+// SQLite has no RAISE outside a trigger. Invalid JSON deliberately aborts the entire D1 batch
+// when a reviewed precondition no longer holds; no item edits/idempotency result can then commit.
+function gdAssert(DB, condition, params) {
+  return DB.prepare(`SELECT json(CASE WHEN (${condition}) THEN 'true' ELSE 'manifest_changed' END)`).bind(...params);
+}
+
 // src/index.ts
 var SEC_HEADERS = {
   "x-content-type-options": "nosniff",
@@ -17626,7 +18101,7 @@ __name(accessLogin, "accessLogin");
 async function route3(req, env, url, requestId) {
   const path = url.pathname;
   const m = req.method;
-  if (m === "GET" && (path === "/" || path === "/index.html" || WEB_ROUTE.test(path))) return new Response(APP_HTML, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
+  if (m === "GET" && (path === "/" || path === "/index.html" || WEB_ROUTE.test(path))) return new Response(APP_HTML, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", ...gdDocumentCsp(env) } });
   if (m === "GET" && path === "/app.js") return new Response(APP_JS, { headers: { "content-type": "text/javascript; charset=utf-8", "cache-control": "no-store" } });
   if (m === "GET" && (path === "/manifest.webmanifest" || path === "/sw.js" || path.startsWith("/icons/"))) {
     const r = servePwa(path);
@@ -17693,6 +18168,7 @@ async function route3(req, env, url, requestId) {
   }
   const pid = str(seg[1], "project", 64);
   const rest = seg.slice(2);
+  if (rest[0] === "drive-import") return gdRoute(ctx, req, pid, rest.slice(1), url, key);
   if (rest[0] === "grants") {
     if (rest.length === 1 && m === "GET") return json(await listGrants(ctx, pid));
     if (rest.length === 1 && m === "POST") return json(await createGrant(ctx, pid, await body(req)), 201);
@@ -17799,6 +18275,7 @@ var index_default = {
   // Cron: expire abandoned uploads and delete their R2 objects (bounded, idempotent).
   async scheduled(_ev, env, ctx) {
     ctx.waitUntil(cleanupChanges(env));
+    ctx.waitUntil(gdCleanup(env));
     ctx.waitUntil(reconcileUploads(env, { limit: 100 }).then((r) => console.log("reconcile", JSON.stringify(r))));
   },
   async fetch(req, env, ctx) {
