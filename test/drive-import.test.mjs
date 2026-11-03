@@ -224,15 +224,18 @@ test('Chrome owner flow: synthetic Google Picker → manifest → imports; keybo
  const rows=await h.req('GET','/api/projects/browser-drive/artifacts');assert.equal(rows.body.artifacts.length,4);
  }finally{await browser.close();}
 });
-// The Chrome flow above restarts the shared server with Google import configured.
 test('CSP: strict everywhere except the owner UI document, and only when Drive import is configured',async()=>{
  const csp=async(base,path)=>(await fetch(base+path)).headers.get('content-security-policy');
- const doc=await csp(s.base,'/'),api=await csp(s.base,`/api/projects/${P}/artifacts`),js=await csp(s.base,'/app.js');
- assert.match(doc,/script-src 'self' https:\/\/accounts\.google\.com\/gsi\/client https:\/\/apis\.google\.com\/js\/api\.js /);
- assert.match(doc,/frame-src 'self' https:\/\/accounts\.google\.com\/gsi\/ https:\/\/docs\.google\.com/);
- assert.ok(!/gstatic|googleapis\.com[;\s]|apis\.google\.com[;\s]/.test(doc),'no broad Google hosts: '+doc);
- for(const strict of [api,js]){assert.match(strict,/script-src 'self';/);assert.ok(!strict.includes('google'),strict);}
- const q=await startServer('drive-quota',SERVER_PORTS['drive-quota']);
+ // Dedicated servers, so the result never depends on another test's restart.
+ let q=await startServer('drive-quota',SERVER_PORTS['drive-quota'],{vars:{GOOGLE_DRIVE_CLIENT_ID:'synthetic.apps.googleusercontent.com',GOOGLE_PICKER_APP_ID:'123456',GOOGLE_PICKER_API_KEY:'synthetic-public-api-key'}});
+ try{
+  const doc=await csp(q.base,'/'),api=await csp(q.base,'/api/projects/any/artifacts'),js=await csp(q.base,'/app.js');
+  assert.match(doc,/script-src 'self' https:\/\/accounts\.google\.com\/gsi\/client https:\/\/apis\.google\.com\/js\/api\.js /);
+  assert.match(doc,/frame-src 'self' https:\/\/accounts\.google\.com\/gsi\/ https:\/\/docs\.google\.com/);
+  assert.ok(!/gstatic|googleapis\.com[;\s]|apis\.google\.com[;\s]/.test(doc),'no broad Google hosts: '+doc);
+  for(const strict of [api,js]){assert.match(strict,/script-src 'self';/);assert.ok(!strict.includes('google'),strict);}
+ }finally{await q.stop();}
+ q=await startServer('drive-quota',SERVER_PORTS['drive-quota']);
  try{const off=await csp(q.base,'/');assert.match(off,/script-src 'self';/);assert.ok(!off.includes('google'),'unconfigured installation keeps the strict policy');}
  finally{await q.stop();}
 });
@@ -240,6 +243,8 @@ test('browser: an expired Google authorization keeps the library session',async 
  const chrome=process.env.CHROME_PATH??'/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
  const pp=process.env.HOME+'/.npm-packages/lib/node_modules/puppeteer';
  if(!existsSync(chrome)||!existsSync(pp)){t.skip('Chrome/Puppeteer unavailable');return;}
+ // Configure Google import on the shared server here, rather than relying on an earlier test's restart.
+ await s.stop();s=await startServer('drive-import',SERVER_PORTS['drive-import'],{fresh:false,vars:{GOOGLE_DRIVE_TEST_ORIGIN:fx.origin,GOOGLE_DRIVE_CLIENT_ID:'synthetic.apps.googleusercontent.com',GOOGLE_PICKER_APP_ID:'123456',GOOGLE_PICKER_API_KEY:'synthetic-public-api-key',RATE_READS_PER_MIN:'100000',RATE_WRITES_PER_MIN:'100000'}});h=await s.login();
  fx.files.set('reauth',{name:'Reauth',mimeType:DOC,native:true,bytes:Buffer.from('Reauth')});
  await setupProject(h,'reauth-drive','Reauthorization fixtures');
  const puppeteer=createRequire(import.meta.url)(pp),browser=await puppeteer.launch({executablePath:chrome,headless:true});
