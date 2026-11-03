@@ -67,6 +67,11 @@
 .vh-burst > .vh-side{flex:none}
 .rv-pending .vh-n{min-height:1px}
 .rv-pending{background:color-mix(in srgb,var(--warn) 5%,transparent)}
-@media (max-width:640px){.vh-list .vh-row > .vh-side,.vh-burst > .vh-side{flex:1 1 100%;padding-left:46px}.vh-side > :last-child{margin-left:auto}}
+/* Phones: the group wraps under the row's text, starting where the text starts (version column + row gap). */
+@media (max-width:640px){.vh-list .vh-row > .vh-side,.vh-burst > .vh-side{flex:1 1 100%;padding-left:calc(2.6 * 13px + 10px)}.vh-side > :last-child{margin-left:auto}}
+.rv-newdoc.rv-wait{visibility:hidden}
+.rv-newdoc > .muted{max-width:22rem}
+.template-form .rv-newdoc-help{margin:-4px 0 0}
+@media (max-width:520px){.rv-sec .tabs{width:100%}.rv-sec .tabs button{flex:1 1 0;justify-content:center}}
 @media (pointer:coarse){.rv-grant,.rv-kind{min-height:44px}}
 @media (max-width:760px){.rv-decide{bottom:calc(var(--tab-h) + 8px + env(safe-area-inset-bottom,0px))}.rv-decide .spacer{display:none}}

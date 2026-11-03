@@ -1,12 +1,12 @@
 {
   "base_file_types_sha256": "cea551a7d442927605e0890073072e7bad69968f1fdf6a4a3886d3dc79a6b1cf",
-  "integrated_sha256": "2729e5aaaf529055baaacf4c0c968cc8987c80518ed5152618b79a8fc5a046d6",
+  "integrated_sha256": "99d020cd5472637061e7efe2c1248eaed5cf43d5b65d944044cdf6e1bddca08a",
   "preserved_outside_patches_sha256": "1e09e18cf9a8be3ea84b9c92b92e1bd4522ca8eedf6a738fc55ceb6588399826",
   "sources_sha256": {
     "src/review/service.js": "66aaa5d16763149e719c5aa57ede9b5ba078fade0945a5a75328f9a0074ed146",
     "src/review/tools.js": "192903fbdd905f4b632a23a22263874502c8691d02a394ddb1596aa8b43d2991",
-    "src/review/browser.js": "1a36bce90adf34a903f0437dc8322bb532210180fe2c961b45d83f1cea76231e",
-    "src/review/browser.css": "94fd970f3ce04787a42cec71bec169d341f487a974358cf9abe815af6f70ace5"
+    "src/review/browser.js": "efa70d26751de9e0387ab235e2514c199c25effd6baebf234aa1cdb97511a292",
+    "src/review/browser.css": "e92a44ea30964a0508d42dab8dbd84df57dfd3a237a0adbdb38de8c8fe87f5ab"
   },
   "patches": [
     {
@@ -493,14 +493,14 @@
       "module": "// src/ui.ts",
       "count": 1,
       "find_sha256": "dbf4cdd569563992bd40313f20a86bcb55703a554eed9585301382dce9e6ee4e",
-      "replace_sha256": "314d30184bf4207d3bc3fe3e93893d2c669fa56b8bbb4c68b4fd95198b10120c"
+      "replace_sha256": "09de9b8660fd1df4cbaaeb2ebe4f1509dbc5a8bf19cb14a5f3d5802519cd31f8"
     },
     {
       "name": "ui: review views and helpers",
       "module": "// src/ui.ts",
       "count": 1,
       "find_sha256": "81bcf3ea5954073fece07463dbbe3470c23d9bf7692c635606fabb17e44ff27a",
-      "replace_sha256": "ccbeece7eb43df14b629e500fe6d4b8ee316daf08dab33055e1ff5bdafdbb69b"
+      "replace_sha256": "266321349b2272d776a98e2292e78199262f5e1b92426dbd8598b58fe01ea7bb"
     },
     {
       "name": "ui: review routes",
@@ -591,7 +591,7 @@
       "module": "// src/ui.ts",
       "count": 1,
       "find_sha256": "17bd355ba99387a2811e4c84d75540e3634819a8f4a063f822f5a80e8f74b945",
-      "replace_sha256": "17e0474846620361376cf603ad0db62902469f1a13e8cc39741cbf8d2bc8ff6e"
+      "replace_sha256": "ce0a211866cf382227b36550a67d5002cb3318df54161a6522e144530134db99"
     },
     {
       "name": "ui: history: mark a version reviewed (advisory)",
@@ -612,7 +612,7 @@
       "module": "// src/ui.ts",
       "count": 1,
       "find_sha256": "eca4ddc7cc4a8154e30570a0ad5b9ae1eac0b41520386be4245207174e8aec09",
-      "replace_sha256": "59117948f4ef3238693140f23c4786b65d11e63be2cd26ec37e1290a3574d15d"
+      "replace_sha256": "55f579c66a473c1f2d225a368d376a8cce00db610fe4f811691dbbc6dc8eca72"
     },
     {
       "name": "ui: new document: review follows the template choice",
