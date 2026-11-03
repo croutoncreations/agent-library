@@ -395,7 +395,15 @@ function rvDocumentUi(A, pid, aid, details, reload) {
 async function rvLoadPending(A, pid, aid) {
   A.rvPending = [];
   if (!A.meta.review) return; // review off and nothing pending
-  try { A.rvPending = (await api("GET", "/api/projects/" + enc(pid) + "/proposals?artifact_id=" + enc(aid))).proposals; } catch (e) {}
+  // Every page: "Review edits" sends the owner here for all of this document's waiting edits (bounded: 20 pages).
+  var all = [], cursor = null, n = 0;
+  try {
+    do {
+      var r = await api("GET", "/api/projects/" + enc(pid) + "/proposals?artifact_id=" + enc(aid) + (cursor ? "&cursor=" + enc(cursor) : ""));
+      all = all.concat(r.proposals); cursor = r.next_cursor;
+    } while (cursor && ++n < 20);
+  } catch (e) {}
+  A.rvPending = all;
 }
 function rvPendingRows(A, pid) {
   var ps = A.rvPending || [];
@@ -440,8 +448,8 @@ function rvNewDocReview(pid, kindOf) {
       if (!s) return;
       var want = sel.value, a = "/api/projects/" + enc(pid) + "/artifacts/" + enc(aid);
       try {
-        var cur = ((await api("GET", a)).artifact.review || {}).mode || "off";
-        if (cur !== want) await api("PUT", a + "/review-mode", { mode: want, expected_revision: 1 });
+        var got = await api("GET", a), cur = (got.artifact.review || {}).mode || "off";
+        if (cur !== want) await api("PUT", a + "/review-mode", { mode: want, expected_revision: got.revision.rev });
       } catch (err) { toast("Created. Review couldn't be set: " + err.message); }
     } };
 }

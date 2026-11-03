@@ -156,7 +156,8 @@ test("Chrome: Home hides Needs review when empty and shows it when an edit waits
       await page.goto(h.appUi + `/#/p/${P}`);
       await page.waitForFunction(() => [...document.querySelectorAll("button")].some((b) => /New document/.test(b.textContent)));
       await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => /New document/.test(b.textContent)).click());
-      await page.waitForSelector(".rv-newdoc:not([hidden]) select");
+      // Loaded: the field is revealed (rv-wait removed) once the project default is known.
+      await page.waitForSelector(".rv-newdoc:not(.rv-wait) select");
       const shown = await page.$eval(".rv-newdoc select", (e) => ({ value: e.value, label: e.options[e.selectedIndex].text }));
       if (mode) await page.select(".rv-newdoc select", mode);
       await page.type('[aria-label="New document title"]', title);
