@@ -12643,9 +12643,10 @@ var APP_CSS = `/* review gating (src/review/browser.js) */
 .rv-newdoc.rv-wait{visibility:hidden}
 .rv-newdoc > .muted{max-width:22rem}
 .template-form .rv-newdoc-help{margin:-4px 0 0}
-@media (max-width:520px){.rv-sec .tabs{width:100%}.rv-sec .tabs button{flex:1 1 0;justify-content:center}}
+@media (max-width:520px){.rv-sec .tabs,.rv-edit .tabs{width:100%;flex-wrap:nowrap}.rv-sec .tabs button,.rv-edit .tabs button{flex:1 1 auto;justify-content:center;padding:4px 8px}}
 @media (pointer:coarse){.rv-grant,.rv-kind{min-height:44px}}
 @media (max-width:760px){.rv-decide{bottom:calc(var(--tab-h) + 8px + env(safe-area-inset-bottom,0px))}.rv-decide .spacer{display:none}}
+@media (max-width:360px){.rv-sec .tabs button,.rv-edit .tabs button{padding:4px 5px;font-size:13.5px}}
 /* File type thumbnails: the media covers the type icon once it has loaded. */
 .ficon-sm{position:relative;overflow:hidden}
 .ficon-sm > .thumb{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:0;pointer-events:none;background:var(--sunk)}
@@ -13891,12 +13892,12 @@ async function viewProjectReview(pid) {
     }
   } catch (err) { doneLoading(list); list.hidden = true; showErr(msg, err); }
   drawSettings();
-  async function drawSettings() {
+  async function drawSettings(refocus) {
     var s;
     try { s = await api("GET", base + "/review-settings"); }
     catch (err) {
       settings.replaceChildren(h("h2", { text: "Review for new documents" }), h("p", { class: "msg error", text: "Review settings couldn't load: " + err.message }),
-        h("div", { class: "row" }, h("button", { type: "button", class: "secondary", onclick: drawSettings }, icon("refresh"), "Try again")));
+        h("div", { class: "row" }, h("button", { type: "button", class: "secondary", onclick: function (e) { e.currentTarget.disabled = true; drawSettings(true); } }, icon("refresh"), "Try again")));
       return;
     }
     var radios = rvModeRadios("rv-default-" + pid, s.default, function () { kindBox.hidden = picked() === "off"; });
@@ -13933,9 +13934,10 @@ async function viewProjectReview(pid) {
       } catch (err) { showErr(smsg, err); } finally { applyBtn.disabled = false; }
     } }, "Save and apply to existing documents");
     function kindNames() { var ks = chosen(); return ks ? kinds.filter(function (l) { return l.firstChild.checked; }).map(function (l) { return l.textContent; }).join(", ") : "all types"; }
-    settings.replaceChildren(h("h2", { text: "Review for new documents" }),
+    settings.replaceChildren(h("h2", { text: "Review for new documents", tabindex: "-1" }),
       h("p", { class: "muted small rv-help", text: "Your own edits never wait for review. Files from publishing apps are never gated. Change one document from its Details." }),
       h("fieldset", { class: "rv-modes" }, h("legend", { class: "rv-legend", text: "New documents" }), radios), kindBox, h("div", { class: "row rv-actions" }, save, applyBtn), smsg);
+    if (refocus) settings.querySelector("h2").focus();
   }
 }
 // One proposal: what changed and why, then the decision.
@@ -14035,7 +14037,7 @@ async function viewProposal(pid, prp) {
           var ref = h("div", { class: "rv-ref" });
           rvDrawDiff(ref, d.diff_from_base, bodyText);
           parts.push(h("div", { class: "row small" }, h("span", { class: "muted", text: "Start from" }), h("div", { class: "tabs", role: "group", "aria-label": "Start from" }, fromCur, fromProp)),
-            h("details", { open: true }, h("summary", { text: "The proposal's changes (from v" + p.base_revision + ")" }), ref));
+            h("details", { open: true }, h("summary", { text: "The proposal's changes" }), ref));
           pick(true);
         }
         parts.push(h("label", { class: "rv-field" }, "Text to publish", editor));
@@ -14132,7 +14134,7 @@ function rvDocumentUi(A, pid, aid, details, reload) {
     var link = h("a", { class: "btn secondary", href: "#/p/" + enc(pid) + "/review", onclick: function (e) {
       if (link.dataset.direct) return;
       var t = [].filter.call(document.querySelectorAll('[role="tab"]'), function (x) { return x.textContent === "History"; })[0];
-      if (t) { e.preventDefault(); t.click(); }
+      if (t) { e.preventDefault(); t.click(); t.focus(); }
     } }, rv.pending_proposals === 1 ? "Review edit" : "Review edits");
     out.banner = h("div", { class: "callout info rv-banner" }, icon("doc"),
       h("span", null, h("strong", { text: plural(rv.pending_proposals, "edit") + " waiting for review." }), " Readers keep seeing the approved version."), link);
@@ -14216,6 +14218,7 @@ function rvPendingRows(A, pid) {
 // creating (owner only; the owner's first version is never gated).
 function rvNewDocReview(pid, kindOf) {
   var sel = h("select", null, RV_MODES_UI.map(function (m) { return h("option", { value: m, text: RV_SHORT[m] }); }));
+  // Not reserved while loading: most projects default to Off (no line), so only an Optional/Required default adds one.
   var help = h("p", { class: "muted small rv-newdoc-help", hidden: true });
   var s = null, touched = false;
   function def() { var k = kindOf(); return s && s.default !== "off" && (!s.kinds || s.kinds.indexOf(k) >= 0) ? s.default : "off"; }

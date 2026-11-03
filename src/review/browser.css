@@ -72,6 +72,7 @@
 .rv-newdoc.rv-wait{visibility:hidden}
 .rv-newdoc > .muted{max-width:22rem}
 .template-form .rv-newdoc-help{margin:-4px 0 0}
-@media (max-width:520px){.rv-sec .tabs{width:100%}.rv-sec .tabs button{flex:1 1 0;justify-content:center}}
+@media (max-width:520px){.rv-sec .tabs,.rv-edit .tabs{width:100%;flex-wrap:nowrap}.rv-sec .tabs button,.rv-edit .tabs button{flex:1 1 auto;justify-content:center;padding:4px 8px}}
 @media (pointer:coarse){.rv-grant,.rv-kind{min-height:44px}}
 @media (max-width:760px){.rv-decide{bottom:calc(var(--tab-h) + 8px + env(safe-area-inset-bottom,0px))}.rv-decide .spacer{display:none}}
+@media (max-width:360px){.rv-sec .tabs button,.rv-edit .tabs button{padding:4px 5px;font-size:13.5px}}

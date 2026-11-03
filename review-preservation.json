@@ -1,12 +1,12 @@
 {
   "base_file_types_sha256": "cea551a7d442927605e0890073072e7bad69968f1fdf6a4a3886d3dc79a6b1cf",
-  "integrated_sha256": "99d020cd5472637061e7efe2c1248eaed5cf43d5b65d944044cdf6e1bddca08a",
+  "integrated_sha256": "0440aed9e74042d9c34daef4ad881b6f2bc033d6b25d90a0c71e5e3dcf873070",
   "preserved_outside_patches_sha256": "1e09e18cf9a8be3ea84b9c92b92e1bd4522ca8eedf6a738fc55ceb6588399826",
   "sources_sha256": {
     "src/review/service.js": "66aaa5d16763149e719c5aa57ede9b5ba078fade0945a5a75328f9a0074ed146",
     "src/review/tools.js": "192903fbdd905f4b632a23a22263874502c8691d02a394ddb1596aa8b43d2991",
-    "src/review/browser.js": "efa70d26751de9e0387ab235e2514c199c25effd6baebf234aa1cdb97511a292",
-    "src/review/browser.css": "e92a44ea30964a0508d42dab8dbd84df57dfd3a237a0adbdb38de8c8fe87f5ab"
+    "src/review/browser.js": "6c7dab557bacfb903c386ab2288d8a4fbcef38b2d4ff2144bcab627a9c98cf2f",
+    "src/review/browser.css": "e429b4eeb7c246b003964470e20770468614b04d7d97dece752c0f0ed663e9bc"
   },
   "patches": [
     {
@@ -493,14 +493,14 @@
       "module": "// src/ui.ts",
       "count": 1,
       "find_sha256": "dbf4cdd569563992bd40313f20a86bcb55703a554eed9585301382dce9e6ee4e",
-      "replace_sha256": "09de9b8660fd1df4cbaaeb2ebe4f1509dbc5a8bf19cb14a5f3d5802519cd31f8"
+      "replace_sha256": "e6b39787a968919720ce0e45279e4437a80cdf7518cbb787aabec6cb67d4ec82"
     },
     {
       "name": "ui: review views and helpers",
       "module": "// src/ui.ts",
       "count": 1,
       "find_sha256": "81bcf3ea5954073fece07463dbbe3470c23d9bf7692c635606fabb17e44ff27a",
-      "replace_sha256": "266321349b2272d776a98e2292e78199262f5e1b92426dbd8598b58fe01ea7bb"
+      "replace_sha256": "2298a85f4ef8bfffe445aa28c224776a9ceb8d7868c427a17a92f95c97eb933c"
     },
     {
       "name": "ui: review routes",
