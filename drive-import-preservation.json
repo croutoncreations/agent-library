@@ -1,10 +1,10 @@
 {
   "base_review_sha256": "4dd1f04a317f7e0b449530cfcb1a5e96d128facf5165125d1012732c42ef889d",
-  "integrated_sha256": "54614cc16e788f7f2628e118248bb0f47deb439896df90fb9f4e09f5ad017d40",
+  "integrated_sha256": "b6ec4268f40f77a73d4e2b3533e8c77f61ae939b8c77491036d495195c1d3e36",
   "sources_sha256": {
     "google.js": "60d71820088940494d28a83cdbf7d7160423338237af31991a7e4594b00aeb93",
-    "service.js": "f6b48024741ab789c2ca15ac669e4cc44b2f4296a8b04fbceb6bf0b2ee908da7",
-    "ui.js": "7c23a1d1dd41d2c46f2fe882ee94a0d7f4b183288cce23b1c06786449e2b1fab",
+    "service.js": "937847c617fc11ff3456ec642e49923e66b8d8b2d8f617d5c7d13e7dd48b2466",
+    "ui.js": "29c51a57b3e04adf6e508dff87ebce9be8b4c207a3eefda1a5fbd900e529baab",
     "ui.css": "c6903188561154d320b556a25c598019bc2e315b0a0ddc40615d1a2a1e89fd07"
   },
   "patches": [
@@ -77,6 +77,10 @@
       "find_sha256": "1030efa5251ee1234a1bfbfbafa7e188d4860033045266a7c2521d6b11f76a14"
     },
     {
+      "name": "import artifact limit error",
+      "find_sha256": "a7c52b37ffa8684d6d03bf8f125f3be791313111ca4af2b9b0b25a663335d297"
+    },
+    {
       "name": "import upload result index",
       "find_sha256": "bb87ab93bc95fc7796755062d4e6cb5e80d4c23329895d0cc3241d2be506f663"
     },
@@ -93,8 +97,8 @@
       "find_sha256": "d08eb589e21fdced455ea2711e08d1e8cb7b45b7a8f2a82e14d667827676eb99"
     },
     {
-      "name": "Picker and GIS CSP",
-      "find_sha256": "05572b4d1e4933388e11831798f3d6464571b720d6c61d1a5b15788ccb5564cd"
+      "name": "owner UI document CSP",
+      "find_sha256": "80b85dd1901ee8650a712d74662f1ea7eaa94dcbce9f0686a9b7883b7f473c7d"
     },
     {
       "name": "cleanup cron",

@@ -144,6 +144,48 @@ test('cancel during an active source read fences publication and cleans staging'
  assert.equal((await publishing).status,200);const r=await read(id);assert.equal(r.state,'cancelled');assert.equal(r.items[0].state,'cancelled');
  const files=await h.req('GET',`/api/projects/${P}/artifacts`);assert.ok(!files.body.artifacts.some(a=>a.title==='Cancel race.md'));
 });
+test('agents see source provenance without the owner Google identity',async()=>{
+ const id=await create(['pdf']);const t=(await inspect(id)).items[0];assert.equal(t.error_code,'already_imported');
+ const owner=(await h.req('GET',`/api/projects/${P}/artifacts/${t.artifact_id}`)).body.source;
+ const agent=(await agentHttp(s.base,g.token)('GET',`/api/projects/${P}/artifacts/${t.artifact_id}`)).body.source;
+ assert.equal(owner.account_id,'account-a');assert.ok(owner.import_owner);
+ for(const k of ['account_id','account_label','import_owner','job_id','item_id'])assert.equal(agent[k],undefined,k);
+ assert.equal(agent.source_id,'pdf');assert.equal(agent.imported_sha256,owner.imported_sha256);
+ assert.ok(!JSON.stringify(owner).includes('a@example.test'),'Google email never stored in provenance');
+});
+test('source change with an unfinished import upload: retry retires it and re-reads the source',async()=>{
+ const sql=q=>execFileSync('wrangler',['d1','execute','DB','--config',LOCAL_CONFIG,'--local','--persist-to',s.dir,'--command',q],{stdio:'pipe'});
+ fx.files.set('stale-upload',{name:'Stale.xlsx',mimeType:X,version:'1',bytes:office});
+ const id=await create(['stale-upload']);let r=await inspect(id);const item=r.items[0];assert.equal(item.state,'ready');
+ // Simulate an interrupted publication: the upload was reserved but never received its bytes.
+ const begun=await h.req('POST',`/api/projects/${P}/uploads`,{title:'Stale.xlsx',mime:'application/octet-stream',size:office.length,sha256:sha256(office)});assert.equal(begun.status,201,JSON.stringify(begun.body));
+ sql(`UPDATE drive_import_items SET upload_id='${begun.body.upload_id}' WHERE id='${item.id}'`);
+ await confirm(id);
+ const changed=Buffer.from('PK\x03\x04synthetic changed Office bytes');Object.assign(fx.files.get('stale-upload'),{version:'2',bytes:changed});
+ await step(id);r=await read(id);assert.equal(r.state,'review');assert.equal(r.items[0].error_code,'source_changed');
+ await ok('POST','/jobs/'+id+'/retry',{});r=await inspect(id);
+ assert.equal(r.items[0].state,'ready',JSON.stringify(r.items[0]));assert.equal(r.items[0].sha256,sha256(changed),'re-read the changed source');
+ r=await publish(id);assert.equal(r.items[0].state,'imported',JSON.stringify(r.items[0]));
+ const dl=await agentHttp(s.base,g.token)('GET',`/api/projects/${P}/artifacts/${r.items[0].artifact_id}/content`,undefined,{binary:true});assert.equal(sha256(dl.body),sha256(changed));
+});
+test('artifact limit: imports return quota_exceeded; ordinary binary uploads are not newly capped',async()=>{
+ const q=await startServer('drive-quota',SERVER_PORTS['drive-quota'],{vars:{GOOGLE_DRIVE_TEST_ORIGIN:fx.origin,GOOGLE_DRIVE_CLIENT_ID:'synthetic.apps.googleusercontent.com',GOOGLE_PICKER_APP_ID:'123456',GOOGLE_PICKER_API_KEY:'synthetic-public-api-key',RATE_READS_PER_MIN:'100000',RATE_WRITES_PER_MIN:'100000'}});
+ try{
+  const hh=await q.login(),PP='limit-drive',base=`/api/projects/${PP}/drive-import`;await setupProject(hh,PP);
+  const ss=(await hh.req('POST',base+'/sessions',{}, {headers})).body.session_id;
+  const j=(await hh.req('POST',base+'/jobs',{session_id:ss,file_ids:['xlsx']},{headers})).body.job_id;
+  for(let n=0;n<5;n++)await hh.req('POST',base+'/jobs/'+j+'/process',{}, {headers});
+  let st=(await hh.req('GET',base+'/jobs/'+j)).body;assert.equal(st.items[0].state,'ready',JSON.stringify(st));
+  await hh.req('POST',base+'/jobs/'+j+'/confirm',{manifest_version:st.manifest_version});
+  // Fill the project to its 100-artifact limit after review, so publication itself hits the cap.
+  const qsql=x=>execFileSync('wrangler',['d1','execute','DB','--config',LOCAL_CONFIG,'--local','--persist-to',q.dir,'--command',x],{stdio:'pipe'});
+  qsql(`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<100) INSERT INTO artifacts (id,project_id,kind,title,folder,head_rev,created_at,updated_at) SELECT 'art_fill'||i,'${PP}','markdown','Fill '||i,'',1,'2026-01-01','2026-01-01' FROM n`);
+  await hh.req('POST',base+'/jobs/'+j+'/process',{}, {headers});
+  st=(await hh.req('GET',base+'/jobs/'+j)).body;assert.equal(st.items[0].state,'failed');assert.equal(st.items[0].error_code,'quota_exceeded',JSON.stringify(st.items[0]));
+  const up=await hh.req('POST',`/api/projects/${PP}/uploads`,{title:'Ordinary.pdf',mime:'application/pdf',size:4,sha256:sha256(Buffer.from('%PDF'))});
+  assert.equal(up.status,201,'ordinary uploads keep their existing behavior: '+JSON.stringify(up.body));
+ }finally{await q.stop();}
+});
 test('Chrome owner flow: synthetic Google Picker → manifest → imports; keyboard, mobile and offline states',async t=>{
  const chrome=process.env.CHROME_PATH??'/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
  const pp=process.env.HOME+'/.npm-packages/lib/node_modules/puppeteer';
@@ -180,6 +222,44 @@ test('Chrome owner flow: synthetic Google Picker → manifest → imports; keybo
  await page.screenshot({path:'tmp/test-evidence/drive-import/office-card-mobile.png',fullPage:true});
  assert.deepEqual(errors,[]);
  const rows=await h.req('GET','/api/projects/browser-drive/artifacts');assert.equal(rows.body.artifacts.length,4);
+ }finally{await browser.close();}
+});
+// The Chrome flow above restarts the shared server with Google import configured.
+test('CSP: strict everywhere except the owner UI document, and only when Drive import is configured',async()=>{
+ const csp=async(base,path)=>(await fetch(base+path)).headers.get('content-security-policy');
+ const doc=await csp(s.base,'/'),api=await csp(s.base,`/api/projects/${P}/artifacts`),js=await csp(s.base,'/app.js');
+ assert.match(doc,/script-src 'self' https:\/\/accounts\.google\.com\/gsi\/client https:\/\/apis\.google\.com\/js\/api\.js /);
+ assert.match(doc,/frame-src 'self' https:\/\/accounts\.google\.com\/gsi\/ https:\/\/docs\.google\.com/);
+ assert.ok(!/gstatic|googleapis\.com[;\s]|apis\.google\.com[;\s]/.test(doc),'no broad Google hosts: '+doc);
+ for(const strict of [api,js]){assert.match(strict,/script-src 'self';/);assert.ok(!strict.includes('google'),strict);}
+ const q=await startServer('drive-quota',SERVER_PORTS['drive-quota']);
+ try{const off=await csp(q.base,'/');assert.match(off,/script-src 'self';/);assert.ok(!off.includes('google'),'unconfigured installation keeps the strict policy');}
+ finally{await q.stop();}
+});
+test('browser: an expired Google authorization keeps the library session',async t=>{
+ const chrome=process.env.CHROME_PATH??'/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+ const pp=process.env.HOME+'/.npm-packages/lib/node_modules/puppeteer';
+ if(!existsSync(chrome)||!existsSync(pp)){t.skip('Chrome/Puppeteer unavailable');return;}
+ fx.files.set('reauth',{name:'Reauth',mimeType:DOC,native:true,bytes:Buffer.from('Reauth')});
+ await setupProject(h,'reauth-drive','Reauthorization fixtures');
+ const puppeteer=createRequire(import.meta.url)(pp),browser=await puppeteer.launch({executablePath:chrome,headless:true});
+ try{
+  const page=await browser.newPage(),errors=[];page.on('pageerror',e=>errors.push(e.message));await page.setRequestInterception(true);
+  page.on('request',r=>{
+   // Google accepts the token for session/job creation, then revokes it: processing gets needs_reauthorization.
+   if(r.url()==='https://accounts.google.com/gsi/client')return r.respond({contentType:'application/javascript',body:`window.google={accounts:{oauth2:{initTokenClient:function(c){return{requestAccessToken:function(){c.callback({access_token:'synthetic-drive-a'});}};}}}};`});
+   if(r.url()==='https://apis.google.com/js/api.js')return r.respond({contentType:'application/javascript',body:`window.gapi={load:function(n,c){google.picker={Action:{PICKED:'picked',CANCEL:'cancel'},Feature:{MULTISELECT_ENABLED:1},DocsView:function(){this.setIncludeFolders=function(){return this;}},PickerBuilder:function(){var cb,self=this;['addView','enableFeature','setMaxItems','setOAuthToken','setDeveloperKey','setAppId','setOrigin'].forEach(function(m){self[m]=function(){return self;};});this.setCallback=function(f){cb=f;return self;};this.build=function(){return{setVisible:function(){cb({action:'picked',docs:[{id:'reauth'}]});}};};}};c.callback();}};`});
+   if(/\/drive-import\/jobs\/[^/]+\/process$/.test(r.url())&&r.method()==='POST')return r.continue({headers:{...r.headers(),'x-google-access-token':'synthetic-drive-revoked'}});
+   r.continue();
+  });
+  const cookieParts=h.cookie.split(';')[0].split('=');await page.setCookie({name:cookieParts[0],value:cookieParts.slice(1).join('='),url:s.base});
+  await page.goto(s.base+'/#/p/reauth-drive');
+  const click=async text=>{await page.waitForFunction(t=>Array.from(document.querySelectorAll('button')).some(b=>b.textContent===t),{},text);await page.evaluate(t=>Array.from(document.querySelectorAll('button')).find(b=>b.textContent===t).click(),text);};
+  await click('Import → Google Drive');await click('Select files with Google Picker');
+  await page.waitForFunction(()=>(document.querySelector('.drive-import [role=status]')?.textContent||'').includes('Google authorization expired'));
+  assert.ok(await page.evaluate(()=>!!document.querySelector('.drive-import')&&!document.querySelector('input[type=password]')),'still signed in to the library');
+  assert.equal((await h.req('GET','/api/me')).status,200,'library session still valid server-side');
+  assert.deepEqual(errors,[]);
  }finally{await browser.close();}
 });
 test('backup/restore provenance detached and no sessions or Google tokens; downloads persist',async()=>{

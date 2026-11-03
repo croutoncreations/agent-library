@@ -5,7 +5,18 @@ function driveImportPanel(pid, onDone) {
   var audience=h('p',{class:'muted small'});
   var base='/api/projects/'+enc(pid)+'/drive-import';
   S.cleanups.push(function(){alive=false;token=null;session=null;});
-  async function call(method,path,body,key){return api(method,base+path,body,{key:key||uuid(),headers:token?{'x-google-access-token':token}:{}});}
+  // A 401 is either Google authorization (handled in place, library session kept) or the library session
+  // itself (renew once, then the normal sign-in flow). The retry reuses the same idempotency key.
+  async function call(method,path,body,key){
+    var opt={key:key||uuid(),noAuthRedirect:true}, send=function(){return api(method,base+path,body,Object.assign({headers:token?{'x-google-access-token':token}:{}},opt));};
+    try{return await send();}
+    catch(e){
+      if(e.status!==401)throw e;
+      if(e.code==='needs_reauthorization'){token=null;session=null;e.message='Google authorization expired. Choose “Authorize / resume same Google account” to continue.';throw e;}
+      if(await renewSession())return send();
+      onUnauthenticated();throw e;
+    }
+  }
   async function loadScript(src){
     await new Promise(function(resolve,reject){var s=document.createElement('script');s.src=src;s.onload=resolve;s.onerror=function(){reject(Error('Google scripts could not load. Check your connection and retry.'));};document.head.append(s);});
   }

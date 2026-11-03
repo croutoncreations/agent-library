@@ -6,15 +6,37 @@ function gdFence(ctx) {
 function gdPublication(ctx, aid, rid) {
   const d=ctx.driveImport;if(!d)return [];
   const {job:j,item:t}=d, m=JSON.parse(t.metadata), gate='EXISTS (SELECT 1 FROM revisions WHERE id=?)';
-  const provenance={provider:'google-drive',account_id:j.account_id,account_label:j.account_label,source_id:t.source_id,source_title:m.name,source_mime:m.mimeType,source_url:m.url,drive_id:m.driveId,source_version:m.version,source_modified_time:m.modifiedTime,export_mime:m.exportMime??m.mimeType,conversion_profile:m.exportMime?'google-native-export/1':'drive-original-bytes/1',imported_sha256:t.sha256,baseline_revision:1,baseline_sha256:t.sha256,baseline_title:t.title,baseline_meta_version:1,import_owner:j.owner_id,imported_at:nowIso(),job_id:j.id,item_id:t.id,role:'primary',state:'detached',sync_enabled:false};
+  const provenance={provider:'google-drive',account_id:j.account_id,source_id:t.source_id,source_title:m.name,source_mime:m.mimeType,source_url:m.url,drive_id:m.driveId,source_version:m.version,source_modified_time:m.modifiedTime,export_mime:m.exportMime??m.mimeType,conversion_profile:m.exportMime?'google-native-export/1':'drive-original-bytes/1',imported_sha256:t.sha256,baseline_revision:1,baseline_sha256:t.sha256,baseline_title:t.title,baseline_meta_version:1,import_owner:j.owner_id,imported_at:nowIso(),job_id:j.id,item_id:t.id,role:'primary',state:'detached',sync_enabled:false};
   return [ctx.env.DB.prepare(`INSERT INTO artifact_sources(id,project_id,artifact_id,account_id,source_id,is_primary,provenance) SELECT ?,?,?,?,?,?,? WHERE ${gate}`).bind(randomId('src'),j.project_id,aid,j.account_id,t.source_id,t.another_copy?0:1,JSON.stringify(provenance),rid),
     ctx.env.DB.prepare(`UPDATE drive_import_items SET state='imported',artifact_id=?,error_code=NULL,error_message=NULL WHERE id=? AND ${gate}`).bind(aid,t.id,rid),
     ctx.env.DB.prepare(`UPDATE artifacts SET folder_id=? WHERE id=? AND ${gate}`).bind(j.folder_id,aid,rid)];
 }
+// Agents, OAuth apps and API keys see where a copy came from, not who imported it or from which account.
+const GD_OWNER_ONLY=['account_id','account_label','import_owner','job_id','item_id'];
 async function gdProvenance(ctx,pid,aid) {
   await authorizeProject(ctx,pid,false);await loadArtifact(ctx,pid,aid);
   const r=await ctx.env.DB.prepare('SELECT provenance FROM artifact_sources WHERE project_id=? AND artifact_id=? LIMIT 1').bind(pid,aid).first('provenance');
-  return r?JSON.parse(r):null;
+  if(!r)return null;
+  const p=JSON.parse(r);
+  if(ctx.principal?.kind!=='human')for(const k of GD_OWNER_ONLY)delete p[k];
+  return p;
+}
+function gdConfigured(env) { return !!(env.GOOGLE_DRIVE_CLIENT_ID&&env.GOOGLE_PICKER_API_KEY&&env.GOOGLE_PICKER_APP_ID); }
+// Google sources are admitted only on the owner UI document, and only when import is configured.
+// API, content, transfer and render responses keep the strict SEC_HEADERS policy.
+const GD_CSP={'script-src':'https://accounts.google.com/gsi/client https://apis.google.com/js/api.js https://apis.google.com/_/scs/','style-src':'https://accounts.google.com/gsi/style','connect-src':'https://accounts.google.com/gsi/','frame-src':'https://accounts.google.com/gsi/ https://docs.google.com'};
+function gdDocumentCsp(env) {
+  if(!gdConfigured(env))return {};
+  const seen=new Set(), csp=SEC_HEADERS['content-security-policy'].split(';').map(d=>d.trim()).filter(Boolean).map(d=>{const n=d.split(/\s+/)[0];if(!GD_CSP[n])return d;seen.add(n);return d+' '+GD_CSP[n];});
+  if(seen.size!==Object.keys(GD_CSP).length)return {}; // fail closed: keep the strict policy
+  return {'content-security-policy':csp.join('; ')};
+}
+// Retire this item's unfinished upload so a stale snapshot can never be resumed, and so the owner's
+// single active-upload slot is released. A sealed upload with a live finalizer lease is left alone.
+const GD_RETIRED=JSON.stringify({status:409,code:'source_changed',message:'Source changed; import upload retired'});
+async function gdRetireUpload(DB,uploadId) {
+  if(!uploadId)return;
+  await DB.prepare("UPDATE uploads SET state='failed',result=?,finalize_token=NULL,finalize_until=NULL WHERE id=? AND (state IN ('pending','received') OR (state='sealed' AND (finalize_until IS NULL OR finalize_until<=?) AND NOT EXISTS (SELECT 1 FROM revisions r WHERE r.id=uploads.final_revision_id)))").bind(GD_RETIRED,uploadId,nowMs()).run();
 }
 async function gdJob(ctx,pid,id) {
   requireHuman(ctx);await authorizeProject(ctx,pid,true);
@@ -102,6 +124,8 @@ async function gdPublish(ctx,j,t,token,lease,req) {
     const imported=await DB.prepare("SELECT 1 AS x FROM drive_import_items WHERE id=? AND state='imported'").bind(t.id).first();
     if(imported)return;
     if(e.code==='source_changed') {
+      const cur=await DB.prepare('SELECT upload_id FROM drive_import_items WHERE id=?').bind(t.id).first('upload_id');
+      await gdRetireUpload(DB,cur);
       await DB.prepare("UPDATE drive_import_jobs SET state='review',confirmed_version=NULL,manifest_version=manifest_version+1 WHERE id=? AND lease=?").bind(j.id,lease).run();
     }
     await DB.prepare('UPDATE drive_import_items SET state=?,error_code=?,error_message=? WHERE id=? AND state NOT IN (\'imported\',\'cancelled\')').bind(e.code==='needs_reauthorization'?'needs_reauthorization':'failed',e.code||'publish_failed',e instanceof HttpError?e.message:'Publication failed; retry',t.id).run();
@@ -117,7 +141,7 @@ async function gdCleanup(env) {
 async function gdRoute(ctx,req,pid,parts,url,key) {
   requireHuman(ctx);await authorizeProject(ctx,pid,true);ctx.importOrigin=url.origin;
   const DB=ctx.env.DB, method=req.method, token=req.headers.get('x-google-access-token');
-  const configured=!!(ctx.env.GOOGLE_DRIVE_CLIENT_ID&&ctx.env.GOOGLE_PICKER_API_KEY&&ctx.env.GOOGLE_PICKER_APP_ID);
+  const configured=gdConfigured(ctx.env);
   if(parts.length===0&&method==='GET') {
     const jobs=await DB.prepare('SELECT id,state,created_at,account_label FROM drive_import_jobs WHERE project_id=? AND owner_id=? ORDER BY created_at DESC LIMIT 20').bind(pid,ctx.principal.id).all();
     return json({configured,client_id:ctx.env.GOOGLE_DRIVE_CLIENT_ID||null,api_key:ctx.env.GOOGLE_PICKER_API_KEY||null,app_id:ctx.env.GOOGLE_PICKER_APP_ID||null,max_files:25,jobs:jobs.results,connections:await listAccess(ctx),api_keys:await listApiKeys(ctx),folders:appConnectEnabled(ctx.env)?await listFolders(ctx,pid):{folders:[]}});
@@ -188,10 +212,13 @@ async function gdRoute(ctx,req,pid,parts,url,key) {
   try {
     if(action==='retry') {
       // Re-inspection invalidates confirmation. Successful items are never revisited.
+      // A changed source must be re-read: retire any upload still holding the old snapshot first.
+      const stale=await DB.prepare("SELECT upload_id FROM drive_import_items WHERE job_id=? AND state='failed' AND error_code='source_changed' AND upload_id IS NOT NULL").bind(j.id).all();
+      for(const r of stale.results)await gdRetireUpload(DB,r.upload_id);
       await DB.batch([
         gdAssert(DB,"EXISTS(SELECT 1 FROM drive_import_jobs WHERE id=? AND lease=? AND state IN ('review','confirmed'))",[j.id,lease]),
         DB.prepare("UPDATE drive_import_items SET state='selected',upload_id=NULL,attempt=attempt+1,error_code=NULL,error_message=NULL WHERE job_id=? AND state='failed' AND (upload_id IS NULL OR EXISTS(SELECT 1 FROM uploads WHERE id=drive_import_items.upload_id AND state IN ('failed','conflict')))").bind(j.id),
-        DB.prepare("UPDATE drive_import_items SET state='ready',error_code=NULL,error_message=NULL WHERE job_id=? AND state='failed' AND upload_id IS NOT NULL").bind(j.id),
+        DB.prepare("UPDATE drive_import_items SET state='ready',error_code=NULL,error_message=NULL WHERE job_id=? AND state='failed' AND upload_id IS NOT NULL AND COALESCE(error_code,'')<>'source_changed'").bind(j.id),
         DB.prepare("UPDATE drive_import_jobs SET state='review',manifest_version=manifest_version+1,confirmed_version=NULL WHERE id=?").bind(j.id)]);
 
     } else {
@@ -231,7 +258,7 @@ function gdRestoreSources(ctx, backup, pid) {
     const a=backup.artifacts.find(a=>a.id===row.artifact_id);
     const r=backup.revisions.find(r=>r.artifact_id===row.artifact_id&&r.rev_no===p?.baseline_revision);
     if(!a||!p||p.provider!=='google-drive'||!r||r.sha256!==p.baseline_sha256||p.imported_sha256!==r.sha256||JSON.stringify(p).length>12000)throw gdError(400,'bad_backup','Invalid source baseline');
-    const detached={provider:'google-drive',account_id:str(p.account_id,'account',200),account_label:str(p.account_label,'account label',200),source_id:gdId(p.source_id),source_title:str(p.source_title,'source title',200),source_mime:str(p.source_mime,'source type',200),source_url:'https://drive.google.com/file/d/'+gdId(p.source_id)+'/view',drive_id:p.drive_id??null,source_version:p.source_version??null,source_modified_time:p.source_modified_time??null,export_mime:p.export_mime,conversion_profile:str(p.conversion_profile,'conversion profile',100),imported_sha256:r.sha256,baseline_revision:r.rev_no,baseline_sha256:r.sha256,baseline_title:a.title,baseline_meta_version:1,imported_at:p.imported_at,state:'detached',sync_enabled:false,role:'primary',restored:true};
+    const detached={provider:'google-drive',account_id:str(p.account_id,'account',200),source_id:gdId(p.source_id),source_title:str(p.source_title,'source title',200),source_mime:str(p.source_mime,'source type',200),source_url:'https://drive.google.com/file/d/'+gdId(p.source_id)+'/view',drive_id:p.drive_id??null,source_version:p.source_version??null,source_modified_time:p.source_modified_time??null,export_mime:p.export_mime,conversion_profile:str(p.conversion_profile,'conversion profile',100),imported_sha256:r.sha256,baseline_revision:r.rev_no,baseline_sha256:r.sha256,baseline_title:a.title,baseline_meta_version:1,imported_at:p.imported_at,state:'detached',sync_enabled:false,role:'primary',restored:true};
     return ctx.env.DB.prepare('INSERT INTO artifact_sources(id,project_id,artifact_id,account_id,source_id,is_primary,provenance) VALUES(?,?,?,?,?,0,?)').bind(randomId('src'),pid,a.id,detached.account_id,detached.source_id,JSON.stringify(detached));
   });
 }
