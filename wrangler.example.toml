@@ -88,3 +88,10 @@ migrations_dir = "migrations"
 [[env.hosted.r2_buckets]]
 binding = "BLOBS"
 bucket_name = "agent-library-blobs"
+
+# Optional one-time Google Drive import (public browser configuration).
+# Set these in your installation's [env.hosted.vars] above, not as top-level TOML keys:
+# GOOGLE_DRIVE_CLIENT_ID = "YOUR_WEB_CLIENT_ID.apps.googleusercontent.com"
+# GOOGLE_PICKER_API_KEY = "YOUR_REFERRER_RESTRICTED_BROWSER_API_KEY"
+# GOOGLE_PICKER_APP_ID = "YOUR_NUMERIC_GOOGLE_CLOUD_PROJECT_NUMBER"
+# See docs/google-drive-import.md for setup, scope, permissions and live smoke checks.

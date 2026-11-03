@@ -24,12 +24,13 @@ export const SERVER_PORTS = range({
   templates: 21043, "templates-restore": 21044, "templates-legacy-restore": 21047,
   diagnostics: 21048, "file-types": 21049, "marketing-capture": 21045, "marketing-clips": 21046,
   "review-gating": 21050, "review-gating-restore": 21051, "review-ui": 21052,
+  "drive-import": 21053, "drive-restore": 21054, "drive-quota": 21055,
 });
 
 /** Plain node:http listeners that tests start next to a server. */
 export const AUX_PORTS = range({
   hostedJwks: 23100, oauthBrowserOidc: 23101, oauthBrowserCallback: 23102, oauthBrowserHop: 23103,
-  chatgptOidc: 23104, chatgptCallback: 23105, hostedSessionJwks: 23106, hostedSessionAccess: 23107,
+  chatgptOidc: 23104, chatgptCallback: 23105, hostedSessionJwks: 23106, hostedSessionAccess: 23107, driveGoogle: 23108,
 });
 
 /** Every port bound during a run, for the uniqueness check. */

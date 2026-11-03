@@ -19,7 +19,7 @@ Project backups cover projects, documents and files you and your agents create, 
 
 ## Backup and recovery
 
-**Connections → Agent tokens → Backup** (owner only) downloads one project as a JSON file: its documents and files, every revision, comments and the binary data they reference, each with a hash. It never includes credentials, sessions or agent grants. Store backups privately and encrypted, outside your Cloudflare account, and try a restore with test data before you rely on them.
+**Connections → Agent tokens → Backup** (owner only) downloads one project as a JSON file: its documents and files, every revision, comments and the binary data they reference, each with a hash. It never includes credentials, sessions or agent grants. One-time Google Drive source provenance is included as optional `sources`; restore leaves mappings detached and non-primary, without restoring Google authorization. See [Google Drive import](google-drive-import.md) for staging recovery and rollback notes. Store backups privately and encrypted, outside your Cloudflare account, and try a restore with test data before you rely on them.
 
 Limits:
 - It's one project at a time, held in memory, so very large projects may exceed Worker limits. There's no whole-account backup yet.

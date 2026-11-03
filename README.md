@@ -70,6 +70,7 @@ Agent Library is a personal library: one owner, many agents.
 - [Review](docs/review-gating.md): optionally require approval before edits by apps and agents go live, or mark versions reviewed so agents can read the reviewed one.
 - [Document templates](docs/templates.md): save a Markdown structure once, then start new documents from it in the app or through MCP and the API.
 - [Changes feed](docs/project-changes.md): checkpoints, incremental polling, retention and resync.
+- [Google Drive import](docs/google-drive-import.md): owner-selected, one-time copies with source provenance.
 - [Operations](docs/operations.md): upgrades, backup and restore, rollback.
 - [Deploy pipeline](docs/deploy-pipeline.md) (optional): auto-deploy your installation from GitHub on every push to `main`.
 - [Version history](docs/version-history.md) and [upload finalization](docs/upload-finalization.md): design notes.
