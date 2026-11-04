@@ -34,7 +34,10 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 //   portal  every request answered 200 text/html by a "captive portal" (hotel/airport Wi-Fi before login)
 //   expired Cloudflare Access session expired (401 for API calls, sign-in page for page loads)
 //   err502  the edge answers 502 (upstream trouble)
-const net = { mode: "up", sockets: new Set() };
+//   refuse  Access is fine but the library refuses the sign-in (409 identity_changed: the owner must act)
+// net.loginDelays: how many of the next session exchanges (POST /auth/access-login) are answered 6 s late.
+const net = { mode: "up", sockets: new Set(), loginDelays: 0, logins: 0 };
+const REFUSAL = "This sign-in has a new Access user ID and the owner account is ambiguous. No account was created.";
 let jwks, srv, access, browser, page;
 function startJwks() { return createServer((q, s) => { s.setHeader("content-type", "application/json"); s.end(JSON.stringify({ keys: [{ ...publicKey.export({ format: "jwk" }), kid: "k1", alg: "RS256", use: "sig" }] })); }).listen(JWKS, "127.0.0.1"); }
 function startWorker() { return startServer("offline-network", WORKER, { vars: { ACCESS_TEAM_DOMAIN: TEAM, ACCESS_AUD: AUD, OWNER_EMAIL: OWNER, ACCESS_CERTS_URL: `http://127.0.0.1:${JWKS}/certs`, RATE_READS_PER_MIN: "100000", RATE_WRITES_PER_MIN: "100000", RATE_AUTHFAIL_PER_MIN: "100000" }, readyHeaders: { "cf-access-jwt-assertion": "x" } }); }
@@ -56,6 +59,13 @@ function startAccess() { return createServer((req, res) => {
     res.writeHead(200, { "content-type": "text/html" }); return res.end(`<!doctype html><title>${SIGNIN}</title><h1>${SIGNIN}</h1>`);
   }
   if (m === "slow") { setTimeout(() => fwd(req, res), 8000); return; }
+  const login = req.method === "POST" && req.url.startsWith("/auth/access-login");
+  if (login) net.logins++;
+  if (m === "refuse") {
+    if (login) { res.writeHead(409, { "content-type": "application/json" }); return res.end(JSON.stringify({ error: { code: "identity_changed", message: REFUSAL } })); }
+    if (req.url.startsWith("/api/me")) { res.writeHead(401, { "content-type": "application/json" }); return res.end(JSON.stringify({ error: { code: "unauthenticated", message: "Sign in" } })); }
+  }
+  if (login && net.loginDelays > 0) { net.loginDelays--; setTimeout(() => fwd(req, res), 6000); return; }
   fwd(req, res);
 }).listen(ACCESS, "127.0.0.1"); }
 const launchBrowser = () => require(PUPPETEER).launch({ executablePath: CHROME, headless: true, protocolTimeout: 15000, args: ["--no-first-run", `--host-resolver-rules=MAP ${HOST} 127.0.0.1`, `--unsafely-treat-insecure-origin-as-secure=${APP}`] });
@@ -68,6 +78,7 @@ async function screen() {
       const banner = (document.querySelector(".offline-banner")?.innerText || "").replace(/\s+/g, " ").slice(0, 60);
       let kind = "other";
       if (document.title === SIGNIN) kind = "signin-access";
+      else if (/owner account is ambiguous/.test(t)) kind = /Packing list/.test(t) ? "offline-saved-refused" : "refused";
       else if (/Accept the terms/.test(t)) kind = "portal";
       else if (/502 Bad Gateway/.test(t)) kind = "error-page";
       else if (document.querySelectorAll("#nav a").length === 4) kind = "live";
@@ -86,12 +97,22 @@ async function waitFor(kinds, ms) {
 }
 async function launch() { await page.goto("about:blank").catch(() => {}); page.goto(APP + "/?source=pwa").catch(() => {}); await sleep(300); }
 const tap = (text) => page.evaluate((text) => { const a = [...document.querySelectorAll("a,button")].find((x) => x.textContent.trim() === text); if (!a) return false; a.click(); return true; }, text).catch(() => false);
-async function setSaved(on) {
-  await page.evaluate(async (on) => {
-    await new Promise((res) => { const r = indexedDB.open("al-offline", 1); r.onsuccess = () => { const d = r.result; const t = d.transaction(["items", "projects"], "readwrite"); if (!on) { t.objectStore("items").clear(); t.objectStore("projects").clear(); } t.oncomplete = () => res(); }; });
-  }, on);
+// Remove every saved copy, as the app's own clear does. Creates the stores the way the app does if they don't exist
+// yet, so the app's database is never left without them.
+async function clearSaved() {
+  await page.evaluate(() => new Promise((res, rej) => {
+    const r = indexedDB.open("al-offline", 1);
+    r.onupgradeneeded = () => { const d = r.result; d.createObjectStore("items", { keyPath: "key" }); d.createObjectStore("projects", { keyPath: "pid" }); d.createObjectStore("meta", { keyPath: "k" }); };
+    r.onerror = () => rej(r.error);
+    r.onsuccess = () => {
+      const d = r.result, t = d.transaction(["items", "projects", "meta"], "readwrite");
+      for (const s of ["items", "projects", "meta"]) t.objectStore(s).clear();
+      t.oncomplete = () => { d.close(); res(); }; t.onerror = () => rej(t.error);
+    };
+  }));
 }
-async function resetNet() { net.mode = "up"; for (const s of net.sockets) s.destroy(); net.sockets.clear(); await page.setOfflineMode(false).catch(() => {}); }
+async function resetNet() { net.mode = "up"; net.loginDelays = 0; for (const s of net.sockets) s.destroy(); net.sockets.clear(); await page.setOfflineMode(false).catch(() => {}); }
+const sessionCookie = async () => ((await page.cookies(APP)).find((c) => c.name === "al_session") || {}).value || null;
 let aid;
 async function onlineHome() { await resetNet(); await launch(); return waitFor(["live"], 15000); }
 async function saveDoc() {
@@ -105,7 +126,10 @@ function scenario(name, saved, fail, steps) {
   const r = { result: "PASS", notes: [] };
   try {
     const home = await onlineHome(); if (home.kind !== "live") throw new Error("setup: not live (" + home.kind + ")");
-    if (saved) await saveDoc(); else await setSaved(false);
+    // The app's once-a-minute sign-in reload throttle must not carry over from an earlier scenario.
+    await page.evaluate(() => sessionStorage.removeItem("al:signin-reload"));
+    if (saved) await saveDoc(); else await clearSaved();
+    net.logins = 0;
     await page.goto("about:blank").catch(() => {}); await sleep(300);
     await fail();
     for (const [what, act, want, ms] of steps) {
@@ -120,7 +144,6 @@ function scenario(name, saved, fail, steps) {
   assert.equal(r.result, "PASS", r.notes.join("\n"));
   });
 }
-const OFFLINE = ["offline-saved", "offline-empty"];
 const offlineFor = (saved) => saved ? ["offline-saved", "offline-saved-connected"] : ["offline-empty"];
 before(async () => {
   jwks = startJwks(); srv = await startWorker(); access = startAccess();
@@ -197,7 +220,7 @@ for (const saved of [true, false]) {
       ["fixed + Try again", async () => { net.mode = "up"; await tap("Try again"); }, ["live"], 15000],
     ]);
     // K. Cloudflare Access signed out (real sign-out): saved copies + sign-in link, or Access's own sign-in page.
-    scenario("K Access signed out", saved, async () => { net.mode = "expired"; await page.evaluate(() => sessionStorage.removeItem("al:signin-reload")).catch(() => {}); }, saved ? [
+    scenario("K Access signed out", saved, async () => { net.mode = "expired"; }, saved ? [
       ["launch", launch, ["offline-saved"], 8000],
       ["tap Sign in link", () => tap("Sign in to open the live library"), ["signin-access"], 10000],
     ] : [
@@ -209,14 +232,36 @@ for (const saved of [true, false]) {
       ["back, tap", async () => { net.mode = "up"; await tap("Try again"); net.mode = "stall"; await sleep(500); await tap("Try again"); }, OFF.concat(["live"]), 8000],
       ["back for good, tap", async () => { net.mode = "up"; await tap("Try again"); }, ["live"], 25000],
     ]);
+    // N. The library refuses the sign-in for good (409 identity_changed): its message is shown, not "can't reach",
+    // and the app doesn't keep retrying a sign-in that can't succeed.
+    scenario("N library refuses the sign-in", saved, async () => { net.mode = "refuse"; }, [
+      ["launch", launch, [saved ? "offline-saved-refused" : "refused"], 8000],
+      ...(saved ? [["no automatic retries", async () => {
+        const n = net.logins; await page.evaluate(() => window.dispatchEvent(new Event("online"))); await sleep(32000);
+        if (net.logins !== n) throw new Error(`signed in again on its own (${net.logins - n} more session exchanges)`);
+      }, ["offline-saved-refused"], 1000]] : []),
+    ]);
+    // O. App session expired, Access fine, slow session exchange; Try again replaces the attempt. The replaced
+    // exchange must not land later and replace the session the live app is using (its CSRF token would stop matching).
+    scenario("O Try again while a session exchange is slow", saved, async () => {
+      await page.deleteCookie({ name: "al_session", url: APP }); net.loginDelays = 1;
+    }, [
+      ["launch", launch, offlineFor(saved), 6000],
+      ["Try again", () => tap("Try again"), ["live"], 10000],
+      ["session kept", async () => {
+        const used = await sessionCookie();
+        await sleep(7000); // the replaced exchange would have been answered by now
+        if (!used || (await sessionCookie()) !== used) throw new Error("a late session exchange replaced the live app's session");
+      }, ["live"], 3000],
+    ]);
 }
 // M. Reading a saved document when the connection returns: never switched away from it.
-  scenario("M reading a saved doc when connection returns", true, async () => { net.mode = "stall"; }, [
-    ["launch", launch, ["offline-saved"], 6000],
-    ["open the doc", async () => { await tap("Packing list"); await page.waitForFunction(() => /Passport/.test(document.body.innerText), { timeout: 5000 }).catch(() => {}); }, ["offline-saved"], 5000],
-    ["connection back (online event)", async () => { net.mode = "up"; await page.evaluate(() => window.dispatchEvent(new Event("online"))).catch(() => {}); }, ["offline-saved-connected"], 10000],
-    ["still on the document", async () => { if (!(await page.evaluate(() => /Passport/.test(document.body.innerText)).catch(() => false))) throw new Error("switched away from the document"); }, ["offline-saved-connected"], 1000],
-  ]);
+scenario("M reading a saved doc when connection returns", true, async () => { net.mode = "stall"; }, [
+  ["launch", launch, ["offline-saved"], 6000],
+  ["open the doc", async () => { await tap("Packing list"); await page.waitForFunction(() => /Passport/.test(document.body.innerText), { timeout: 5000 }).catch(() => {}); }, ["offline-saved"], 5000],
+  ["connection back (online event)", async () => { net.mode = "up"; await page.evaluate(() => window.dispatchEvent(new Event("online"))).catch(() => {}); }, ["offline-saved-connected"], 10000],
+  ["still on the document", async () => { if (!(await page.evaluate(() => /Passport/.test(document.body.innerText)).catch(() => false))) throw new Error("switched away from the document"); }, ["offline-saved-connected"], 1000],
+]);
 test("the app threw no errors in any scenario", { skip: !haveChrome && "Chrome not installed" }, () => {
   assert.deepEqual([...new Set(errors)], []);
 });

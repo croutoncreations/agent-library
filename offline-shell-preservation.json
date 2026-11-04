@@ -1,10 +1,10 @@
 {
   "base_review_sha256": "8058a319758596e8704f5fff99e89f343f61ab79de9bb03746774628564172f7",
-  "integrated_sha256": "17e30826356204f3367629817e8951b4a3fd639ba7145a734fd9cee6e2fc6ce0",
+  "integrated_sha256": "eca73a3934a1447dd673d8c8056ef85f69abb03d5a897cf2ad56e1e9125733ad",
   "preserved_outside_patches_sha256": "96bb5e7ded3c6292b4b8472956c4cecff86d64e2d0ee9cb36e32bfce9bb987eb",
   "sources_sha256": {
     "src/offline/sw.js": "39be06884dccc421a5b49f3b03e5c3a888398bb1a88a316e34630a95516961b3",
-    "src/offline/boot.js": "c4eca90d6e3856bd257339daa860efffee9fd9a0a066d9016ecc163aa6167384",
+    "src/offline/boot.js": "fbcf81b45e91eefcc204a71b173540d054f700739aaca72fd16c7ac8a87c0088",
     "src/offline/version.js": "0a0cf678f7528a2c220b9517802e38a77fb8c77755e1bba8ea3b88354ca5c630"
   },
   "patches": [
@@ -54,7 +54,7 @@
       "name": "ui: boot opens saved copies after a short wait",
       "module": "// src/ui.ts",
       "find_sha256": "9f94e80e6de8a6d1940655a5c1883d263a871aae05f93e4ad8f5e9ddaa457ba5",
-      "replace_sha256": "c4eca90d6e3856bd257339daa860efffee9fd9a0a066d9016ecc163aa6167384"
+      "replace_sha256": "fbcf81b45e91eefcc204a71b173540d054f700739aaca72fd16c7ac8a87c0088"
     },
     {
       "name": "ui: api() takes an abort signal (boot gives up on requests that never get an answer)",
