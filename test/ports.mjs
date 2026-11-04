@@ -23,13 +23,13 @@ export const SERVER_PORTS = range({
   "data-preview": 21037, "chunked-reads": 21038, "ranked-search": 21041, "project-changes": 21042, "oauth-files": 21039, "smoke-setup": 21040,
   templates: 21043, "templates-restore": 21044, "templates-legacy-restore": 21047,
   diagnostics: 21048, "file-types": 21049, "marketing-capture": 21045, "marketing-clips": 21046,
-  "review-gating": 21050, "review-gating-restore": 21051, "review-ui": 21052, "offline-shell": 21053,
+  "review-gating": 21050, "review-gating-restore": 21051, "review-ui": 21052, "offline-shell": 21053, "offline-network": 21054,
 });
 
 /** Plain node:http listeners that tests start next to a server. */
 export const AUX_PORTS = range({
   hostedJwks: 23100, oauthBrowserOidc: 23101, oauthBrowserCallback: 23102, oauthBrowserHop: 23103,
-  chatgptOidc: 23104, chatgptCallback: 23105, hostedSessionJwks: 23106, hostedSessionAccess: 23107, offlineShellProxy: 23108,
+  chatgptOidc: 23104, chatgptCallback: 23105, hostedSessionJwks: 23106, hostedSessionAccess: 23107, offlineShellProxy: 23108, offlineNetworkJwks: 23109, offlineNetworkAccess: 23110,
 });
 
 /** Every port bound during a run, for the uniqueness check. */
