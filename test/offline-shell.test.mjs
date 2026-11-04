@@ -28,7 +28,9 @@ function forward(req, res) {
     const chunks = []; r.on("data", (c) => chunks.push(c)); r.on("end", () => {
       let body = Buffer.concat(chunks);
       if (path === "/shell-version") body = Buffer.from(JSON.stringify({ version: net.deploy }));
-      if (path === "/app.js") body = Buffer.concat([body, Buffer.from("\n// deploy " + net.deploy + "\n")]);
+      // The marker comment identifies the copy; the global shows which copy the page actually ran.
+      if (path === "/app.js") body = Buffer.concat([body, Buffer.from("\n// deploy " + net.deploy + "\nself.__deploy = " + JSON.stringify(net.deploy) + ";\n")]);
+      if (path === "/app.css") body = Buffer.concat([body, Buffer.from("\n:root{--deploy:" + JSON.stringify(net.deploy) + "}\n")]);
       const headers = { ...r.headers, "content-length": String(body.length) };
       if (r.headers["x-shell-version"]) headers["x-shell-version"] = net.deploy;
       res.writeHead(r.statusCode, headers); res.end(body);
@@ -155,6 +157,7 @@ test("new deploy: the shell downloads once in the background and the next launch
     await launch();
     assert.equal(net.shellGets, gets + 1, "downloaded once");
     assert.doesNotMatch(await appJs(), /deploy testdeploy1/, "this launch still runs the cached version");
+    assert.equal(await page.evaluate(() => self.__deploy), undefined, "the page ran the cached script");
     await launch();
     assert.match(await appJs(), /deploy testdeploy1/, "the next launch swapped the new version in");
     assert.equal(net.shellGets, gets + 1, "and did not download it again");
@@ -179,11 +182,9 @@ test("a sign-in navigation right after a deploy loads its script from the same (
     await page.goto("about:blank");
     await page.goto(APP + "/?al_net=1&t=2#/");
     await page.waitForSelector("#nav a");
-    const scripts = await page.evaluate(() => performance.getEntriesByType("resource").filter((r) => /\/app\.(js|css)$/.test(r.name)).map((r) => r.name));
-    assert.ok(scripts.length >= 2, "the page loaded its script and styles");
-    // The proxy appends the marker only to the network copy of /app.js for this simulated deploy.
-    const live = await page.evaluate(async () => (await (await fetch("/app.js", { cache: "no-store" })).text()).includes("deploy signindeploy"));
-    assert.equal(live, true, "the page's own requests go to the network");
+    // The script and styles this page actually loaded are the network (new) copies, not the cached ones.
+    assert.equal(await page.evaluate(() => self.__deploy), "signindeploy", "the page ran the new script");
+    assert.equal(await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue("--deploy").trim()), '"signindeploy"', "the page applied the new styles");
     assert.doesNotMatch(await appJs(), /deploy signindeploy/, "the cached shell is unchanged until the next launch swaps it");
   } finally { net.deploy = null; }
   await launch(); await launch();
