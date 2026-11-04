@@ -12632,14 +12632,22 @@ var APP_CSS = `/* review gating (src/review/browser.js) */
 .rv-radio > input{margin:2px 0 0;flex:none}
 .rv-radio > span{display:flex;flex-direction:column;gap:2px;min-width:0}
 /* History: badges and the row's button form one group, centered on each other. */
-.vh-side{display:flex;align-items:center;gap:8px;flex:none;margin-left:auto}
+.vh-side{display:flex;flex-wrap:wrap;align-items:center;gap:8px;flex:none;margin-left:auto;max-width:100%}
 .vh-side .vh-open,.vh-side .vh-toggle{margin-left:0}
 .vh-list .vh-row > .grow{flex:1 1 0}
 .vh-burst > .vh-side{flex:none}
 .rv-pending .vh-n{min-height:1px}
 .rv-pending{background:color-mix(in srgb,var(--warn) 5%,transparent)}
-/* Phones: the group wraps under the row's text, starting where the text starts (version column + row gap). */
-@media (max-width:640px){.vh-list .vh-row > .vh-side,.vh-burst > .vh-side{flex:1 1 100%;padding-left:calc(2.6 * 13px + 10px)}.vh-side > :last-child{margin-left:auto}}
+/* Phones: every History row stacks the same way: number, then text, then the badges and button (which wrap if needed). */
+@media (max-width:640px){
+.vh-list .vh-row,.vh-list .vh-burst{flex-wrap:wrap}
+.vh-list .vh-row > .vh-n,.vh-list .vh-burst > .vh-n{flex:1 1 100%}
+.vh-list .vh-row > .grow{flex:1 1 100%}
+.vh-list .vh-row > .vh-side,.vh-burst > .vh-side{flex:1 1 100%;margin-left:0}
+.vh-side > :last-child{margin-left:auto}
+.rv-pending > .vh-n{display:none}
+}
+.rv-load-err{display:flex;flex-wrap:wrap;align-items:center;gap:8px;color:var(--bad)}
 .rv-newdoc.rv-wait{visibility:hidden}
 .rv-newdoc > .muted{max-width:22rem}
 .template-form .rv-newdoc-help{margin:-4px 0 0}
@@ -12647,6 +12655,8 @@ var APP_CSS = `/* review gating (src/review/browser.js) */
 @media (pointer:coarse){.rv-grant,.rv-kind{min-height:44px}}
 @media (max-width:760px){.rv-decide{bottom:calc(var(--tab-h) + 8px + env(safe-area-inset-bottom,0px))}.rv-decide .spacer{display:none}}
 @media (max-width:360px){.rv-sec .tabs button,.rv-edit .tabs button{padding:4px 5px;font-size:13.5px}}
+/* The long "Save and apply…" label wraps rather than overflowing the card on narrow phones. */
+.rv-actions > button{white-space:normal;text-align:center;max-width:100%}
 /* File type thumbnails: the media covers the type icon once it has loaded. */
 .ficon-sm{position:relative;overflow:hidden}
 .ficon-sm > .thumb{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:0;pointer-events:none;background:var(--sunk)}
@@ -14131,8 +14141,9 @@ function rvDocumentUi(A, pid, aid, details, reload) {
   var rv = A.meta.review || null, out = { banner: null, chip: null };
   if (rv && rv.pending_proposals) {
     // Several: this document's History lists exactly its waiting edits (the project queue would mix in others).
+    // If History couldn't load the list (A.rvPendingFailed), it goes to the project's Review queue instead.
     var link = h("a", { class: "btn secondary", href: "#/p/" + enc(pid) + "/review", onclick: function (e) {
-      if (link.dataset.direct) return;
+      if (link.dataset.direct || A.rvPendingFailed) return;
       var t = [].filter.call(document.querySelectorAll('[role="tab"]'), function (x) { return x.textContent === "History"; })[0];
       if (t) { e.preventDefault(); t.click(); t.focus(); }
     } }, rv.pending_proposals === 1 ? "Review edit" : "Review edits");
@@ -14187,15 +14198,17 @@ function rvDocumentUi(A, pid, aid, details, reload) {
   } }, "Save review setting");
   function picked() { return rvPicked(radios, cur); }
   function sync() { save.hidden = picked() === cur; }
-  // After the details fields, their Save and its message (which stays next to its button); before the ID line.
+  // Details order: fields → Save details → its message ("Details saved.") → Review → ID line. The base UI puts the ID
+  // line before the message, so the ID line moves below the Review section.
   var box = h("fieldset", { class: "rv-docmode" }, h("legend", { class: "rv-legend", text: "Review" }), radios, h("div", { class: "row" }, save), rmsg);
-  var after = details.querySelector(":scope > p.msg");
-  if (after) after.after(box); else details.append(box);
+  var metaMsg = details.querySelector(":scope > p.msg"), idLine = details.querySelector(":scope > p.muted.small");
+  if (metaMsg) metaMsg.after(box); else details.append(box);
+  if (idLine) box.after(idLine);
   return out;
 }
 // History: edits waiting for review, listed above the versions with a direct Review link (the owner sees them all).
 async function rvLoadPending(A, pid, aid) {
-  A.rvPending = [];
+  A.rvPending = []; A.rvPendingFailed = null;
   if (!A.meta.review) return; // review off and nothing pending
   // Every page: "Review edits" sends the owner here for all of this document's waiting edits (bounded: 20 pages).
   var all = [], cursor = null, n = 0;
@@ -14204,11 +14217,17 @@ async function rvLoadPending(A, pid, aid) {
       var r = await api("GET", "/api/projects/" + enc(pid) + "/proposals?artifact_id=" + enc(aid) + (cursor ? "&cursor=" + enc(cursor) : ""));
       all = all.concat(r.proposals); cursor = r.next_cursor;
     } while (cursor && ++n < 20);
-  } catch (e) {}
+  } catch (e) { A.rvPendingFailed = e; }
   A.rvPending = all;
 }
-function rvPendingRows(A, pid) {
+function rvPendingRows(A, pid, retry) {
   var ps = A.rvPending || [];
+  if (A.rvPendingFailed) {
+    var again = h("button", { type: "button", class: "secondary", onclick: function () { again.disabled = true; retry(); } }, icon("refresh"), "Try again");
+    return [h("li", { class: "group", text: "Waiting for review" }),
+      h("li", { class: "rv-load-err", role: "alert" }, h("span", { class: "grow", text: "Couldn't load the edits waiting for review: " + (A.rvPendingFailed.message || "error") + "." }), again,
+        h("a", { class: "btn secondary", href: "#/p/" + enc(pid) + "/review" }, "Open project Review"))];
+  }
   if (!ps.length) return [];
   return [h("li", { class: "group", text: "Waiting for review" })].concat(ps.map(function (p) {
     return h("li", { class: "vh-row rv-pending", dataset: { proposal: p.proposal_id } },
@@ -14219,7 +14238,7 @@ function rvPendingRows(A, pid) {
           [rvCap(rvChanges(p)), "proposed " + rvAgo(p.created_at), p.is_new ? null : "based on v" + p.base_revision].filter(Boolean).join(" · ")),
         p.change_note ? h("span", { class: "vh-note agent" }, "“" + p.change_note + "”") : null),
       h("span", { class: "vh-side" }, h("span", { class: "badge warnb", text: "Pending" }),
-        h("a", { class: "btn vh-open", href: "#/p/" + enc(pid) + "/review/" + enc(p.proposal_id) }, "Review", h("span", { class: "sr", text: " edit by " + p.who }))));
+        h("a", { class: "btn secondary vh-open", href: "#/p/" + enc(pid) + "/review/" + enc(p.proposal_id) }, "Review", h("span", { class: "sr", text: " edit by " + p.who }))));
   }));
 }
 // New document form: review for this document, starting at the project's default for its type. Applied right after
@@ -14243,7 +14262,7 @@ function rvNewDocReview(pid, kindOf) {
   var label = h("label", { class: "rv-newdoc rv-wait" }, "Review", sel);
   api("GET", "/api/projects/" + enc(pid) + "/review-settings", undefined, { noAuthRedirect: true })
     .then(function (r) { s = r; sync(); label.classList.remove("rv-wait"); })
-    .catch(function () { label.replaceChildren("Review", h("span", { class: "muted small", text: "Project default. Couldn't load the options: change it in Details after creating." })); label.classList.remove("rv-wait"); });
+    .catch(function () { label.replaceChildren("Review", h("span", { class: "muted small", text: "Couldn't load review options. The project default will apply; you can change it in Details." })); label.classList.remove("rv-wait"); });
   return { label: label, help: help, sync: sync,
     // Sets the chosen mode if creation (project default at that moment, which may have changed since the form loaded) didn't.
     // Pinned to the revision this form created: turning on Required vouches for it, so an agent version saved in
@@ -15297,6 +15316,7 @@ async function viewArtifact(pid, aid, initialTab) {
       var want = "#/p/" + enc(pid) + "/a/" + enc(aid) + (name === "edit" ? "/edit" : "");
       if (location.hash !== want) history.replaceState(null, "", want);
     }
+    if (name === "history" && !/[?&](v|tab)=/.test(location.hash)) history.replaceState(null, "", "#/p/" + enc(pid) + "/a/" + enc(aid) + "?tab=history");
     if (tabBtns[name].onShow) tabBtns[name].onShow();
   }
 
@@ -15372,8 +15392,8 @@ async function viewArtifact(pid, aid, initialTab) {
     }
     function draw() {
       list.replaceChildren(); list.removeAttribute("aria-busy");
-      rvPendingRows(A, pid).forEach(function (li) { list.append(li); });
-      if (A.rvPending && A.rvPending.length && revs.length) list.append(h("li", { class: "group", text: "Versions" }));
+      rvPendingRows(A, pid, function () { rvLoadPending(A, pid, aid).then(draw); }).forEach(function (li) { list.append(li); });
+      if ((A.rvPendingFailed || A.rvPending && A.rvPending.length) && revs.length) list.append(h("li", { class: "group", text: "Versions" }));
       if (!revs.length) { list.append(h("li", { class: "empty", text: "No versions yet." })); return; }
       groups().forEach(function (g) {
         if (!g.burst || g.items.length < 3) { g.items.forEach(function (v) { list.append(revRow(v, revs.indexOf(v))); }); return; }
@@ -15402,7 +15422,7 @@ async function viewArtifact(pid, aid, initialTab) {
             h("span", { class: "grow" }, whoLine(m),
               h("span", { class: "meta", text: "“" + m.title + "”" + (m.folder ? " · " + m.folder : "") + (m.tags.length ? " · " + m.tags.join(", ") : "") + (m.trashed ? " · in trash" : "") + " · " + ago(m.created_at) }),
               note(m)),
-            cur ? h("span", { class: "badge accent", text: "current" }) : h("button", { type: "button", class: "secondary", onclick: function (e) { restoreMeta(m, e.currentTarget); } }, "Restore", h("span", { class: "sr", text: " title and tags from details version " + m.version }))));
+            h("span", { class: "vh-side" }, cur ? h("span", { class: "badge accent", text: "current" }) : h("button", { type: "button", class: "secondary", onclick: function (e) { restoreMeta(m, e.currentTarget); } }, "Restore", h("span", { class: "sr", text: " title and tags from details version " + m.version })))));
         });
         // Details history pages separately from content versions (its own cursor).
         if (metaCursor) list.append(h("li", { class: "vh-more-meta" }, moreMeta));
@@ -15662,7 +15682,7 @@ async function viewArtifact(pid, aid, initialTab) {
   // Documents open on the rendered view; Edit is one tap away (and /edit deep links open the editor).
   var wantV = VH.requestedVersion();
   if (wantV) VH.open(wantV);
-  showTab(wantV ? "history" : isTextDoc(A.meta.kind) && initialTab === "edit" ? "edit" : "preview");
+  showTab(wantV || /[?&]tab=history(?:&|$)/.test(location.hash) ? "history" : isTextDoc(A.meta.kind) && initialTab === "edit" ? "edit" : "preview");
   resumeApply("artifact");
 }
 

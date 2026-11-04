@@ -213,9 +213,17 @@ const PATCHES = [
     '          note(v), rvHistoryWho(v)),\n        h("span", { class: "vh-side" }, rvHistoryBits(A, v),\n        current ? h("span", { class: "badge accent", text: "current" }) : null,\n        h("button", { type: "button", class: "secondary vh-open", onclick: function () { open(v.rev); } }, current ? "View" : "Compare", h("span", { class: "sr", text: " version " + v.rev }))));'],
   ['ui: history burst row: badge and toggle grouped', UI, '          first.rev === A.rev ? h("span", { class: "badge accent", text: "current" }) : null,\n          toggle, inner));',
     '          h("span", { class: "vh-side" }, first.rev === A.rev ? h("span", { class: "badge accent", text: "current" }) : null,\n          toggle), inner));'],
+  // Details (title, folder, tags) rows: the same badge/button group, so every History row has one phone layout.
+  ['ui: history details rows: badge or Restore grouped', UI, '            cur ? h("span", { class: "badge accent", text: "current" }) : h("button", { type: "button", class: "secondary", onclick: function (e) { restoreMeta(m, e.currentTarget); } }, "Restore", h("span", { class: "sr", text: " title and tags from details version " + m.version }))));',
+    '            h("span", { class: "vh-side" }, cur ? h("span", { class: "badge accent", text: "current" }) : h("button", { type: "button", class: "secondary", onclick: function (e) { restoreMeta(m, e.currentTarget); } }, "Restore", h("span", { class: "sr", text: " title and tags from details version " + m.version })))));'],
+  // Opening the History tab records it in the URL (?tab=history), so Back from a review screen returns to History.
+  ['ui: History tab is restorable from the URL', UI, '  showTab(wantV ? "history" : isTextDoc(A.meta.kind) && initialTab === "edit" ? "edit" : "preview");',
+    '  showTab(wantV || /[?&]tab=history(?:&|$)/.test(location.hash) ? "history" : isTextDoc(A.meta.kind) && initialTab === "edit" ? "edit" : "preview");'],
+  ['ui: History tab writes ?tab=history', UI, '    if (tabBtns[name].onShow) tabBtns[name].onShow();\n  }\n',
+    '    if (name === "history" && !/[?&](v|tab)=/.test(location.hash)) history.replaceState(null, "", "#/p/" + enc(pid) + "/a/" + enc(aid) + "?tab=history");\n    if (tabBtns[name].onShow) tabBtns[name].onShow();\n  }\n'],
   // Pending edits of this document (reviewers/owner see them all) above its versions, each with a Review link.
   ['ui: history lists edits waiting for review', UI, '      if (!revs.length) { list.append(h("li", { class: "empty", text: "No versions yet." })); return; }\n',
-    '      rvPendingRows(A, pid).forEach(function (li) { list.append(li); });\n      if (A.rvPending && A.rvPending.length && revs.length) list.append(h("li", { class: "group", text: "Versions" }));\n      if (!revs.length) { list.append(h("li", { class: "empty", text: "No versions yet." })); return; }\n'],
+    '      rvPendingRows(A, pid, function () { rvLoadPending(A, pid, aid).then(draw); }).forEach(function (li) { list.append(li); });\n      if ((A.rvPendingFailed || A.rvPending && A.rvPending.length) && revs.length) list.append(h("li", { class: "group", text: "Versions" }));\n      if (!revs.length) { list.append(h("li", { class: "empty", text: "No versions yet." })); return; }\n'],
   ['ui: history loads waiting edits with the first page', UI, '        await fetchPage(again);\n',
     '        await Promise.all([again ? null : rvLoadPending(A, pid, aid), fetchPage(again)]);\n'],
   ['ui: history: mark a version reviewed (advisory)', UI, '      if (n !== A.rev) actions.append(h("button", { type: "button", onclick: function (e) { restoreRev(n, e.currentTarget); } }, "Restore this version"));',

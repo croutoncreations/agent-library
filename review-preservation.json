@@ -1,12 +1,12 @@
 {
   "base_file_types_sha256": "cea551a7d442927605e0890073072e7bad69968f1fdf6a4a3886d3dc79a6b1cf",
-  "integrated_sha256": "388cf6749fb91a39cd6db5370ecb3f689bc9ceeb1cad81f5568efdc547f929c0",
-  "preserved_outside_patches_sha256": "1e09e18cf9a8be3ea84b9c92b92e1bd4522ca8eedf6a738fc55ceb6588399826",
+  "integrated_sha256": "78aaf52f4173e0b6bd381b6812bf400a90d2f79f0dc2221a1a6efcbf0c6cd52b",
+  "preserved_outside_patches_sha256": "78f16890e49b7f7fd8c533c6e1dc37b111f3185f97f2ab2d569951970a26758d",
   "sources_sha256": {
     "src/review/service.js": "66aaa5d16763149e719c5aa57ede9b5ba078fade0945a5a75328f9a0074ed146",
     "src/review/tools.js": "192903fbdd905f4b632a23a22263874502c8691d02a394ddb1596aa8b43d2991",
-    "src/review/browser.js": "41181a23dfcc13615cd8089e70f411a65191e6aba093c1dbf17839c8b0a809b1",
-    "src/review/browser.css": "e429b4eeb7c246b003964470e20770468614b04d7d97dece752c0f0ed663e9bc"
+    "src/review/browser.js": "11ee5fab244a5b9d51602fb4cf71ff61d58f0c2df7cfb379523807ced8b76987",
+    "src/review/browser.css": "d0eb76c0fb98004466bec9e9d6f1f36a97d8d92afa91726e3be350ee909b9536"
   },
   "patches": [
     {
@@ -493,14 +493,14 @@
       "module": "// src/ui.ts",
       "count": 1,
       "find_sha256": "dbf4cdd569563992bd40313f20a86bcb55703a554eed9585301382dce9e6ee4e",
-      "replace_sha256": "e6b39787a968919720ce0e45279e4437a80cdf7518cbb787aabec6cb67d4ec82"
+      "replace_sha256": "7e4ae891456ce82a734dd21afbd0dceb8b37063d23c98075bbf3813f41db05e4"
     },
     {
       "name": "ui: review views and helpers",
       "module": "// src/ui.ts",
       "count": 1,
       "find_sha256": "81bcf3ea5954073fece07463dbbe3470c23d9bf7692c635606fabb17e44ff27a",
-      "replace_sha256": "9a5a3d9ca6036a36b9d5963d554082a0babb112e7430ef59ad285efbe23f98e7"
+      "replace_sha256": "e17f658f62d33d655af2a0840f12dd765d15b39ed7dd1353d5b7f4b0fe6e9b3d"
     },
     {
       "name": "ui: review routes",
@@ -580,11 +580,32 @@
       "replace_sha256": "51c428f7f014ac5e47e313a4043d03a72cbe8cf569d600ba21d0eaf808dfbdb4"
     },
     {
+      "name": "ui: history details rows: badge or Restore grouped",
+      "module": "// src/ui.ts",
+      "count": 1,
+      "find_sha256": "0cb51bda901aae61d3610de337cb61d15d119bac2bc2700047578772dcb4ebf5",
+      "replace_sha256": "6092ba14369e9cdf57751ac0791ca18cb92df3afe87648e73184d41ebba1ec1f"
+    },
+    {
+      "name": "ui: History tab is restorable from the URL",
+      "module": "// src/ui.ts",
+      "count": 1,
+      "find_sha256": "bd02cbc0af3755f79878227952a869d29a8a82c231b1cb01909a2273b81a5957",
+      "replace_sha256": "ce7a09b24aee58790732f791c6c74c615207c30b1bcc4f3d59559f39c9d3191c"
+    },
+    {
+      "name": "ui: History tab writes ?tab=history",
+      "module": "// src/ui.ts",
+      "count": 1,
+      "find_sha256": "f7f4a1aed07f83b028812afb8f941485969673f7f91bc2d8427514540f8afe5f",
+      "replace_sha256": "b8b371041b4131d5dadb22f75a07e3ca43470b083944ef652e85dc5e2338f2b8"
+    },
+    {
       "name": "ui: history lists edits waiting for review",
       "module": "// src/ui.ts",
       "count": 1,
       "find_sha256": "85530fa32bdbe43c4dd05ec2b8aeb43cfda3d4a71cb666770a624a0cc443981c",
-      "replace_sha256": "9b16ce4e9b84471fbc8973666b7fbe668587c1eb45f48b8ff39506ca44a3186c"
+      "replace_sha256": "e21e4513a2f633f4503e93088b9e5705f14a2c23cd29f976967d9e9e84d56af5"
     },
     {
       "name": "ui: history loads waiting edits with the first page",

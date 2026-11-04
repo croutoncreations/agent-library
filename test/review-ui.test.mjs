@@ -57,6 +57,8 @@ test("Chrome: Home hides Needs review when empty and shows it when an edit waits
     await page.waitForFunction(() => /Review required/.test(document.querySelector(".rv-chip")?.textContent || ""));
     assert.equal((await owner.req("GET", base + "/artifacts/" + doc)).body.artifact.review.mode, "required");
     await shot(page, "doc-setting");
+    // Details order: Review comes before the ID line.
+    assert.equal(await page.evaluate(() => { const b = document.querySelector(".rv-docmode"), id = [...b.parentElement.children].find((e) => /^ID art_/.test(e.textContent)); return !!id && !!(b.compareDocumentPosition(id) & Node.DOCUMENT_POSITION_FOLLOWING); }), true, "Review section sits above the ID line");
     // The agent proposes an edit; Home now shows it.
     const s = await agent.call("save_markdown", { project_id: P, artifact_id: doc, expected_revision: 1, body: "# Trip plan\n\nDay 1: arrive\nDay 2: museum\nDay 3: hike\n", change_note: "Added the hike day", idempotency_key: key() });
     assert.equal(s.data.status, "pending_review");
@@ -72,6 +74,33 @@ test("Chrome: Home hides Needs review when empty and shows it when an edit waits
     // Badges and the row's button share one centered group.
     const aligned = await page.$$eval(".vh-list .vh-side", (els) => els.every((g) => { const c = [...g.children].map((x) => { const r = x.getBoundingClientRect(); return r.top + r.height / 2; }); return c.every((y) => Math.abs(y - c[0]) <= 1); }));
     assert.equal(aligned, true, "badges and buttons are vertically centered on each other");
+    // Row-level Review is secondary like View/Compare/Restore (one primary action per screen).
+    assert.equal(await page.$eval(".rv-pending a.vh-open", (e) => e.classList.contains("secondary")), true);
+    // The History tab is in the URL, so Back from the review screen returns to History.
+    assert.match(await page.evaluate(() => location.hash), /\?tab=history$/);
+    await page.evaluate(() => document.querySelector(".rv-pending a.vh-open").click());
+    await page.waitForSelector(".rv-decide");
+    await page.goBack();
+    await page.waitForSelector(".vh-list .rv-pending");
+    assert.equal(await page.evaluate(() => [...document.querySelectorAll('[role="tab"]')].find((t) => t.getAttribute("aria-selected") === "true")?.textContent), "History");
+    // 320px: every History row stacks the same way and nothing overflows its card.
+    await page.setViewport({ width: 320, height: 800 });
+    await new Promise((r) => setTimeout(r, 200));
+    const fits = await page.$$eval(".vh-list > li", (lis) => lis.every((li) => { const b = li.getBoundingClientRect(); return [...li.querySelectorAll("*")].every((x) => { const r = x.getBoundingClientRect(); return !r.width || r.right <= b.right + 1; }); }));
+    assert.equal(fits, true, "History rows fit at 320px");
+    await page.setViewport({ width: 1280, height: 900 });
+    // A failed load of waiting edits says so (with Try again), and the banner falls back to the project queue.
+    await page.setRequestInterception(true);
+    const fail = (r) => (/\/proposals\?artifact_id=/.test(r.url()) ? r.respond({ status: 500, contentType: "application/json", body: '{"error":{"code":"internal","message":"boom"}}' }) : r.continue());
+    page.on("request", fail);
+    // Same URL as now (History is open): reload, so the page loads fresh with the failing request.
+    await page.goto(h.appUi + `/#/p/${P}/a/${doc}?tab=history`);
+    await page.reload();
+    await page.waitForSelector(".vh-list .rv-load-err");
+    assert.match(await page.$eval(".rv-load-err", (e) => e.innerText), /Couldn't load the edits waiting for review/);
+    await page.evaluate(() => document.querySelector(".rv-banner a").click());
+    await page.waitForFunction(() => /\/review$/.test(location.hash));
+    page.off("request", fail); await page.setRequestInterception(false);
     await page.goto(h.appUi + "/#/");
     await page.waitForFunction(() => { const e = document.querySelector(".rv-home"); return e && !e.hidden; });
     const homeText = await page.$eval(".rv-home", (e) => e.innerText);

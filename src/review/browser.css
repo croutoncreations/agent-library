@@ -61,14 +61,22 @@
 .rv-radio > input{margin:2px 0 0;flex:none}
 .rv-radio > span{display:flex;flex-direction:column;gap:2px;min-width:0}
 /* History: badges and the row's button form one group, centered on each other. */
-.vh-side{display:flex;align-items:center;gap:8px;flex:none;margin-left:auto}
+.vh-side{display:flex;flex-wrap:wrap;align-items:center;gap:8px;flex:none;margin-left:auto;max-width:100%}
 .vh-side .vh-open,.vh-side .vh-toggle{margin-left:0}
 .vh-list .vh-row > .grow{flex:1 1 0}
 .vh-burst > .vh-side{flex:none}
 .rv-pending .vh-n{min-height:1px}
 .rv-pending{background:color-mix(in srgb,var(--warn) 5%,transparent)}
-/* Phones: the group wraps under the row's text, starting where the text starts (version column + row gap). */
-@media (max-width:640px){.vh-list .vh-row > .vh-side,.vh-burst > .vh-side{flex:1 1 100%;padding-left:calc(2.6 * 13px + 10px)}.vh-side > :last-child{margin-left:auto}}
+/* Phones: every History row stacks the same way: number, then text, then the badges and button (which wrap if needed). */
+@media (max-width:640px){
+.vh-list .vh-row,.vh-list .vh-burst{flex-wrap:wrap}
+.vh-list .vh-row > .vh-n,.vh-list .vh-burst > .vh-n{flex:1 1 100%}
+.vh-list .vh-row > .grow{flex:1 1 100%}
+.vh-list .vh-row > .vh-side,.vh-burst > .vh-side{flex:1 1 100%;margin-left:0}
+.vh-side > :last-child{margin-left:auto}
+.rv-pending > .vh-n{display:none}
+}
+.rv-load-err{display:flex;flex-wrap:wrap;align-items:center;gap:8px;color:var(--bad)}
 .rv-newdoc.rv-wait{visibility:hidden}
 .rv-newdoc > .muted{max-width:22rem}
 .template-form .rv-newdoc-help{margin:-4px 0 0}
@@ -76,3 +84,5 @@
 @media (pointer:coarse){.rv-grant,.rv-kind{min-height:44px}}
 @media (max-width:760px){.rv-decide{bottom:calc(var(--tab-h) + 8px + env(safe-area-inset-bottom,0px))}.rv-decide .spacer{display:none}}
 @media (max-width:360px){.rv-sec .tabs button,.rv-edit .tabs button{padding:4px 5px;font-size:13.5px}}
+/* The long "Save and apply…" label wraps rather than overflowing the card on narrow phones. */
+.rv-actions > button{white-space:normal;text-align:center;max-width:100%}
