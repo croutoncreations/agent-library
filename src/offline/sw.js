@@ -16,6 +16,14 @@ var NEXT = SHELL + "-next", VKEY = "/__al-shell-version", updating = null;
 // and is dropped once both have loaded, so the map stays small.
 var netPages = {}, NET_FILES = ["/app.js", "/app.css"];
 function noop() {}
+// Background requests give up after this long: on a link that accepts connections but never answers, a request left
+// hanging holds one of the browser's few connections to this host, and the page's own requests (sign-in, Try
+// again) queue behind it. A worker also keeps one update attempt "running" until it settles.
+var BG_TIMEOUT_MS = 20000;
+function bgFetch(url) {
+  var c = new AbortController(), t = setTimeout(function () { c.abort(); }, BG_TIMEOUT_MS);
+  return fetch(url, { credentials: "same-origin", cache: "no-store", signal: c.signal }).then(function (r) { clearTimeout(t); return r; }, function (e) { clearTimeout(t); throw e; });
+}
 // The shell version a cache holds, or null (no cache, or no complete shell in it).
 function versionOf(name) {
   return caches.has(name).then(function (has) {
@@ -26,7 +34,7 @@ function versionOf(name) {
 // Download every shell file; all must report the same version (want, if given). Resolves { list, version }.
 function fetchShell(want) {
   return Promise.all(PATHS.map(function (p) {
-    return fetch(p, { credentials: "same-origin", cache: "no-store" }).then(function (r) {
+    return bgFetch(p).then(function (r) {
       // Only a real 200 same-origin response (never an Access redirect or sign-in page).
       var ct = r.headers.get("content-type") || "";
       // HTML only for "/", and nothing else may be HTML (a sign-in or error page in place of the script or styles).
@@ -53,7 +61,7 @@ function store(name, got) {
   });
 }
 function refresh() {
-  if (!updating) updating = fetch("/shell-version", { credentials: "same-origin", cache: "no-store" })
+  if (!updating) updating = bgFetch("/shell-version")
     .then(function (r) { if (!r.ok || r.redirected || r.type !== "basic") throw new Error("no version"); return r.json(); })
     .then(function (d) {
       var v = d && d.version;
