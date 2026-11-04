@@ -57,10 +57,74 @@ test("Chrome: Home hides Needs review when empty and shows it when an edit waits
     await page.waitForFunction(() => /Review required/.test(document.querySelector(".rv-chip")?.textContent || ""));
     assert.equal((await owner.req("GET", base + "/artifacts/" + doc)).body.artifact.review.mode, "required");
     await shot(page, "doc-setting");
+    // Details order: Review comes before the ID line.
+    assert.equal(await page.evaluate(() => { const b = document.querySelector(".rv-docmode"), id = [...b.parentElement.children].find((e) => /^ID art_/.test(e.textContent)); return !!id && !!(b.compareDocumentPosition(id) & Node.DOCUMENT_POSITION_FOLLOWING); }), true, "Review section sits above the ID line");
     // The agent proposes an edit; Home now shows it.
     const s = await agent.call("save_markdown", { project_id: P, artifact_id: doc, expected_revision: 1, body: "# Trip plan\n\nDay 1: arrive\nDay 2: museum\nDay 3: hike\n", change_note: "Added the hike day", idempotency_key: key() });
     assert.equal(s.data.status, "pending_review");
+    // History lists the waiting edit above the versions, linked straight to its review.
+    await page.goto(h.appUi + `/#/p/${P}/a/${doc}`);
+    await page.waitForSelector('[role="tab"]');
+    await page.evaluate(() => [...document.querySelectorAll('[role="tab"]')].find((t) => t.textContent === "History").click());
+    await page.waitForSelector(".vh-list .rv-pending");
+    const pendRow = await page.$eval(".vh-list .rv-pending", (e) => ({ text: e.innerText, href: e.querySelector("a.vh-open")?.getAttribute("href"), first: e.previousElementSibling?.textContent }));
+    assert.match(pendRow.text, /Claude/); assert.match(pendRow.text, /Added the hike day/); assert.match(pendRow.text, /Pending/);
+    assert.equal(pendRow.href, `#/p/${P}/review/${s.data.proposal_id}`);
+    assert.equal(pendRow.first, "Waiting for review");
+    // Badges and the row's button share one centered group.
+    const aligned = await page.$$eval(".vh-list .vh-side", (els) => els.every((g) => { const c = [...g.children].map((x) => { const r = x.getBoundingClientRect(); return r.top + r.height / 2; }); return c.every((y) => Math.abs(y - c[0]) <= 1); }));
+    assert.equal(aligned, true, "badges and buttons are vertically centered on each other");
+    // Row-level Review is secondary like View/Compare/Restore (one primary action per screen).
+    assert.equal(await page.$eval(".rv-pending a.vh-open", (e) => e.classList.contains("secondary")), true);
+    // The History tab is in the URL, so Back from the review screen returns to History.
+    assert.match(await page.evaluate(() => location.hash), /\?tab=history$/);
+    await page.evaluate(() => document.querySelector(".rv-pending a.vh-open").click());
+    await page.waitForSelector(".rv-decide");
+    await page.goBack();
+    await page.waitForSelector(".vh-list .rv-pending");
+    assert.equal(await page.evaluate(() => [...document.querySelectorAll('[role="tab"]')].find((t) => t.getAttribute("aria-selected") === "true")?.textContent), "History");
+    // 320px: every History row stacks the same way and nothing overflows its card.
+    await page.setViewport({ width: 320, height: 800 });
+    await new Promise((r) => setTimeout(r, 200));
+    const fits = await page.$$eval(".vh-list > li", (lis) => lis.every((li) => { const b = li.getBoundingClientRect(); return [...li.querySelectorAll("*")].every((x) => { const r = x.getBoundingClientRect(); return !r.width || r.right <= b.right + 1; }); }));
+    assert.equal(fits, true, "History rows fit at 320px");
+    await page.setViewport({ width: 1280, height: 900 });
+    // A failed load of waiting edits says so (with Try again), and the banner falls back to the project queue.
+    await page.setRequestInterception(true);
+    const fail = (r) => (/\/proposals\?artifact_id=/.test(r.url()) ? r.respond({ status: 500, contentType: "application/json", body: '{"error":{"code":"internal","message":"boom"}}' }) : r.continue());
+    page.on("request", fail);
+    // Same URL as now (History is open): reload, so the page loads fresh with the failing request.
+    await page.goto(h.appUi + `/#/p/${P}/a/${doc}?tab=history`);
+    await page.reload();
+    await page.waitForSelector(".vh-list .rv-load-err");
+    assert.match(await page.$eval(".rv-load-err", (e) => e.innerText), /Couldn't load the edits waiting for review/);
+    await page.evaluate(() => document.querySelector(".rv-banner a").click());
+    await page.waitForFunction(() => /\/review$/.test(location.hash));
+    page.off("request", fail); await page.setRequestInterception(false);
+    // ?tab=history only while History shows: another tab (on any kind, e.g. JSON, whose Preview doesn't rewrite the URL) drops it.
+    const json = (await owner.req("POST", base + "/artifacts", { title: "Prices", kind: "json", content: '{"a":1}' })).body.artifact_id;
+    await page.goto(h.appUi + `/#/p/${P}/a/${json}?tab=history`);
+    await page.waitForSelector(".vh-list li");
+    await page.evaluate(() => [...document.querySelectorAll('[role="tab"]')].find((t) => t.textContent === "Preview").click());
+    assert.equal(await page.evaluate(() => location.hash), `#/p/${P}/a/${json}`, "leaving History drops ?tab=history");
+    // Offline: a saved document still opens from a URL with a query (?tab=history).
+    await page.goto(h.appUi + `/#/p/${P}/a/${doc}`);
+    await page.waitForSelector('[aria-label="Make available offline"]');
+    await page.click('[aria-label="Make available offline"]');
+    await page.waitForSelector('[aria-label^="Available offline"]');
+    // No network for the app's API (the page itself still loads), the way the app sees a dropped connection.
+    await page.setRequestInterception(true);
+    const offline = (r) => (/\/api\/|\/auth\//.test(r.url()) ? r.abort("internetdisconnected") : r.continue());
+    page.on("request", offline);
+    await page.goto(h.appUi + `/#/p/${P}/a/${doc}?tab=history`);
+    await page.reload();
+    await page.waitForFunction(() => /offline/i.test(document.querySelector("main")?.innerText || ""));
+    const offlineText = await page.$eval("main", (e) => e.innerText);
+    page.off("request", offline); await page.setRequestInterception(false);
+    assert.doesNotMatch(offlineText, /Not available offline/, "offline routing ignores ?tab=history");
+    assert.match(offlineText, /Trip plan/);
     await page.goto(h.appUi + "/#/");
+    await page.reload(); // back online: the app re-checks its session at load
     await page.waitForFunction(() => { const e = document.querySelector(".rv-home"); return e && !e.hidden; });
     const homeText = await page.$eval(".rv-home", (e) => e.innerText);
     assert.match(homeText, /Needs review/i); assert.match(homeText, /Trip plan/); assert.match(homeText, /Claude/); assert.match(homeText, /Added the hike day/);
@@ -123,21 +187,47 @@ test("Chrome: Home hides Needs review when empty and shows it when an edit waits
     await page.waitForFunction(() => location.hash.endsWith("/review"));
     assert.equal((await agent.call("read_proposal", { project_id: P, proposal_id: s3.data.proposal_id })).data.review.note, "Not this");
     // Project Review tab: empty state and the default for new documents.
-    await page.waitForSelector(".rv-settings select");
+    await page.waitForSelector(".rv-settings .rv-radio");
     assert.match(await page.$eval("main", (e) => e.innerText), /Nothing to review/);
-    await page.select(".rv-settings select", "required");
+    // On a phone the radio can sit under the bottom tab bar: pick it in the page (like the other clicks here), then check it took.
+    const pick = (v) => page.evaluate((x) => { const r = document.querySelector(`.rv-settings input[value="${x}"]`); r.click(); return r.checked; }, v);
+    assert.equal(await pick("required"), true);
     await page.evaluate(() => [...document.querySelectorAll(".rv-settings button")].find((b) => b.textContent === "Save").click());
-    await page.waitForFunction(() => /Saved/.test(document.querySelector(".rv-settings .msg").textContent));
+    await page.waitForFunction(() => /Saved|error|couldn't/i.test(document.querySelector(".rv-settings .msg")?.textContent || ""));
+    assert.match(await page.$eval(".rv-settings .msg", (e) => e.textContent), /Saved/);
     assert.equal((await owner.req("GET", base + "/review-settings")).body.default, "required");
     await shot(page, "project-review-mobile");
     // Apply uses what the page shows (not a stale saved value), and says what it changes before it does.
-    await page.select(".rv-settings select", "off");
+    assert.equal(await pick("off"), true);
     let applyMsg = ""; page.once("dialog", (d) => { applyMsg = d.message(); d.dismiss(); });
     await page.evaluate(() => [...document.querySelectorAll(".rv-settings button")].find((b) => b.textContent.startsWith("Save and apply")).click());
     await new Promise((r) => setTimeout(r, 300));
     assert.match(applyMsg, /^Turn review off for 1 document currently requiring review/); assert.match(applyMsg, /go live without approval/);
     assert.equal((await owner.req("GET", base + "/review-settings")).body.default, "required", "dismissed: nothing saved");
     assert.equal((await owner.req("GET", base + "/artifacts/" + doc)).body.artifact.review.mode, "required");
+    // New document: Review starts at the project default (required, set above) and can be changed before creating.
+    await page.setViewport({ width: 1280, height: 900 });
+    const newDoc = async (title, mode) => {
+      await page.goto(h.appUi + `/#/p/${P}`);
+      await page.waitForFunction(() => [...document.querySelectorAll("button")].some((b) => /New document/.test(b.textContent)));
+      await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => /New document/.test(b.textContent)).click());
+      // Loaded: the field is revealed (rv-wait removed) once the project default is known.
+      await page.waitForSelector(".rv-newdoc:not(.rv-wait) select");
+      const shown = await page.$eval(".rv-newdoc select", (e) => ({ value: e.value, label: e.options[e.selectedIndex].text }));
+      if (mode) await page.select(".rv-newdoc select", mode);
+      await page.type('[aria-label="New document title"]', title);
+      await page.evaluate(() => [...document.querySelectorAll("form.template-form button")].find((b) => b.textContent === "Create").click());
+      await page.waitForFunction(() => /\/a\/art_[^/]+\/edit$/.test(location.hash));
+      const id = await page.evaluate(() => location.hash.split("/a/")[1].split("/")[0]);
+      return { shown, review: (await owner.req("GET", base + "/artifacts/" + id)).body.artifact.review };
+    };
+    const d1 = await newDoc("Default review");
+    assert.deepEqual(d1.shown, { value: "required", label: "Required (project default)" });
+    assert.equal(d1.review.mode, "required", "project default applied");
+    const d2 = await newDoc("Chosen review", "advisory");
+    assert.equal(d2.review.mode, "advisory", "the choice on the form wins");
+    const d3 = await newDoc("No review", "off");
+    assert.equal(d3.review, undefined, "off: no review state");
     // Connections: Can review toggle (owner only, per project).
     await page.setViewport({ width: 1280, height: 900 });
     await page.goto(h.appUi + "/#/settings/apps");

@@ -208,10 +208,39 @@ const PATCHES = [
   ['ui: review chip follows details reloads', UI, '  async function reloadMeta() { try { var r = await api("GET", base); A.meta = r.artifact; fillMeta(); } catch (e) {} }',
     '  async function reloadMeta() { try { var r = await api("GET", base); A.meta = r.artifact; fillMeta(); if (A.rvRedraw) A.rvRedraw(); } catch (e) {} }'],
   ['ui: pending banner above the document', UI, '  for (var k in panels) app.append(panels[k]);', '  if (rvUi.banner) app.insertBefore(rvUi.banner, tabNav);\n  if (rvUi.chip) { var rvAt = app.querySelector(".titlebar + .doc-meta") || app.querySelector(".titlebar"); if (rvAt) rvAt.after(rvUi.chip); }\n  for (var k in panels) app.append(panels[k]);'],
-  ['ui: history row review mark', UI, '          note(v)),\n        current ? h("span", { class: "badge accent", text: "current" }) : null,',
-    '          note(v), rvHistoryWho(v)),\n        rvHistoryBits(A, v),\n        current ? h("span", { class: "badge accent", text: "current" }) : null,'],
+  // Badges and the row's button sit in one group (.vh-side) so they center on each other and wrap together.
+  ['ui: history row review mark', UI, '          note(v)),\n        current ? h("span", { class: "badge accent", text: "current" }) : null,\n        h("button", { type: "button", class: "secondary vh-open", onclick: function () { open(v.rev); } }, current ? "View" : "Compare", h("span", { class: "sr", text: " version " + v.rev })));',
+    '          note(v), rvHistoryWho(v)),\n        h("span", { class: "vh-side" }, rvHistoryBits(A, v),\n        current ? h("span", { class: "badge accent", text: "current" }) : null,\n        h("button", { type: "button", class: "secondary vh-open", onclick: function () { open(v.rev); } }, current ? "View" : "Compare", h("span", { class: "sr", text: " version " + v.rev }))));'],
+  ['ui: history burst row: badge and toggle grouped', UI, '          first.rev === A.rev ? h("span", { class: "badge accent", text: "current" }) : null,\n          toggle, inner));',
+    '          h("span", { class: "vh-side" }, first.rev === A.rev ? h("span", { class: "badge accent", text: "current" }) : null,\n          toggle), inner));'],
+  // Details (title, folder, tags) rows: the same badge/button group, so every History row has one phone layout.
+  ['ui: history details rows: badge or Restore grouped', UI, '            cur ? h("span", { class: "badge accent", text: "current" }) : h("button", { type: "button", class: "secondary", onclick: function (e) { restoreMeta(m, e.currentTarget); } }, "Restore", h("span", { class: "sr", text: " title and tags from details version " + m.version }))));',
+    '            h("span", { class: "vh-side" }, cur ? h("span", { class: "badge accent", text: "current" }) : h("button", { type: "button", class: "secondary", onclick: function (e) { restoreMeta(m, e.currentTarget); } }, "Restore", h("span", { class: "sr", text: " title and tags from details version " + m.version })))));'],
+  // Opening the History tab records it in the URL (?tab=history), so Back from a review screen returns to History.
+  ['ui: History tab is restorable from the URL', UI, '  showTab(wantV ? "history" : isTextDoc(A.meta.kind) && initialTab === "edit" ? "edit" : "preview");',
+    '  showTab(wantV || /[?&]tab=history(?:&|$)/.test(location.hash) ? "history" : isTextDoc(A.meta.kind) && initialTab === "edit" ? "edit" : "preview");'],
+  // ...and only while History shows: any other tab drops it (other tabs keep their own URL handling above).
+  ['ui: History tab writes ?tab=history', UI, '    if (tabBtns[name].onShow) tabBtns[name].onShow();\n  }\n',
+    '    if (name === "history" && !/[?&](v|tab)=/.test(location.hash)) history.replaceState(null, "", "#/p/" + enc(pid) + "/a/" + enc(aid) + "?tab=history");\n    else if (name !== "history" && /[?&]tab=history(?:&|$)/.test(location.hash)) history.replaceState(null, "", location.hash.replace(/([?&])tab=history(&|$)/, function (m, a, b) { return b ? a : ""; }).replace(/[?&]$/, ""));\n    if (tabBtns[name].onShow) tabBtns[name].onShow();\n  }\n'],
+  // Offline: document URLs may now carry ?tab=history (and ?v=N); route on the path only, like route() does.
+  ['ui: offline routing ignores the query', UI, '  var p = location.hash.replace(/^#\\/?/, "").split("/").filter(Boolean).map(decodeURIComponent);\n  if (p[0] === "p" && p[1] && p[2] === "a" && p[3]) return viewOfflineItem(',
+    '  var p = location.hash.replace(/^#\\/?/, "").replace(/\\?.*$/, "").split("/").filter(Boolean).map(decodeURIComponent);\n  if (p[0] === "p" && p[1] && p[2] === "a" && p[3]) return viewOfflineItem('],
+  // Pending edits of this document (reviewers/owner see them all) above its versions, each with a Review link.
+  ['ui: history lists edits waiting for review', UI, '      if (!revs.length) { list.append(h("li", { class: "empty", text: "No versions yet." })); return; }\n',
+    '      rvPendingRows(A, pid, function () { rvLoadPending(A, pid, aid).then(function () { draw(); var f = list.querySelector(".rv-load-err button, .rv-pending a.vh-open"); if (f) f.focus(); }); }).forEach(function (li) { list.append(li); });\n      if ((A.rvPendingFailed || A.rvPending && A.rvPending.length) && revs.length) list.append(h("li", { class: "group", text: "Versions" }));\n      if (!revs.length) { list.append(h("li", { class: "empty", text: "No versions yet." })); return; }\n'],
+  ['ui: history loads waiting edits with the first page', UI, '        await fetchPage(again);\n',
+    '        await Promise.all([again ? null : rvLoadPending(A, pid, aid), fetchPage(again)]);\n'],
   ['ui: history: mark a version reviewed (advisory)', UI, '      if (n !== A.rev) actions.append(h("button", { type: "button", onclick: function (e) { restoreRev(n, e.currentTarget); } }, "Restore this version"));',
     '      var rvMark = rvMarkButton(A, v, function () { load(); });\n      if (rvMark) actions.append(rvMark);\n      if (n !== A.rev) actions.append(h("button", { type: "button", onclick: function (e) { restoreRev(n, e.currentTarget); } }, "Restore this version"));'],
+  // New document: choose review up front (starts at the project default for the chosen type; applied after creating).
+  ['ui: new document: review choice', UI, '    var createBtn = h("button", { type: "submit" }, "Create");\n',
+    '    var createBtn = h("button", { type: "submit" }, "Create");\n    var rvNew = rvNewDocReview(pid, function () { return selectedTemplate ? "markdown" : dkind.value === "html" ? "html" : "markdown"; });\n    dkind.addEventListener("change", rvNew.sync);\n'],
+  ['ui: new document: review field', UI, '      } }, h("div", { class: "row" }, h("label", null, "Title", dtitle), h("label", null, "Document type", dkind)),',
+    '      } }, h("div", { class: "row" }, h("label", null, "Title", dtitle), h("label", null, "Document type", dkind), rvNew.label), rvNew.help,'],
+  ['ui: new document: review follows the template choice', UI, '    start.addEventListener("change", function () { selectedTemplate = templates[start.value] || null; scheduleTemplatePreview(); });',
+    '    start.addEventListener("change", function () { selectedTemplate = templates[start.value] || null; scheduleTemplatePreview(); rvNew.sync(); });'],
+  ['ui: new document: apply the review choice', UI, 'try { var r = await api("POST", path, req, { key: pending.key }); pending = null; location.hash',
+    'try { var r = await api("POST", path, req, { key: pending.key }); pending = null; await rvNew.apply(r.artifact_id, r.revision); location.hash'],
   ['ui: apps: can review', UI, 'diagnostic: connectionSummary("oauth", c.id, c.client_name, c.projects, c.expires_at, c.last_used_at, c.status, data.checked_at),',
     'diagnostic: h("div", null, rvReviewToggles("oauth", c.id, c.projects, c.status === "active"), connectionSummary("oauth", c.id, c.client_name, c.projects, c.expires_at, c.last_used_at, c.status, data.checked_at)),'],
   ['ui: agent tokens: can review', UI, '      li.append(connectionSummary("legacy_grant", g.id, g.label, [{ project_id: g.project_id, title: g.project_title, access: g.access }], g.expires_at, null, g.status, data.checked_at));',
