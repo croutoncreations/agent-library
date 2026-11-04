@@ -57,7 +57,8 @@ The deployable Worker is a committed, byte-pinned bundle. `npm run build:design`
 - `src/upload-fixes/*`;
 - `src/oauth-renewal/*`;
 - `src/file-tools/*` (files for OAuth connections, `build-file-tools-fixes.mjs`);
-- `src/review/*` (optional review per document, `build-review.mjs`, the last step).
+- `src/review/*` (optional review per document, `build-review.mjs`);
+- `src/offline/*` (installed app shell and offline launch, [offline.md](offline.md), `build-offline-shell.mjs`, the last step).
 
 Each step must leave every other byte unchanged and records hashes in a `*-preservation.json` manifest. CI's `npm run check:bundle` rebuilds in a temporary copy and fails on any difference. Because of this, every change to what ships is a reviewable source diff, and the shipped bytes are reproducible.
 

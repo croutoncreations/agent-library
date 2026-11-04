@@ -13350,7 +13350,7 @@ function reloadForSignIn() {
     if (Date.now() - last < 60000) return false;
     sessionStorage.setItem("al:signin-reload", String(Date.now()));
   } catch (e) { return false; }
-  location.reload();
+  signInNavigate();
   return true;
 }
 
@@ -13534,7 +13534,7 @@ async function logout() {
 // ---------- login ----------
 function viewLogin(note) {
   if (hostedApp()) {
-    var again = h("button", { type: "button", onclick: function () { location.reload(); } }, "Sign in");
+    var again = h("button", { type: "button", onclick: function () { signInNavigate(); } }, "Sign in");
     shell([{ t: "Sign in" }], note ? h("p", { class: "banner", text: note }) : null,
       h("div", { class: "card" }, h("h1", { text: "Sign in" }), h("p", { class: "muted small", text: "Sign in with your Cloudflare Access account to continue." }), again));
     again.focus();
@@ -16608,10 +16608,6 @@ function offlineToggle(A) {
 }
 
 // ---------- offline mode views (no network: read saved copies only) ----------
-function offlineBanner() {
-  return h("p", { class: "banner offline-banner" }, "Offline: showing copies saved on this device (read-only). ",
-    h("a", { href: "#", onclick: function (e) { e.preventDefault(); location.reload(); } }, "Try again"));
-}
 function offAge(t) { return t ? "saved " + fmtDate(t) : ""; }
 async function viewOfflineHome() {
   var list = h("ul", { class: "list" });
@@ -16901,15 +16897,15 @@ document.addEventListener("click", function (e) { if (e.target.closest && e.targ
 
 // ---------- boot ----------
 window.addEventListener("hashchange", route);
-// Installable app (PWA): register the network-only service worker (it caches nothing). Registration is async
-// and failure is harmless (the site works the same without it).
+// Installable app (PWA): register the service worker that keeps the app shell (no library data) for instant,
+// offline launches (docs/offline.md). Registration is async and failure is harmless (the site works without it).
 if ("serviceWorker" in navigator && (location.protocol === "https:" || /^(localhost|127\.0\.0\.1)$/.test(location.hostname))) {
   window.addEventListener("load", function () { navigator.serviceWorker.register("/sw.js", { scope: "/" }).catch(function () {}); });
 }
 // Installed app launches with ?source=pwa; drop it so links and reloads stay clean.
 // "Bare" = the installed app's start URL (or the site root) with no in-app route at all; "#/" is an explicit link.
 var launchedBare = (location.pathname === "/" || location.pathname === "/index.html") && (!location.hash || location.hash === "#");
-if (/[?&]source=pwa\b/.test(location.search)) history.replaceState(null, "", location.pathname + location.hash);
+if (/[?&](source=pwa|al_net=1)\b/.test(location.search)) history.replaceState(null, "", location.pathname + location.hash);
 // Canonical deep links are paths (/p/:pid[/a/:aid], see src/links.ts) so they survive sign-in redirects.
 // Map them onto the in-app hash route before anything else (login included) so the destination is kept.
 (function adoptPathRoute() {
@@ -16918,25 +16914,103 @@ if (/[?&]source=pwa\b/.test(location.search)) history.replaceState(null, "", loc
   var v = m[2] && /[?&]v=([0-9]{1,9})(?:&|$)/.exec(location.search);
   history.replaceState(null, "", "/#/p/" + m[1] + (m[2] ? "/a/" + m[2] + (m[3] ? "/" + m[3] : "") + (v ? "?v=" + v[1] : "") : ""));
 })();
-(async function boot() {
-  try {
-    var me;
-    try { me = await api("GET", "/api/me", undefined, { noAuthRedirect: true }); }
+// ---------- boot (docs/offline.md) ----------
+// The installed app's shell comes from the service worker cache at once (src/offline/sw.js); boot decides what to
+// show. When this device has saved copies, signing in is waited for at most BOOT_WAIT_MS: after that the saved
+// copies open (read-only) while signing in continues in the background, and when it succeeds the offline banner
+// offers the live library (it never switches under the reader). Without saved copies there is nothing else to
+// show, so boot waits for the network as before.
+var BOOT_WAIT_MS = 3000;
+// "pending": still signing in behind the saved copies; "ready": signed in, the live library is one tap away;
+// "signin": hosted, Cloudflare Access needs the owner to sign in again.
+var bootState = null, bootIdentity = null;
+// Hosted: an expired Cloudflare Access session answers with a redirect to its (cross-origin) sign-in page, which a
+// fetch reports as a network error, exactly like being offline. Tell the two apart without following the redirect.
+async function accessWantsSignIn() {
+  if (!hostedApp()) return false;
+  try { return (await fetch("/api/me", { credentials: "same-origin", cache: "no-store", redirect: "manual" })).type === "opaqueredirect"; }
+  catch (e) { return false; }
+}
+function bootSignIn() {
+  return (async function () {
+    try { return await api("GET", "/api/me", undefined, { noAuthRedirect: true }); }
     catch (e1) {
+      if (e1.status === 0 && await accessWantsSignIn()) throw new ApiError(401, { error: { code: "access_signin", message: "Sign in with Cloudflare Access" } });
       // Hosted: exchange the verified Cloudflare Access identity for an app session (no passphrase).
       if (e1.status !== 401 || /^(localhost|127\.0\.0\.1)$/.test(location.hostname)) throw e1;
       await api("POST", "/auth/access-login", {}, { noAuthRedirect: true });
-      me = await api("GET", "/api/me", undefined, { noAuthRedirect: true });
+      return await api("GET", "/api/me", undefined, { noAuthRedirect: true });
     }
-    API_BASE_HINT = me.api_base || "See your installation configuration"; S.me = me.principal; S.csrf = me.csrf;
-    if (S.me.kind !== "human") { S.me = null; return viewLogin("Bearer-token principals cannot use the browser app."); }
-    purgeForeignDrafts(S.me.id);
-    await offCheckOwner(S.me.id);
-    await offSweep();
-  } catch (e) {
+  })();
+}
+// Use a signed-in identity. False for a non-human principal.
+async function bootApply(me) {
+  API_BASE_HINT = me.api_base || "See your installation configuration"; S.me = me.principal; S.csrf = me.csrf;
+  if (S.me.kind !== "human") { S.me = null; return false; }
+  purgeForeignDrafts(S.me.id);
+  await offCheckOwner(S.me.id);
+  await offSweep();
+  return true;
+}
+async function bootHasSaved() {
+  await offSweep();
+  try { return (await OFF.all("items")).length > 0; } catch (e) { return false; }
+}
+// Sign in through Cloudflare Access: a real network navigation (?al_net=1 bypasses the cached shell; the
+// timestamp makes it a new URL even if the current one is the same). Boot strips the parameter again.
+function signInNavigate() { location.replace("/?al_net=1&t=" + Date.now() + (location.hash || "")); }
+// Retry from the network: hosted goes through Access (a plain reload would come from the cached shell); if the
+// network still fails, the worker answers from the cache and the saved copies open again.
+function retryOnline(e) { e.preventDefault(); if (hostedApp()) signInNavigate(); else location.reload(); }
+function offlineBanner() {
+  if (bootState === "ready") return h("p", { class: "banner offline-banner", role: "status" }, "You're connected. These are the copies saved on this device. ",
+    h("a", { href: "#", onclick: function (e) { e.preventDefault(); goOnline(); } }, "Open the live library"));
+  if (bootState === "pending") return h("p", { class: "banner offline-banner", role: "status" }, "Connecting… Meanwhile, here are the copies saved on this device (read-only). ",
+    h("a", { href: "#", onclick: retryOnline }, "Try again"));
+  if (bootState === "signin") return h("p", { class: "banner offline-banner", role: "status" }, "Showing copies saved on this device (read-only). ",
+    h("a", { href: "#", onclick: function (e) { e.preventDefault(); signInNavigate(); } }, "Sign in to open the live library"));
+  return h("p", { class: "banner offline-banner" }, "Offline: showing copies saved on this device (read-only). ",
+    h("a", { href: "#", onclick: retryOnline }, "Try again"));
+}
+function refreshOfflineBanners() {
+  document.querySelectorAll(".offline-banner").forEach(function (b) { b.replaceWith(offlineBanner()); });
+}
+async function goOnline() {
+  var me = bootIdentity; bootIdentity = null; bootState = null;
+  if (!me || !S.offline) return;
+  S.offline = false;
+  if (!(await bootApply(me))) return viewLogin("Bearer-token principals cannot use the browser app.");
+  route();
+  setTimeout(function () { offRefreshAll().catch(function () {}); }, 1500);
+}
+(async function boot() {
+  var signIn = bootSignIn().then(function (me) { return { me: me }; }, function (e) { return { err: e }; });
+  var r = null;
+  // Known offline: no wait at all. Otherwise a short one, so a fast connection still opens the live library.
+  if (await bootHasSaved()) r = await Promise.race([signIn, new Promise(function (res) { setTimeout(res, navigator.onLine === false ? 0 : BOOT_WAIT_MS, null); })]);
+  else r = await signIn;
+  if (!r) {
+    // Slow or no connection: open the saved copies now; keep signing in behind them.
+    S.offline = true; bootState = "pending";
+    signIn.then(function (late) {
+      if (!S.offline) return;
+      if (late.me) { bootIdentity = late.me; bootState = "ready"; }
+      else bootState = late.err && late.err.status === 401 && hostedApp() ? "signin" : null;
+      refreshOfflineBanners();
+    });
+  } else if (r.me) {
+    if (!(await bootApply(r.me))) return viewLogin("Bearer-token principals cannot use the browser app.");
+  } else {
+    var e = r.err;
     S.me = null;
-    // No network (or Access sign-in page unreachable): open saved offline copies instead of a dead login form.
-    if (e && e.status === 0) {
+    // Hosted, Access itself signed out (the cached shell never passed Access): saved copies stay readable with a
+    // sign-in link, since Access's page may not load on a poor connection. Without saved copies, go to its sign-in
+    // page (at most once a minute; otherwise the hosted Sign in view offers it).
+    if (e && e.status === 401 && hostedApp()) {
+      if (await bootHasSaved()) { S.offline = true; bootState = "signin"; }
+      else if (reloadForSignIn()) return;
+    } else if (e && e.status === 0) {
+      // No network (or Access sign-in page unreachable): open saved offline copies instead of a dead login form.
       await offSweep();
       var saved = []; try { saved = await OFF.all("items"); } catch (e2) {}
       if (saved.length || !navigator.onLine) S.offline = true;
@@ -16998,44 +17072,179 @@ var MANIFEST2 = JSON.stringify({
     { src: "/icons/app-maskable-512.png", sizes: "512x512", type: "image/png", purpose: "maskable" }
   ]
 });
-var SHELL_CACHE = "al-shell-v2";
+var SHELL_CACHE = "al-shell-v3";
 var SHELL_PATHS = ["/", "/app.js", "/app.css", "/manifest.webmanifest", "/icons/app-icon-192.png", "/icons/app-apple-180.png"];
 var SERVICE_WORKER = `"use strict";
 var SHELL = ${JSON.stringify(SHELL_CACHE)}, PATHS = ${JSON.stringify(SHELL_PATHS)};
+// Installed-app shell (docs/offline.md). Integrated into the PWA module's SERVICE_WORKER text by
+// build-offline-shell.mjs, after a header that defines SHELL (cache name) and PATHS (shell files).
+// The app opens from this cache at once, with no network or a slow one: launches never wait on the network.
+// Only the static shell is cached (HTML, script, styles, manifest, icons): never library data or API responses.
+// Every data request still goes to the network, through Cloudflare Access; offline reading uses the copies the
+// owner saved in IndexedDB.
+// Updates: each launch asks the server for the shell version (/shell-version, a few bytes). Only when it differs from
+// the cached shell (and from one already downloaded) is a complete new shell downloaded into NEXT in the background;
+// the next launch swaps it in whole, so one launch never mixes files from two versions. Every file of a download
+// must carry that same version (X-Shell-Version), so a deploy landing mid-download is never stored.
+// A navigation with ?al_net=1 (sign-in through Access) goes to the network first, so Access can show its page.
+var NEXT = SHELL + "-next", VKEY = "/__al-shell-version", updating = null;
+// Pages that came from the network (sign-in navigations): their script and styles come from the network too, so the
+// page and its files are one version even right after a deploy (best effort: a worker restart in between forgets
+// the page, and its files then come from the cache). Keyed by client id; each entry holds the files still to load
+// and is dropped once both have loaded, so the map stays small.
+var netPages = {}, NET_FILES = ["/app.js", "/app.css"];
+function noop() {}
+// The shell version a cache holds, or null (no cache, or no complete shell in it).
+function versionOf(name) {
+  return caches.has(name).then(function (has) {
+    if (!has) return null;
+    return caches.open(name).then(function (c) { return c.match(VKEY); }).then(function (r) { return r ? r.text() : null; });
+  });
+}
+// Download every shell file; all must report the same version (want, if given). Resolves { list, version }.
+function fetchShell(want) {
+  return Promise.all(PATHS.map(function (p) {
+    return fetch(p, { credentials: "same-origin", cache: "no-store" }).then(function (r) {
+      // Only a real 200 same-origin response (never an Access redirect or sign-in page).
+      var ct = r.headers.get("content-type") || "";
+      // HTML only for "/", and nothing else may be HTML (a sign-in or error page in place of the script or styles).
+      if (!r.ok || r.redirected || r.type !== "basic" || (p === "/") !== (ct.indexOf("text/html") === 0)) throw new Error("shell fetch failed: " + p);
+      // Read each body at once: unread bodies would hold the browser's few connections per host while the rest wait.
+      return r.blob().then(function (b) {
+        // "/" must be this app's page (it loads /app.js), never a sign-in or interstitial page answered in its place.
+        return (p === "/" ? b.text() : Promise.resolve("")).then(function (t) {
+          if (p === "/" && t.indexOf('<script src="/app.js"') < 0) throw new Error("not the app shell");
+          return [p, new Response(b, { status: 200, headers: r.headers }), r.headers.get("x-shell-version") || ""];
+        });
+      });
+    });
+  })).then(function (list) {
+    var v = want || list[0][2];
+    if (!v || list.some(function (x) { return x[2] !== v; })) throw new Error("shell files from different versions");
+    return { list: list, version: v };
+  });
+}
+function store(name, got) {
+  return caches.open(name).then(function (c) {
+    return Promise.all(got.list.map(function (x) { return c.put(x[0], x[1]); }))
+      .then(function () { return c.put(VKEY, new Response(got.version)); }); // written last: marks the cache complete
+  });
+}
+function refresh() {
+  if (!updating) updating = fetch("/shell-version", { credentials: "same-origin", cache: "no-store" })
+    .then(function (r) { if (!r.ok || r.redirected || r.type !== "basic") throw new Error("no version"); return r.json(); })
+    .then(function (d) {
+      var v = d && d.version;
+      if (!v) return;
+      return Promise.all([versionOf(SHELL), versionOf(NEXT)]).then(function (have) {
+        if (have[0] === v) return have[1] ? caches.delete(NEXT) : null; // current (drop any other download, e.g. after a rollback)
+        if (have[1] === v) return; // already downloaded; swapped in on the next launch
+        return fetchShell(v).then(function (got) { return caches.delete(NEXT).then(function () { return store(NEXT, got); }); });
+      });
+    })
+    .catch(noop)
+    .then(function () { updating = null; });
+  return updating;
+}
+// Swap in a complete downloaded shell (all PATHS and its version present); an incomplete one is dropped. Best effort:
+// skipped while more than one window is listed. A window that already loaded keeps its script and styles in memory,
+// so a swap at the same moment only changes what its later manifest and icon requests see.
+function promote() {
+  if (updating) return Promise.resolve();
+  var keys = PATHS.concat([VKEY]);
+  return self.clients.matchAll({ type: "window" }).then(function (ws) {
+    if (ws.length > 1) return;
+    return caches.has(NEXT).then(function (has) {
+      if (!has) return;
+      return caches.open(NEXT).then(function (n) {
+        return Promise.all(keys.map(function (p) { return n.match(p); })).then(function (rs) {
+          if (rs.some(function (r) { return !r; })) return;
+          return caches.open(SHELL).then(function (c) { return Promise.all(rs.map(function (r, i) { return c.put(keys[i], r); })); });
+        });
+      }).then(function () { return caches.delete(NEXT); });
+    });
+  }).catch(noop);
+}
+function offline() { return new Response("Offline", { status: 503, headers: { "content-type": "text/plain; charset=utf-8" } }); }
+function fromCache(key) { return caches.open(SHELL).then(function (c) { return c.match(key); }); }
 self.addEventListener("install", function (e) {
-  e.waitUntil(caches.open(SHELL).then(function (c) {
-    return Promise.all(PATHS.map(function (p) {
-      return fetch(p, { credentials: "same-origin", cache: "no-store" }).then(function (r) { if (r.ok && !r.redirected) return c.put(p, r); }).catch(function () {});
-    }));
-  }).then(function () { return self.skipWaiting(); }));
+  // All or nothing: if the shell can't be fetched completely, installation fails and the current worker stays.
+  e.waitUntil(fetchShell(null).then(function (got) { return store(SHELL, got); }).then(function () { return self.skipWaiting(); }));
 });
 self.addEventListener("activate", function (e) {
-  e.waitUntil(caches.keys().then(function (ks) { return Promise.all(ks.filter(function (k) { return k !== SHELL; }).map(function (k) { return caches.delete(k); })); })
+  e.waitUntil(caches.keys().then(function (ks) { return Promise.all(ks.filter(function (k) { return k !== SHELL && k !== NEXT; }).map(function (k) { return caches.delete(k); })); })
     .then(function () { return self.clients.claim(); }));
 });
 self.addEventListener("fetch", function (e) {
   var u = new URL(e.request.url);
   if (e.request.method !== "GET" || u.origin !== location.origin) return;
   var nav = e.request.mode === "navigate";
-  // Only app-shell navigations (/ and /p/... deep links) fall back to the cached shell. Other navigations
-  // (e.g. a PDF opened in a new tab) are never touched or cached.
-  if (nav && !(u.pathname === "/" || u.pathname === "/index.html" || /^\\/p\\//.test(u.pathname))) return;
+  // Only app-shell navigations (/ and the app's /p/... deep links, the server's WEB_ROUTE) use the cached shell.
+  // Other navigations (e.g. a PDF opened in a new tab) are never touched or cached.
+  if (nav && !(u.pathname === "/" || u.pathname === "/index.html" || /^\\/p\\/([^/]+)(?:\\/a\\/([^/]+)(?:\\/(preview|edit))?)?\\/?$/.test(u.pathname))) return;
   var key = nav ? "/" : u.pathname;
   if (!nav && PATHS.indexOf(key) < 0) return; // data and everything else: browser default (network)
-  e.respondWith(fetch(e.request).then(function (r) {
-    // Refresh the shell copy only from a real 200 same-origin response (never an Access redirect/login page).
-    var ct = r.headers.get("content-type") || "";
-    if (r.ok && !r.redirected && r.type === "basic" && (!nav || ct.indexOf("text/html") === 0)) { var copy = r.clone(); caches.open(SHELL).then(function (c) { return c.put(key, copy); }); }
-    return r;
-  }).catch(function () {
-    return caches.open(SHELL).then(function (c) { return c.match(key); }).then(function (hit) {
-      return hit || new Response("Offline", { status: 503, headers: { "content-type": "text/plain; charset=utf-8" } });
-    });
+  if (nav && /[?&]al_net=1(&|$)/.test(u.search)) {
+    var page = e.resultingClientId;
+    e.respondWith(fetch(e.request).then(function (r) {
+      // This app's page from the network (not an Access redirect or sign-in page): load its files from the network too.
+      if (page && r.ok && r.headers.get("x-shell-version")) netPages[page] = NET_FILES.slice();
+      return r;
+    }).catch(function () { return fromCache(key).then(function (hit) { return hit || offline(); }); }));
+    return;
+  }
+  var pending = !nav && netPages[e.clientId];
+  if (pending && pending.indexOf(key) >= 0) {
+    pending.splice(pending.indexOf(key), 1);
+    if (!pending.length) delete netPages[e.clientId];
+    e.respondWith(fetch(e.request).catch(function () { return fromCache(key).then(function (hit) { return hit || offline(); }); }));
+    return;
+  }
+  var ready = nav ? promote() : Promise.resolve();
+  e.respondWith(ready.then(function () { return fromCache(key); }).then(function (hit) {
+    return hit || fetch(e.request).catch(offline);
   }));
+  if (nav) e.waitUntil(ready.then(refresh));
 });
 `;
+// Shell version (docs/offline.md): a fingerprint of exactly the bytes the service worker caches (SHELL_PATHS).
+// Served at /shell-version and as X-Shell-Version on every shell file, so an installed app downloads the shell only
+// when it changed, and never keeps files from two versions. Computed once per isolate (the bytes are constants of
+// this Worker version). cyrb53: a fast 53-bit hash; this detects changes, it is not a security check.
+var shellVersionValue = null;
+function shellBytesFor(p) {
+  if (p === "/") return APP_HTML;
+  if (p === "/app.js") return APP_JS;
+  if (p === "/app.css") return APP_CSS;
+  if (p === "/manifest.webmanifest") return MANIFEST2;
+  if (p.startsWith("/icons/")) return ICONS[p.slice("/icons/".length)] ?? p;
+  return p;
+}
+function shellVersion() {
+  if (shellVersionValue) return shellVersionValue;
+  const s = SHELL_PATHS.map((p) => p + "\0" + shellBytesFor(p)).join("\0");
+  let h1 = 0xdeadbeef, h2 = 0x41c6ce57;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 2654435761);
+    h2 = Math.imul(h2 ^ c, 1597334677);
+  }
+  h1 = Math.imul(h1 ^ h1 >>> 16, 2246822507) ^ Math.imul(h2 ^ h2 >>> 13, 3266489909);
+  h2 = Math.imul(h2 ^ h2 >>> 16, 2246822507) ^ Math.imul(h1 ^ h1 >>> 13, 3266489909);
+  shellVersionValue = (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36);
+  return shellVersionValue;
+}
+function serveShellVersion() {
+  return new Response(JSON.stringify({ version: shellVersion() }), { headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" } });
+}
+
 var ICON_BYTES = new Map(Object.entries(ICONS).map(([k, v]) => [k, Uint8Array.from(atob(v), (c) => c.charCodeAt(0))]));
 function servePwa(path) {
+  const r = servePwaFile(path);
+  if (r && path !== "/sw.js") r.headers.set("x-shell-version", shellVersion());
+  return r;
+}
+function servePwaFile(path) {
   if (path === "/manifest.webmanifest")
     return new Response(MANIFEST2, { headers: { "content-type": "application/manifest+json; charset=utf-8", "cache-control": "no-cache" } });
   if (path === "/sw.js")
@@ -17768,13 +17977,14 @@ __name(accessLogin, "accessLogin");
 async function route3(req, env, url, requestId) {
   const path = url.pathname;
   const m = req.method;
-  if (m === "GET" && (path === "/" || path === "/index.html" || WEB_ROUTE.test(path))) return new Response(APP_HTML, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
-  if (m === "GET" && path === "/app.js") return new Response(APP_JS, { headers: { "content-type": "text/javascript; charset=utf-8", "cache-control": "no-store" } });
+  if (m === "GET" && (path === "/" || path === "/index.html" || WEB_ROUTE.test(path))) return new Response(APP_HTML, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "x-shell-version": shellVersion() } });
+  if (m === "GET" && path === "/shell-version") return serveShellVersion();
+  if (m === "GET" && path === "/app.js") return new Response(APP_JS, { headers: { "content-type": "text/javascript; charset=utf-8", "cache-control": "no-store", "x-shell-version": shellVersion() } });
   if (m === "GET" && (path === "/manifest.webmanifest" || path === "/sw.js" || path.startsWith("/icons/"))) {
     const r = servePwa(path);
     if (r) return r;
   }
-  if (m === "GET" && path === "/app.css") return new Response(APP_CSS, { headers: { "content-type": "text/css; charset=utf-8", "cache-control": "no-store" } });
+  if (m === "GET" && path === "/app.css") return new Response(APP_CSS, { headers: { "content-type": "text/css; charset=utf-8", "cache-control": "no-store", "x-shell-version": shellVersion() } });
   if (m === "GET" && path === `/editor.${EDITOR_JS_SHA256.slice(0, 16)}.js`)
     return new Response(EDITOR_JS, { headers: { "content-type": "text/javascript; charset=utf-8", "cache-control": "public, max-age=31536000, immutable" } });
   if (path === "/mcp") return handleMcp(req, env, requestId, url.origin);

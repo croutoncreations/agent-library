@@ -86,9 +86,10 @@ test("installed-app icons are the Fold mark: manifest, favicon and touch icon se
   // Pages and launchers still holding the old URLs get the new mark, not the retired book icon.
   for (const [old, now] of [["icon-192.png", "app-icon-192.png"], ["icon-512.png", "app-icon-512.png"], ["maskable-512.png", "app-maskable-512.png"], ["apple-180.png", "app-apple-180.png"]])
     assert.equal(await bytes("/icons/" + old), hash(brand(now)), old);
-  // A new shell cache name makes installed apps drop cached copies of the old shell and icons.
+  // A new shell cache name makes installed apps drop cached copies of the old shell and icons (v3: cache-first
+  // shell, build-offline-shell.mjs).
   const sw = await (await get("/sw.js")).text();
-  assert.match(sw, /var SHELL = "al-shell-v2"/);
+  assert.match(sw, /var SHELL = "al-shell-v3"/);
   assert.match(sw, /"\/icons\/app-icon-192\.png","\/icons\/app-apple-180\.png"/);
   assert.equal((await fetch(ORIGIN + "/icons/nope.png")).status, 404);
 });
