@@ -24,27 +24,65 @@
 .rv-decide .row{flex-wrap:wrap}
 .rv-edit{display:flex;flex-direction:column;gap:10px}
 .rv-text{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;min-height:200px}
-.rv-settings{margin-top:20px}
-.rv-settings h2{margin:0 0 4px}
-.rv-kinds{border:0;padding:0;margin:8px 0;display:flex;flex-wrap:wrap;gap:6px 14px}
-.rv-kinds legend{padding:0;margin-bottom:4px}
-.rv-kind{display:inline-flex;align-items:center;gap:6px}
-.rv-banner{align-items:center}
+/* This sheet comes first in APP_CSS: selectors that share a base rule's specificity (.card, .callout) are doubled up. */
+.card.rv-settings{margin:20px 0 0;display:flex;flex-direction:column;gap:14px}
+.rv-settings > *{margin:0}
+.rv-settings h2{margin:0}
+.rv-settings .rv-help{margin-top:-8px}
+.rv-settings .msg:empty{display:none}
+.rv-legend{float:left;width:100%;padding:0;margin:0 0 6px;font-weight:600;font-size:14px;color:var(--fg)}
+.rv-modes{border:0;padding:0;min-width:0}
+.rv-modes > .rv-radio,.rv-docmode > .rv-radio{clear:both}
+.rv-kinds{border:0;padding:0;min-width:0;display:flex;flex-wrap:wrap;gap:6px 16px}
+.rv-kinds legend{float:left;width:100%;padding:0;margin:0 0 2px}
+.rv-kind{display:inline-flex;align-items:center;gap:8px;min-height:32px}
+.rv-actions{gap:8px}
+.callout.rv-banner{align-items:center;margin:0 0 16px}
+.callout.rv-banner svg{margin-top:0}
 .rv-banner > span{flex:1 1 auto}
+@media (max-width:520px){.callout.rv-banner{flex-wrap:wrap}.rv-banner > span{flex:1 1 calc(100% - 40px)}.rv-banner > .btn{margin-left:28px}}
 .rv-badge{gap:4px}
 .rv-badge svg{width:12px;height:12px;stroke:currentColor;fill:none;stroke-width:2.4}
 .rv-hist{display:block;font-size:13px;color:var(--muted)}
 .rv-grants{width:100%}
 .rv-grants-d summary{font-size:13px;color:var(--muted);cursor:pointer}
 .rv-grant{display:flex;align-items:center;gap:8px;font-size:13.5px;margin:4px 0}
-.rv-chip-row{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:6px 0 0}
+.rv-chip-row{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:8px 0 14px}
 .rv-chip{display:inline-flex;align-items:center;gap:6px;font-size:13px;color:var(--ok);margin:6px 0 0}
 .rv-chip-row .rv-chip{margin:0}
 .rv-chip.warn{color:var(--warn)}
 .rv-chip svg{width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:2.2}
-.rv-docmode{border:0;padding:10px 0 0;margin:12px 0 0;border-top:1px solid var(--line);display:flex;flex-direction:column;gap:6px}
-.rv-docmode legend{font-weight:600;padding:0}
-.rv-radio{display:flex;align-items:flex-start;gap:8px;min-height:44px;cursor:pointer}
-.rv-radio > span{display:flex;flex-direction:column}
+/* A section of Details: separated from the fields above it, its legend inside (not on the border). */
+.rv-docmode{border:0;border-top:1px solid var(--line);padding:14px 0 0;margin:16px 0 12px;min-width:0}
+.rv-docmode > .row{clear:both;margin-top:4px}
+.rv-docmode > .row:has(> button[hidden]:only-child){display:none}
+.rv-docmode .msg{clear:both}
+.rv-radio{display:flex;align-items:flex-start;gap:10px;padding:6px 0;min-height:44px;cursor:pointer}
+.rv-radio > input{margin:2px 0 0;flex:none}
+.rv-radio > span{display:flex;flex-direction:column;gap:2px;min-width:0}
+/* History: badges and the row's button form one group, centered on each other. */
+.vh-side{display:flex;flex-wrap:wrap;align-items:center;gap:8px;flex:none;margin-left:auto;max-width:100%}
+.vh-side .vh-open,.vh-side .vh-toggle{margin-left:0}
+.vh-list .vh-row > .grow{flex:1 1 0}
+.vh-burst > .vh-side{flex:none}
+.rv-pending .vh-n{min-height:1px}
+.rv-pending{background:color-mix(in srgb,var(--warn) 5%,transparent)}
+/* Phones: every History row stacks the same way: number, then text, then the badges and button (which wrap if needed). */
+@media (max-width:640px){
+.vh-list .vh-row,.vh-list .vh-burst{flex-wrap:wrap}
+.vh-list .vh-row > .vh-n,.vh-list .vh-burst > .vh-n{flex:1 1 100%}
+.vh-list .vh-row > .grow{flex:1 1 100%}
+.vh-list .vh-row > .vh-side,.vh-burst > .vh-side{flex:1 1 100%;margin-left:0}
+.vh-side > :last-child{margin-left:auto}
+.rv-pending > .vh-n{display:none}
+}
+.rv-load-err{display:flex;flex-wrap:wrap;align-items:center;gap:8px;color:var(--bad)}
+.rv-newdoc.rv-wait{visibility:hidden}
+.rv-newdoc > .muted{max-width:22rem}
+.template-form .rv-newdoc-help{margin:-4px 0 0}
+@media (max-width:520px){.rv-sec .tabs,.rv-edit .tabs{width:100%;flex-wrap:nowrap}.rv-sec .tabs button,.rv-edit .tabs button{flex:1 1 auto;justify-content:center;padding:4px 8px}}
 @media (pointer:coarse){.rv-grant,.rv-kind{min-height:44px}}
 @media (max-width:760px){.rv-decide{bottom:calc(var(--tab-h) + 8px + env(safe-area-inset-bottom,0px))}.rv-decide .spacer{display:none}}
+@media (max-width:360px){.rv-sec .tabs button,.rv-edit .tabs button{padding:4px 5px;font-size:13.5px}}
+/* The long "Save and apply…" label wraps rather than overflowing the card on narrow phones. */
+.rv-actions > button{white-space:normal;text-align:center;max-width:100%}

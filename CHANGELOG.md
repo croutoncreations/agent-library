@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Review UI: History lists a document's edits waiting for review, with a direct Review link; New document offers the review mode, starting at the project default; the project default uses the same Off / Optional / Required choices as Details; aligned History badges and buttons; spacing fixes in Details, the project Review tab, the pending banner and the review screen's comparison tabs.
 - Optional review per document ([docs/review-gating.md](docs/review-gating.md)). **Required**: edits by OAuth apps, API keys and agent tokens become proposals that the owner, or an agent the owner allows to review, approves, edits and approves, or rejects; everyone else keeps reading the approved version. **Advisory**: edits go live, and versions can be marked reviewed so agents can read `reviewed: true`. A project default can apply to new documents. New MCP tools `list_proposals`, `read_proposal`, `withdraw_proposal`, `review_proposal`, `review_revision`; `/v1` proposal routes; Home "Needs review", a review screen, a project Review tab, review status on documents and History, and per-connection review permission on the Connections pages. Owner edits and App Connect files are never gated. Backups move to `agent-library-backup/3`. Needs migration `0017` (additive; database triggers keep an older Worker fail-closed on required documents).
 
 ## 0.1.0 (2026-10-28)

@@ -4,6 +4,20 @@
 // changes and file previews, with Approve / Edit and approve / Reject. Everything is built from text nodes.
 var RV_MODES_UI = ["off", "advisory", "required"];
 var RV_MODE_LABELS = { off: "Off", advisory: "Optional (mark versions reviewed)", required: "Required (agent edits wait for approval)" };
+var RV_SHORT = { off: "Off", advisory: "Optional", required: "Required" };
+function rvViaBadge(via) {
+  var t = via && { oauth: "connected app", api_key: "API key", grant: "agent token" }[via.kind];
+  return t ? h("span", { class: "badge", text: t }) : null;
+}
+// Off / Optional / Required as radios with what each means (document Details and the project default share it).
+function rvModeRadios(name, cur, onChange) {
+  return RV_MODES_UI.map(function (m) {
+    var r = h("input", { type: "radio", name: name, value: m, checked: cur === m });
+    if (onChange) r.addEventListener("change", onChange);
+    return h("label", { class: "rv-radio" }, r, h("span", null, h("strong", { text: RV_SHORT[m] }), h("span", { class: "muted small", text: RV_DESC[m] })));
+  });
+}
+function rvPicked(radios, fallback) { var c = radios.map(function (l) { return l.firstChild; }).filter(function (x) { return x.checked; })[0]; return c ? c.value : fallback; }
 function rvChanges(p) {
   var parts = [];
   if (p.is_new) parts.push("new " + (p.kind === "binary" ? "file" : "document"));
@@ -76,19 +90,25 @@ async function viewProjectReview(pid) {
     }
   } catch (err) { doneLoading(list); list.hidden = true; showErr(msg, err); }
   drawSettings();
-  async function drawSettings() {
+  async function drawSettings(refocus) {
     var s;
-    try { s = await api("GET", base + "/review-settings"); } catch (err) { settings.replaceChildren(h("p", { class: "msg error", text: "Review settings couldn't load: " + err.message })); return; }
-    var mode = h("select", { "aria-label": "Review for new documents" }, ["off", "advisory", "required"].map(function (m) { return h("option", { value: m, text: RV_MODE_LABELS[m], selected: s.default === m }); }));
+    try { s = await api("GET", base + "/review-settings"); }
+    catch (err) {
+      settings.replaceChildren(h("h2", { text: "Review for new documents" }), h("p", { class: "msg error", text: "Review settings couldn't load: " + err.message }),
+        h("div", { class: "row" }, h("button", { type: "button", class: "secondary", onclick: function (e) { e.currentTarget.disabled = true; drawSettings(true); } }, icon("refresh"), "Try again")));
+      return;
+    }
+    var radios = rvModeRadios("rv-default-" + pid, s.default, function () { kindBox.hidden = picked() === "off"; });
+    var picked = function () { return rvPicked(radios, s.default); };
     var kinds = [["markdown", "Docs"], ["html", "Pages"], ["json", "JSON"], ["csv", "CSV"], ["binary", "Files (images, PDFs, other uploads)"]].map(function (k) {
       return h("label", { class: "rv-kind" }, h("input", { type: "checkbox", value: k[0], checked: !s.kinds || s.kinds.indexOf(k[0]) >= 0 }), k[1]);
     });
-    var kindBox = h("fieldset", { class: "rv-kinds", hidden: s.default === "off" }, h("legend", { class: "small muted", text: "Applies to" }), kinds);
+    var kindBox = h("fieldset", { class: "rv-kinds", hidden: s.default === "off" }, h("legend", { class: "rv-legend", text: "Applies to" }), kinds);
     var smsg = h("p", { class: "msg", role: "status", "aria-live": "polite" });
     function chosen() { var ks = kinds.map(function (l) { return l.firstChild; }).filter(function (c) { return c.checked; }).map(function (c) { return c.value; }); return ks.length === kinds.length ? null : ks; }
     async function persist() {
       var ks = chosen(); if (ks && !ks.length) { showMsg(smsg, "Pick at least one type, or turn review off."); return false; }
-      s = await api("PUT", base + "/review-settings", { default: mode.value, kinds: ks });
+      s = await api("PUT", base + "/review-settings", { default: picked(), kinds: ks });
       return true;
     }
     var save = h("button", { type: "button", onclick: async function () {
@@ -98,7 +118,7 @@ async function viewProjectReview(pid) {
     } }, "Save");
     // Applies exactly what the page shows (saving it first), and says what it will change before it does.
     var applyBtn = h("button", { type: "button", class: "secondary", onclick: async function () {
-      var target = mode.value, docs = s.documents || {}, others = RV_MODES_UI.filter(function (m) { return m !== target; })
+      var target = picked(), docs = s.documents || {}, others = RV_MODES_UI.filter(function (m) { return m !== target; })
         .map(function (m) { return docs[m] ? (chosen() ? "documents" : plural(docs[m], "document")) + " currently " + (m === "off" ? "without review" : m === "required" ? "requiring review" : "with optional review") : null; }).filter(Boolean);
       if (!others.length) { showMsg(smsg, "Every document already uses this setting.", true); return; }
       var what = target === "off" ? "Turn review off for " : "Set review to " + RV_MODE_LABELS[target].split(" (")[0].toLowerCase() + " for ";
@@ -112,10 +132,10 @@ async function viewProjectReview(pid) {
       } catch (err) { showErr(smsg, err); } finally { applyBtn.disabled = false; }
     } }, "Save and apply to existing documents");
     function kindNames() { var ks = chosen(); return ks ? kinds.filter(function (l) { return l.firstChild.checked; }).map(function (l) { return l.textContent; }).join(", ") : "all types"; }
-    mode.addEventListener("change", function () { kindBox.hidden = mode.value === "off"; });
-    settings.replaceChildren(h("h2", { text: "Review for new documents" }),
-      h("p", { class: "muted small", text: "Your own edits never wait for review. Files from publishing apps are never gated. Change one document from its Details." }),
-      h("div", { class: "row" }, h("label", { class: "row" }, "New documents", mode)), kindBox, h("div", { class: "row" }, save, applyBtn), smsg);
+    settings.replaceChildren(h("h2", { text: "Review for new documents", tabindex: "-1" }),
+      h("p", { class: "muted small rv-help", text: "Your own edits never wait for review. Files from publishing apps are never gated. Change one document from its Details." }),
+      h("fieldset", { class: "rv-modes" }, h("legend", { class: "rv-legend", text: "New documents" }), radios), kindBox, h("div", { class: "row rv-actions" }, save, applyBtn), smsg);
+    if (refocus) settings.querySelector("h2").focus();
   }
 }
 // One proposal: what changed and why, then the decision.
@@ -133,8 +153,8 @@ async function viewProposal(pid, prp) {
   var msg = h("p", { class: "msg", role: "status", "aria-live": "polite" });
   var head = pageHead(rvTitle(p), { eyebrow: p.is_new ? "New " + (p.kind === "binary" ? "file" : "document") + " · waiting for review" : "Proposed " + rvChanges(p),
     actions: p.is_new ? null : h("a", { class: "btn secondary", href: docHref }, "Open document") });
-  var who = h("p", { class: "rv-who" }, h("strong", { text: p.who }), p.via && p.via.kind === "oauth" ? h("span", { class: "badge", text: "connected app" }) : p.via && p.via.kind === "api_key" ? h("span", { class: "badge", text: "API key" }) : p.via && p.via.kind === "grant" ? h("span", { class: "badge", text: "agent token" }) : null,
-    h("span", { class: "muted small", text: (p.client_info ? " via " + p.client_info : "") + " · " + rvAgo(p.created_at) + (p.is_new ? "" : " · based on v" + p.base_revision) }));
+  var who = h("p", { class: "rv-who" }, h("strong", { text: p.who }), rvViaBadge(p.via),
+    h("span", { class: "muted small", text: [p.client_info ? "via " + p.client_info : null, rvAgo(p.created_at), p.is_new ? null : "based on v" + p.base_revision].filter(Boolean).join(" · ") }));
   var why = p.change_note ? h("blockquote", { class: "rv-why" }, p.change_note) : h("p", { class: "muted small", text: "No note given." });
   var status = p.status !== "pending" ? h("div", { class: "callout " + (p.status === "approved" ? "info" : "warn") }, icon(p.status === "approved" ? "check" : "alert"),
     h("span", null, h("strong", { text: { approved: "Approved", rejected: "Rejected", superseded: "Replaced by a newer proposal", withdrawn: "Withdrawn by its author" }[p.status] || p.status }),
@@ -161,8 +181,9 @@ async function viewProposal(pid, prp) {
       var diffBox = h("div");
       var tabs = h("div", { class: "tabs", role: "group", "aria-label": "Compare with" });
       function tabBtn(label, diff, sel) { var b = h("button", { type: "button", "aria-pressed": String(!!sel), onclick: function () { tabs.querySelectorAll("button").forEach(function (x) { x.setAttribute("aria-pressed", String(x === b)); }); rvDrawDiff(diffBox, diff, bodyText); } }, label); return b; }
-      if (d.diff_from_current) tabs.append(tabBtn("Vs current (v" + d.diff_from_current.from_revision + ")", d.diff_from_current, true));
-      if (d.diff_from_base) tabs.append(tabBtn("Its changes (from v" + d.diff_from_base.from_revision + ")", d.diff_from_base, !d.diff_from_current));
+      // Short labels (they fit a phone side by side); the caption above the diff names the version compared with.
+      if (d.diff_from_current) tabs.append(tabBtn("Vs current", d.diff_from_current, true));
+      if (d.diff_from_base) tabs.append(tabBtn("Proposed changes", d.diff_from_base, !d.diff_from_current));
       tabs.append(tabBtn("Full text", null, !d.diff_from_base && !d.diff_from_current));
       sections.push(h("section", { class: "rv-sec" }, h("h2", { text: p.is_new ? "Content" : "Changes" }), tabs.children.length > 1 ? tabs : null, diffBox));
       rvDrawDiff(diffBox, d.diff_from_current || d.diff_from_base, bodyText);
@@ -214,7 +235,7 @@ async function viewProposal(pid, prp) {
           var ref = h("div", { class: "rv-ref" });
           rvDrawDiff(ref, d.diff_from_base, bodyText);
           parts.push(h("div", { class: "row small" }, h("span", { class: "muted", text: "Start from" }), h("div", { class: "tabs", role: "group", "aria-label": "Start from" }, fromCur, fromProp)),
-            h("details", { open: true }, h("summary", { text: "The proposal's changes (from v" + p.base_revision + ")" }), ref));
+            h("details", { open: true }, h("summary", { text: "The proposal's changes" }), ref));
           pick(true);
         }
         parts.push(h("label", { class: "rv-field" }, "Text to publish", editor));
@@ -284,7 +305,7 @@ function rvDrawDiff(into, d, full) {
   if (!d) { into.replaceChildren(h("pre", { class: "raw", tabindex: "0", text: full || "" })); return; }
   if (d.identical) { into.replaceChildren(h("p", { class: "muted", text: "No text changes." })); return; }
   if (d.too_many_lines) { into.replaceChildren(h("p", { class: "muted small", text: "Too many lines to compare here." }), h("pre", { class: "raw", tabindex: "0", text: full || "" })); return; }
-  var cap = h("p", { class: "muted small", text: d.added + " added, " + d.removed + " removed" + (d.truncated ? " (large change: partly shown)" : "") });
+  var cap = h("p", { class: "muted small", text: (d.from_revision ? "Compared with v" + d.from_revision + ": " : "") + d.added + " added, " + d.removed + " removed" + (d.truncated ? " (large change: partly shown)" : "") });
   var pre = h("div", { class: "vh-diff", role: "group", tabindex: "0", "aria-label": "Proposed changes" });
   d.hunks.forEach(function (hk, i) {
     if (i) pre.append(h("div", { class: "vh-gap", "aria-hidden": "true", text: "⋯" }));
@@ -307,11 +328,17 @@ function rvDrawDiff(into, d, full) {
 function rvDocumentUi(A, pid, aid, details, reload) {
   var rv = A.meta.review || null, out = { banner: null, chip: null };
   if (rv && rv.pending_proposals) {
-    var link = h("a", { class: "btn secondary", href: "#/p/" + enc(pid) + "/review" }, "Review");
+    // Several: this document's History lists exactly its waiting edits (the project queue would mix in others).
+    // If History couldn't load the list (A.rvPendingFailed), it goes to the project's Review queue instead.
+    var link = h("a", { class: "btn secondary", href: "#/p/" + enc(pid) + "/review", onclick: function (e) {
+      if (link.dataset.direct || A.rvPendingFailed) return;
+      var t = [].filter.call(document.querySelectorAll('[role="tab"]'), function (x) { return x.textContent === "History"; })[0];
+      if (t) { e.preventDefault(); t.click(); t.focus(); }
+    } }, rv.pending_proposals === 1 ? "Review edit" : "Review edits");
     out.banner = h("div", { class: "callout info rv-banner" }, icon("doc"),
       h("span", null, h("strong", { text: plural(rv.pending_proposals, "edit") + " waiting for review." }), " Readers keep seeing the approved version."), link);
     if (rv.pending_proposals === 1) api("GET", "/api/projects/" + enc(pid) + "/proposals?artifact_id=" + enc(aid)).then(function (r) {
-      if (r.proposals.length === 1) link.href = "#/p/" + enc(pid) + "/review/" + enc(r.proposals[0].proposal_id);
+      if (r.proposals.length === 1) { link.href = "#/p/" + enc(pid) + "/review/" + enc(r.proposals[0].proposal_id); link.dataset.direct = "1"; }
     }).catch(function () {});
   }
   // Status chip: one container, redrawn from A.meta.review and A.rev after any change (mode save, mark, reload, autosave).
@@ -338,12 +365,8 @@ function rvDocumentUi(A, pid, aid, details, reload) {
   out.redraw();
   A.rvRedraw = out.redraw;
   if (A.meta.publisher) return out;
-  var cur = rv ? rv.mode : "off", name = "rv-mode-" + aid;
-  var radios = RV_MODES_UI.map(function (m) {
-    var r = h("input", { type: "radio", name: name, value: m, checked: cur === m });
-    r.addEventListener("change", sync);
-    return h("label", { class: "rv-radio" }, r, h("span", null, h("strong", { text: RV_MODE_LABELS[m].split(" (")[0] }), h("span", { class: "muted small", text: RV_DESC[m] })));
-  });
+  var cur = rv ? rv.mode : "off";
+  var radios = rvModeRadios("rv-mode-" + aid, cur, function () { sync(); });
   var rmsg = h("p", { class: "msg", role: "status", "aria-live": "polite" });
   var save = h("button", { type: "button", hidden: true, onclick: async function () {
     var want = picked();
@@ -361,10 +384,85 @@ function rvDocumentUi(A, pid, aid, details, reload) {
       else showErr(rmsg, err);
     } finally { save.disabled = false; }
   } }, "Save review setting");
-  function picked() { var c = radios.map(function (l) { return l.firstChild; }).filter(function (x) { return x.checked; })[0]; return c ? c.value : cur; }
+  function picked() { return rvPicked(radios, cur); }
   function sync() { save.hidden = picked() === cur; }
-  details.append(h("fieldset", { class: "rv-docmode" }, h("legend", { text: "Review" }), radios, h("div", { class: "row" }, save), rmsg));
+  // Details order: fields → Save details → its message ("Details saved.") → Review → ID line. The base UI puts the ID
+  // line before the message, so the ID line moves below the Review section.
+  var box = h("fieldset", { class: "rv-docmode" }, h("legend", { class: "rv-legend", text: "Review" }), radios, h("div", { class: "row" }, save), rmsg);
+  var metaMsg = details.querySelector(":scope > p.msg"), idLine = details.querySelector(":scope > p.muted.small");
+  if (metaMsg) metaMsg.after(box); else details.append(box);
+  if (idLine) box.after(idLine);
   return out;
+}
+// History: edits waiting for review, listed above the versions with a direct Review link (the owner sees them all).
+async function rvLoadPending(A, pid, aid) {
+  A.rvPending = []; A.rvPendingFailed = null;
+  if (!A.meta.review) return; // review off and nothing pending
+  // Every page: "Review edits" sends the owner here for all of this document's waiting edits (bounded: 20 pages).
+  var all = [], cursor = null, n = 0;
+  try {
+    do {
+      var r = await api("GET", "/api/projects/" + enc(pid) + "/proposals?artifact_id=" + enc(aid) + (cursor ? "&cursor=" + enc(cursor) : ""));
+      all = all.concat(r.proposals); cursor = r.next_cursor;
+    } while (cursor && ++n < 20);
+  } catch (e) { A.rvPendingFailed = e; }
+  A.rvPending = all;
+}
+function rvPendingRows(A, pid, retry) {
+  var ps = A.rvPending || [];
+  if (A.rvPendingFailed) {
+    var again = h("button", { type: "button", class: "secondary", onclick: function () { again.disabled = true; retry(); } }, icon("refresh"), "Try again");
+    return [h("li", { class: "group", text: "Waiting for review" }),
+      h("li", { class: "rv-load-err", role: "alert" }, h("span", { class: "grow", text: "Couldn't load the edits waiting for review: " + (A.rvPendingFailed.message || "error") + "." }), again,
+        h("a", { class: "btn secondary", href: "#/p/" + enc(pid) + "/review" }, "Open project Review"))];
+  }
+  if (!ps.length) return [];
+  return [h("li", { class: "group", text: "Waiting for review" })].concat(ps.map(function (p) {
+    return h("li", { class: "vh-row rv-pending", dataset: { proposal: p.proposal_id } },
+      h("span", { class: "vh-n", "aria-hidden": "true" }),
+      h("span", { class: "grow" },
+        h("span", { class: "vh-wholine" }, h("strong", { class: "vh-who", text: p.who }), rvViaBadge(p.via), p.client_info ? h("span", { class: "muted small", text: "via " + p.client_info }) : null),
+        h("span", { class: "meta" }, p.stale ? h("span", { class: "rv-stale", text: "Outdated: document changed · " }) : null,
+          [rvCap(rvChanges(p)), "proposed " + rvAgo(p.created_at), p.is_new ? null : "based on v" + p.base_revision].filter(Boolean).join(" · ")),
+        p.change_note ? h("span", { class: "vh-note agent" }, "“" + p.change_note + "”") : null),
+      h("span", { class: "vh-side" }, h("span", { class: "badge warnb", text: "Pending" }),
+        h("a", { class: "btn secondary vh-open", href: "#/p/" + enc(pid) + "/review/" + enc(p.proposal_id) }, "Review", h("span", { class: "sr", text: " edit by " + p.who }))));
+  }));
+}
+// New document form: review for this document, starting at the project's default for its type. Applied right after
+// creating (owner only; the owner's first version is never gated).
+function rvNewDocReview(pid, kindOf) {
+  var sel = h("select", null, RV_MODES_UI.map(function (m) { return h("option", { value: m, text: RV_SHORT[m] }); }));
+  // Not reserved while loading: most projects default to Off (no line), so only an Optional/Required default adds one.
+  var help = h("p", { class: "muted small rv-newdoc-help", hidden: true });
+  var s = null, touched = false;
+  function def() { var k = kindOf(); return s && s.default !== "off" && (!s.kinds || s.kinds.indexOf(k) >= 0) ? s.default : "off"; }
+  function sync() {
+    var d = def();
+    [].forEach.call(sel.options, function (o) { o.textContent = RV_SHORT[o.value] + (s && o.value === d ? " (project default)" : ""); });
+    if (!touched) sel.value = d;
+    explain();
+  }
+  // Off needs no explanation; Optional and Required say what they mean here too.
+  function explain() { help.textContent = RV_DESC[sel.value]; help.hidden = sel.value === "off"; }
+  sel.addEventListener("change", function () { touched = true; explain(); });
+  // Its space is kept while the project default loads (no jump); the choice is offered only once the default is known.
+  var label = h("label", { class: "rv-newdoc rv-wait" }, "Review", sel);
+  api("GET", "/api/projects/" + enc(pid) + "/review-settings", undefined, { noAuthRedirect: true })
+    .then(function (r) { s = r; sync(); label.classList.remove("rv-wait"); })
+    .catch(function () { label.replaceChildren("Review", h("span", { class: "muted small", text: "Couldn't load review options. The project default will apply; you can change it in Details." })); label.classList.remove("rv-wait"); });
+  return { label: label, help: help, sync: sync,
+    // Sets the chosen mode if creation (project default at that moment, which may have changed since the form loaded) didn't.
+    // Pinned to the revision this form created: turning on Required vouches for it, so an agent version saved in
+    // between must never be vouched for unseen (the server answers 409 and the owner sets it from Details).
+    apply: async function (aid, rev) {
+      if (!s) return;
+      var want = sel.value, a = "/api/projects/" + enc(pid) + "/artifacts/" + enc(aid);
+      try {
+        var cur = ((await api("GET", a)).artifact.review || {}).mode || "off";
+        if (cur !== want) await api("PUT", a + "/review-mode", { mode: want, expected_revision: rev || 1 });
+      } catch (err) { toast(err.status === 409 ? "Created. The document changed right away, so review wasn't set: set it from Details." : "Created. Review couldn't be set: " + err.message); }
+    } };
 }
 var RV_DESC = {
   off: "Edits go live as usual.",
