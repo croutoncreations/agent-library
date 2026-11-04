@@ -219,11 +219,15 @@ const PATCHES = [
   // Opening the History tab records it in the URL (?tab=history), so Back from a review screen returns to History.
   ['ui: History tab is restorable from the URL', UI, '  showTab(wantV ? "history" : isTextDoc(A.meta.kind) && initialTab === "edit" ? "edit" : "preview");',
     '  showTab(wantV || /[?&]tab=history(?:&|$)/.test(location.hash) ? "history" : isTextDoc(A.meta.kind) && initialTab === "edit" ? "edit" : "preview");'],
+  // ...and only while History shows: any other tab drops it (other tabs keep their own URL handling above).
   ['ui: History tab writes ?tab=history', UI, '    if (tabBtns[name].onShow) tabBtns[name].onShow();\n  }\n',
-    '    if (name === "history" && !/[?&](v|tab)=/.test(location.hash)) history.replaceState(null, "", "#/p/" + enc(pid) + "/a/" + enc(aid) + "?tab=history");\n    if (tabBtns[name].onShow) tabBtns[name].onShow();\n  }\n'],
+    '    if (name === "history" && !/[?&](v|tab)=/.test(location.hash)) history.replaceState(null, "", "#/p/" + enc(pid) + "/a/" + enc(aid) + "?tab=history");\n    else if (name !== "history" && /[?&]tab=history(?:&|$)/.test(location.hash)) history.replaceState(null, "", location.hash.replace(/([?&])tab=history(&|$)/, function (m, a, b) { return b ? a : ""; }).replace(/[?&]$/, ""));\n    if (tabBtns[name].onShow) tabBtns[name].onShow();\n  }\n'],
+  // Offline: document URLs may now carry ?tab=history (and ?v=N); route on the path only, like route() does.
+  ['ui: offline routing ignores the query', UI, '  var p = location.hash.replace(/^#\\/?/, "").split("/").filter(Boolean).map(decodeURIComponent);\n  if (p[0] === "p" && p[1] && p[2] === "a" && p[3]) return viewOfflineItem(',
+    '  var p = location.hash.replace(/^#\\/?/, "").replace(/\\?.*$/, "").split("/").filter(Boolean).map(decodeURIComponent);\n  if (p[0] === "p" && p[1] && p[2] === "a" && p[3]) return viewOfflineItem('],
   // Pending edits of this document (reviewers/owner see them all) above its versions, each with a Review link.
   ['ui: history lists edits waiting for review', UI, '      if (!revs.length) { list.append(h("li", { class: "empty", text: "No versions yet." })); return; }\n',
-    '      rvPendingRows(A, pid, function () { rvLoadPending(A, pid, aid).then(draw); }).forEach(function (li) { list.append(li); });\n      if ((A.rvPendingFailed || A.rvPending && A.rvPending.length) && revs.length) list.append(h("li", { class: "group", text: "Versions" }));\n      if (!revs.length) { list.append(h("li", { class: "empty", text: "No versions yet." })); return; }\n'],
+    '      rvPendingRows(A, pid, function () { rvLoadPending(A, pid, aid).then(function () { draw(); var f = list.querySelector(".rv-load-err button, .rv-pending a.vh-open"); if (f) f.focus(); }); }).forEach(function (li) { list.append(li); });\n      if ((A.rvPendingFailed || A.rvPending && A.rvPending.length) && revs.length) list.append(h("li", { class: "group", text: "Versions" }));\n      if (!revs.length) { list.append(h("li", { class: "empty", text: "No versions yet." })); return; }\n'],
   ['ui: history loads waiting edits with the first page', UI, '        await fetchPage(again);\n',
     '        await Promise.all([again ? null : rvLoadPending(A, pid, aid), fetchPage(again)]);\n'],
   ['ui: history: mark a version reviewed (advisory)', UI, '      if (n !== A.rev) actions.append(h("button", { type: "button", onclick: function (e) { restoreRev(n, e.currentTarget); } }, "Restore this version"));',

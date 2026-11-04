@@ -15317,6 +15317,7 @@ async function viewArtifact(pid, aid, initialTab) {
       if (location.hash !== want) history.replaceState(null, "", want);
     }
     if (name === "history" && !/[?&](v|tab)=/.test(location.hash)) history.replaceState(null, "", "#/p/" + enc(pid) + "/a/" + enc(aid) + "?tab=history");
+    else if (name !== "history" && /[?&]tab=history(?:&|$)/.test(location.hash)) history.replaceState(null, "", location.hash.replace(/([?&])tab=history(&|$)/, function (m, a, b) { return b ? a : ""; }).replace(/[?&]$/, ""));
     if (tabBtns[name].onShow) tabBtns[name].onShow();
   }
 
@@ -15392,7 +15393,7 @@ async function viewArtifact(pid, aid, initialTab) {
     }
     function draw() {
       list.replaceChildren(); list.removeAttribute("aria-busy");
-      rvPendingRows(A, pid, function () { rvLoadPending(A, pid, aid).then(draw); }).forEach(function (li) { list.append(li); });
+      rvPendingRows(A, pid, function () { rvLoadPending(A, pid, aid).then(function () { draw(); var f = list.querySelector(".rv-load-err button, .rv-pending a.vh-open"); if (f) f.focus(); }); }).forEach(function (li) { list.append(li); });
       if ((A.rvPendingFailed || A.rvPending && A.rvPending.length) && revs.length) list.append(h("li", { class: "group", text: "Versions" }));
       if (!revs.length) { list.append(h("li", { class: "empty", text: "No versions yet." })); return; }
       groups().forEach(function (g) {
@@ -16697,7 +16698,7 @@ async function viewOfflineItem(pid, aid, tab) {
   resumeApply("artifact");
 }
 function offlineRoute() {
-  var p = location.hash.replace(/^#\/?/, "").split("/").filter(Boolean).map(decodeURIComponent);
+  var p = location.hash.replace(/^#\/?/, "").replace(/\?.*$/, "").split("/").filter(Boolean).map(decodeURIComponent);
   if (p[0] === "p" && p[1] && p[2] === "a" && p[3]) return viewOfflineItem(p[1], p[3], p[4] === "preview" ? "preview" : null);
   if (p[0] === "settings" && p[1] === "publishing") return viewPublishingApps();
   if (p[0] === "settings" && p[1] === "device") return viewDevice();

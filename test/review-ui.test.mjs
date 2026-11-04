@@ -101,7 +101,30 @@ test("Chrome: Home hides Needs review when empty and shows it when an edit waits
     await page.evaluate(() => document.querySelector(".rv-banner a").click());
     await page.waitForFunction(() => /\/review$/.test(location.hash));
     page.off("request", fail); await page.setRequestInterception(false);
+    // ?tab=history only while History shows: another tab (on any kind, e.g. JSON, whose Preview doesn't rewrite the URL) drops it.
+    const json = (await owner.req("POST", base + "/artifacts", { title: "Prices", kind: "json", content: '{"a":1}' })).body.artifact_id;
+    await page.goto(h.appUi + `/#/p/${P}/a/${json}?tab=history`);
+    await page.waitForSelector(".vh-list li");
+    await page.evaluate(() => [...document.querySelectorAll('[role="tab"]')].find((t) => t.textContent === "Preview").click());
+    assert.equal(await page.evaluate(() => location.hash), `#/p/${P}/a/${json}`, "leaving History drops ?tab=history");
+    // Offline: a saved document still opens from a URL with a query (?tab=history).
+    await page.goto(h.appUi + `/#/p/${P}/a/${doc}`);
+    await page.waitForSelector('[aria-label="Make available offline"]');
+    await page.click('[aria-label="Make available offline"]');
+    await page.waitForSelector('[aria-label^="Available offline"]');
+    // No network for the app's API (the page itself still loads), the way the app sees a dropped connection.
+    await page.setRequestInterception(true);
+    const offline = (r) => (/\/api\/|\/auth\//.test(r.url()) ? r.abort("internetdisconnected") : r.continue());
+    page.on("request", offline);
+    await page.goto(h.appUi + `/#/p/${P}/a/${doc}?tab=history`);
+    await page.reload();
+    await page.waitForFunction(() => /offline/i.test(document.querySelector("main")?.innerText || ""));
+    const offlineText = await page.$eval("main", (e) => e.innerText);
+    page.off("request", offline); await page.setRequestInterception(false);
+    assert.doesNotMatch(offlineText, /Not available offline/, "offline routing ignores ?tab=history");
+    assert.match(offlineText, /Trip plan/);
     await page.goto(h.appUi + "/#/");
+    await page.reload(); // back online: the app re-checks its session at load
     await page.waitForFunction(() => { const e = document.querySelector(".rv-home"); return e && !e.hidden; });
     const homeText = await page.$eval(".rv-home", (e) => e.innerText);
     assert.match(homeText, /Needs review/i); assert.match(homeText, /Trip plan/); assert.match(homeText, /Claude/); assert.match(homeText, /Added the hike day/);

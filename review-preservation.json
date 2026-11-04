@@ -1,7 +1,7 @@
 {
   "base_file_types_sha256": "cea551a7d442927605e0890073072e7bad69968f1fdf6a4a3886d3dc79a6b1cf",
-  "integrated_sha256": "78aaf52f4173e0b6bd381b6812bf400a90d2f79f0dc2221a1a6efcbf0c6cd52b",
-  "preserved_outside_patches_sha256": "78f16890e49b7f7fd8c533c6e1dc37b111f3185f97f2ab2d569951970a26758d",
+  "integrated_sha256": "8058a319758596e8704f5fff99e89f343f61ab79de9bb03746774628564172f7",
+  "preserved_outside_patches_sha256": "b8058cec2d7d883daf279b274758cfc91858a12ca8227bebb95d9700d7183417",
   "sources_sha256": {
     "src/review/service.js": "66aaa5d16763149e719c5aa57ede9b5ba078fade0945a5a75328f9a0074ed146",
     "src/review/tools.js": "192903fbdd905f4b632a23a22263874502c8691d02a394ddb1596aa8b43d2991",
@@ -598,14 +598,21 @@
       "module": "// src/ui.ts",
       "count": 1,
       "find_sha256": "f7f4a1aed07f83b028812afb8f941485969673f7f91bc2d8427514540f8afe5f",
-      "replace_sha256": "b8b371041b4131d5dadb22f75a07e3ca43470b083944ef652e85dc5e2338f2b8"
+      "replace_sha256": "13d47c9f3c96c5a3e60b1784c674ca9ecde8118f9930d423c9369d336cc78d22"
+    },
+    {
+      "name": "ui: offline routing ignores the query",
+      "module": "// src/ui.ts",
+      "count": 1,
+      "find_sha256": "c9624351d9bd434b4f3a960539b6cab671c382f347e894d2cae722e87cf1548e",
+      "replace_sha256": "e1f1960d3225b0ea2d6881c6a89183b22627f13cc5128b1aa40b675a5ba51820"
     },
     {
       "name": "ui: history lists edits waiting for review",
       "module": "// src/ui.ts",
       "count": 1,
       "find_sha256": "85530fa32bdbe43c4dd05ec2b8aeb43cfda3d4a71cb666770a624a0cc443981c",
-      "replace_sha256": "e21e4513a2f633f4503e93088b9e5705f14a2c23cd29f976967d9e9e84d56af5"
+      "replace_sha256": "38a19ae3fe01e627dc060725f403a8596d582e667e8d237d61deeb2ff6f23f7d"
     },
     {
       "name": "ui: history loads waiting edits with the first page",
