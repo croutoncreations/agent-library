@@ -33,11 +33,13 @@ function jwt(claims) {
 }
 
 let jwks, access, s, browser, page;
-const accessState = { expired: false, sub: "user-owner-1", xhr401: 0, logoutDelayMs: 0 };
+// unreachable: every connection is dropped, like a phone with no signal that still thinks it is online.
+const accessState = { expired: false, unreachable: false, sub: "user-owner-1", xhr401: 0, logoutDelayMs: 0 };
 const SIGNIN_TITLE = "Stand-in Cloudflare Access sign-in";
 
 function startAccess() {
   return createServer((req, res) => {
+    if (accessState.unreachable) { req.socket.destroy(); return; }
     if (accessState.expired) {
       if ((req.headers["x-requested-with"] || "").toLowerCase() === "xmlhttprequest") { accessState.xhr401++; res.writeHead(401); return res.end(); }
       res.writeHead(200, { "content-type": "text/html" });
@@ -213,6 +215,28 @@ test("cached shell with saved copies: Access expired opens the copies with a sig
   // cached shell, so the next launch is still the app.
   await page.goto(APP + "/#/"); await page.waitForSelector("#nav a");
   assert.notEqual(await page.title(), SIGNIN_TITLE);
+});
+
+test("cached shell, unreachable network, nothing saved: the offline page, never the Sign in screen", { skip }, async () => {
+  await openHome();
+  await page.evaluate(async () => { await navigator.serviceWorker.register("/sw.js", { scope: "/" }); await navigator.serviceWorker.ready; });
+  await openHome();
+  await page.evaluate(async () => { await new Promise((res) => { const r = indexedDB.open("al-offline", 1); r.onsuccess = () => { const d = r.result; const t = d.transaction(["items", "projects"], "readwrite"); t.objectStore("items").clear(); t.objectStore("projects").clear(); t.oncomplete = () => res(); }; }); });
+  await page.evaluate(() => sessionStorage.removeItem("al:signin-reload"));
+  accessState.unreachable = true;
+  try {
+    await page.goto("about:blank");
+    const nav = await page.goto(APP + "/?source=pwa");
+    assert.equal(nav.fromServiceWorker(), true, "the shell came from the cache");
+    assert.equal(await page.evaluate(() => navigator.onLine), true, "the browser still thinks it is online");
+    await page.waitForFunction(() => /Nothing is saved on this device yet/.test(document.body.innerText), { timeout: 15000 });
+    const text = await page.evaluate(() => document.body.innerText);
+    assert.match(text, /Offline: showing copies saved on this device/);
+    assert.doesNotMatch(text, /Sign in with your Cloudflare Access account/);
+    assert.notEqual(await page.title(), SIGNIN_TITLE);
+  } finally { accessState.unreachable = false; }
+  // Back online: the next launch opens the live library as before.
+  await openHome();
 });
 
 test("server: a new Access user ID for the owner email keeps the same owner account and library", async () => {

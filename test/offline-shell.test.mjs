@@ -111,6 +111,37 @@ test("stalled network: the app opens saved copies within seconds, then offers th
   await page.waitForFunction(() => !document.querySelector(".offline-banner") && /Passport and charger/.test(document.body.innerText));
 });
 
+test("dead link that comes back: Try again reaches the live library in place, even with requests still stuck", { skip }, async () => {
+  net.stallApi = true;
+  try {
+    await page.goto("about:blank");
+    page.goto(APP + "/").catch(() => {});
+    await page.waitForFunction(() => /Connecting/.test(document.querySelector(".offline-banner")?.innerText || ""), { timeout: 10000 });
+    // The network comes back, but the requests sent while it was dead stay stuck (they are never answered).
+    net.stallApi = false;
+    const stuck = net.held.length;
+    assert.ok(stuck >= 1, "sign-in requests are stuck");
+    await page.evaluate(() => [...document.querySelectorAll(".offline-banner a")].find((a) => a.textContent === "Try again").click());
+    // In place (no page load that would queue behind the stuck requests): the live library opens.
+    await page.waitForSelector("#nav a", { timeout: 20000 });
+    assert.equal(await page.$(".offline-banner"), null);
+  } finally { net.stallApi = false; net.held = []; }
+});
+
+test("dead link that comes back on its own: the app notices (online event) and offers the live library", { skip }, async () => {
+  net.stallApi = true;
+  try {
+    await page.goto("about:blank");
+    page.goto(APP + "/").catch(() => {});
+    await page.waitForFunction(() => /Connecting/.test(document.querySelector(".offline-banner")?.innerText || ""), { timeout: 10000 });
+    await page.waitForFunction(() => /Saved on this device/.test(document.body.innerText));
+    net.stallApi = false;
+    await page.evaluate(() => window.dispatchEvent(new Event("online")));
+    await page.waitForFunction(() => /Open the live library/.test(document.body.innerText), { timeout: 20000 });
+    assert.match(await page.evaluate(() => document.body.innerText), /Saved on this device/, "the reader is not switched away");
+  } finally { net.stallApi = false; net.held = []; }
+});
+
 test("no network at all: the installed app opens from cache straight to saved copies", { skip }, async () => {
   await page.setOfflineMode(true);
   try {

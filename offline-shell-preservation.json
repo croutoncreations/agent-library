@@ -1,10 +1,10 @@
 {
   "base_review_sha256": "8058a319758596e8704f5fff99e89f343f61ab79de9bb03746774628564172f7",
-  "integrated_sha256": "28c8f6952336911ab2dae101c8f9076d3df5cfe241abdcc677eb688dc1047c92",
-  "preserved_outside_patches_sha256": "ad3627be329557a8d752a0cd5451504f1710675fb44326e6977fe983e6a135d0",
+  "integrated_sha256": "eca73a3934a1447dd673d8c8056ef85f69abb03d5a897cf2ad56e1e9125733ad",
+  "preserved_outside_patches_sha256": "96bb5e7ded3c6292b4b8472956c4cecff86d64e2d0ee9cb36e32bfce9bb987eb",
   "sources_sha256": {
-    "src/offline/sw.js": "330b8b10b04c93bfcaa08cae300716e08fb4816b53fd4978dae973625241c55e",
-    "src/offline/boot.js": "1e0679c7233db806637a4f1a52adf185865fa63cab2cc44856dc215aaa6efe7d",
+    "src/offline/sw.js": "39be06884dccc421a5b49f3b03e5c3a888398bb1a88a316e34630a95516961b3",
+    "src/offline/boot.js": "fbcf81b45e91eefcc204a71b173540d054f700739aaca72fd16c7ac8a87c0088",
     "src/offline/version.js": "0a0cf678f7528a2c220b9517802e38a77fb8c77755e1bba8ea3b88354ca5c630"
   },
   "patches": [
@@ -18,7 +18,7 @@
       "name": "pwa: cache-first shell service worker",
       "module": "// src/pwa.ts",
       "find_sha256": "6459c94f1d471f1ca7efa5eaaa7b5747dbf21213955a8fa21aa70dc059aed290",
-      "replace_sha256": "ba364f67372aab11ca1368b9069223a403c8f3aff597fc84f9aa3779e20956a8"
+      "replace_sha256": "4194bf056e178e7e150c06c277160dc68670e77600d5301367b80e551ce095d5"
     },
     {
       "name": "ui: registration comment",
@@ -54,7 +54,19 @@
       "name": "ui: boot opens saved copies after a short wait",
       "module": "// src/ui.ts",
       "find_sha256": "9f94e80e6de8a6d1940655a5c1883d263a871aae05f93e4ad8f5e9ddaa457ba5",
-      "replace_sha256": "1e0679c7233db806637a4f1a52adf185865fa63cab2cc44856dc215aaa6efe7d"
+      "replace_sha256": "fbcf81b45e91eefcc204a71b173540d054f700739aaca72fd16c7ac8a87c0088"
+    },
+    {
+      "name": "ui: api() takes an abort signal (boot gives up on requests that never get an answer)",
+      "module": "// src/ui.ts",
+      "find_sha256": "3c61db900332dee72ee76cbd84c87ca0ed7a809a97c160803cc1bbba9a6765a5",
+      "replace_sha256": "627f08a3bc94a9f2934541fbcb1b6c79a0aa34f2b1554c95df5e81bd53ca5ec3"
+    },
+    {
+      "name": "ui: the empty offline page says how to save documents",
+      "module": "// src/ui.ts",
+      "find_sha256": "9706087dde8bb005e03ed18160d741a575e07eabba7588af540b7f00d40405f8",
+      "replace_sha256": "f5d91e24c4915259f442da34d7f2e12f7ae25ed67dfa3c6cd0cd9069372a19cc"
     },
     {
       "name": "pwa: shell version (fingerprint of the cached shell bytes)",
