@@ -24,7 +24,7 @@ const PLAN = /^[a-z0-9_-]{1,40}$/;
 /**
  * Apply one verified provider event: the subscription's current state. change: { provider, eventId, eventType,
  * eventAt (ms), workspaceId, customerId, subscriptionId, status, plan (the plan this subscription is for, or null),
- * periodEnd? (ms) }. Returns { applied: boolean, reason? }; reasons: duplicate, no_workspace, stale,
+ * periodEnd? (ms), cancelAt? (ms: the subscription is set to end then; absent = renews) }. Returns { applied: boolean, reason? }; reasons: duplicate, no_workspace, stale,
  * other_customer (the workspace's stored customer differs), other_subscription (the workspace already has another
  * open subscription: the provider is charging for a duplicate; refund it).
  * A workspace has at most one billing customer (never overwritten) and one open subscription at a time.
@@ -34,6 +34,7 @@ export async function applyBillingChange(env, c) {
   if (!Number.isSafeInteger(c.eventAt) || c.eventAt < 0) throw new HttpError(400, "invalid_input", "bad eventAt");
   for (const k of ["customerId", "subscriptionId"]) if (typeof c[k] !== "string" || !ID.test(c[k])) throw new HttpError(400, "invalid_input", `bad ${k}`);
   if (c.plan != null && !PLAN.test(c.plan)) throw new HttpError(400, "invalid_input", "bad plan");
+  if (c.cancelAt != null && (!Number.isSafeInteger(c.cancelAt) || c.cancelAt < 0)) throw new HttpError(400, "invalid_input", "bad cancelAt");
   if (typeof c.status !== "string" || !/^[a-z_]{1,40}$/.test(c.status)) throw new HttpError(400, "invalid_input", "bad status");
   const DB = env.DB, now = nowIso(), ws = c.workspaceId, nonce = randomId("bev", 12);
   const exists = await DB.prepare("SELECT status FROM workspaces WHERE id = ?").bind(ws).first("status");
@@ -59,13 +60,13 @@ export async function applyBillingChange(env, c) {
   if (live) {
     stmts.push(
       // workspace_billing.plan is the subscription's plan (shown while payment is due); workspaces.plan is the one in force.
-      DB.prepare(`INSERT INTO workspace_billing (workspace_id, provider, customer_id, subscription_id, subscription_status, plan, current_period_end, suspended_by_billing, last_event_at, updated_at)
-        SELECT ?, ?, ?, ?, ?, ?, ?, 0, ?, ? WHERE ${gate}
+      DB.prepare(`INSERT INTO workspace_billing (workspace_id, provider, customer_id, subscription_id, subscription_status, plan, current_period_end, cancel_at, suspended_by_billing, last_event_at, updated_at)
+        SELECT ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ? WHERE ${gate}
         ON CONFLICT (workspace_id) DO UPDATE SET customer_id = COALESCE(customer_id, excluded.customer_id),
           subscription_id = excluded.subscription_id, subscription_status = excluded.subscription_status, plan = excluded.plan,
-          current_period_end = COALESCE(excluded.current_period_end, current_period_end),
+          current_period_end = COALESCE(excluded.current_period_end, current_period_end), cancel_at = excluded.cancel_at,
           last_event_at = MAX(last_event_at, excluded.last_event_at), updated_at = excluded.updated_at`)
-        .bind(ws, c.provider, c.customerId, c.subscriptionId, c.status, c.plan ?? null, c.periodEnd ?? null, c.eventAt, now, ...gp)
+        .bind(ws, c.provider, c.customerId, c.subscriptionId, c.status, c.plan ?? null, c.periodEnd ?? null, c.cancelAt ?? null, c.eventAt, now, ...gp)
     );
     {
       // After the upsert: applies only if this call recorded the event and the upsert stored this subscription's state.
@@ -116,6 +117,6 @@ export async function linkBillingCustomer(env, workspaceId, provider, customerId
 
 /** Billing row of a workspace (for the app and the billing adapter). */
 export async function workspaceBilling(env, workspaceId) {
-  return env.DB.prepare("SELECT provider, customer_id, subscription_id, subscription_status, plan, current_period_end, suspended_by_billing FROM workspace_billing WHERE workspace_id = ?")
+  return env.DB.prepare("SELECT provider, customer_id, subscription_id, subscription_status, plan, current_period_end, cancel_at, suspended_by_billing FROM workspace_billing WHERE workspace_id = ?")
     .bind(workspaceId).first();
 }

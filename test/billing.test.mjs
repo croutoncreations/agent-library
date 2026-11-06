@@ -115,3 +115,15 @@ test("a first payment that never completed doesn't suspend; unpaid then cancelle
   await lib.applyBillingChange(env, ev({ subscriptionId: "sub_9", status: "canceled", plan: "pro" }));
   assert.deepEqual(ws(sql), { status: "active", plan: "free" });
 });
+
+test("a scheduled cancellation is recorded (cancel_at) and cleared when resumed", async () => {
+  const { env } = mkDB();
+  await lib.applyBillingChange(env, ev({ status: "active", plan: "pro", periodEnd: 2e12 }));
+  assert.equal((await lib.workspaceBilling(env, "wsp_team")).cancel_at, null);
+  await lib.applyBillingChange(env, ev({ status: "active", plan: "pro", periodEnd: 2e12, cancelAt: 2e12 }));
+  assert.equal((await lib.workspaceBilling(env, "wsp_team")).cancel_at, 2e12);
+  // Resumed in the portal: the next state has no cancellation.
+  await lib.applyBillingChange(env, ev({ status: "active", plan: "pro", periodEnd: 2e12 }));
+  assert.equal((await lib.workspaceBilling(env, "wsp_team")).cancel_at, null);
+  await assert.rejects(lib.applyBillingChange(env, ev({ status: "active", plan: "pro", cancelAt: -5 })), /bad cancelAt/);
+});

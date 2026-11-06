@@ -47,7 +47,8 @@ export const unlimited = {
    */
   async limits() { return {}; },
   /**
-   * Billing shown to workspace admins (hosted): null = no billing. Otherwise { plan, status?, period_end?, notice?,
+   * Billing shown to workspace admins (hosted): null = no billing. Otherwise { plan, status?, period_end? (renews),
+   * ends_at? (scheduled to end; then period_end is null), notice?, suspended_reason?,
    * actions: [{ id, label, path }] } where each path is a same-origin POST /api/... route (the installation's own
    * adapter route) that answers { url } to send the browser to (checkout, billing portal).
    */

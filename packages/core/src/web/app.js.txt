@@ -852,11 +852,11 @@ function billingBlock(b) {
   var msg = h("p", { class: "msg", role: "status" });
   var plan = String(b.plan || "free");
   var line = "Plan: " + plan.charAt(0).toUpperCase() + plan.slice(1) + (b.status ? " (" + b.status + ")" : "") +
-    (b.period_end ? " · renews " + new Date(b.period_end).toLocaleDateString() : "");
+    (b.ends_at ? " · ends " + new Date(b.ends_at).toLocaleDateString() : b.period_end ? " · renews " + new Date(b.period_end).toLocaleDateString() : "");
   // When billing suspended the workspace, the reason and the pay button are in the read-only banner instead.
   var buttons = b.suspended_reason ? [] : billingButtons(b, msg);
   return h("div", { class: "billing" }, h("p", { text: line }),
-    b.notice ? h("p", { class: "notice", text: b.notice }) : null,
+    b.notice ? h("p", { class: "notice" + (b.notice_tone === "info" ? " info" : ""), text: b.notice }) : null,
     buttons.length ? h("div", { class: "row" }, buttons) : null, msg);
 }
 // Plan usage (hosted installations with plan limits). Nothing is shown when the workspace has no limits.
