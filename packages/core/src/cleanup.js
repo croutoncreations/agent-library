@@ -31,6 +31,8 @@ async function reconcileUploads(env, opts = {}) {
     const r = await DB.prepare("UPDATE uploads SET final_purged_at = ? WHERE id = ? AND final_purged_at IS NULL").bind(now, u.id).run();
     purgedFinal += r.meta.changes ? 1 : 0;
   }
+  // rate_counters.win is a minute number. Only past windows are deleted: longer counters (hosted daily email caps) use
+  // the minute their period ends, so keep this "older than" and never delete future windows.
   await DB.prepare("DELETE FROM rate_counters WHERE win < ?").bind(Math.floor(now / 6e4) - 2).run();
   await DB.prepare("DELETE FROM transfer_links WHERE expires_at < ?").bind(now).run().catch(() => {
   });

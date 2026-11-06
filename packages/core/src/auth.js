@@ -19,6 +19,7 @@ async function rateLimit(env, key, limit) {
   const n = await env.DB.prepare(
     "INSERT INTO rate_counters (k, win, n) VALUES (?, ?, 1) ON CONFLICT (k, win) DO UPDATE SET n = n + 1 RETURNING n"
   ).bind(key, win).first("n");
+  // Past windows only (see cleanup.js: longer counters use the minute their period ends).
   if (Math.random() < 0.02) await env.DB.prepare("DELETE FROM rate_counters WHERE win < ?").bind(win - 2).run();
   if ((n ?? 0) > limit)
     throw new HttpError(429, "rate_limited", "Too many requests; slow down", { retry_after_seconds: 60 - Math.floor(now % 6e4 / 1e3) });
