@@ -1,7 +1,7 @@
 {
-  "base_read_fixes_sha256": "7a43cd26079cd727ae39c79a70f338d1a0e834121fc61bde574218cd8ed3c519",
-  "integrated_sha256": "11e993ece24a938aaf6e270b8a85a0fe6ab49075d9efadabe706d05cc37c4696",
-  "preserved_outside_patches_sha256": "dcf10069a8b81333a3b177835cd9ef07a79692e2c4c501e503b52a535aa9c69f",
+  "base_read_fixes_sha256": "c80f95dd7421b237578410c0cd348e5af04df4aa750008888a8b52e8ac28e46f",
+  "integrated_sha256": "8a50db97bb47c50772be5dac63bb75bfaa14eb6ac3f43c40158cb733b8f80765",
+  "preserved_outside_patches_sha256": "677d0fdad05bb4ba2410af45129d8953d8af06efa8ce9235921598c7db741a78",
   "module_sha256": "b7f6dfbb13fb82860fdffaef02a7aa5a9161c668bb09dc1d5886a99964546ef7",
   "patches": [
     {

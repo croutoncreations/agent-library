@@ -143,7 +143,8 @@
       return {
         replaceChildren: function () { if (into._req === req) into.replaceChildren.apply(into, arguments); },
         // A failed comparison clears the picker, so choosing the same version again retries it.
-        failed: function (node) { if (into._req !== req) return; into.replaceChildren(node); if (picker) picker.value = ""; }
+        // (req !== bodyReq: a version opened since then has its own picker, which this must not touch.)
+        failed: function (node) { if (into._req !== req || req !== bodyReq) return; into.replaceChildren(node); if (picker) picker.value = ""; }
       };
     }
     // "Compare with" picker: every other loaded version, newest first; refilled when older pages load.
