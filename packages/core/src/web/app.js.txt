@@ -947,9 +947,15 @@ function toggleProjectSettings(pid, opener) {
 }
 // Shown once after creating an invitation. Like secretBox: copy can fail (plain HTTP, denied permission).
 function inviteLinkBox(box, r, onDone) {
-  var note = h("span", { class: "muted small", id: "invite-link-note", text: (r.emailed ? "We've emailed this invitation to " + r.email + ". You can also send the link yourself: it" : "Send this link to " + r.email + ". It") + " works once, only for someone signed in as " + r.email + ", until " + fmtDate(r.expires_at) + ". It isn't shown again." });
+  // Hosted emails the link; the page says whether that worked, and always offers the link too.
+  var until = new Date(r.expires_at).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+  var rules = "It works once, only for someone signed in as " + r.email + ", until " + until + ". You won't see it again.";
+  var first = r.emailed ? "We've emailed this invitation to " + r.email + ". You can also send the link yourself."
+    : r.email_failed ? "Send this link to " + r.email + " yourself." : "Send this link to " + r.email + ".";
+  var note = h("span", { class: "muted small", id: "invite-link-note" }, first, h("br"), rules);
+  var failed = r.email_failed ? h("div", { class: "callout warn", role: "alert", style: "margin:8px 0" }, icon("alert"), h("div", { text: "We couldn't email this invitation. Copy the link below and send it yourself." })) : null;
   var link = h("input", { class: "token", type: "text", readOnly: true, value: r.accept_url, "aria-label": "Invitation link", "aria-describedby": "invite-link-note" });
-  box.replaceChildren(h("p", null, h("strong", { text: "Invitation for " + r.email + " (" + ROLE_LABEL[r.role] + ")" }), h("br"), note), link,
+  box.replaceChildren(h("p", null, h("strong", { text: "Invitation for " + r.email + " (" + ROLE_LABEL[r.role] + ")" }), h("br"), failed, note), link,
     h("div", { class: "row" }, h("button", { type: "button", onclick: function () {
       link.select();
       if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(link.value).then(function () { toast("Link copied"); }, function () { toast("Copy failed; select the link and copy it manually"); });

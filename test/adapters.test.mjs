@@ -152,14 +152,14 @@ test("adapter route RegExps with g/y flags are rejected (lastIndex would leak be
   assert.throws(() => W.createWorker({ routes: [{ path: /^\/x$/g, handler: async () => new Response("") }] }), /g or y/);
 });
 
-test("notify returns the hook's result, or null when there's no hook or it fails", async () => {
+test("notify returns the hook's result: null with no hook, { hookFailed } when it throws", async () => {
   const env = W.withAdapters({}, W.resolveAdapters({ lifecycle: { inviteCreated: async () => ({ emailed: true }) } }));
   assert.deepEqual(await W.notify(env, "inviteCreated", {}), { emailed: true });
   assert.equal(await W.notify(W.withAdapters({}, W.resolveAdapters({})), "inviteCreated", {}), null);
   const orig = console.error; console.error = () => {};
   try {
     const bad = W.withAdapters({}, W.resolveAdapters({ lifecycle: { inviteCreated: async () => { throw new Error("x"); } } }));
-    assert.equal(await W.notify(bad, "inviteCreated", {}), null);
+    assert.deepEqual(await W.notify(bad, "inviteCreated", {}), { hookFailed: true });
   } finally { console.error = orig; }
 });
 

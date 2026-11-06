@@ -58,7 +58,10 @@ export const unlimited = {
 export const noLifecycle = {
   async workspaceCreated() {},
   async workspaceDeleted() {},
-  /** An invitation was created; acceptUrl is the one-time link. Return { emailed: true } if it was sent (hosted). */
+  /**
+   * An invitation was created; acceptUrl is the one-time link. Hosted returns { emailed: true } if it was sent, or
+   * { emailed: false, failed: true } if sending was expected but didn't happen (the page then says so).
+   */
   async inviteCreated() {}
 };
 
@@ -95,7 +98,8 @@ export const defaultAdapters = () => RESOLVED_DEFAULTS;
 /**
  * Run a lifecycle hook after the change is committed. Hooks never undo the core operation, and are capped at
  * HOOK_MS so a slow provider can't hold the response. Arguments can carry secrets (an invitation's one-time link),
- * so only the error's name is logged. Returns the hook's result, or null if it failed or timed out.
+ * so only the error's name is logged. Returns the hook's result (null if none), or { hookFailed: true } if it threw or
+ * timed out.
  */
 export const HOOK_MS = 5000;
 export async function notify(env, hook, ...args) {
@@ -104,6 +108,6 @@ export async function notify(env, hook, ...args) {
   let timer;
   try {
     return (await Promise.race([Promise.resolve().then(() => fn(env, ...args)), new Promise((_, rej) => { timer = setTimeout(() => rej(Object.assign(new Error("timeout"), { name: "HookTimeout" })), HOOK_MS); })])) ?? null;
-  } catch (e) { console.error("lifecycle_hook_failed", hook, e?.name ?? "Error"); return null; }
+  } catch (e) { console.error("lifecycle_hook_failed", hook, e?.name ?? "Error"); return { hookFailed: true }; }
   finally { clearTimeout(timer); }
 }

@@ -70,7 +70,7 @@ The modules were recovered mechanically from the previous byte-pinned bundle (Ph
 | `entitlements.limits(env, {workspaceId} \| {principalId})` | None | `planEntitlements` (`PLAN_LIMITS`; [limits.md](limits.md)) | None |
 | `lifecycle`: `workspaceCreated`, `workspaceDeleted`, `inviteCreated` | None | Billing customer, invitation email | None |
 | `routes`: `{ method?, path, handler }` | None | Billing, sign-up, legal pages | None |
-| `mailer.send` | Logs only | SendGrid | Logs only |
+| `mailer.send` | Logs only | Not used (invitation email is sent by `lifecycle.inviteCreated`, SendGrid) | Logs only |
 
 Not yet adapters (deferred from the plan's interface list): a `KeyProvider` (per-workspace encryption; the seam is `content-store.js`, docs/encryption.md), an external `AuditSink`/metrics (phase 5; audits stay in D1), UI slots such as settings tabs (phase 3/4, with the hosted billing UI) and a `workspaceSuspended` hook (core has no suspend operation yet). Core doesn't call `mailer` yet; hosted mail is sent from lifecycle hooks. The plan's `createWorker(config, adapters)` became `createWorker(adapters)`: configuration stays in Worker vars.
 

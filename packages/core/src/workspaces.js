@@ -215,7 +215,9 @@ export async function createInvite(ctx, id, input, origin) {
   const accept_url = `${origin}/invite/${token}`;
   const sent = await notify(ctx.env, "inviteCreated", { id: inviteId, workspaceId: id, email, role: r, acceptUrl: accept_url, by: ctx.principal.id, expiresAt: expires });
   // The link is always returned too: email can be delayed, filtered or (self-host) not configured.
-  return { id: inviteId, email, role: r, expires_at: new Date(expires).toISOString(), accept_url, emailed: sent?.emailed === true };
+  const emailed = sent?.emailed === true;
+  return { id: inviteId, email, role: r, expires_at: new Date(expires).toISOString(), accept_url, emailed,
+    email_failed: !emailed && (sent?.failed === true || sent?.hookFailed === true) };
 }
 
 export async function revokeInvite(ctx, id, inviteId) {
