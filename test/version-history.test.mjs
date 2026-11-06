@@ -378,6 +378,15 @@ test("browser: History shows who/why, groups autosave bursts, compares, restores
     assert.equal(await burstToggle.evaluate((b) => b.getAttribute("aria-expanded")), "true");
     await page.click('.vh-row[data-rev="6"] button');
     await page.waitForFunction(() => [...document.querySelectorAll(".vh-detail button")].some((b) => b.textContent === "Restore this version"));
+    // An older version opens compared with current; the picker compares it with any other version instead.
+    await page.waitForFunction(() => /Current \(v7\) compared with v6 · 1 added, 0 removed/.test(document.querySelector(".vh-body").textContent));
+    assert.equal(await page.$eval(".vh-compare", (s) => s.value), "7");
+    assert.deepEqual((await page.$$eval(".vh-compare option:not([hidden])", (os) => os.map((o) => o.value))), ["7", "5", "4", "3", "2", "1"]);
+    assert.match(await page.$eval('.vh-compare option[value="5"]', (o) => o.textContent), /^v5 \(previous\)/);
+    assert.equal(await page.$eval('label[for="vh-compare-6"]', (l) => l.textContent), "Compare with");
+    assert.equal(await page.evaluate(() => [...document.querySelectorAll(".vh-detail button")].some((b) => /Compare with current|What changed in/.test(b.textContent))), false);
+    await page.select(".vh-compare", "2");
+    await page.waitForFunction(() => /Changes from v2 to v6 · 1 added, 1 removed/.test(document.querySelector(".vh-body").textContent));
     await page.evaluate(() => [...document.querySelectorAll(".vh-detail button")].find((b) => b.textContent === "Restore this version").click());
     await page.waitForFunction(() => /Restored version 6 as version 8/.test(document.querySelector(".vh .msg").textContent));
     assert.equal((await owner.req("GET", docUrl(id))).body.body, "start\nedit 5");
