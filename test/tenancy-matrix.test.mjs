@@ -214,6 +214,7 @@ test("other workspace: every write surface is refused for every credential type 
 test("idempotency replay does not outlive a demotion (API key and OAuth)", async () => {
   // Invite the owner into A so their OAuth agent can write there, then demote and replay.
   const inv = ok(await bob.req("POST", `/api/workspaces/${WSA}/invites`, { email: "owner@example.test", role: "member" }), 201);
+  assert.equal(inv.emailed, false, "no mail adapter: the invitation says it wasn't emailed (link only)");
   ok(await owner.req("POST", "/api/invites/accept", { token: inv.accept_url.split("/").pop() }));
   cred.oauthA = await h.connectMcpAgent({ [A.project]: "write" }, { clientName: "Owner agent A" });
   // Key write with K, then bob (the key's creator) is capped to viewer on that project; replaying K must not return

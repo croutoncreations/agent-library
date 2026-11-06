@@ -76,7 +76,9 @@ shared workspace exists, or accept this for the rollback window.
   (admin+; can't remove or demote the last owner; admins can't change owners; anyone may remove themselves except
   the last owner).
 - `GET|POST /api/workspaces/:id/invites` `{email, role}` (admin+); `POST …/invites/:id/revoke`. Creating an invite
-  returns the accept link once (the token is never shown again). Hosted sends it by email; self-host shows it to copy.
+  returns the accept link once (the token is never shown again) and `emailed`: true if the installation's
+  `inviteCreated` hook sent it (hosted, SendGrid). The link is always returned too, so it can be copied if the email is
+  late or filtered; self-host (no hook) shows it to copy.
 - `POST /api/invites/accept` `{token}`: the signed-in user's verified email must match. Single use, ≤ 14 days.
 - `GET /api/projects` returns projects from every workspace I can see, each with `workspace_id` and `path`;
   `POST /api/projects` takes `workspace_id` (default: my personal workspace) and optional `slug`;

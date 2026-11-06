@@ -213,8 +213,9 @@ export async function createInvite(ctx, id, input, origin) {
   // The link is returned once. It is a path (not a #fragment) so it survives a sign-in redirect; the token alone
   // grants nothing (signed-in, verified matching email, single use, <= 14 days). Hosted delivery emails it.
   const accept_url = `${origin}/invite/${token}`;
-  await notify(ctx.env, "inviteCreated", { id: inviteId, workspaceId: id, email, role: r, acceptUrl: accept_url, by: ctx.principal.id });
-  return { id: inviteId, email, role: r, expires_at: new Date(expires).toISOString(), accept_url };
+  const sent = await notify(ctx.env, "inviteCreated", { id: inviteId, workspaceId: id, email, role: r, acceptUrl: accept_url, by: ctx.principal.id, expiresAt: expires });
+  // The link is always returned too: email can be delayed, filtered or (self-host) not configured.
+  return { id: inviteId, email, role: r, expires_at: new Date(expires).toISOString(), accept_url, emailed: sent?.emailed === true };
 }
 
 export async function revokeInvite(ctx, id, inviteId) {

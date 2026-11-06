@@ -152,6 +152,17 @@ test("adapter route RegExps with g/y flags are rejected (lastIndex would leak be
   assert.throws(() => W.createWorker({ routes: [{ path: /^\/x$/g, handler: async () => new Response("") }] }), /g or y/);
 });
 
+test("notify returns the hook's result, or null when there's no hook or it fails", async () => {
+  const env = W.withAdapters({}, W.resolveAdapters({ lifecycle: { inviteCreated: async () => ({ emailed: true }) } }));
+  assert.deepEqual(await W.notify(env, "inviteCreated", {}), { emailed: true });
+  assert.equal(await W.notify(W.withAdapters({}, W.resolveAdapters({})), "inviteCreated", {}), null);
+  const orig = console.error; console.error = () => {};
+  try {
+    const bad = W.withAdapters({}, W.resolveAdapters({ lifecycle: { inviteCreated: async () => { throw new Error("x"); } } }));
+    assert.equal(await W.notify(bad, "inviteCreated", {}), null);
+  } finally { console.error = orig; }
+});
+
 test("a hanging lifecycle hook is cut off and logs no details", async () => {
   const logs = []; const orig = console.error; console.error = (...a) => logs.push(a.join(" "));
   const realSet = globalThis.setTimeout; globalThis.setTimeout = (f) => realSet(f, 5);
