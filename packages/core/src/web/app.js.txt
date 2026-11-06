@@ -951,7 +951,7 @@ function inviteLinkBox(box, r, onDone) {
   var until = new Date(r.expires_at).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
   var rules = "It works once, only for someone signed in as " + r.email + ", until " + until + ". You won't see it again.";
   var first = r.emailed ? "We've emailed this invitation to " + r.email + ". You can also send the link yourself."
-    : r.email_failed ? "Send this link to " + r.email + " yourself." : "Send this link to " + r.email + ".";
+    : r.email_failed ? "Only " + r.email + " can use it." : "Send this link to " + r.email + ".";
   var note = h("span", { class: "muted small", id: "invite-link-note" }, first, h("br"), rules);
   var failed = r.email_failed ? h("div", { class: "callout warn", role: "alert", style: "margin:8px 0" }, icon("alert"), h("div", { text: "We couldn't email this invitation. Copy the link below and send it yourself." })) : null;
   var link = h("input", { class: "token", type: "text", readOnly: true, value: r.accept_url, "aria-label": "Invitation link", "aria-describedby": "invite-link-note" });
