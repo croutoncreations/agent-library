@@ -1,8 +1,8 @@
 {
-  "base_portability_fixes_sha256": "208a096fdefe49889ff1fcc7f60b18023d2ea4299c27677e3588fd380c5d0ae4",
-  "integrated_sha256": "fcd84560e2c3f06c43220c735dbd59884d112024c9c46f12357fe5d9c4cdf6ba",
+  "base_portability_fixes_sha256": "960d0146c5e3faa9c25d982b7e1eae01b8b095736be21de28f755a5e954ce14d",
+  "integrated_sha256": "99e4bbefa3b1aaae3af0a607bc692736f2ed642477670e2bbff04f44fd7d0d58",
   "preserved_prefix_sha256": "19b50260e0a355db6335b5fb3358991cc0fe18baccba220c8a5635858f31a95f",
-  "preserved_suffix_before_label_sha256": "fe1f36ae27c5650d3cc0430c9de868727cc79f5310345105835435cafcc8ee89",
+  "preserved_suffix_before_label_sha256": "83f93adf94f7fd6f7bbdadb750795587fdce58101c7998aad255fdb7cf21f616",
   "preserved_suffix_after_label_sha256": "e8c5313347fa2bb68967cda40d5afc2cb8fdd3e6e6d5749ebd924a4f3e0cf854",
   "ui_expiry_label_sha256": "5edfbd9261a14a03da256d0c5632db6aff04bd8f8676730b060595a37ccfde7f",
   "oauth_server_module_sha256": {
