@@ -70,9 +70,9 @@ Measured worst case is about 8 ms CPU for a 1 MiB rewrite; a typical edit takes 
 
 - One timeline: content versions (`v7`) then a "Title, folder and tags" section (`d3`), each with who, badge, "via <client>", relative time, size change, restored-from, and the change note.
 - Three or more consecutive autosaves of yours within 10 minutes (no note, not a restore) collapse into "v1–6 · You · N edits"; expandable. Agent and app versions are never grouped.
-- Opening a version shows its diff (current: what changed in it; older: against current), "Restore this version", "Compare with current", "What changed in vN", "Show full text" and a copy-link button.
+- Opening a version shows its diff (older: against current, so you see how it differs before restoring; current: what changed in it), "Restore this version", a "Compare with" picker listing every other loaded version (current and previous are labelled; the diff always reads older → newer), "Show full text" and a copy-link button.
 - Data files: CSV versions show the same line diff. JSON versions are compared by value instead: each added, removed or changed value is listed by path (`$.limits.rows 50000 → 100000`), so one-line minified JSON and formatting-only edits read correctly. The JSON comparison runs in the browser on the two versions' text and lists at most 300 changes. "Preview vN" shows that version as a table or tree.
-- Deep link `/p/:p/a/:a?v=N` (also the `version_url` agents get) opens the History tab on that version, through sign-in.
+- Deep link `/p/:p/a/:a?v=N` (also the `version_url` agents get) opens the History tab on that version, through sign-in, showing what that version changed (so it matches the agent's note).
 
 ## Not done / follow-ups
 

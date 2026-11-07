@@ -1,7 +1,7 @@
 {
-  "base_review_sha256": "8058a319758596e8704f5fff99e89f343f61ab79de9bb03746774628564172f7",
-  "integrated_sha256": "eca73a3934a1447dd673d8c8056ef85f69abb03d5a897cf2ad56e1e9125733ad",
-  "preserved_outside_patches_sha256": "96bb5e7ded3c6292b4b8472956c4cecff86d64e2d0ee9cb36e32bfce9bb987eb",
+  "base_review_sha256": "595c44d89630cc4b875a12bfe20436b799ae0a60b02c51bf8c8ab0773b923bf2",
+  "integrated_sha256": "c2bdaaa0da8476563b82d7b30769518513bb2635143d54233acf17cf09da3720",
+  "preserved_outside_patches_sha256": "9c4e350196e37b4873fe631af16ce1cfa60b678cb8a60a482101f2ddc2fe1c96",
   "sources_sha256": {
     "src/offline/sw.js": "39be06884dccc421a5b49f3b03e5c3a888398bb1a88a316e34630a95516961b3",
     "src/offline/boot.js": "fbcf81b45e91eefcc204a71b173540d054f700739aaca72fd16c7ac8a87c0088",

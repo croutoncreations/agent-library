@@ -1,6 +1,6 @@
 {
-  "base_app_connect_fixes_sha256": "d22972f73386e5cffce029ad0fce2d3b649c4f5eb743c7cb040fb7e5bc82044f",
-  "integrated_sha256": "97d64b132fb2154a690dbdadccefce91a7f4c100b86fb3e8777be7fee7b3195a",
+  "base_app_connect_fixes_sha256": "d3caf3714f1329aae3aac7d596f5d25a990bfceaeabd22d61bfcd51aae2293bb",
+  "integrated_sha256": "c80f95dd7421b237578410c0cd348e5af04df4aa750008888a8b52e8ac28e46f",
   "sources_sha256": {
     "service.js": "aa8ce47b2a58a675b23714df6747a47bed232233da3f890c2e70db4a02391217",
     "v1-route.js": "e6a8c0ee65a03b32ca8dc11fb7ea415fec4999ff05e286cbed0530638da0ab22"

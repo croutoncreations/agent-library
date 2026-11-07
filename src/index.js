@@ -12915,6 +12915,10 @@ details summary:hover{color:var(--fg)}
 .vh-head{display:flex;align-items:center;gap:8px}
 .vh-head h2{margin:0;scroll-margin-top:calc(var(--top-h) + 8px);scroll-margin-bottom:calc(var(--tab-h) + 16px)}
 .vh-body{margin-top:12px}
+.vh-compare-field{display:inline-flex;align-items:center;gap:8px;min-width:0;max-width:100%}
+.vh-compare-field label{white-space:nowrap}
+@media (pointer:coarse){.vh-compare{min-height:44px}}
+.vh-compare{min-width:0;max-width:min(22rem,100%);flex:1 1 auto;cursor:pointer}
 .vh-diff{font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--card);border:1px solid var(--line);border-radius:var(--r2);overflow:auto;max-height:60vh}
 .vh-diff:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .vh-line{display:grid;grid-template-columns:3.5em 3.5em 1.5em minmax(0,1fr);white-space:pre-wrap;overflow-wrap:anywhere}
@@ -15454,6 +15458,7 @@ async function viewArtifact(pid, aid, initialTab) {
         // A requested version older than the loaded pages: keep paging until it is loaded (or the history ends).
         while (!again && openRev && cursor && !revs.some(function (x) { return x.rev === openRev; }) && openRev < revs[revs.length - 1].rev) await fetchPage(true);
         draw();
+        if (again) fillPicker();
         if (openRev && !again) await open(openRev, true);
       } catch (err) { list.removeAttribute("aria-busy"); showErr(msg, err); }
       finally { loading = false; more.disabled = false; }
@@ -15461,11 +15466,39 @@ async function viewArtifact(pid, aid, initialTab) {
     more.onclick = function () { load(true); };
     function link(n) { return docUrl(pid, aid) + "?v=" + n; }
     function busy(btn, on) { if (btn) btn.disabled = on; }
+    // Only the latest request may fill the version panel's body: a slow earlier comparison never overwrites a newer one.
+    var bodyReq = 0;
+    function claim(into) {
+      var req = into._req = ++bodyReq;
+      return {
+        replaceChildren: function () { if (into._req === req) into.replaceChildren.apply(into, arguments); },
+        // A failed comparison clears the picker, so choosing the same version again retries it.
+        // (req !== bodyReq: a version opened since then has its own picker, which this must not touch.)
+        failed: function (node) { if (into._req !== req || req !== bodyReq) return; into.replaceChildren(node); if (picker) picker.value = ""; }
+      };
+    }
+    // "Compare with" picker: every other loaded version, newest first; refilled when older pages load.
+    var picker = null, linkRev = null;
+    function fillPicker() {
+      if (!picker) return;
+      var n = picker._rev, keep = picker.value;
+      var opts = [h("option", { value: "", disabled: true, hidden: true, text: "Choose a version" })];
+      revs.forEach(function (x) {
+        if (x.rev === n) return;
+        var tag = x.rev === A.rev ? " (current)" : x.rev === n - 1 ? " (previous)" : "";
+        opts.push(h("option", { value: String(x.rev), text: "v" + x.rev + tag + " · " + (x.who || "Unknown") + ", " + ago(x.created_at) }));
+      });
+      // The default (e.g. the previous version of a deep-linked one) may sit on a page that isn't loaded yet.
+      var want = picker._want;
+      if (want && want !== n && !revs.some(function (x) { return x.rev === want; })) opts.push(h("option", { value: String(want), text: "v" + want + (want === n - 1 ? " (previous)" : "") }));
+      picker.replaceChildren.apply(picker, opts);
+      picker.value = keep;
+    }
     async function open(n, quiet) {
       var v = revs.filter(function (x) { return x.rev === n; })[0];
       if (!v) {
         // load() pages back to any existing version first, so a miss here means it never existed.
-        openRev = null; draw();
+        openRev = linkRev = null; draw();
         detail.replaceChildren(h("p", { class: "msg error", role: "alert", text: "Version " + n + " doesn't exist for this document." }));
         return;
       }
@@ -15476,24 +15509,43 @@ async function viewArtifact(pid, aid, initialTab) {
         h("span", { class: "icons" }, copyIcon("link", "Copy link to this version", function () { return link(n); })));
       var body = h("div", { class: "vh-body" });
       var actions = h("div", { class: "row" });
+      var diffable = isTextDoc(A.meta.kind) || isDataKind(A.meta.kind);
+      // Default comparison: an older version against the current one (what restoring it would change). The current
+      // version, and a version opened from its link (an agent's version_url), show what that version changed.
+      var fromLink = linkRev === n; if (!fromLink) linkRev = null;
+      var against = n !== A.rev && !fromLink ? A.rev : n > 1 ? n - 1 : null;
       var rvMark = rvMarkButton(A, v, function () { load(); });
       if (rvMark) actions.append(rvMark);
       if (n !== A.rev) actions.append(h("button", { type: "button", onclick: function (e) { restoreRev(n, e.currentTarget); } }, "Restore this version"));
-      if (n > 1) actions.append(h("button", { type: "button", class: "secondary", onclick: function () { showDiff(n - 1, n, body); } }, "What changed in v" + n));
-      if (n !== A.rev) actions.append(h("button", { type: "button", class: "secondary", onclick: function () { showDiff(n, A.rev, body); } }, "Compare with current"));
-      if (isDataKind(A.meta.kind)) actions.append(h("button", { type: "button", class: "ghost", onclick: function () { body.replaceChildren(mediaFor(v.mime, base + "/content?rev=" + n, A.meta.title, "v" + n)); } }, "Preview v" + n));
-      if (isTextDoc(A.meta.kind) || isDataKind(A.meta.kind)) actions.append(h("button", { type: "button", class: "ghost", onclick: function () { showSource(n, body); } }, "Show full text"));
+      picker = null;
+      if (diffable && revs.length > 1) {
+        var pickId = "vh-compare-" + n;
+        picker = h("select", { id: pickId, class: "vh-compare" });
+        picker._rev = n; picker._want = against;
+        fillPicker();
+        picker.value = against ? String(against) : "";
+        picker.onchange = function () { if (picker.value) showDiff(Number(picker.value), n, body); };
+        actions.append(h("span", { class: "vh-compare-field" }, h("label", { for: pickId, class: "muted small", text: "Compare with" }), picker));
+      }
+      // Other views of the body clear the picker, so choosing the same version again compares again.
+      var other = function (fn) { return function () { if (picker) picker.value = ""; fn(); }; };
+      if (isDataKind(A.meta.kind)) actions.append(h("button", { type: "button", class: "ghost", onclick: other(function () { claim(body).replaceChildren(mediaFor(v.mime, base + "/content?rev=" + n, A.meta.title, "v" + n)); }) }, "Preview v" + n));
+      if (diffable) actions.append(h("button", { type: "button", class: "ghost", onclick: other(function () { showSource(n, body); }) }, "Show full text"));
       // replaceChildren() would print a null argument as the text "null"; pass only real nodes.
       var parts = [head, h("p", { class: "muted small" }, whoLine(v, fmtDate(v.created_at)))];
       if (note(v)) parts.push(h("p", null, note(v)));
       parts.push(actions, body);
       detail.replaceChildren.apply(detail, parts);
-      // Default view: what this version changed (matches its note); "Compare with current" is one tap away.
-      if (isTextDoc(A.meta.kind) || isDataKind(A.meta.kind)) await showDiff(Math.max(1, n - 1), n, body);
-      else body.append(mediaFor(v.mime, base + "/content?rev=" + n, A.meta.title));
+      // Any other version is one pick away.
+      if (diffable) await showDiff(against || n, n, body);
+      else claim(body).replaceChildren(mediaFor(v.mime, base + "/content?rev=" + n, A.meta.title));
       if (!quiet || VH.focusOnOpen) { title.focus({ preventScroll: true }); title.scrollIntoView({ block: "start", behavior: "smooth" }); VH.focusOnOpen = false; }
     }
-    async function showDiff(from, to, into) {
+    // An older version opened and compared with current reads as such; anything else as a plain range.
+    function caption(from, to) { return to === A.rev && openRev === from ? "Current (v" + to + ") compared with v" + from : "Changes from v" + from + " to v" + to; }
+    // Always diffs older → newer, so additions read the same way whichever version was picked.
+    async function showDiff(a, b, body) {
+      var into = claim(body), from = Math.min(a, b), to = Math.max(a, b);
       if (from === to) { into.replaceChildren(h("p", { class: "muted", text: "This is the first version." })); return; }
       into.replaceChildren(h("p", { class: "muted", text: "Comparing…" }));
       if (A.meta.kind === "json") return showJsonDiff(from, to, into);
@@ -15503,7 +15555,7 @@ async function viewArtifact(pid, aid, initialTab) {
     async function showLineDiff(from, to, into, note) {
       try {
         var d = await api("GET", base + "/diff?from=" + from + "&to=" + to);
-        var what = to === A.rev && from !== to - 1 ? "Current (v" + to + ") compared with v" + from : "Changes from v" + from + " to v" + to;
+        var what = caption(from, to);
         var cap = h("p", { class: "muted small", text: (note ? note + " " : "") + what + (d.identical ? " · identical" : d.binary ? " · file changed (" + fmtBytes(d.from.size) + " → " + fmtBytes(d.to.size) + ")" : d.too_many_lines ? " · too many lines to compare here (" + fmtBytes(d.from.size) + " → " + fmtBytes(d.to.size) + "); use Show full text" : " · " + d.added + " added, " + d.removed + " removed" + (d.truncated ? " (large change: partly shown)" : "")) });
         if (d.binary || d.identical || d.too_many_lines) { into.replaceChildren(cap); return; }
         var pre = h("div", { class: "vh-diff", role: "group", tabindex: "0", "aria-label": what });
@@ -15522,7 +15574,7 @@ async function viewArtifact(pid, aid, initialTab) {
           });
         });
         into.replaceChildren(cap, pre);
-      } catch (err) { into.replaceChildren(h("p", { class: "msg error", role: "alert", text: "Couldn't compare: " + err.message })); }
+      } catch (err) { into.failed(h("p", { class: "msg error", role: "alert", text: "Couldn't compare: " + err.message })); }
     }
     // JSON: compare values by path (minified JSON is often one line, so a line diff would only say "everything").
     // Built with text nodes only; bounded by jsonChanges' cap. Falls back to the line diff when a side isn't valid
@@ -15535,7 +15587,7 @@ async function viewArtifact(pid, aid, initialTab) {
         var ra = await api("GET", base + "?rev=" + from), rb = await api("GET", base + "?rev=" + to);
         var A1, B1;
         try { A1 = jsonParse(ra.content); B1 = jsonParse(rb.content); } catch (e) { return showLineDiff(from, to, into, "One of these versions isn't valid JSON, so this compares lines."); }
-        var what = to === A.rev && from !== to - 1 ? "Current (v" + to + ") compared with v" + from : "Changes from v" + from + " to v" + to;
+        var what = caption(from, to);
         var identical = ra.revision.sha256 === rb.revision.sha256;
         var c = identical ? { list: [], total: 0, incomplete: false } : jsonChanges(A1, B1, 300);
         if (c.incomplete) return showLineDiff(from, to, into, "Too large to compare value by value, so this compares lines.");
@@ -15557,9 +15609,10 @@ async function viewArtifact(pid, aid, initialTab) {
           box.append(row);
         });
         into.replaceChildren(cap, box);
-      } catch (err) { into.replaceChildren(h("p", { class: "msg error", role: "alert", text: "Couldn't compare: " + err.message })); }
+      } catch (err) { into.failed(h("p", { class: "msg error", role: "alert", text: "Couldn't compare: " + err.message })); }
     }
-    async function showSource(n, into) {
+    async function showSource(n, body) {
+      var into = claim(body);
       try { var r = await api("GET", base + "?rev=" + n); into.replaceChildren(h("pre", { class: "raw", tabindex: "0", text: typeof r.body === "string" ? r.body : r.content })); }
       catch (err) { into.replaceChildren(h("p", { class: "msg error", role: "alert", text: "Couldn't load the text: " + err.message })); }
     }
@@ -15605,7 +15658,7 @@ async function viewArtifact(pid, aid, initialTab) {
       var q = /[?&]v=([0-9]{1,9})(?:&|$)/.exec(location.search) || /[?&]v=([0-9]{1,9})(?:&|$)/.exec(location.hash);
       return q ? Number(q[1]) : null;
     }
-    return { root: root, load: function () { return load(false); }, open: function (n) { openRev = n; VH.focusOnOpen = true; }, requestedVersion: requestedVersion, focusOnOpen: false };
+    return { root: root, load: function () { return load(false); }, open: function (n) { openRev = linkRev = n; VH.focusOnOpen = true; }, requestedVersion: requestedVersion, focusOnOpen: false };
   })();
   // history (previous list, kept for its view/restore helpers)
   var histMsg = h("p", { class: "msg", role: "status" }), histList = h("ul", { class: "list" }), histView = h("div");

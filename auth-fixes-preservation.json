@@ -1,9 +1,9 @@
 {
-  "base_portability_fixes_sha256": "208a096fdefe49889ff1fcc7f60b18023d2ea4299c27677e3588fd380c5d0ae4",
-  "integrated_sha256": "fcd84560e2c3f06c43220c735dbd59884d112024c9c46f12357fe5d9c4cdf6ba",
+  "base_portability_fixes_sha256": "2930b27d5fef0cb7e04bcaf3eba5f208063e5dc523991061594b63142e55a594",
+  "integrated_sha256": "426f8aab2d895c8315a9b0d25f99e4d4fc53c1371c15a8510553da0436c6b30e",
   "preserved_prefix_sha256": "19b50260e0a355db6335b5fb3358991cc0fe18baccba220c8a5635858f31a95f",
-  "preserved_suffix_before_label_sha256": "fe1f36ae27c5650d3cc0430c9de868727cc79f5310345105835435cafcc8ee89",
-  "preserved_suffix_after_label_sha256": "e8c5313347fa2bb68967cda40d5afc2cb8fdd3e6e6d5749ebd924a4f3e0cf854",
+  "preserved_suffix_before_label_sha256": "073d61cb7f680a8453c6897e76dad7c57098e1e989344cbf0941edfde8d001e7",
+  "preserved_suffix_after_label_sha256": "5fcf603c2294f4a5b3f3b72036da952371f1d6587cb097b340d3db9dc3175b49",
   "ui_expiry_label_sha256": "5edfbd9261a14a03da256d0c5632db6aff04bd8f8676730b060595a37ccfde7f",
   "oauth_server_module_sha256": {
     "base": "832b0a78fab4b7f480cb5b76a5721b39a1b84157ce37a953e696ad9d131eb072",
