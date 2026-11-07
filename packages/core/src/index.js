@@ -19,6 +19,7 @@ import { listAccess, listConnections, revokeConnection, revokeConnectionById } f
 import { handleFileTransfer } from "./oauth/mcp.js";
 import { handleOAuthHost, originFor } from "./oauth/server.js";
 import { servePwa } from "./pwa.js";
+import { deleteProject, listDeletedProjects, purgeDueProjects, purgeProjectNow, restoreProject } from "./project-deletion.js";
 import { acceptInvite, createInvite, createWorkspace, deleteWorkspace, listMembers, listWorkspaces, multiUser, previewInvite, removeMember, revokeInvite, setMemberRole, updateWorkspace } from "./workspaces.js";
 import { __name } from "./runtime.js";
 import { IMAGE_TYPES, VIDEO_TYPES, addComment, appConnectEnabled, chQuery, cleanupChanges, createFile, createFolder, createFromTemplate, createGrant, createMarkdown, createProject, updateProject, diffRevisions, getArtifact, history, listArtifacts, listAudit, listChanges, listComments, listFolders, listGrants, listProjects, listTemplates, metaHistory, previewTemplate, readRecords, readTextChunk, requireAppConnect, restoreMetadata, restoreRevision, rsQuery, rsReady, rtQuery, saveAsTemplate, saveFile, saveMarkdown, searchArtifacts, updateGrant, updateMetadata } from "./service.js";
@@ -204,6 +205,7 @@ async function route3(req, env, url, requestId, seen = {}) {
       return json(await importBackup(ctx, wid, parsed, k ? idemKey(k) : null, k ? await sha256Hex(raw) : ""), 201);
     }
     if (seg[2] === "invites" && seg.length === 3 && m === "POST") return json(await createInvite(ctx, wid, await body(req), url.origin), 201);
+    if (seg[2] === "deleted-projects" && seg.length === 3 && m === "GET") return json(await listDeletedProjects(ctx, wid));
     if (seg[2] === "usage" && seg.length === 3 && m === "GET") { const w = await requireWorkspaceRole(ctx, wid, "viewer", true); return json(await workspaceUsage(env, wid, w.role)); }
     if (seg[2] === "invites" && seg.length === 5 && seg[4] === "revoke" && m === "POST") return json(await revokeInvite(ctx, wid, str(seg[3], "invite", 80)));
     throw new HttpError(404, "not_found", "Not found");
@@ -239,6 +241,9 @@ async function route3(req, env, url, requestId, seen = {}) {
   const pid = await resolveProjectRef(env, str(seg[1], "project", 110));
   const rest = seg.slice(2);
   if (rest.length === 0 && m === "PATCH") return json(await updateProject(ctx, pid, await body(req)));
+  if (rest.length === 0 && m === "DELETE") return json(await deleteProject(ctx, pid, await body(req)));
+  if (rest.length === 1 && rest[0] === "restore" && m === "POST") return json(await restoreProject(ctx, pid));
+  if (rest.length === 1 && rest[0] === "purge" && m === "POST") return json(await purgeProjectNow(ctx, pid, await body(req)));
   if (rest[0] === "grants") {
     if (rest.length === 1 && m === "GET") return json(await listGrants(ctx, pid));
     if (rest.length === 1 && m === "POST") return json(await createGrant(ctx, pid, await body(req)), 201);
@@ -368,6 +373,8 @@ var coreWorker = {
   async scheduled(_ev, env, ctx) {
     ctx.waitUntil(cleanupChanges(env));
     ctx.waitUntil(reconcileUploads(env, { limit: 100 }).then((r) => console.log("reconcile", JSON.stringify(r))));
+    // Deleted projects past their 30 days (D21): bounded per run, finished by later runs.
+    ctx.waitUntil(purgeDueProjects(env).then((r) => { if (r.projects || r.rows || r.files) console.log("project_purge", JSON.stringify({ projects: r.projects, rows: r.rows, files: r.files })); }));
   },
   async fetch(req, env, ctx) {
     const url = new URL(req.url);

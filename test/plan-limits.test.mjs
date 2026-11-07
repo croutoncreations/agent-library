@@ -52,6 +52,23 @@ test("projects: the limit refuses the next one (402) and writes nothing; usage e
   assert.equal((await bob.req("GET", `/api/workspaces/${W.team}/usage`)).status, 404);
 });
 
+test("projects: deleting one frees its slot at once; restoring needs a free slot (D21)", async () => {
+  const e = refused(await alice.req("POST", "/api/projects", { title: "P3", workspace_id: W.team }), "projects");
+  assert.match(e.message, /Delete a project you no longer need \(Project settings\)/);
+  const list = ok(await alice.req("GET", "/api/projects")).projects.filter((p) => p.workspace_id === W.team);
+  const victim = list[0];
+  ok(await alice.req("DELETE", `/api/projects/${victim.id}`, { confirm_title: victim.title }));
+  assert.deepEqual(ok(await alice.req("GET", `/api/workspaces/${W.team}/usage`)).projects, { used: 2, limit: 3 });
+  const fresh = ok(await alice.req("POST", "/api/projects", { title: "P3", workspace_id: W.team }), 201);
+  // Full again: the deleted one can't come back until there's room.
+  const r = refused(await alice.req("POST", `/api/projects/${victim.id}/restore`), "projects");
+  assert.deepEqual([r.used, r.allowed], [3, 3]);
+  assert.equal(sql(`SELECT COUNT(*) AS n FROM projects WHERE id = '${victim.id}' AND deleted_at IS NOT NULL`)[0].n, 1, "still deleted");
+  ok(await alice.req("DELETE", `/api/projects/${fresh.id}`, { confirm_title: "P3" }));
+  ok(await alice.req("POST", `/api/projects/${victim.id}/restore`));
+  assert.deepEqual(ok(await alice.req("GET", `/api/workspaces/${W.team}/usage`)).projects, { used: 3, limit: 3 });
+});
+
 test("concurrent creates can't overshoot (the check is inside the INSERT)", async () => {
   const ws = (await alice.req("GET", "/api/workspaces")).body.workspaces.find((w) => w.personal).id;
   const rs = await Promise.all(Array.from({ length: 8 }, (_, i) => alice.req("POST", "/api/projects", { title: `Race ${i}` })));

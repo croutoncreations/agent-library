@@ -33,7 +33,10 @@ export async function personLimits(env, principalId) {
 // --- Usage, as SQL over one workspace (wsExpr: an SQL expression for the workspace id) ---------------------------
 // Index-friendly: legacy rows (workspace_id NULL) belong to 'wsp_' || owner, matched via the owner index.
 const inWs = (wsCol, ownerCol, ws) => `(${wsCol} = ${ws} OR (${wsCol} IS NULL AND ${ownerCol} = substr(${ws}, 5) AND 'wsp_' || ${ownerCol} = ${ws}))`;
+// Storage counts every project's content until it's purged (deleted projects still hold their bytes for 30 days);
+// the projects and grant counts are over live projects only (D21: a deleted project frees its slot at once).
 const PROJECTS_OF = (ws) => `SELECT id FROM projects WHERE ${inWs("workspace_id", "owner_id", ws)}`;
+const LIVE_PROJECTS_OF = (ws) => `${PROJECTS_OF(ws)} AND deleted_at IS NULL`;
 const NOW_MS = "CAST(strftime('%s','now') AS INTEGER) * 1000";
 /** Bytes stored: every revision (text and files) plus reservations in flight (uploads, staged app generations). */
 export const usageSql = {
@@ -41,14 +44,14 @@ export const usageSql = {
     + (SELECT COALESCE(SUM(expected_size), 0) FROM uploads WHERE project_id IN (${PROJECTS_OF(ws)})
          AND (state IN ('receiving','sealed') OR (state IN ('pending','received') AND expires_at > ${NOW_MS})))
     + (SELECT COALESCE(SUM(total_bytes), 0) FROM publisher_generations WHERE project_id IN (${PROJECTS_OF(ws)}) AND state = 'staged' AND expires_at > ${NOW_MS}))`,
-  projects: (ws) => `(SELECT COUNT(*) FROM (${PROJECTS_OF(ws)}))`,
+  projects: (ws) => `(SELECT COUNT(*) FROM (${LIVE_PROJECTS_OF(ws)}))`,
   members: (ws) => `((SELECT COUNT(*) FROM workspace_members WHERE workspace_id = ${ws})
     + (SELECT COUNT(*) FROM workspace_invites WHERE workspace_id = ${ws} AND accepted_at IS NULL AND revoked_at IS NULL AND expires_at > CAST(strftime('%s','now') AS INTEGER) * 1000))`,
   // Live OAuth connections, API keys, publishing apps and (legacy) project grant tokens.
   agents: (ws) => `((SELECT COUNT(*) FROM oauth_connections c WHERE ${inWs("c.workspace_id", "c.owner_principal_id", ws)} AND c.revoked_at IS NULL AND c.expires_at > ${NOW_MS})
     + (SELECT COUNT(*) FROM api_credentials k WHERE ${inWs("k.workspace_id", "k.owner_principal_id", ws)} AND k.revoked_at IS NULL AND k.expires_at > ${NOW_MS})
     + (SELECT COUNT(*) FROM publishers p WHERE ${inWs("p.workspace_id", "p.owner_principal_id", ws)} AND p.revoked_at IS NULL)
-    + (SELECT COUNT(*) FROM grants g WHERE g.project_id IN (${PROJECTS_OF(ws)}) AND g.revoked_at IS NULL AND g.expires_at > ${NOW_MS}))`,
+    + (SELECT COUNT(*) FROM grants g WHERE g.project_id IN (${LIVE_PROJECTS_OF(ws)}) AND g.revoked_at IS NULL AND g.expires_at > ${NOW_MS}))`,
   owned_workspaces: (who) => `(SELECT COUNT(*) FROM workspaces w WHERE w.created_by = ${who} AND w.personal = 0 AND w.status <> 'deleting')`
 };
 
@@ -80,8 +83,8 @@ export async function explainLimit(env, workspaceId, adds, limits) {
 }
 // What frees room, per limit (no in-app upgrade yet; owners/admins can do these).
 const FIX = {
-  storage_bytes: "Delete documents or files you no longer need (deleted items stop counting once they're removed from the trash), or ask the workspace owner about a bigger plan.",
-  projects: "Delete a project you no longer need, or ask the workspace owner about a bigger plan.",
+  storage_bytes: "Delete documents or files you no longer need (deleted items stop counting once they're removed from the trash, and deleted projects once they're deleted permanently under Recently deleted), or ask the workspace owner about a bigger plan.",
+  projects: "Delete a project you no longer need (Project settings), or ask the workspace owner about a bigger plan.",
   members: "Cancel a pending invitation or remove a member, or ask the workspace owner about a bigger plan.",
   agents: "Disconnect an app or revoke an API key you no longer use (Connections), or ask the workspace owner about a bigger plan.",
   owned_workspaces: "Delete a shared workspace you no longer need."

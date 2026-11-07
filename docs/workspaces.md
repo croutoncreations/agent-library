@@ -83,6 +83,9 @@ shared workspace exists, or accept this for the rollback window.
 - `GET /api/projects` returns projects from every workspace I can see, each with `workspace_id` and `path`;
   `POST /api/projects` takes `workspace_id` (default: my personal workspace) and optional `slug`;
   `PATCH /api/projects/:id` `{title?, slug?}` (project admin).
+- Deleting a project ([below](#deleting-a-project)): `DELETE /api/projects/:id {confirm_title}`,
+  `POST /api/projects/:id/restore`, `POST /api/projects/:id/purge {confirm_title}` (delete permanently now), and
+  `GET /api/workspaces/:id/deleted-projects` (workspace admins).
 - Settings lists (`/api/access`, `/api/api-keys`, `/api/app-clients`) show credentials across my workspaces:
   the ones I created, plus, in workspaces where I'm an admin, everyone's. `/api/app-clients` lists the apps I
   registered (while I'm still a member of the app's workspace) or administer, each with `workspace_id`; each app's
@@ -102,6 +105,22 @@ shared workspace exists, or accept this for the rollback window.
   Imported version labels are marked "(imported)". (Decision D8 B.)
 - `POST /api/restore` (whole-store restore with original ids) works only on a single-owner installation with no
   projects (`MULTI_USER` unset and at most one person); shared installations answer 403 `restore_unavailable`.
+
+## Deleting a project
+
+Decision D21 B. Workspace owners and admins delete a project from Project settings by typing its name.
+- **At once:** it is closed to everyone and to every agent. `memberRoleSql` excludes deleted projects, and every human,
+  API key, grant, OAuth and publisher gate is built from it. A deleted project answers like one that never existed (404),
+  and a credential whose only project it was is inactive (401 `credential_inactive`). It is removed from every list, stops counting
+  toward the `projects` limit, and its address is free for a new project. Its files still count toward storage.
+- **30 days:** admins see it under **Recently deleted** on the workspace page, and can restore it (if the projects limit
+  has room) with all its content, history and agent access. It gets its old address back, or a fresh one if that was
+  taken meanwhile. **Delete permanently** skips the wait.
+- **Then:** the 15-minute cron (`purgeDueProjects`) removes its R2 files and every row keyed by the project, in bounded
+  batches. The `projects` row stays as a tombstone (title "Deleted project", no address), because API keys, connections
+  and audits reference it. Audits `project.delete`, `project.restore`, `project.purge_requested` and `project.purge`.
+- **Migration 0024** adds `deleted_at`, `deleted_by`, `purge_at`, `purged_at` and `deleted_slug` to `projects`. Rolling
+  back to an earlier Worker makes deleted, not-yet-purged projects reappear.
 
 ## Addresses
 

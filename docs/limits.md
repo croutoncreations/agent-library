@@ -24,7 +24,8 @@ how core enforces them. (Plan phase 4; decision D18 sets the hosted free tier's 
 - **Downgrades never lose data** (decision D19, pending; this is the proposed default). A workspace over its new
   limits keeps everything and stays readable; it just can't grow until it's under the limit again: no new projects,
   members or agents, and over the storage limit no new versions (every save adds a version, so text edits are refused
-  too; title, folder and tag changes, trash and deletion still work). A failed payment is different: the workspace
+  too; title, folder and tag changes, trash and deletion still work). Deleting a project (Project settings) frees its
+  projects slot at once; its storage is freed when it's removed for good (after 30 days, or with Delete permanently). A failed payment is different: the workspace
   becomes read-only (D11 B / D13 A).
 - Replacing an OAuth connection in the same workspace doesn't need a free slot (the old one is revoked in the same
   step). Replacing an API key does, because the old key keeps working until you revoke it. Revoking frees a slot.

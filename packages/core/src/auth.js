@@ -57,13 +57,15 @@ async function authenticateInner(req, env, requestId) {
     await adapters(env).identity.bearer(req, env);
     const row = await env.DB.prepare(
       `SELECT g.id, g.project_id, g.can_write, g.expires_at, g.revoked_at, g.client_info, p.id AS pid, p.kind, p.label,
-              ${memberRoleSql("g.project_id", "viewer", "g.created_by")} AS creator_ok
+              ${memberRoleSql("g.project_id", "viewer", "g.created_by")} AS creator_ok,
+              (SELECT deleted_at IS NOT NULL FROM projects WHERE id = g.project_id) AS project_deleted
        FROM grants g JOIN principals p ON p.id = g.principal_id WHERE g.token_hash = ?`
     ).bind(await sha256Hex(m[1])).first();
     if (!row || row.kind !== "agent") throw new HttpError(401, "unauthenticated", "Unknown token");
     if (row.revoked_at !== null) throw new HttpError(401, "grant_revoked", "Grant revoked");
     if (row.expires_at <= nowMs()) throw new HttpError(401, "grant_expired", "Grant expired");
     // The person who created the grant lost access (removed, or the workspace is closed): the token is inactive.
+    if (row.project_deleted) throw new HttpError(401, "credential_inactive", "This token's project was deleted");
     if (!row.creator_ok) throw new HttpError(401, "credential_inactive", "The person who created this token no longer has access");
     return {
       env,

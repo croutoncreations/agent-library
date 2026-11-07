@@ -486,6 +486,8 @@ main > .tabs,main > nav.tabs{margin:16px 0 12px}
 .addr-input .muted{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:50%}
 .proj-settings{margin-bottom:14px;display:flex;flex-direction:column;gap:12px;max-width:36rem}
 .proj-settings h2{margin:0}
+.proj-delete{margin:8px 0 0;padding:16px;min-width:0}
+.deleted-project .row{gap:8px;flex-wrap:wrap;justify-content:flex-end}
 .proj-settings .field,#ws-handle-form .field{display:flex;flex-direction:column;align-items:stretch;gap:6px;font-size:14px;font-weight:600;min-width:0}
 .proj-settings .field input{width:100%}
 .proj-settings p{margin:0}

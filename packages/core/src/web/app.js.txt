@@ -644,11 +644,13 @@ async function viewWorkspace(id) {
   var linkBox = h("div", { class: "card", hidden: true }); // kept across reloads while an invitation link is shown
   var focusAfter = null; // selector of the element to focus after the next reload
   async function load() {
-    var d, projects, usage;
+    var d, projects, usage, deleted;
     try {
       var r = await Promise.all([api("GET", "/api/workspaces/" + enc(id) + "/members"), api("GET", "/api/projects"),
-        api("GET", "/api/workspaces/" + enc(id) + "/usage").catch(function () { return null; })]);
+        api("GET", "/api/workspaces/" + enc(id) + "/usage").catch(function () { return null; }),
+        api("GET", "/api/workspaces/" + enc(id) + "/deleted-projects").catch(function () { return null; })]);
       d = r[0]; noteProjects(r[1].projects); projects = r[1].projects.filter(function (p) { return p.workspace_id === id; }); usage = r[2];
+      deleted = r[3] && r[3].projects;
     } catch (err) {
       if (err.status === 401) return;
       setCrumbs([{ t: "Home", href: "#/" }, { t: "Workspaces", href: "#/workspaces" }, { t: "Not available" }]);
@@ -702,6 +704,38 @@ async function viewWorkspace(id) {
       newProj = h("div", null, newProj, importForm);
     }
 
+    // Recently deleted (admins): restore within 30 days, or delete permanently now. Hidden when empty.
+    var deletedList = null;
+    if (realAdmin && deleted && deleted.length) {
+      var delMsg = sectionMsg();
+      var dl = h("ul", { class: "list", "aria-label": "Recently deleted projects" });
+      deleted.forEach(function (p) {
+        var days = Math.max(1, Math.ceil((Date.parse(p.purge_at) - Date.now()) / 864e5));
+        var restoreBtn = h("button", { type: "button", class: "secondary", disabled: suspended, title: suspended ? "The workspace is read-only" : null }, "Restore");
+        restoreBtn.addEventListener("click", async function () {
+          restoreBtn.disabled = true;
+          try { await api("POST", "/api/projects/" + enc(p.id) + "/restore"); toast("Restored " + p.title); focusAfter = "h2#projects-h"; load(); }
+          catch (err) { sectionErr(delMsg, err); restoreBtn.disabled = false; }
+        });
+        var purgeBtn = h("button", { type: "button", class: "danger secondary", disabled: suspended }, "Delete permanently");
+        purgeBtn.addEventListener("click", async function () {
+          var typed = prompt("Delete " + p.title + " permanently? Its " + p.items + (p.items === 1 ? " item" : " items") + " and their history are removed and can't be restored. Type the project's name to confirm.");
+          if (typed === null) return;
+          if (typed.trim() !== p.title) { sectionErr(delMsg, { message: "The name didn't match, so nothing was deleted." }); return; }
+          purgeBtn.disabled = true;
+          try { await api("POST", "/api/projects/" + enc(p.id) + "/purge", { confirm_title: typed.trim() }); toast("Deleted " + p.title + " permanently"); load(); }
+          catch (err) { sectionErr(delMsg, err); purgeBtn.disabled = false; }
+        });
+        dl.append(h("li", { class: "deleted-project" }, h("span", { class: "ficon-sm", "aria-hidden": "true" }, icon("trash")),
+          h("div", { class: "grow" }, h("strong", { text: p.title }),
+            h("small", { class: "muted", text: (p.items === 1 ? "1 item" : p.items + " items") + " · deleted " + new Date(p.deleted_at).toLocaleDateString() + (p.deleted_by ? " by " + p.deleted_by : "") + " · removed for good in " + days + (days === 1 ? " day" : " days") })),
+          h("span", { class: "row" }, restoreBtn, purgeBtn)));
+      });
+      deletedList = h("section", { "aria-labelledby": "deleted-h" }, h("h3", { id: "deleted-h", text: "Recently deleted" }),
+        h("p", { class: "muted small", text: "Deleted projects stay here for 30 days. Nobody can open them, and they don't count toward the projects limit; their files still count toward storage until they're removed." }),
+        delMsg, dl);
+    }
+
     // Members. Role changes are a pending choice saved with a button, and promotions to admin/owner are confirmed.
     var memMsg = sectionMsg();
     var members = h("ul", { class: "list", "aria-label": "Members" });
@@ -751,7 +785,7 @@ async function viewWorkspace(id) {
       suspended ? suspendedBanner(owner, usage && usage.billing) : null,
       ws.handle ? h("p", { class: "proj-addr" }, h("span", { class: "muted small", text: "Project links start with" }), h("code", { text: "/" + ws.handle + "/" })) : null,
       usagePanel(usage, admin, realAdmin && suspended),
-      h("h2", { id: "projects-h", tabIndex: -1, text: "Projects" }), projMsg, projList, newProj,
+      h("h2", { id: "projects-h", tabIndex: -1, text: "Projects" }), projMsg, projList, newProj, deletedList,
       h("h2", { id: "members-h", tabIndex: -1, text: "Members" }), memMsg, members];
 
     if (admin && !ws.personal) {
@@ -876,7 +910,7 @@ function usagePanel(u, canManage, suspendedAdmin) {
   var over = USAGE_ROWS.some(function (r) { var x = u[r[0]]; return x && x.limit != null && x.used > x.limit; });
   return h("section", { "aria-labelledby": "usage-h" }, h("h2", { id: "usage-h", text: u.billing ? "Plan and billing" : "Plan usage" }), billingBlock(u.billing), limited ? list : null,
     h("p", { class: "muted small", text: (over ? "Everything over a limit is kept; nothing is removed. " : "At a limit nothing is removed; you just can't add more. ") +
-      (canManage ? "To make room, delete what you no longer need (projects, documents, invitations or connected apps)." :
+      (canManage ? "To make room, delete what you no longer need: projects (Project settings), documents, invitations or connected apps." :
         suspendedAdmin ? "While the workspace is read-only, projects and content can't be added or deleted." : "Only the workspace owner or admins can free up room.") }));
 }
 var ADDR_HINT = "Lower-case letters, digits and hyphens.";
@@ -941,9 +975,34 @@ function toggleProjectSettings(pid, opener) {
     h("label", { class: "field" }, h("span", { text: "Title" }), title),
     h("label", { class: "field" }, h("span", null, "Address", h("span", { class: "sr", text: " (after /" + handle + "/)" })), h("span", { class: "addr-input" }, h("span", { class: "muted", "aria-hidden": "true", text: "/" + handle + "/" }), sl)),
     h("p", { id: "proj-slug-help", class: "muted small", text: ADDR_HINT + " Changing it breaks existing links to this project." }),
-    h("div", { class: "row" }, save, h("button", { type: "button", class: "secondary", onclick: close }, "Cancel")));
+    h("div", { class: "row" }, save, h("button", { type: "button", class: "secondary", onclick: close }, "Cancel")),
+    projectDeleteZone(pid, msg));
   var addr = app.querySelector(".proj-addr"); addr.after(box);
   opener.setAttribute("aria-expanded", "true"); title.focus();
+}
+// Delete a project (D21): closed to everyone at once, restorable for 30 days from the workspace page, then removed.
+// A fieldset inside the settings form (forms can't nest); its own button submits nothing else.
+function projectDeleteZone(pid, msg) {
+  var name = projectTitles[pid] || "";
+  var confirmName = h("input", { type: "text", autocomplete: "off", spellcheck: false, "aria-describedby": "proj-del-help", placeholder: name });
+  var btn = h("button", { type: "button", class: "danger", disabled: true }, "Delete project");
+  confirmName.addEventListener("input", function () { btn.disabled = confirmName.value.trim() !== name; });
+  confirmName.addEventListener("keydown", function (e) { if (e.key === "Enter") { e.preventDefault(); if (!btn.disabled) btn.click(); } });
+  btn.addEventListener("click", async function () {
+    if (confirmName.value.trim() !== name) return;
+    btn.disabled = true;
+    try {
+      var ws = projectAccess[pid] && projectAccess[pid].workspace_id;
+      await api("DELETE", "/api/projects/" + enc(pid), { confirm_title: name });
+      delete projectPaths[pid]; delete projectTitles[pid];
+      toast("Deleted " + name + ". You can restore it from the workspace for 30 days.");
+      location.hash = ws ? "#/workspaces/" + enc(ws) : "#/";
+    } catch (err) { sectionErr(msg, err); btn.disabled = false; }
+  });
+  return h("fieldset", { class: "card danger-zone proj-delete" }, h("legend", { class: "sr", text: "Delete project" }),
+    h("p", null, h("strong", { text: "Delete project" }), h("br"),
+      h("span", { id: "proj-del-help", class: "muted small", text: "Closes it right away for everyone in the workspace and for every agent, app and API key connected to it. Its address becomes free. Workspace admins can restore it, with everything in it, from the workspace page for 30 days; after that it's removed for good." })),
+    h("label", { class: "field" }, h("span", { text: "Type " + name + " to confirm" }), confirmName), btn);
 }
 // Shown once after creating an invitation. Like secretBox: copy can fail (plain HTTP, denied permission).
 function inviteLinkBox(box, r, onDone) {

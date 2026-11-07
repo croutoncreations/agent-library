@@ -89,7 +89,7 @@ export async function projectPaths(env, ids) {
   const rows = (await env.DB.prepare(
     `SELECT p.id, p.title, p.slug, w.id AS wid, w.handle, w.personal, w.name, w.status
      FROM projects p JOIN workspaces w ON w.id = COALESCE(p.workspace_id, 'wsp_' || p.owner_id)
-     WHERE p.id IN (SELECT value FROM json_each(?))`
+     WHERE p.id IN (SELECT value FROM json_each(?)) AND p.deleted_at IS NULL`
   ).bind(JSON.stringify(want.slice(0, 1000))).all()).results;
   // Missing handles/slugs are assigned here (first use after migration 0020), at most ASSIGN_PER_CALL per request so
   // one request stays far below D1's per-invocation query limit; the rest get theirs on later requests.
@@ -117,7 +117,7 @@ export async function resolveProjectRef(env, ref) {
   const m = PATH_RE.exec(ref.replace(/%2f/gi, "/"));
   if (!m) return NO_PROJECT;
   const id = await env.DB.prepare(
-    "SELECT p.id FROM workspaces w JOIN projects p ON p.workspace_id = w.id AND p.slug = ? WHERE w.handle = ? AND w.status <> 'deleting'"
+    "SELECT p.id FROM workspaces w JOIN projects p ON p.workspace_id = w.id AND p.slug = ? AND p.deleted_at IS NULL WHERE w.handle = ? AND w.status <> 'deleting'"
   ).bind(m[2], m[1]).first("id");
   return id ?? NO_PROJECT;
 }

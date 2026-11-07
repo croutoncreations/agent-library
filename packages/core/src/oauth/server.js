@@ -684,7 +684,7 @@ async function cxPublishPage(env, app, principalId, email, projects, consent, va
   const folderSelect = `<select name="destination" aria-label="Folder">${opt("new", "New folder")}${opt("root", "No folder (project root)")}${folderGroups}</select>`;
   const prev = await env.DB.prepare(
     `SELECT pb.id, pb.created_at, pb.resumed_at, pb.current_source_revision, pb.revoked_at, p.title AS project_title, f.name AS folder_name FROM publishers pb
-     JOIN projects p ON p.id = pb.project_id LEFT JOIN folders f ON f.id = pb.folder_id WHERE pb.app_client_id = ? AND pb.owner_principal_id = ? ORDER BY pb.created_at DESC LIMIT 20`
+     JOIN projects p ON p.id = pb.project_id AND p.deleted_at IS NULL LEFT JOIN folders f ON f.id = pb.folder_id WHERE pb.app_client_id = ? AND pb.owner_principal_id = ? ORDER BY pb.created_at DESC LIMIT 20`
   ).bind(app.id, principalId).all();
   // Most recently used first. Nothing is resumed unless the owner picks it: resuming signs out the app's older session.
   const active = prev.results.filter((r) => r.revoked_at === null).sort((a, b) => String(b.resumed_at ?? b.created_at).localeCompare(String(a.resumed_at ?? a.created_at)));

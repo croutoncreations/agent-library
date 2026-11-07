@@ -99,6 +99,8 @@ export async function startAppConnectServer({ port, oidcPort = port + OIDC_OFFSE
     async owner() { return (ownerSession ??= await s.loginAt(appUi)); },
     /** Another synthetic person on the owner UI host (local dev login, email <user>@example.test). */
     async person(user) { return s.loginAt(appUi, user); },
+    /** The per-run dev-login passphrase, for real-browser sign-in in tests only. */
+    passphrase: () => s.passphrase(),
     /** Register a publisher app (owner action). */
     async registerApp(body) {
       const o = await h.owner();

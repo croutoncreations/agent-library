@@ -44,7 +44,7 @@ async function listAccess(ctx) {
   ).bind(me2, me2).all();
   const cps = await ctx.env.DB.prepare(
     `SELECT cp.connection_id, cp.project_id, cp.can_write, p.title FROM oauth_connection_projects cp
-     JOIN oauth_connections c ON c.id = cp.connection_id JOIN projects p ON p.id = cp.project_id
+     JOIN oauth_connections c ON c.id = cp.connection_id JOIN projects p ON p.id = cp.project_id AND p.deleted_at IS NULL
      WHERE ${MANAGE}`
   ).bind(me2, me2).all();
   const byConn = /* @__PURE__ */ new Map();
@@ -55,7 +55,7 @@ async function listAccess(ctx) {
   }
   const grants = await ctx.env.DB.prepare(
     `SELECT g.id, g.project_id, pr.title, pl.label, g.can_write, g.expires_at, g.revoked_at, g.created_at
-     FROM grants g JOIN projects pr ON pr.id = g.project_id JOIN principals pl ON pl.id = g.principal_id
+     FROM grants g JOIN projects pr ON pr.id = g.project_id AND pr.deleted_at IS NULL JOIN principals pl ON pl.id = g.principal_id
      WHERE (g.created_by = ? OR ${memberRoleSql("pr.id", "admin", "?", true)}) ORDER BY g.created_at DESC LIMIT 200`
   ).bind(me2, me2).all();
   const now = nowMs();

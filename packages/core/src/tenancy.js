@@ -36,7 +36,8 @@ const rankCase = (expr) => `CASE ${expr} WHEN 'owner' THEN 4 WHEN 'admin' THEN 3
 /**
  * SQL: does the human `principalExpr` have at least `need` on the project `projectIdExpr`?
  * Both are SQL expressions ("?" placeholders are bound by the caller, principal first, then project).
- * Effective role = workspace role, capped by a project_members row if present; the workspace must be active.
+ * Effective role = workspace role, capped by a project_members row if present; the workspace must be active and
+ * the project not deleted (D21: every human and agent gate is built from this, so a deleted project is closed to all).
  */
 export function memberRoleSql(projectIdExpr, need, principalExpr = "?", allowSuspended = need === "viewer") {
   const min = ROLE_RANK[need];
@@ -45,7 +46,7 @@ export function memberRoleSql(projectIdExpr, need, principalExpr = "?", allowSus
       JOIN workspaces t_w ON t_w.id = ${projectWorkspaceSql("t_p")}
       JOIN workspace_members t_m ON t_m.workspace_id = t_w.id AND t_m.principal_id = ${principalExpr}
       LEFT JOIN project_members t_pm ON t_pm.project_id = t_p.id AND t_pm.principal_id = t_m.principal_id
-      WHERE t_p.id = ${projectIdExpr} AND ${statusOk("t_w", allowSuspended)}
+      WHERE t_p.id = ${projectIdExpr} AND t_p.deleted_at IS NULL AND ${statusOk("t_w", allowSuspended)}
         AND MIN(${rankCase("t_m.role")}, CASE WHEN t_pm.role IS NULL THEN 4 ELSE ${rankCase("t_pm.role")} END) >= ${min})`;
 }
 
@@ -96,7 +97,7 @@ export async function projectRole(env, principalId, projectId) {
      FROM projects t_p JOIN workspaces t_w ON t_w.id = ${projectWorkspaceSql("t_p")}
      JOIN workspace_members t_m ON t_m.workspace_id = t_w.id AND t_m.principal_id = ?
      LEFT JOIN project_members t_pm ON t_pm.project_id = t_p.id AND t_pm.principal_id = t_m.principal_id
-     WHERE t_p.id = ?`
+     WHERE t_p.id = ? AND t_p.deleted_at IS NULL`
   ).bind(principalId, projectId).first();
 }
 
@@ -120,7 +121,7 @@ export async function visibleProjects(env, principalId) {
        CASE MIN(${rankCase("t_m.role")}, CASE WHEN t_pm.role IS NULL THEN 4 ELSE ${rankCase("t_pm.role")} END)
          WHEN 4 THEN 'owner' WHEN 3 THEN 'admin' WHEN 2 THEN 'member' WHEN 1 THEN 'viewer' ELSE NULL END AS role`;
   const from = (join) => `FROM workspace_members t_m JOIN workspaces t_w ON t_w.id = t_m.workspace_id AND ${statusOk("t_w", true)}
-     JOIN projects t_p ON ${join}
+     JOIN projects t_p ON ${join} AND t_p.deleted_at IS NULL
      LEFT JOIN project_members t_pm ON t_pm.project_id = t_p.id AND t_pm.principal_id = t_m.principal_id
      WHERE t_m.principal_id = ?`;
   const r = await env.DB.prepare(

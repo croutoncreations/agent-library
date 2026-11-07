@@ -85,7 +85,7 @@ async function listApiKeys(ctx) {
   const keys = await ctx.env.DB.prepare(`SELECT * FROM api_credentials WHERE id IN (${mine}) ORDER BY created_at DESC`).bind(ctx.principal.id, ctx.principal.id).all();
   const scopes = await ctx.env.DB.prepare(
     `SELECT acp.credential_id, acp.project_id, acp.can_write, p.title FROM api_credential_projects acp
-     JOIN projects p ON p.id = acp.project_id
+     JOIN projects p ON p.id = acp.project_id AND p.deleted_at IS NULL
      WHERE acp.credential_id IN (${mine})`
   ).bind(ctx.principal.id, ctx.principal.id).all();
   const now = nowMs();
