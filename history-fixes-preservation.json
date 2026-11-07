@@ -1,13 +1,13 @@
 {
   "base_icon_fixes_sha256": "506b28ac1ff5749810cc7e8f454ed5032bb544b63faab1348743d5bac93d5911",
-  "integrated_sha256": "597fd6e2b5d27236983259d6b62fb4d43f82bc56b54e23cf3d5ea436e112f55e",
+  "integrated_sha256": "dbc48441eb4d2553d84dcd23ef247e89b63c28c39c81ca9f3e9fd7856f63c63c",
   "sources_sha256": {
     "service.js": "8b1c74c4d7a99af0b5aaad18fb02584d28249e743ebd28b5d5e961734892c49f",
     "oauth-tools.js": "abc5f4eb6d87826363a6c865388eeee5073435d65f531db0f0e429b594daf473",
     "legacy-tools.js": "39719d06ba296048881fef5bb03fa3120839a7100949fbacc5fc405be3433e9a",
     "v1-routes.js": "e0bc3cb3ffd3f6854a1ce757e8513f0b5988472331832d1d6b8d30a3ce820052",
-    "ui-history.js": "b136d9b4c8e85237d32fa83706e6bf5bf818689be5859ebffd22abc9f723266c",
-    "ui-history.css": "1f5983801180c48e4fbc1252ed9871bcf0811aa34c2db857ee927c47305a655e",
+    "ui-history.js": "626607cd3919e0cd7278fb868a3c8603fbc76ad9448b6f9dabc5059d9ee7b77b",
+    "ui-history.css": "b5f25a7e90dfedb1e63114a983f0312a7b452a247267211bb148c357151a3299",
     "util.js": "1a28d48083a48a167ae0322ef7d0c8ed3bb268b0d4bd486904036b5722cae7b7"
   },
   "migration": "0010_version_history.sql",
