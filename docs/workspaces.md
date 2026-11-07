@@ -125,8 +125,16 @@ Decision D21 B. Workspace owners and admins delete a project from Project settin
   `projects` row as a tombstone (title "Deleted project", no address), grants, API keys, OAuth connections and their
   project scopes, publishers, and audits. At purge, its grants and publishers are revoked, and so are API keys and OAuth
   connections that have no live project left. Audits `project.delete`, `project.restore`, `project.purge_requested` and `project.purge`.
-- **Migration 0024** adds `deleted_at`, `deleted_by`, `purge_at`, `purged_at` and `deleted_slug` to `projects`. Rolling
-  back to an earlier Worker makes deleted, not-yet-purged projects reappear.
+- **Restore closes an hour before `purge_at`** (409 `purge_started`), so a restore and a purge on different clocks can't
+  overlap; each purge step also re-checks that the project is still deleted and due, and the final tombstone and
+  revocations run only if it is. After the rows, both R2 prefixes (`blobs/<id>/`, `staging/<id>/`) are swept for files
+  no row names. Credentials are revoked only when every project they cover is purged, so a project still in Recently
+  deleted keeps its agent access for a restore.
+- **Migration 0024** adds `deleted_at`, `deleted_by`, `purge_at`, `purged_at` and `deleted_slug` to `projects`.
+  **Rollback risk:** a Worker from before this change doesn't know `deleted_at`, so after a rollback deleted (not yet
+  purged) projects are open again to their members and agents, under no address. Purged ones show as empty "Deleted
+  project" rows. Roll back across this change only in an emergency, and delete any project that must stay closed again
+  once the new Worker is back.
 
 ## Addresses
 

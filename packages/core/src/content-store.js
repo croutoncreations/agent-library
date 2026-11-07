@@ -31,6 +31,12 @@ export async function deleteBlob(env, key) {
   return env.BLOBS.delete(key);
 }
 
+/** Up to `limit` object keys under a prefix (one page), for cleanup sweeps. */
+export async function listBlobKeys(env, prefix, limit = 100) {
+  const r = await env.BLOBS.list({ prefix, limit });
+  return r.objects.map((o) => o.key);
+}
+
 
 // Text bodies stored inline in D1 (revisions.body, comments.body). Every JS write passes the plaintext through
 // storeText before binding it, and every JS read passes the column through readText. Identity until per-workspace

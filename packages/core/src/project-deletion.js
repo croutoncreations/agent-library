@@ -9,13 +9,15 @@
 //             (title "Deleted project", no address) because API keys, connections and audits reference it.
 // Nothing here runs for agents, and nothing is removed outside purgeDueProjects.
 import { requireHuman } from "./auth.js";
-import { deleteBlob } from "./content-store.js";
+import { deleteBlob, listBlobKeys } from "./content-store.js";
 import { explainLimit, limitGuard } from "./limits.js";
 import { ensureSlug } from "./paths.js";
 import { memberRoleSql, projectWorkspaceSql, requireWorkspaceRole, workspaceRoleSql } from "./tenancy.js";
 import { HttpError, nowIso, nowMs } from "./util.js";
 
 export const RETENTION_DAYS = 30;
+// Restore closes an hour before purge_at, so a restore and a purge running on different clocks can't overlap.
+const RESTORE_MARGIN_MS = 36e5;
 const DAY = 864e5;
 
 function audit(ctx, projectId, action, result, gate, gateParams) {
@@ -86,14 +88,16 @@ export async function restoreProject(ctx, projectId) {
   const grants = await ctx.env.DB.prepare("SELECT COUNT(*) AS n FROM grants WHERE project_id = ? AND revoked_at IS NULL AND expires_at > ?").bind(projectId, nowMs()).first("n");
   const adds = { projects: 1, ...grants ? { agents: grants } : {} };
   const lg = await limitGuard(ctx.env, p.workspace_id, adds);
+  // Not in its last hour: the purge may already be running then (it starts once purge_at passes, on any clock).
   const live = "deleted_at IS NOT NULL AND purged_at IS NULL AND purge_at > ?";
   const [u] = await ctx.env.DB.batch([
     ctx.env.DB.prepare(`UPDATE projects SET deleted_at = NULL, deleted_by = NULL, purge_at = NULL, deleted_slug = NULL
-        WHERE id = ? AND ${live} AND ${workspaceRoleSql("?", "admin")} AND ${lg.sql}`).bind(projectId, nowMs(), ctx.principal.id, p.workspace_id, ...lg.params),
+        WHERE id = ? AND ${live} AND ${workspaceRoleSql("?", "admin")} AND ${lg.sql}`).bind(projectId, nowMs() + RESTORE_MARGIN_MS, ctx.principal.id, p.workspace_id, ...lg.params),
     audit(ctx, projectId, "project.restore", "ok", "changes() = 1", [])
   ]);
   if (!u.meta.changes) {
     await explainLimit(ctx.env, p.workspace_id, adds, lg.limits);
+    if (p.purge_at <= nowMs() + RESTORE_MARGIN_MS) throw new HttpError(409, "purge_started", "This project is being deleted permanently and can't be restored any more.");
     throw new HttpError(409, "conflict", "The project changed meanwhile. Reload and try again.");
   }
   // Its old address if still free (a new project may have taken it meanwhile), else a fresh one from the title.
@@ -124,6 +128,7 @@ export async function purgeProjectNow(ctx, projectId, input) {
   return { ok: true, id: projectId };
 }
 
+const STILL_DUE = "EXISTS (SELECT 1 FROM projects d WHERE d.id = ?1 AND d.deleted_at IS NOT NULL AND d.purged_at IS NULL AND d.purge_at <= ?3)";
 // Purge order: children before parents (composite foreign keys), and R2 files before the rows that name them so a
 // crash never leaves a file nobody can find. Each step deletes at most `n` rows.
 const STEPS = [
@@ -159,6 +164,7 @@ export async function purgeDueProjects(env, { projectId, rowBudget = 5000, blobB
     .bind(now, ...projectId ? [projectId] : []).all()).results;
   const out = { projects: 0, rows: 0, files: 0, finished: [] };
   for (const { id } of due) {
+    const stillDue = async () => !!await env.DB.prepare(`SELECT 1 AS ok WHERE ${STILL_DUE}`).bind(id, null, now).first("ok");
     // R2 first: files named by this project's revisions and uploads (keys always start blobs/<id>/ or staging/<id>/).
     for (;;) {
       if (blobBudget <= 0) return out;
@@ -168,6 +174,7 @@ export async function purgeDueProjects(env, { projectId, rowBudget = 5000, blobB
            UNION SELECT final_key FROM uploads WHERE project_id = ?1 AND final_key IS NOT NULL AND final_purged_at IS NULL) LIMIT ?2`
       ).bind(id, Math.min(100, blobBudget)).all()).results.map((r) => r.k);
       if (!keys.length) break;
+      if (!await stillDue()) return out;
       for (const k of keys) {
         if (!k.startsWith(`blobs/${id}/`) && !k.startsWith(`staging/${id}/`)) { console.error("purge_foreign_key_skipped"); continue; }
         await deleteBlob(env, k);
@@ -184,26 +191,40 @@ export async function purgeDueProjects(env, { projectId, rowBudget = 5000, blobB
       for (;;) {
         if (rowBudget <= 0) return out;
         const n = Math.min(500, rowBudget);
-        const r = await env.DB.prepare(`DELETE FROM ${table} WHERE rowid IN (SELECT rowid FROM ${table} WHERE ${where} LIMIT ?2)`).bind(id, n).run();
+        // Every step re-checks that the project is still deleted and due (defence in depth against a late restore).
+        const r = await env.DB.prepare(`DELETE FROM ${table} WHERE rowid IN (SELECT rowid FROM ${table} WHERE ${where} AND ${STILL_DUE} LIMIT ?2)`).bind(id, n, now).run();
         const k = r.meta.changes ?? 0;
         rowBudget -= k; out.rows += k;
         if (k < n) break;
       }
     }
-    // An upload whose finish lease started before the delete may still write its file: sweep the prefix once the lease
-    // has surely ended (the purge runs on a 15-minute cron; "delete permanently" waits for the next run for these).
+    // Then sweep both prefixes for anything no row names (a write that landed after its row went, or an earlier
+    // crash). The run waits while an upload is inside its finish lease (see `due`), so nothing new arrives after this.
+    for (const prefix of [`blobs/${id}/`, `staging/${id}/`]) {
+      for (;;) {
+        if (blobBudget <= 0) return out;
+        if (!await stillDue()) return out;
+        const keys = await listBlobKeys(env, prefix, Math.min(100, blobBudget));
+        if (!keys.length) break;
+        for (const k of keys) await deleteBlob(env, k);
+        blobBudget -= keys.length; out.files += keys.length;
+      }
+    }
     // Search index rows go with their artifacts (trigger). Publishers stop for good; API keys and OAuth connections
-    // whose every project is now gone are revoked (they can't reach anything and would hold an agents slot forever).
-    const noLive = (table, col) => `NOT EXISTS (SELECT 1 FROM ${table} x JOIN projects pj ON pj.id = x.project_id WHERE x.${col} = c.id AND x.project_id <> ?2 AND pj.deleted_at IS NULL)`;
-    await env.DB.batch([
-      env.DB.prepare("UPDATE publishers SET revoked_at = COALESCE(revoked_at, ?) WHERE project_id = ?").bind(now, id),
-      env.DB.prepare(`UPDATE api_credentials AS c SET revoked_at = ?1 WHERE c.revoked_at IS NULL AND EXISTS (SELECT 1 FROM api_credential_projects WHERE credential_id = c.id AND project_id = ?2) AND ${noLive("api_credential_projects", "credential_id")}`).bind(now, id),
-      env.DB.prepare(`UPDATE oauth_connections AS c SET revoked_at = ?1 WHERE c.revoked_at IS NULL AND EXISTS (SELECT 1 FROM oauth_connection_projects WHERE connection_id = c.id AND project_id = ?2) AND ${noLive("oauth_connection_projects", "connection_id")}`).bind(now, id),
-      env.DB.prepare("UPDATE grants SET revoked_at = COALESCE(revoked_at, ?) WHERE project_id = ?").bind(now, id),
-      env.DB.prepare("UPDATE projects SET purged_at = ?, title = 'Deleted project', slug = NULL, deleted_slug = NULL WHERE id = ? AND purged_at IS NULL").bind(now, id),
+    // whose every project is purged are revoked (they can't reach anything and would hold an agents slot forever). A
+    // project still in Recently deleted counts as live here, so restoring it brings its credentials back.
+    const noLive = (table, col) => `NOT EXISTS (SELECT 1 FROM ${table} x JOIN projects pj ON pj.id = x.project_id WHERE x.${col} = c.id AND x.project_id <> ?2 AND pj.purged_at IS NULL)`;
+    // One transaction, tombstone first: the rest runs only if this call tombstoned it (still deleted and due).
+    const [tomb] = await env.DB.batch([
+      env.DB.prepare(`UPDATE projects SET purged_at = ?3, title = 'Deleted project', slug = NULL, deleted_slug = NULL WHERE id = ?1 AND purged_at IS NULL AND deleted_at IS NOT NULL AND purge_at <= ?3`).bind(id, null, now),
+      env.DB.prepare("UPDATE publishers SET revoked_at = COALESCE(revoked_at, ?1) WHERE project_id = ?2 AND EXISTS (SELECT 1 FROM projects WHERE id = ?2 AND purged_at = ?1)").bind(now, id),
+      env.DB.prepare(`UPDATE api_credentials AS c SET revoked_at = ?1 WHERE c.revoked_at IS NULL AND EXISTS (SELECT 1 FROM projects WHERE id = ?2 AND purged_at = ?1) AND EXISTS (SELECT 1 FROM api_credential_projects WHERE credential_id = c.id AND project_id = ?2) AND ${noLive("api_credential_projects", "credential_id")}`).bind(now, id),
+      env.DB.prepare(`UPDATE oauth_connections AS c SET revoked_at = ?1 WHERE c.revoked_at IS NULL AND EXISTS (SELECT 1 FROM projects WHERE id = ?2 AND purged_at = ?1) AND EXISTS (SELECT 1 FROM oauth_connection_projects WHERE connection_id = c.id AND project_id = ?2) AND ${noLive("oauth_connection_projects", "connection_id")}`).bind(now, id),
+      env.DB.prepare("UPDATE grants SET revoked_at = COALESCE(revoked_at, ?1) WHERE project_id = ?2 AND EXISTS (SELECT 1 FROM projects WHERE id = ?2 AND purged_at = ?1)").bind(now, id),
       env.DB.prepare(`INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id, workspace_id)
-        SELECT ?, 'system', ?, 'project.purge', ?, 'ok', 'cron', workspace_id FROM projects WHERE id = ?`).bind(nowIso(), id, id, id)
+        SELECT ?, 'system', ?, 'project.purge', ?, 'ok', 'cron', workspace_id FROM projects WHERE id = ? AND purged_at = ?`).bind(nowIso(), id, id, id, now)
     ]);
+    if (!tomb.meta.changes) continue;
     out.projects++; out.finished.push(id);
   }
   return out;

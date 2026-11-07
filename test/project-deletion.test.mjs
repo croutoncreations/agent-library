@@ -170,6 +170,15 @@ test("restore keeps the address it had when deleted, if still free", async () =>
   assert.equal(`${before.split("/")[0]}/${r.slug}`, before);
 });
 
+test("restore closes an hour before the purge (it may already be running)", async () => {
+  const q = ok(await owner.req("POST", "/api/projects", { title: "Late", workspace_id: WS }), 201).id;
+  ok(await owner.req("DELETE", `/api/projects/${q}`, { confirm_title: "Late" }));
+  await sql(`UPDATE projects SET purge_at = ${Date.now() + 30 * 60e3} WHERE id = '${q}'`);
+  const r = await owner.req("POST", `/api/projects/${q}/restore`);
+  assert.equal(r.status, 409); assert.equal(r.body.error.code, "purge_started");
+  assert.equal(await n(`SELECT COUNT(*) AS n FROM projects WHERE id = '${q}' AND deleted_at IS NOT NULL`), 1);
+});
+
 test("delete permanently: rows and R2 files are removed, a tombstone stays, credentials stay closed", async () => {
   // Control: a file in another project, which must survive.
   const keep = ok(await owner.req("POST", "/api/projects", { title: "Keep", workspace_id: WS }), 201).id;
@@ -301,7 +310,7 @@ test("the purge is bounded: a small budget stops part-way and the next run finis
     runSync() { return { meta: { changes: Number(db.prepare(q).run(...p).changes) } }; }, async run() { return this.runSync(); } });
   const DB = { prepare(q) { return { bind: (...p) => stmt(q, p), ...stmt(q, []) }; }, async batch(ss) { db.exec("BEGIN"); try { const r = ss.map((s) => s.runSync()); db.exec("COMMIT"); return r; } catch (e) { db.exec("ROLLBACK"); throw e; } } };
   const gone = [];
-  const env = { DB, BLOBS: { async delete(k) { gone.push(k); } } };
+  const env = { DB, BLOBS: { async delete(k) { gone.push(k); }, async list() { return { objects: [] }; } } };
   const at = new Date().toISOString();
   db.prepare("INSERT INTO principals (id, kind, issuer, subject, label, created_at) VALUES ('hum_u','human','synthetic','u','U',?)").run(at);
   db.prepare("INSERT INTO projects (id, owner_id, title, created_at, deleted_at, purge_at) VALUES ('prj_u','hum_u','U',?,1,1)").run(at);
@@ -326,4 +335,56 @@ test("the purge is bounded: a small budget stops part-way and the next run finis
   assert.deepEqual([...new Set(gone)].sort(), Array.from({ length: 30 }, (_, i) => `blobs/prj_u/art_${i}/f`).sort(), "every project file, once, and nothing outside it");
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM artifacts WHERE project_id = 'prj_u'").get().n, 0);
   assert.ok(db.prepare("SELECT purged_at FROM projects WHERE id = 'prj_u'").get().purged_at > 0);
+});
+
+// One in-memory world over every migration (node:sqlite), with an R2 double that lists and deletes by key.
+async function unitWorld() {
+  const { loadWorker } = await import("./load-worker.mjs");
+  const { DatabaseSync: D } = await import("node:sqlite");
+  const { readFileSync, readdirSync: rd } = await import("node:fs");
+  const lib = await loadWorker({ "project-deletion.js": ["purgeDueProjects", "restoreProject"] });
+  const db = new D(":memory:");
+  for (const f of rd(join(ROOT, "migrations")).filter((f) => f.endsWith(".sql")).sort()) db.exec(readFileSync(join(ROOT, "migrations", f), "utf8"));
+  const stmt = (q, p) => ({ async first(c) { const r = db.prepare(q).get(...p); return c ? r?.[c] ?? null : r ?? null; }, async all() { return { results: db.prepare(q).all(...p) }; },
+    runSync() { return { meta: { changes: Number(db.prepare(q).run(...p).changes) } }; }, async run() { return this.runSync(); } });
+  const hooks = {};
+  const DB = { prepare(q) { return { bind: (...p) => stmt(q, p), ...stmt(q, []) }; },
+    async batch(ss) { if (hooks.beforeBatch) { const h2 = hooks.beforeBatch; hooks.beforeBatch = null; await h2(); } db.exec("BEGIN"); try { const r = ss.map((s) => s.runSync()); db.exec("COMMIT"); return r; } catch (e) { db.exec("ROLLBACK"); throw e; } } };
+  const objects = new Set();
+  const BLOBS = { async delete(k) { objects.delete(k); }, async list({ prefix, limit }) { return { objects: [...objects].filter((k) => k.startsWith(prefix)).slice(0, limit).map((key) => ({ key })) }; } };
+  const at = new Date().toISOString();
+  db.prepare("INSERT INTO principals (id, kind, issuer, subject, label, created_at) VALUES ('hum_u','human','synthetic','u','U',?)").run(at);
+  db.prepare("INSERT INTO principals (id, kind, issuer, subject, label, created_at) VALUES ('agt_k','agent','synthetic','k','K',?)").run(at);
+  db.prepare("INSERT INTO workspaces (id, name, personal, created_by, created_at) VALUES ('wsp_t','T',0,'hum_u',?)").run(at);
+  db.prepare("INSERT INTO workspace_members (workspace_id, principal_id, role, created_at) VALUES ('wsp_t','hum_u','owner',?)").run(at);
+  return { lib, db, hooks, objects, env: { DB, BLOBS }, at };
+}
+
+test("purge: a key over two deleted projects survives the first purge (the other can still be restored); orphaned R2 files are swept", async () => {
+  const w = await unitWorld();
+  for (const id of ["prj_a", "prj_b"]) w.db.prepare("INSERT INTO projects (id, owner_id, title, created_at, workspace_id, deleted_at, purge_at) VALUES (?,'hum_u','X',?,'wsp_t',1,?)").run(id, w.at, id === "prj_a" ? 1 : Date.now() + 864e5);
+  w.db.prepare("INSERT INTO api_credentials (id, owner_principal_id, principal_id, label, token_hash, created_at, expires_at) VALUES ('akey_1','hum_u','agt_k','k','h',?,?)").run(w.at, Date.now() + 864e5);
+  for (const id of ["prj_a", "prj_b"]) w.db.prepare("INSERT INTO api_credential_projects (credential_id, project_id, can_write) VALUES ('akey_1', ?, 0)").run(id);
+  w.objects.add("blobs/prj_a/art_lost/f"); w.objects.add("staging/prj_a/upl_lost"); w.objects.add("blobs/prj_b/art_keep/f"); w.objects.add("blobs/prj_ab/x/f");
+  const r = await w.lib.purgeDueProjects(w.env);
+  assert.equal(r.projects, 1);
+  assert.equal(w.db.prepare("SELECT revoked_at FROM api_credentials WHERE id = 'akey_1'").get().revoked_at, null, "B is still restorable, so the key stays");
+  assert.deepEqual([...w.objects].sort(), ["blobs/prj_ab/x/f", "blobs/prj_b/art_keep/f"], "A's unreferenced files swept; B's and a look-alike prefix kept");
+  // Now B is purged too: the key has nothing left and is revoked.
+  w.db.prepare("UPDATE projects SET purge_at = 1 WHERE id = 'prj_b'").run();
+  await w.lib.purgeDueProjects(w.env);
+  assert.ok(w.db.prepare("SELECT revoked_at FROM api_credentials WHERE id = 'akey_1'").get().revoked_at > 0);
+});
+
+test("purge vs restore: a restore that lands mid-purge stops it, and nothing is tombstoned or revoked", async () => {
+  const w = await unitWorld();
+  w.db.prepare("INSERT INTO projects (id, owner_id, title, created_at, workspace_id, deleted_at, purge_at) VALUES ('prj_r','hum_u','R',?,'wsp_t',1,1)").run(w.at);
+  w.db.prepare("INSERT INTO grants (id, project_id, principal_id, token_hash, can_write, expires_at, created_by, created_at) VALUES ('g1','prj_r','agt_k','t',0,?,'hum_u',?)").run(Date.now() + 864e5, w.at);
+  // Simulate a restore committing between the purge's steps (as if from another clock): clear deleted_at.
+  w.hooks.beforeBatch = async () => { w.db.prepare("UPDATE projects SET deleted_at = NULL, purge_at = NULL WHERE id = 'prj_r'").run(); };
+  w.objects.add("blobs/prj_r/a/f");
+  await w.lib.purgeDueProjects(w.env);
+  const row = w.db.prepare("SELECT title, purged_at FROM projects WHERE id = 'prj_r'").get();
+  assert.deepEqual([row.title, row.purged_at], ["R", null], "not tombstoned");
+  assert.equal(w.db.prepare("SELECT revoked_at FROM grants WHERE id = 'g1'").get().revoked_at, null, "its grant isn't revoked");
 });
