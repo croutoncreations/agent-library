@@ -6,10 +6,12 @@
 // Synthetic data only.
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { join } from "node:path";
 import { readdirSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
+import { createHash } from "node:crypto";
 import { key, sha256, mcpClient, LOCAL_CONFIG, ROOT } from "./helpers.mjs";
 import { SERVER_PORTS } from "./ports.mjs";
 import { makePng } from "./make-fixtures.mjs";
@@ -19,15 +21,36 @@ const PORT = SERVER_PORTS["project-deletion"];
 let h, owner, bob, carol, WS, P = {}, cred = {};
 const png = makePng(8, 8);
 const ok = (r, status = 200) => { assert.equal(r.status, status, JSON.stringify(r.body)); return r.body; };
-const sql = (q) => JSON.parse(execFileSync("wrangler", ["d1", "--config", LOCAL_CONFIG, "execute", "DB", "--local", "--persist-to", h.dir, "--json", "--command", q],
-  { cwd: ROOT, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }))[0].results;
-const n = (q) => sql(q)[0].n;
+// Async on purpose (as in app-connect-phase3.test.mjs): a synchronous child process blocks the event loop for seconds,
+// so fetch can't retire keep-alive sockets wrangler dev has already closed, and the next request fails ECONNRESET.
+const sql = async (q) => JSON.parse((await promisify(execFile)("wrangler", ["d1", "--config", LOCAL_CONFIG, "execute", "DB", "--local", "--persist-to", h.dir, "--json", "--command", q],
+  { cwd: ROOT, encoding: "utf8" })).stdout)[0].results;
+const n = async (q) => (await sql(q))[0].n;
 async function http(base, token, method, path, body) {
   const hd = { authorization: `Bearer ${token}` };
   if (body !== undefined) { hd["content-type"] = "application/json"; hd["idempotency-key"] = key("pd"); }
   const r = await fetch(base + path, { method, headers: hd, body: body === undefined ? undefined : JSON.stringify(body) });
   return { status: r.status, text: await r.text() };
 }
+const sha = (s) => createHash("sha256").update(s).digest("hex");
+// A publisher commits one generation (two JSON parts) into the project, so the purge has generations and a snapshot.
+async function publishGeneration(pub) {
+  const gid = "g_pd", data = JSON.stringify({ format: "agentlib.generation.part/1", generation_id: gid, source_revision: 1, records: [{ synthetic: true }] });
+  const root = JSON.stringify({ format: "agentlib.generation.index/1", generation_id: gid, source_revision: 1,
+    entries: [{ name: "part.json", sha256: sha(data), bytes: Buffer.byteLength(data), kind: "synthetic", count: 1, file: "part.json", utf8_bytes: Buffer.byteLength(data) }] });
+  const base = "/publisher/generations";
+  let x = await h.pub(pub.access_token, "POST", base, { body: { generation_id: gid, source_revision: 1, expected_current_snapshot_id: null, root_name: "root.json",
+    root_sha256: sha(root), part_count: 2, total_bytes: Buffer.byteLength(data) + Buffer.byteLength(root) }, idem: key() });
+  assert.equal(x.status, 201, JSON.stringify(x.json));
+  for (const [name, content] of [["part.json", data], ["root.json", root]]) {
+    x = await h.pub(pub.access_token, "PUT", `${base}/${gid}/parts/${name}`, { body: { content, sha256: sha(content), bytes: Buffer.byteLength(content) } });
+    assert.ok([200, 201].includes(x.status), JSON.stringify(x.json));
+  }
+  x = await h.pub(pub.access_token, "POST", `${base}/${gid}/commit`, { body: {}, idem: key() });
+  assert.equal(x.status, 201, JSON.stringify(x.json));
+}
+// MCP tool errors carry the HTTP-like status and code; a refusal must be a real not_found/forbidden, not a crash.
+const toolCode = (r) => r.data?.error?.code ?? r.data?.code ?? null;
 const toolStatus = (r) => !r.isError ? 200 : (r.data?.error?.status ?? r.data?.status ?? (r.status >= 400 ? r.status : 500));
 // Every way to reach a project, per credential. Each returns an HTTP status.
 const reach = {
@@ -35,7 +58,8 @@ const reach = {
   bobAddress: async (path) => (await bob.req("GET", `/api/projects/${encodeURIComponent(path)}/artifacts`)).status,
   key: (p, d) => http(h.issuer, cred.key, "GET", `/v1/projects/${p}/files/${d}`).then((r) => r.status),
   grant: (p, d) => http(h.appUi, cred.grant, "GET", `/api/projects/${p}/artifacts/${d}`).then((r) => r.status),
-  oauth: async (p, d) => toolStatus(await cred.oauth.call("read_artifact", { project_id: p, artifact_id: d })),
+  oauth: async (p, d) => { const r = await cred.oauth.call("read_artifact", { project_id: p, artifact_id: d }); const s = toolStatus(r); return s === 200 ? 200 : `${s}:${toolCode(r)}`; },
+  publisher: async () => (await h.pub(cred.pub.access_token, "GET", "/publisher/me")).status,
   // The SDK client throws when the server refuses the token itself (401 at the transport).
   grantMcp: async (p, d) => { try { return toolStatus(await cred.grantMcp.call("read_artifact", { project_id: p, artifact_id: d })); } catch (e) { return /401|-32001/.test(String(e.message)) ? 401 : 500; } },
 };
@@ -64,6 +88,10 @@ before(async () => {
   cred.grant = ok(await owner.req("POST", `/api/projects/${P.id}/grants`, { label: "pd grant", can_write: true }), 201).token;
   cred.grantMcp = await mcpClient(h.appUi, cred.grant, "pd-grant");
   cred.oauth = await h.connectMcpAgent({ [P.id]: "write" }, { clientName: "PD agent" });
+  cred.app = await h.registerApp({ display_name: "PD Publisher", redirect_uris: ["http://127.0.0.1:5995/cb"] });
+  cred.pub = await h.connectPublisher(cred.app, { project_id: P.id, destination: "root" });
+  await publishGeneration(cred.pub);
+  assert.ok(await n(`SELECT COUNT(*) AS n FROM snapshots WHERE publisher_id = '${cred.pub.publisher_id}'`) >= 1);
 });
 after(async () => { await cred.grantMcp?.close(); await h?.stop(); });
 
@@ -74,11 +102,12 @@ test("before deleting: every way in works", async () => {
 
 test("only admins can delete, and only with the project's name typed", async () => {
   assert.equal((await carol.req("DELETE", `/api/projects/${P.id}`, { confirm_title: "Old Notes" })).status, 403, "a member can't");
-  assert.equal((await http(h.issuer, cred.key, "DELETE", `/v1/projects/${P.id}`, { confirm_title: "Old Notes" })).status === 200, false, "an API key can't");
+  assert.ok([403, 404, 405].includes((await http(h.issuer, cred.key, "DELETE", `/v1/projects/${P.id}`, { confirm_title: "Old Notes" })).status), "an API key can't");
+  assert.equal(await n(`SELECT COUNT(*) AS n FROM projects WHERE id = '${P.id}' AND deleted_at IS NULL`), 1);
   assert.equal((await http(h.appUi, cred.grant, "DELETE", `/api/projects/${P.id}`, { confirm_title: "Old Notes" })).status, 403, "a grant token can't");
   const e = await bob.req("DELETE", `/api/projects/${P.id}`, { confirm_title: "old notes" });
   assert.equal(e.status, 400); assert.equal(e.body.error.code, "confirmation_required");
-  assert.equal(n(`SELECT COUNT(*) AS n FROM projects WHERE id = '${P.id}' AND deleted_at IS NOT NULL`), 0);
+  assert.equal(await n(`SELECT COUNT(*) AS n FROM projects WHERE id = '${P.id}' AND deleted_at IS NOT NULL`), 0);
 });
 
 test("delete: closed to everyone at once (same 404 as unknown), frees the limit slot and the address", async () => {
@@ -86,13 +115,15 @@ test("delete: closed to everyone at once (same 404 as unknown), frees the limit 
   const d = ok(await bob.req("DELETE", `/api/projects/${P.id}`, { confirm_title: "Old Notes" }));
   assert.ok(Date.parse(d.purge_at) - Date.parse(d.deleted_at) === 30 * 864e5);
   const unknown = await bob.req("GET", `/api/projects/prj_doesnotexist/artifacts/${P.doc}`);
+  assert.equal(await reach.publisher(), 401, "the publisher's token is refused (its project is gone)");
   for (const [name, f] of Object.entries(reach)) {
     if (name === "bobAddress") continue;
     const s = await f(P.id, P.doc);
     // 404 like an unknown project; an API key whose only project is gone is inactive as a whole (401
-    // credential_inactive, the same as when its creator loses access; a legacy grant token likewise); MCP tools answer
-    // with a tool error.
-    assert.ok(s === 404 || ((name === "key" || name === "grant") && s === 401) || (name === "oauth" || name === "grantMcp") && s >= 400, `${name} after delete: ${s}`);
+    // credential_inactive, the same as when its creator loses access; a legacy grant token likewise); the OAuth
+    // connection likewise (401 at the MCP transport: it has no live project left); the publisher's token is refused (401).
+    const want = { bob: [404], key: [401], grant: [401], grantMcp: [401], oauth: ["401:-32001"], publisher: [401, 403] }[name];
+    assert.ok(want.includes(s), `${name} after delete: ${s}`);
   }
   assert.equal((await bob.req("GET", `/api/projects/${P.id}/artifacts/${P.doc}`)).body.error.message, unknown.body.error.message, "indistinguishable from unknown");
   assert.equal(await reach.bobAddress(P.path), 404, "the address no longer resolves");
@@ -107,17 +138,19 @@ test("delete: closed to everyone at once (same 404 as unknown), frees the limit 
   const fresh = ok(await owner.req("POST", "/api/projects", { title: "Old Notes", workspace_id: WS, slug: P.slug }), 201);
   assert.equal(fresh.slug, P.slug);
   P.taker = fresh.id;
-  assert.equal(n(`SELECT COUNT(*) AS n FROM audits WHERE action = 'project.delete' AND project_id = '${P.id}'`), 1);
+  assert.equal(await n(`SELECT COUNT(*) AS n FROM audits WHERE action = 'project.delete' AND project_id = '${P.id}'`), 1);
 });
 
 test("recently deleted: admins see it with its purge date; members don't", async () => {
   const l = ok(await bob.req("GET", `/api/workspaces/${WS}/deleted-projects`));
-  assert.deepEqual(l.projects.map((p) => [p.id, p.title, p.items, p.deleted_by]), [[P.id, "Old Notes", 2, "Bob"]]);
+  // 2 documents plus the publisher's 3 generation files (2 parts and its manifest).
+  assert.deepEqual(l.projects.map((p) => [p.id, p.title, p.items, p.deleted_by]), [[P.id, "Old Notes", 5, "Bob"]]);
   assert.equal((await carol.req("GET", `/api/workspaces/${WS}/deleted-projects`)).status, 403);
 });
 
 test("restore: content, history and agent access come back; a taken address gets a fresh one", async () => {
-  assert.equal((await carol.req("POST", `/api/projects/${P.id}/restore`)).status, 403);
+  // A member learns nothing about deleted projects: the same 404 as an unknown id.
+  assert.equal((await carol.req("POST", `/api/projects/${P.id}/restore`)).status, 404);
   const r = ok(await owner.req("POST", `/api/projects/${P.id}/restore`));
   assert.notEqual(r.slug, P.slug, "its old address was taken meanwhile");
   assert.equal(r.address_changed, true, "the app is told the address changed");
@@ -138,33 +171,53 @@ test("restore keeps the address it had when deleted, if still free", async () =>
 });
 
 test("delete permanently: rows and R2 files are removed, a tombstone stays, credentials stay closed", async () => {
+  // Control: a file in another project, which must survive.
+  const keep = ok(await owner.req("POST", "/api/projects", { title: "Keep", workspace_id: WS }), 201).id;
+  const kb = ok(await owner.req("POST", `/api/projects/${keep}/uploads`, { title: "keep", mime: "image/png", size: png.length, sha256: sha256(png) }), 201);
+  assert.equal((await fetch(h.appUi + kb.put_url, { method: "PUT", headers: { cookie: owner.cookie, "x-csrf-token": owner.csrf, "content-type": "application/octet-stream" }, body: png })).status, 200);
+  ok(await owner.req("POST", `/api/projects/${keep}/uploads/${kb.upload_id}/finish`));
   ok(await bob.req("DELETE", `/api/projects/${P.id}`, { confirm_title: "Old Notes" }));
-  const keys = sql(`SELECT blob_key FROM revisions WHERE project_id = '${P.id}' AND blob_key IS NOT NULL`).map((r) => r.blob_key);
+  const keys = (await sql(`SELECT blob_key FROM revisions WHERE project_id = '${P.id}' AND blob_key IS NOT NULL`)).map((r) => r.blob_key);
   assert.ok(keys.length >= 1 && keys.every((k) => k.startsWith(`blobs/${P.id}/`)));
   const e = await bob.req("POST", `/api/projects/${P.id}/purge`, { confirm_title: "nope" });
   assert.equal(e.status, 400);
-  assert.equal((await carol.req("POST", `/api/projects/${P.id}/purge`, { confirm_title: "Old Notes" })).status, 403);
+  assert.equal((await carol.req("POST", `/api/projects/${P.id}/purge`, { confirm_title: "Old Notes" })).status, 404);
   ok(await bob.req("POST", `/api/projects/${P.id}/purge`, { confirm_title: "Old Notes" }));
-  for (const t of ["artifacts", "revisions", "comments", "meta_versions", "uploads", "project_changes", "folders", "idempotency"])
-    assert.equal(n(`SELECT COUNT(*) AS n FROM ${t} WHERE project_id = '${P.id}'`), 0, `${t} purged`);
-  const row = sql(`SELECT title, slug, purged_at FROM projects WHERE id = '${P.id}'`)[0];
+  for (const t of ["artifacts", "revisions", "comments", "meta_versions", "uploads", "project_changes", "folders", "idempotency", "transfer_links",
+    "project_members", "project_change_state", "change_scope_epochs", "publisher_generations"])
+    assert.equal(await n(`SELECT COUNT(*) AS n FROM ${t} WHERE project_id = '${P.id}'`), 0, `${t} purged`);
+  assert.equal(await n(`SELECT COUNT(*) AS n FROM snapshots WHERE publisher_id = '${cred.pub.publisher_id}'`), 0, "snapshots purged");
+  assert.equal(await n(`SELECT COUNT(*) AS n FROM publisher_generation_parts WHERE publisher_id = '${cred.pub.publisher_id}'`), 0, "generation parts purged");
+  // Credentials whose only project this was are revoked (they'd otherwise hold an agents slot forever).
+  assert.equal(await n(`SELECT COUNT(*) AS n FROM publishers WHERE id = '${cred.pub.publisher_id}' AND revoked_at IS NOT NULL`), 1);
+  assert.equal(await n(`SELECT COUNT(*) AS n FROM api_credential_projects acp JOIN api_credentials k ON k.id = acp.credential_id WHERE acp.project_id = '${P.id}' AND k.revoked_at IS NULL`), 0);
+  assert.equal(await n(`SELECT COUNT(*) AS n FROM oauth_connection_projects cp JOIN oauth_connections c ON c.id = cp.connection_id WHERE cp.project_id = '${P.id}' AND c.revoked_at IS NULL`), 0);
+  assert.equal(await n(`SELECT COUNT(*) AS n FROM grants WHERE project_id = '${P.id}' AND revoked_at IS NULL`), 0);
+  const row = (await sql(`SELECT title, slug, purged_at FROM projects WHERE id = '${P.id}'`))[0];
   assert.equal(row.title, "Deleted project"); assert.equal(row.slug, null); assert.ok(row.purged_at > 0);
-  assert.equal(n(`SELECT COUNT(*) AS n FROM artifact_search_keys WHERE artifact_id IN ('${P.doc}', '${P.file}')`), 0, "search index cleared");
-  // R2: the objects are gone from the local bucket (miniflare keeps object metadata in SQLite under the persist dir).
-  const r2db = readdirSync(join(h.dir, "v3", "r2", "miniflare-R2BucketObject")).find((f) => f.endsWith(".sqlite") && f !== "metadata.sqlite");
-  const r2keys = new DatabaseSync(join(h.dir, "v3", "r2", "miniflare-R2BucketObject", r2db), { readOnly: true }).prepare("SELECT key FROM _mf_objects").all().map((r) => r.key);
-  for (const k of keys) assert.ok(!r2keys.includes(k), `R2 object ${k} removed`);
-  assert.ok(!r2keys.some((k) => k.startsWith(`blobs/${P.id}/`) || k.startsWith(`staging/${P.id}/`)), "nothing left under the project's prefixes");
+  assert.equal(await n(`SELECT COUNT(*) AS n FROM artifact_search_keys WHERE artifact_id IN ('${P.doc}', '${P.file}')`), 0, "search index cleared");
   // Not restorable, not listed; credentials still closed.
   assert.equal((await owner.req("POST", `/api/projects/${P.id}/restore`)).status, 404);
   assert.ok(!ok(await bob.req("GET", `/api/workspaces/${WS}/deleted-projects`)).projects.some((x) => x.id === P.id), "no longer under Recently deleted");
-  // The API key's only project is gone, so the key is inactive (401); the OAuth agent gets a tool error.
+  // The API key is revoked now (401); the OAuth agent's connection is revoked, so its token stops working.
   assert.equal(await reach.key(P.id, P.doc), 401);
-  assert.ok((await reach.oauth(P.id, P.doc)) >= 400);
-  assert.equal(n(`SELECT COUNT(*) AS n FROM audits WHERE action = 'project.purge' AND project_id = '${P.id}'`), 1);
+  assert.equal((await fetch(`${h.issuer}/mcp`, { method: "POST", headers: { authorization: `Bearer ${cred.oauth.access_token}`, "content-type": "application/json", accept: "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }) })).status, 401);
+  assert.equal(await n(`SELECT COUNT(*) AS n FROM audits WHERE action = 'project.purge' AND project_id = '${P.id}'`), 1);
+  // R2: the objects are gone from the local bucket. Read miniflare's object index directly (read-only): a second
+  // wrangler process on the live persist dir would disturb the running server.
+  const dir = join(h.dir, "v3", "r2", "miniflare-R2BucketObject");
+  const r2db = readdirSync(dir).find((f) => f.endsWith(".sqlite") && f !== "metadata.sqlite");
+  const r2 = new DatabaseSync(join(dir, r2db), { readOnly: true });
+  try {
+    const r2keys = r2.prepare("SELECT key FROM _mf_objects").all().map((r) => r.key);
+    assert.ok(r2keys.some((k) => k.startsWith(`blobs/${keep}/`)), "control: another project's file is still there");
+    for (const k of keys) assert.ok(!r2keys.includes(k), `R2 object ${k} removed`);
+    assert.ok(!r2keys.some((k) => k.startsWith(`blobs/${P.id}/`) || k.startsWith(`staging/${P.id}/`)), "nothing left under the project's prefixes");
+  } finally { r2.close(); }
 });
 
-test("the cron purges projects whose 30 days have passed, in bounded batches", async () => {
+test("the cron purges projects whose 30 days have passed", async () => {
   const q = ok(await owner.req("POST", "/api/projects", { title: "Expiring", workspace_id: WS }), 201).id;
   const docs = [];
   for (let i = 0; i < 3; i++) docs.push(ok(await owner.req("POST", `/api/projects/${q}/artifacts`, { title: `d${i}`, body: `synthetic ${i}` }), 201).artifact_id);
@@ -172,14 +225,14 @@ test("the cron purges projects whose 30 days have passed, in bounded batches", a
   // Not due yet: the cron leaves it alone.
   await fetch(`${h.issuer}/cdn-cgi/handler/scheduled`);
   await new Promise((r) => setTimeout(r, 500));
-  assert.equal(n(`SELECT COUNT(*) AS n FROM artifacts WHERE project_id = '${q}'`), 3, "kept during the 30 days");
+  assert.equal(await n(`SELECT COUNT(*) AS n FROM artifacts WHERE project_id = '${q}'`), 3, "kept during the 30 days");
   // Its 30 days are over.
-  sql(`UPDATE projects SET purge_at = 1 WHERE id = '${q}'`);
+  await sql(`UPDATE projects SET purge_at = 1 WHERE id = '${q}'`);
   const t = await fetch(`${h.issuer}/cdn-cgi/handler/scheduled`);
   assert.equal(t.status, 200, "wrangler dev runs the cron on /cdn-cgi/handler/scheduled");
-  for (let i = 0; i < 20 && n(`SELECT COUNT(*) AS n FROM projects WHERE id = '${q}' AND purged_at IS NOT NULL`) === 0; i++) await new Promise((r) => setTimeout(r, 300));
-  assert.equal(n(`SELECT COUNT(*) AS n FROM artifacts WHERE project_id = '${q}'`), 0);
-  assert.equal(n(`SELECT COUNT(*) AS n FROM projects WHERE id = '${q}' AND purged_at IS NOT NULL`), 1);
+  for (let i = 0; i < 20 && await n(`SELECT COUNT(*) AS n FROM projects WHERE id = '${q}' AND purged_at IS NOT NULL`) === 0; i++) await new Promise((r) => setTimeout(r, 300));
+  assert.equal(await n(`SELECT COUNT(*) AS n FROM artifacts WHERE project_id = '${q}'`), 0);
+  assert.equal(await n(`SELECT COUNT(*) AS n FROM projects WHERE id = '${q}' AND purged_at IS NOT NULL`), 1);
 });
 
 test("browser: delete from Project settings, see it under Recently deleted, restore it", async (t) => {
@@ -235,4 +288,42 @@ test("browser: delete from Project settings, see it under Recently deleted, rest
     assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1), "no horizontal scroll");
     await page.screenshot({ path: "tmp/test-evidence/project-delete-mobile.png", fullPage: true });
   } finally { await browser.close(); }
+});
+
+test("the purge is bounded: a small budget stops part-way and the next run finishes (unit, real migrations)", async () => {
+  const { loadWorker } = await import("./load-worker.mjs");
+  const { DatabaseSync } = await import("node:sqlite");
+  const { readFileSync, readdirSync: rd } = await import("node:fs");
+  const lib = await loadWorker({ "project-deletion.js": ["purgeDueProjects"] });
+  const db = new DatabaseSync(":memory:");
+  for (const f of rd(join(ROOT, "migrations")).filter((f) => f.endsWith(".sql")).sort()) db.exec(readFileSync(join(ROOT, "migrations", f), "utf8"));
+  const stmt = (q, p) => ({ async first(c) { const r = db.prepare(q).get(...p); return c ? r?.[c] ?? null : r ?? null; }, async all() { return { results: db.prepare(q).all(...p) }; },
+    runSync() { return { meta: { changes: Number(db.prepare(q).run(...p).changes) } }; }, async run() { return this.runSync(); } });
+  const DB = { prepare(q) { return { bind: (...p) => stmt(q, p), ...stmt(q, []) }; }, async batch(ss) { db.exec("BEGIN"); try { const r = ss.map((s) => s.runSync()); db.exec("COMMIT"); return r; } catch (e) { db.exec("ROLLBACK"); throw e; } } };
+  const gone = [];
+  const env = { DB, BLOBS: { async delete(k) { gone.push(k); } } };
+  const at = new Date().toISOString();
+  db.prepare("INSERT INTO principals (id, kind, issuer, subject, label, created_at) VALUES ('hum_u','human','synthetic','u','U',?)").run(at);
+  db.prepare("INSERT INTO projects (id, owner_id, title, created_at, deleted_at, purge_at) VALUES ('prj_u','hum_u','U',?,1,1)").run(at);
+  for (let i = 0; i < 30; i++) {
+    db.prepare("INSERT INTO artifacts (id, project_id, kind, title, created_at, updated_at, head_rev) VALUES (?, 'prj_u', 'binary', 'f', ?, ?, 1)").run(`art_${i}`, at, at);
+    db.prepare("INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, blob_key, size, sha256, mime, created_at) VALUES (?, ?, 'prj_u', 1, 'hum_u', ?, 1, 'x', 'image/png', ?)")
+      .run(`rev_${i}`, `art_${i}`, `blobs/prj_u/art_${i}/f`, at);
+  }
+  // A key outside the project's prefix is never deleted.
+  db.prepare("INSERT INTO artifacts (id, project_id, kind, title, created_at, updated_at, head_rev) VALUES ('art_x', 'prj_u', 'binary', 'x', ?, ?, 1)").run(at, at);
+  db.prepare("INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, blob_key, size, sha256, mime, created_at) VALUES ('rev_x', 'art_x', 'prj_u', 1, 'hum_u', 'blobs/prj_other/art_x/f', 1, 'x', 'image/png', ?)").run(at);
+  const orig = console.error; console.error = () => {};
+  try {
+    const a = await lib.purgeDueProjects(env, { rowBudget: 10, blobBudget: 12 });
+    assert.equal(a.projects, 0, "not finished within the budget");
+    assert.ok(gone.length >= 1 && gone.length <= 12, `at most the R2 budget (${gone.length})`);
+    let runs = 1, r;
+    do { r = await lib.purgeDueProjects(env, { rowBudget: 10, blobBudget: 12 }); runs++; } while (!r.projects && runs < 40);
+    assert.equal(r.projects, 1, "a later run finishes it");
+    assert.ok(runs > 3, "it really took several bounded runs");
+  } finally { console.error = orig; }
+  assert.deepEqual([...new Set(gone)].sort(), Array.from({ length: 30 }, (_, i) => `blobs/prj_u/art_${i}/f`).sort(), "every project file, once, and nothing outside it");
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM artifacts WHERE project_id = 'prj_u'").get().n, 0);
+  assert.ok(db.prepare("SELECT purged_at FROM projects WHERE id = 'prj_u'").get().purged_at > 0);
 });

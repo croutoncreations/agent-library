@@ -116,9 +116,15 @@ Decision D21 B. Workspace owners and admins delete a project from Project settin
 - **30 days:** admins see it under **Recently deleted** on the workspace page, and can restore it (if the projects limit
   has room) with all its content, history and agent access. It gets its old address back, or a fresh one if that was
   taken meanwhile. **Delete permanently** skips the wait.
-- **Then:** the 15-minute cron (`purgeDueProjects`) removes its R2 files and every row keyed by the project, in bounded
-  batches. The `projects` row stays as a tombstone (title "Deleted project", no address), because API keys, connections
-  and audits reference it. Audits `project.delete`, `project.restore`, `project.purge_requested` and `project.purge`.
+- **Who:** deleting, restoring and deleting permanently all need the admin or owner role in the workspace (a
+  per-project role cap doesn't change that), in an active workspace. Restoring needs room in the projects limit, and in
+  the agents limit for its legacy grant tokens.
+- **Then:** the 15-minute cron (`purgeDueProjects`) removes its R2 files and its content rows (documents, versions,
+  comments, details history, folders, uploads, change feed, idempotency, publisher generations and snapshots, per-project
+  roles), in bounded batches, skipping a project while an upload is inside its finish lease. Kept, all closed: the
+  `projects` row as a tombstone (title "Deleted project", no address), grants, API keys, OAuth connections and their
+  project scopes, publishers, and audits. At purge, its grants and publishers are revoked, and so are API keys and OAuth
+  connections that have no live project left. Audits `project.delete`, `project.restore`, `project.purge_requested` and `project.purge`.
 - **Migration 0024** adds `deleted_at`, `deleted_by`, `purge_at`, `purged_at` and `deleted_slug` to `projects`. Rolling
   back to an earlier Worker makes deleted, not-yet-purged projects reappear.
 

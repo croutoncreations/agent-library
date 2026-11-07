@@ -33,6 +33,8 @@ const confirmTitle = (input, title) => {
 /** DELETE /api/projects/:id {confirm_title}: workspace admins (project admin role); the workspace must be active. */
 export async function deleteProject(ctx, projectId, input) {
   requireHuman(ctx);
+  // Deleting, restoring and purging all need the admin (or owner) role in the project's workspace, whatever any
+  // per-project cap says: it's a workspace-level action, like creating a project.
   const p = await ctx.env.DB.prepare(`SELECT p.id, p.title, ${projectWorkspaceSql("p")} AS workspace_id FROM projects p WHERE p.id = ? AND p.deleted_at IS NULL AND ${memberRoleSql("p.id", "viewer")}`)
     .bind(projectId, ctx.principal.id).first();
   if (!p) throw new HttpError(404, "not_found", "Project not found");
@@ -44,7 +46,7 @@ export async function deleteProject(ctx, projectId, input) {
     // workspace_id is filled for legacy rows so the Recently deleted list (by workspace) finds them. The address is
     // released (a new project can take it) and kept in deleted_slug for a restore.
     ctx.env.DB.prepare(`UPDATE projects SET deleted_at = ?, deleted_by = ?, purge_at = ?, deleted_slug = slug, slug = NULL, workspace_id = COALESCE(workspace_id, 'wsp_' || owner_id)
-        WHERE id = ? AND deleted_at IS NULL AND ${memberRoleSql("?", "admin")}`).bind(now, ctx.principal.id, now + RETENTION_DAYS * DAY, projectId, ctx.principal.id, projectId),
+        WHERE id = ? AND deleted_at IS NULL AND ${workspaceRoleSql("?", "admin")}`).bind(now, ctx.principal.id, now + RETENTION_DAYS * DAY, projectId, ctx.principal.id, p.workspace_id),
     audit(ctx, projectId, "project.delete", "ok", gate, [])
   ]);
   if (!u.meta.changes) throw new HttpError(403, "forbidden", "Needs the admin role in this workspace");
@@ -57,7 +59,7 @@ export async function listDeletedProjects(ctx, workspaceId) {
   await requireWorkspaceRole(ctx, workspaceId, "admin", true);
   const r = await ctx.env.DB.prepare(
     `SELECT p.id, p.title, p.deleted_at, p.purge_at, pr.label AS deleted_by_label,
-       (SELECT COUNT(*) FROM artifacts a WHERE a.project_id = p.id AND a.head_rev > 0) AS items
+       (SELECT COUNT(*) FROM artifacts a WHERE a.project_id = p.id AND a.head_rev > 0 AND a.trashed_at IS NULL) AS items
      FROM projects p LEFT JOIN principals pr ON pr.id = p.deleted_by
      WHERE p.workspace_id = ? AND p.deleted_at IS NOT NULL AND p.purged_at IS NULL AND p.purge_at > ? ORDER BY p.deleted_at DESC LIMIT 200`
   ).bind(workspaceId, nowMs()).all();
@@ -68,8 +70,11 @@ export async function listDeletedProjects(ctx, workspaceId) {
 async function deletedRow(ctx, projectId) {
   const p = await ctx.env.DB.prepare("SELECT id, title, deleted_slug AS slug, workspace_id, purge_at FROM projects WHERE id = ? AND deleted_at IS NOT NULL AND purged_at IS NULL AND purge_at > ?")
     .bind(projectId, nowMs()).first();
-  if (!p?.workspace_id) throw new HttpError(404, "not_found", "Deleted project not found");
-  await requireWorkspaceRole(ctx, p.workspace_id, "admin");
+  // Same 404 whether it doesn't exist or the caller isn't an admin of its workspace (nothing about it is revealed).
+  // workspaceRoleSql's SQL names the principal (join) before the workspace (where): bind in that order.
+  const admin = p?.workspace_id && await ctx.env.DB.prepare(`SELECT ${workspaceRoleSql("?", "admin", "?", true)} AS ok`).bind(ctx.principal.id, p.workspace_id).first("ok");
+  if (!admin) throw new HttpError(404, "not_found", "Deleted project not found");
+  await requireWorkspaceRole(ctx, p.workspace_id, "admin");   // read-only (suspended) workspaces: 403 workspace_read_only
   return p;
 }
 
@@ -77,7 +82,10 @@ async function deletedRow(ctx, projectId) {
 export async function restoreProject(ctx, projectId) {
   requireHuman(ctx);
   const p = await deletedRow(ctx, projectId);
-  const lg = await limitGuard(ctx.env, p.workspace_id, { projects: 1 });
+  // Its legacy grant tokens come back with it and count as agents again.
+  const grants = await ctx.env.DB.prepare("SELECT COUNT(*) AS n FROM grants WHERE project_id = ? AND revoked_at IS NULL AND expires_at > ?").bind(projectId, nowMs()).first("n");
+  const adds = { projects: 1, ...grants ? { agents: grants } : {} };
+  const lg = await limitGuard(ctx.env, p.workspace_id, adds);
   const live = "deleted_at IS NOT NULL AND purged_at IS NULL AND purge_at > ?";
   const [u] = await ctx.env.DB.batch([
     ctx.env.DB.prepare(`UPDATE projects SET deleted_at = NULL, deleted_by = NULL, purge_at = NULL, deleted_slug = NULL
@@ -85,7 +93,7 @@ export async function restoreProject(ctx, projectId) {
     audit(ctx, projectId, "project.restore", "ok", "changes() = 1", [])
   ]);
   if (!u.meta.changes) {
-    await explainLimit(ctx.env, p.workspace_id, { projects: 1 }, lg.limits);
+    await explainLimit(ctx.env, p.workspace_id, adds, lg.limits);
     throw new HttpError(409, "conflict", "The project changed meanwhile. Reload and try again.");
   }
   // Its old address if still free (a new project may have taken it meanwhile), else a fresh one from the title.
@@ -110,8 +118,9 @@ export async function purgeProjectNow(ctx, projectId, input) {
     audit(ctx, projectId, "project.purge_requested", "ok", "changes() = 1", [])
   ]);
   if (!u.meta.changes) throw new HttpError(409, "conflict", "The project changed meanwhile. Reload and try again.");
-  // Start right away (bounded); the cron finishes anything left.
-  await purgeDueProjects(ctx.env, { projectId, rowBudget: 2000, blobBudget: 200 });
+  // Start right away (bounded) unless an upload could still be finishing (its lease is 60 s); the cron finishes the rest.
+  const leased = await ctx.env.DB.prepare("SELECT 1 FROM uploads WHERE project_id = ? AND finalize_until > ? LIMIT 1").bind(projectId, now).first();
+  if (!leased) await purgeDueProjects(ctx.env, { projectId, rowBudget: 2000, blobBudget: 200 });
   return { ok: true, id: projectId };
 }
 
@@ -134,8 +143,9 @@ const STEPS = [
   ["project_change_state", "project_id = ?1"],
   ["change_scope_epochs", "project_id = ?1"]
 ];
-// Kept (they hold credentials and history, all closed by the gate): grants, oauth_connection_projects,
-// api_credential_projects, publishers (revoked here), audits.
+// Kept (credentials and history; all closed by the gate): grants, oauth_connections, oauth_connection_projects,
+// api_credentials, api_credential_projects, publishers and audits. At purge, publishers and grants for this project are
+// revoked, and so are API keys and OAuth connections left with no live project.
 
 /**
  * Cron: remove the content of projects whose purge_at has passed. Bounded per run (rowBudget rows, blobBudget R2
@@ -143,7 +153,9 @@ const STEPS = [
  */
 export async function purgeDueProjects(env, { projectId, rowBudget = 5000, blobBudget = 500 } = {}) {
   const now = nowMs();
-  const due = (await env.DB.prepare(`SELECT id FROM projects WHERE purge_at IS NOT NULL AND purge_at <= ? AND purged_at IS NULL AND deleted_at IS NOT NULL${projectId ? " AND id = ?" : ""} ORDER BY purge_at LIMIT 5`)
+  // A project with an upload still inside its finish lease waits for the next run, so no file lands after its rows go.
+  const due = (await env.DB.prepare(`SELECT id FROM projects WHERE purge_at IS NOT NULL AND purge_at <= ?1 AND purged_at IS NULL AND deleted_at IS NOT NULL${projectId ? " AND id = ?2" : ""}
+      AND NOT EXISTS (SELECT 1 FROM uploads u WHERE u.project_id = projects.id AND u.finalize_until > ?1) ORDER BY purge_at LIMIT 5`)
     .bind(now, ...projectId ? [projectId] : []).all()).results;
   const out = { projects: 0, rows: 0, files: 0, finished: [] };
   for (const { id } of due) {
@@ -178,9 +190,16 @@ export async function purgeDueProjects(env, { projectId, rowBudget = 5000, blobB
         if (k < n) break;
       }
     }
-    // Search index rows go with their artifacts (trigger). Publishers stop for good; the project row becomes a tombstone.
+    // An upload whose finish lease started before the delete may still write its file: sweep the prefix once the lease
+    // has surely ended (the purge runs on a 15-minute cron; "delete permanently" waits for the next run for these).
+    // Search index rows go with their artifacts (trigger). Publishers stop for good; API keys and OAuth connections
+    // whose every project is now gone are revoked (they can't reach anything and would hold an agents slot forever).
+    const noLive = (table, col) => `NOT EXISTS (SELECT 1 FROM ${table} x JOIN projects pj ON pj.id = x.project_id WHERE x.${col} = c.id AND x.project_id <> ?2 AND pj.deleted_at IS NULL)`;
     await env.DB.batch([
       env.DB.prepare("UPDATE publishers SET revoked_at = COALESCE(revoked_at, ?) WHERE project_id = ?").bind(now, id),
+      env.DB.prepare(`UPDATE api_credentials AS c SET revoked_at = ?1 WHERE c.revoked_at IS NULL AND EXISTS (SELECT 1 FROM api_credential_projects WHERE credential_id = c.id AND project_id = ?2) AND ${noLive("api_credential_projects", "credential_id")}`).bind(now, id),
+      env.DB.prepare(`UPDATE oauth_connections AS c SET revoked_at = ?1 WHERE c.revoked_at IS NULL AND EXISTS (SELECT 1 FROM oauth_connection_projects WHERE connection_id = c.id AND project_id = ?2) AND ${noLive("oauth_connection_projects", "connection_id")}`).bind(now, id),
+      env.DB.prepare("UPDATE grants SET revoked_at = COALESCE(revoked_at, ?) WHERE project_id = ?").bind(now, id),
       env.DB.prepare("UPDATE projects SET purged_at = ?, title = 'Deleted project', slug = NULL, deleted_slug = NULL WHERE id = ? AND purged_at IS NULL").bind(now, id),
       env.DB.prepare(`INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id, workspace_id)
         SELECT ?, 'system', ?, 'project.purge', ?, 'ok', 'cron', workspace_id FROM projects WHERE id = ?`).bind(nowIso(), id, id, id)
