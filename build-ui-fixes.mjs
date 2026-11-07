@@ -6,7 +6,7 @@
 import {readFileSync,writeFileSync} from 'node:fs';
 import {createHash} from 'node:crypto';
 const sha=b=>createHash('sha256').update(b).digest('hex');
-const SERVICE='a3c7f3830859eb44df2d6637495b8b190e6e4529a971d870015992cb958020e0';
+const SERVICE='47338896cb1e67153a41803d1d7a77ccd3762b8ccebe3c4e7c53bc378bc82926';
 const input=readFileSync('src/index.js','utf8');
 if(sha(input)!==SERVICE)throw Error('Input is not the service-fixes bundle e43008c1; run build-service-fixes.mjs first');
 const once=(s,needle,what,from=0)=>{const i=s.indexOf(needle,from);if(i<0||s.indexOf(needle,i+1)>=0)throw Error('Expected exactly one '+what);return i;};
