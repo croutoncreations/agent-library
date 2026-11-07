@@ -668,7 +668,7 @@ async function viewWorkspace(id) {
     // Projects in this workspace (what members can reach), with a shortcut to create one here.
     var projMsg = sectionMsg();
     var projList = h("ul", { class: "list", "aria-label": "Projects in " + wsLabel(ws) });
-    if (!projects.length) projList.append(h("li", { class: "empty", text: admin ? "No projects yet." : "No projects you can open yet." }));
+    if (!projects.length) projList.append(h("li", { class: "empty", text: realAdmin && deleted && deleted.length ? "No active projects. Recently deleted projects are below." : admin ? "No projects yet." : "No projects you can open yet." }));
     projects.forEach(function (p) {
       projList.append(h("li", { class: "link" }, h("span", { class: "ficon-sm", "aria-hidden": "true" }, icon("folder")),
         h("div", { class: "grow" }, rowLink("#/p/" + enc(p.id), p.title), h("small", { class: "muted", text: (p.path ? "/" + p.path : "") + (p.role === "viewer" ? (p.path ? " · " : "") + "View only" : "") })),
@@ -711,28 +711,51 @@ async function viewWorkspace(id) {
       var dl = h("ul", { class: "list", "aria-label": "Recently deleted projects" });
       deleted.forEach(function (p) {
         var days = Math.max(1, Math.ceil((Date.parse(p.purge_at) - Date.now()) / 864e5));
-        var restoreBtn = h("button", { type: "button", class: "secondary", disabled: suspended, title: suspended ? "The workspace is read-only" : null }, "Restore");
+        var restoreBtn = h("button", { type: "button", class: "secondary", disabled: suspended }, "Restore");
         restoreBtn.addEventListener("click", async function () {
           restoreBtn.disabled = true;
-          try { await api("POST", "/api/projects/" + enc(p.id) + "/restore"); toast("Restored " + p.title); focusAfter = "h2#projects-h"; load(); }
-          catch (err) { sectionErr(delMsg, err); restoreBtn.disabled = false; }
+          try {
+            var r = await api("POST", "/api/projects/" + enc(p.id) + "/restore");
+            toast(r.address_changed ? "Restored " + p.title + ". Its old address was taken, so it's now at /" + (ws.handle ? ws.handle + "/" : "") + r.slug + "." : "Restored " + p.title);
+            focusAfter = "h2#projects-h"; load();
+          } catch (err) { sectionErr(delMsg, err); restoreBtn.disabled = false; }
         });
-        var purgeBtn = h("button", { type: "button", class: "danger secondary", disabled: suspended }, "Delete permanently");
-        purgeBtn.addEventListener("click", async function () {
-          var typed = prompt("Delete " + p.title + " permanently? Its " + p.items + (p.items === 1 ? " item" : " items") + " and their history are removed and can't be restored. Type the project's name to confirm.");
-          if (typed === null) return;
-          if (typed.trim() !== p.title) { sectionErr(delMsg, { message: "The name didn't match, so nothing was deleted." }); return; }
-          purgeBtn.disabled = true;
-          try { await api("POST", "/api/projects/" + enc(p.id) + "/purge", { confirm_title: typed.trim() }); toast("Deleted " + p.title + " permanently"); load(); }
-          catch (err) { sectionErr(delMsg, err); purgeBtn.disabled = false; }
+        var purgeBtn = h("button", { type: "button", class: "danger secondary", disabled: suspended, "aria-expanded": "false" }, "Delete permanently");
+        var li = h("li", { class: "deleted-project", dataset: { pid: p.id } });
+        // Inline confirmation, like the other danger zones: type the name; Cancel/Escape collapses it.
+        var confirmBox = null;
+        function closeConfirm() { if (confirmBox) { confirmBox.remove(); confirmBox = null; purgeBtn.setAttribute("aria-expanded", "false"); purgeBtn.focus(); } }
+        purgeBtn.addEventListener("click", function () {
+          if (confirmBox) { closeConfirm(); return; }
+          var input = h("input", { type: "text", autocomplete: "off", spellcheck: false, "aria-describedby": "purge-help-" + p.id, placeholder: p.title });
+          var go = h("button", { type: "button", class: "danger", disabled: true }, "Delete permanently");
+          input.addEventListener("input", function () { go.disabled = input.value.trim() !== p.title; });
+          go.addEventListener("click", async function () {
+            if (input.value.trim() !== p.title) return;
+            go.disabled = true;
+            try {
+              await api("POST", "/api/projects/" + enc(p.id) + "/purge", { confirm_title: p.title });
+              toast("Deleted " + p.title + " permanently");
+              var next = li.nextElementSibling || li.previousElementSibling;
+              focusAfter = next && next.dataset.pid ? "li.deleted-project[data-pid='" + next.dataset.pid + "'] button" : "h2#projects-h";
+              load();
+            } catch (err) { sectionErr(delMsg, err); go.disabled = false; }
+          });
+          confirmBox = h("div", { class: "danger-zone purge-confirm", onkeydown: function (e) { if (e.key === "Escape") { e.preventDefault(); closeConfirm(); } else if (e.key === "Enter" && e.target === input) { e.preventDefault(); if (!go.disabled) go.click(); } } },
+            h("p", { id: "purge-help-" + p.id, class: "muted small", text: "Its " + (p.items === 1 ? "1 item" : p.items + " items") + " and all their versions, comments and files are removed now. This can't be undone." }),
+            h("label", { class: "field" }, h("span", null, "Type ", h("strong", { text: "“" + p.title + "”" }), " to delete it permanently"), input),
+            h("div", { class: "row" }, go, h("button", { type: "button", class: "secondary", onclick: closeConfirm }, "Cancel")));
+          li.append(confirmBox); purgeBtn.setAttribute("aria-expanded", "true"); input.focus();
         });
-        dl.append(h("li", { class: "deleted-project" }, h("span", { class: "ficon-sm", "aria-hidden": "true" }, icon("trash")),
+        li.append(h("span", { class: "ficon-sm", "aria-hidden": "true" }, icon("trash")),
           h("div", { class: "grow" }, h("strong", { text: p.title }),
-            h("small", { class: "muted", text: (p.items === 1 ? "1 item" : p.items + " items") + " · deleted " + new Date(p.deleted_at).toLocaleDateString() + (p.deleted_by ? " by " + p.deleted_by : "") + " · removed for good in " + days + (days === 1 ? " day" : " days") })),
-          h("span", { class: "row" }, restoreBtn, purgeBtn)));
+            h("small", { class: "muted", text: (p.items === 1 ? "1 item" : p.items + " items") + " · deleted " + new Date(p.deleted_at).toLocaleDateString() + (p.deleted_by ? " by " + p.deleted_by : "") + " · removed for good on " + new Date(p.purge_at).toLocaleDateString() })),
+          h("span", { class: "row" }, restoreBtn, purgeBtn));
+        dl.append(li);
       });
-      deletedList = h("section", { "aria-labelledby": "deleted-h" }, h("h3", { id: "deleted-h", text: "Recently deleted" }),
-        h("p", { class: "muted small", text: "Deleted projects stay here for 30 days. Nobody can open them, and they don't count toward the projects limit; their files still count toward storage until they're removed." }),
+      deletedList = h("section", { class: "recently-deleted", "aria-labelledby": "deleted-h" }, h("h3", { id: "deleted-h", text: "Recently deleted" }),
+        h("p", { class: "muted small", text: "Deleted projects stay here for 30 days. Nobody can open them, and they don't count toward the projects limit; their files still count toward storage until they're removed." +
+          (suspended ? " While the workspace is read-only, they can't be restored or deleted permanently." : "") }),
         delMsg, dl);
     }
 
@@ -984,6 +1007,7 @@ function toggleProjectSettings(pid, opener) {
 // A fieldset inside the settings form (forms can't nest); its own button submits nothing else.
 function projectDeleteZone(pid, msg) {
   var name = projectTitles[pid] || "";
+  if (!name) return null;   // never offer a delete that can't be confirmed by name
   var confirmName = h("input", { type: "text", autocomplete: "off", spellcheck: false, "aria-describedby": "proj-del-help", placeholder: name });
   var btn = h("button", { type: "button", class: "danger", disabled: true }, "Delete project");
   confirmName.addEventListener("input", function () { btn.disabled = confirmName.value.trim() !== name; });
@@ -999,10 +1023,11 @@ function projectDeleteZone(pid, msg) {
       location.hash = ws ? "#/workspaces/" + enc(ws) : "#/";
     } catch (err) { sectionErr(msg, err); btn.disabled = false; }
   });
-  return h("fieldset", { class: "card danger-zone proj-delete" }, h("legend", { class: "sr", text: "Delete project" }),
+  return h("div", { class: "proj-danger" }, h("h3", { class: "danger-h", text: "Danger zone" }),
+    h("fieldset", { class: "card danger-zone proj-delete" }, h("legend", { class: "sr", text: "Delete project" }),
     h("p", null, h("strong", { text: "Delete project" }), h("br"),
-      h("span", { id: "proj-del-help", class: "muted small", text: "Closes it right away for everyone in the workspace and for every agent, app and API key connected to it. Its address becomes free. Workspace admins can restore it, with everything in it, from the workspace page for 30 days; after that it's removed for good." })),
-    h("label", { class: "field" }, h("span", { text: "Type " + name + " to confirm" }), confirmName), btn);
+      h("span", { id: "proj-del-help", class: "muted small", text: "Closes it right away for everyone in the workspace and for every agent, app and API key connected to it. Its address becomes free, so a new project can take it. Workspace admins can restore it, with everything in it, from the workspace page for 30 days; after that it's removed for good." })),
+    h("label", { class: "field" }, h("span", null, "Type ", h("strong", { text: "“" + name + "”" }), " to confirm"), confirmName), btn));
 }
 // Shown once after creating an invitation. Like secretBox: copy can fail (plain HTTP, denied permission).
 function inviteLinkBox(box, r, onDone) {

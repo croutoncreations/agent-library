@@ -120,6 +120,7 @@ test("restore: content, history and agent access come back; a taken address gets
   assert.equal((await carol.req("POST", `/api/projects/${P.id}/restore`)).status, 403);
   const r = ok(await owner.req("POST", `/api/projects/${P.id}/restore`));
   assert.notEqual(r.slug, P.slug, "its old address was taken meanwhile");
+  assert.equal(r.address_changed, true, "the app is told the address changed");
   for (const [name, f] of Object.entries(reach)) if (name !== "bobAddress") assert.equal(await f(P.id, P.doc), 200, `${name} after restore`);
   const hist = ok(await bob.req("GET", `/api/projects/${P.id}/artifacts/${P.doc}/history`));
   assert.equal(hist.revisions?.length ?? hist.items?.length, 2);
@@ -209,10 +210,21 @@ test("browser: delete from Project settings, see it under Recently deleted, rest
     await page.waitForFunction(() => /^#\/workspaces\//.test(location.hash));
     await page.waitForSelector(".deleted-project");
     const row = await page.evaluate(() => [...document.querySelectorAll(".deleted-project")].map((e) => e.innerText).find((x) => /Q3 Research/.test(x)) ?? "");
-    assert.match(row, /Q3 Research[\s\S]*1 item · deleted .* by Bob · removed for good in 30 days/);
+    assert.match(row, /Q3 Research[\s\S]*1 item · deleted .* by Bob · removed for good on /);
     assert.doesNotMatch(await page.$eval("[aria-label^='Projects in']", (e) => e.innerText), /Q3 Research/, "not in the live list");
     await page.screenshot({ path: "tmp/test-evidence/project-recently-deleted.png", fullPage: true });
-    await (await page.waitForSelector("xpath/.//li[contains(@class,'deleted-project')][.//strong[normalize-space()='Q3 Research']]//button[normalize-space()='Restore']")).click();
+    // Delete permanently asks inline (typed name); Cancel collapses it and nothing changes.
+    const rowX = "xpath/.//li[contains(@class,'deleted-project')][.//strong[normalize-space()='Q3 Research']]";
+    await (await page.waitForSelector(`${rowX}//button[normalize-space()='Delete permanently']`)).click();
+    const box = await page.waitForSelector(".purge-confirm");
+    assert.match(await box.evaluate((e) => e.innerText), /1 item and all their versions, comments and files are removed now\. This can't be undone\.[\s\S]*Type “Q3 Research” to delete it permanently/);
+    assert.equal(await page.evaluate(() => document.activeElement?.closest(".purge-confirm") !== null), true, "focus moves into the confirmation");
+    assert.equal(await page.$eval(".purge-confirm button.danger", (b) => b.disabled), true);
+    await page.screenshot({ path: "tmp/test-evidence/project-purge-confirm.png", fullPage: true });
+    await page.keyboard.press("Escape");
+    assert.equal(await page.$(".purge-confirm"), null, "Escape collapses it");
+    assert.match(await page.evaluate(() => document.activeElement?.textContent ?? ""), /Delete permanently/, "focus returns to the button");
+    await (await page.waitForSelector(`${rowX}//button[normalize-space()='Restore']`)).click();
     await page.waitForFunction(() => /Q3 Research/.test(document.querySelector("[aria-label^='Projects in']")?.innerText ?? ""));
     assert.doesNotMatch(await page.evaluate(() => [...document.querySelectorAll(".deleted-project")].map((e) => e.innerText).join("\n")), /Q3 Research/, "no longer under Recently deleted");
     // Mobile: the settings panel and danger zone fit.

@@ -95,7 +95,7 @@ export async function restoreProject(ctx, projectId) {
     catch (e) { if (!/UNIQUE|constraint/i.test(String(e))) throw e; }
   }
   slug ??= await ensureSlug(ctx.env, { id: projectId, slug: null, title: p.title });
-  return { ok: true, id: projectId, title: p.title, slug };
+  return { ok: true, id: projectId, title: p.title, slug, address_changed: !!p.slug && slug !== p.slug };
 }
 
 /** POST /api/projects/:id/purge {confirm_title}: delete permanently now (an already-deleted project). Irreversible. */
