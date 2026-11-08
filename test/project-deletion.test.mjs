@@ -191,8 +191,10 @@ test("delete permanently: rows and R2 files are removed, a tombstone stays, cred
   const e = await bob.req("POST", `/api/projects/${P.id}/purge`, { confirm_title: "nope" });
   assert.equal(e.status, 400);
   assert.equal((await carol.req("POST", `/api/projects/${P.id}/purge`, { confirm_title: "Old Notes" })).status, 404);
+  // A user-content view link (CONTENT_HOST) for this project goes too.
+  await sql(`INSERT INTO view_links (token_hash, session_hash, principal_id, project_id, artifact_id, rev_no, purpose, expires_at, created_at) VALUES ('vlh_pd', 's', 'p', '${P.id}', 'art_x', 1, 'render', ${Date.now() + 864e5}, 'now')`);
   ok(await bob.req("POST", `/api/projects/${P.id}/purge`, { confirm_title: "Old Notes" }));
-  for (const t of ["artifacts", "revisions", "comments", "meta_versions", "uploads", "project_changes", "folders", "idempotency", "transfer_links",
+  for (const t of ["artifacts", "revisions", "comments", "meta_versions", "uploads", "project_changes", "folders", "idempotency", "transfer_links", "view_links",
     "project_members", "project_change_state", "change_scope_epochs", "publisher_generations"])
     assert.equal(await n(`SELECT COUNT(*) AS n FROM ${t} WHERE project_id = '${P.id}'`), 0, `${t} purged`);
   assert.equal(await n(`SELECT COUNT(*) AS n FROM snapshots WHERE publisher_id = '${cred.pub.publisher_id}'`), 0, "snapshots purged");

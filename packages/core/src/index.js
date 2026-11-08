@@ -19,7 +19,7 @@ import { listAccess, listConnections, revokeConnection, revokeConnectionById } f
 import { handleFileTransfer } from "./oauth/mcp.js";
 import { handleOAuthHost, originFor } from "./oauth/server.js";
 import { servePwa } from "./pwa.js";
-import { contentOrigin, handleContentHost, projectMedia, viewLinkRedirect, wantsContentHost } from "./view-links.js";
+import { contentOrigin, handleContentHost, isContentHost, projectMedia, viewLinkRedirect, wantsContentHost } from "./view-links.js";
 import { deleteProject, listDeletedProjects, purgeDueProjects, purgeProjectNow, restoreProject } from "./project-deletion.js";
 import { acceptInvite, createInvite, createWorkspace, deleteWorkspace, listMembers, listWorkspaces, multiUser, previewInvite, removeMember, revokeInvite, setMemberRole, updateWorkspace } from "./workspaces.js";
 import { __name } from "./runtime.js";
@@ -380,7 +380,7 @@ var coreWorker = {
     const e2 = env;
     // The user-content host serves view links only (no cookies, no app or API routes).
     // Not withSec: its X-Frame-Options DENY would stop the app from framing rendered pages (they set frame-ancestors).
-    if (contentOrigin(env) && host === e2.CONTENT_HOST.toLowerCase()) return handleContentHost(req, env, url);
+    if (isContentHost(env, host)) return handleContentHost(req, env, url);
     if (e2.MCP_HOST && host === e2.MCP_HOST.toLowerCase()) {
       const publisherRoute = env.APP_CONNECT_ENABLED === "1" && /^\/v1\/publisher(\/|$)/.test(url.pathname);
       if (url.pathname.startsWith("/files/")) return withSec(await handleFileTransfer(req, env, url));

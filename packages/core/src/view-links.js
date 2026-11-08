@@ -8,10 +8,15 @@ import { IMAGE_TYPES, VIDEO_TYPES, getArtifact } from "./service.js";
 import { serveContent } from "./uploads.js";
 import { HttpError, nowIso, nowMs, randomId, sha256Hex } from "./util.js";
 
-export const VIEW_LINK_TTL_MS = 30 * 60e3;
+// A link works for whoever holds it until it expires (like a signed URL), so it is short: a page frame asks for a new
+// one each time it opens; a PDF tab keeps its link for the viewer's range requests.
+export const VIEW_LINK_TTL_MS = { render: 5 * 60e3, file: 30 * 60e3 };
 const LINK = /^\/c\/(vl_[A-Za-z0-9_-]{20,64})(?:\/m\/(art_[A-Za-z0-9_-]{1,64}))?$/;
 
-export const contentOrigin = (env) => env.CONTENT_HOST ? originFor(env.CONTENT_HOST) : null;
+// Off unless set to its own host (the same host as the app or agents would give no isolation).
+const contentHost = (env) => { const c = env.CONTENT_HOST?.toLowerCase(); return c && c !== env.APP_HOST?.toLowerCase() && c !== env.MCP_HOST?.toLowerCase() ? c : null; };
+export const contentOrigin = (env) => contentHost(env) ? originFor(contentHost(env)) : null;
+export const isContentHost = (env, host) => !!contentHost(env) && host === contentHost(env);
 const appOrigin = (env) => env.APP_HOST ? originFor(env.APP_HOST) : "'none'";
 
 /** Image and video files of this project referenced by a document, mapped to the URL that serves them. */
@@ -34,7 +39,7 @@ export async function projectMedia(env, pid, refs, urlFor) {
  * Sec-Fetch-Dest keep today's sandboxed app-host rendering.
  */
 export function wantsContentHost(env, req, ctx) {
-  if (!env.CONTENT_HOST || ctx.principal.kind !== "human" || !ctx.sessionHash) return false;
+  if (!contentHost(env) || ctx.principal.kind !== "human" || !ctx.sessionHash) return false;
   return ["iframe", "frame", "document"].includes(req.headers.get("sec-fetch-dest") ?? "");
 }
 
@@ -42,7 +47,7 @@ export function wantsContentHost(env, req, ctx) {
 export async function viewLinkRedirect(ctx, projectId, artifactId, revNo, purpose) {
   const token = randomId("vl", 24);
   await ctx.env.DB.prepare(`INSERT INTO view_links (token_hash, session_hash, principal_id, project_id, artifact_id, rev_no, purpose, expires_at, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(await sha256Hex(token), ctx.sessionHash, ctx.principal.id, projectId, artifactId, revNo, purpose, nowMs() + VIEW_LINK_TTL_MS, nowIso()).run();
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(await sha256Hex(token), ctx.sessionHash, ctx.principal.id, projectId, artifactId, revNo, purpose, nowMs() + VIEW_LINK_TTL_MS[purpose], nowIso()).run();
   return new Response(null, { status: 302, headers: { location: `${contentOrigin(ctx.env)}/c/${token}`, "cache-control": "no-store", "referrer-policy": "no-referrer" } });
 }
 
@@ -62,7 +67,7 @@ export async function handleContentHost(req, env, url) {
     if (url.pathname === "/robots.txt") return textPage(env, 200, "User-agent: *\nDisallow: /\n");
     const m = LINK.exec(url.pathname);
     if (!m) return textPage(env, 404, "Not found");
-    if (req.method !== "GET" && req.method !== "HEAD") return new Response(null, { status: 405, headers: { allow: "GET, HEAD" } });
+    if (req.method !== "GET" && req.method !== "HEAD") { const r = textPage(env, 405, "Method not allowed"); r.headers.set("allow", "GET, HEAD"); return r; }
     const now = nowMs();
     const row = await env.DB.prepare(`SELECT v.*, s.revoked_at AS s_revoked, s.expires_at AS s_expires FROM view_links v
       LEFT JOIN sessions s ON s.id_hash = v.session_hash WHERE v.token_hash = ?`).bind(await sha256Hex(m[1])).first();
@@ -77,14 +82,15 @@ export async function handleContentHost(req, env, url) {
       if (m[2]) return textPage(env, 404, "Not found");
       return await serveContent(ctx, inner(req, url, "?open=1"), row.project_id, row.artifact_id, String(row.rev_no));
     }
+    const r = await getArtifact(ctx, row.project_id, row.artifact_id, row.rev_no);
+    if (r.artifact.kind !== "html") return textPage(env, 404, "Not found");
     if (m[2]) {
-      // An image or video shown inside the page: same project, current version.
+      // An image or video this revision of the page shows (same project; the file's current version, as in the app).
+      if (!htmlRefs(r.body).includes(m[2])) return textPage(env, 404, "Not found");
       const media = await projectMedia(env, row.project_id, [m[2]], () => "");
       if (!media(m[2])) return textPage(env, 404, "Not found");
       return await serveContent(ctx, inner(req, url), row.project_id, m[2], null);
     }
-    const r = await getArtifact(ctx, row.project_id, row.artifact_id, row.rev_no);
-    if (r.artifact.kind !== "html") return textPage(env, 404, "Not found");
     const media = await projectMedia(env, row.project_id, htmlRefs(r.body), (ref) => `/c/${m[1]}/m/${encodeURIComponent(ref)}`);
     const page = renderHtmlDocument(r.body, media, r.artifact.title);
     return new Response(req.method === "HEAD" ? null : page, { status: 200, headers: {

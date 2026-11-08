@@ -9,7 +9,9 @@ import assert from "node:assert/strict";
 import { request } from "node:http";
 import { createRequire } from "node:module";
 import { existsSync } from "node:fs";
-import { startServer, grant, agentHttp, sha256 } from "./helpers.mjs";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { startServer, grant, agentHttp, sha256, LOCAL_CONFIG, ROOT } from "./helpers.mjs";
 import { SERVER_PORTS } from "./ports.mjs";
 import { makePng, makePdf } from "./make-fixtures.mjs";
 
@@ -20,6 +22,8 @@ const haveChrome = existsSync(CHROME) && existsSync(PUPPETEER);
 const PORT = SERVER_PORTS["content-host"];
 const APP = `http://localhost:${PORT}`, CONTENT = `content.localhost:${PORT}`;
 let s, alice, bob, WS, PID, OTHER, html, pdf, img, otherImg, tok;
+const sql = async (q) => JSON.parse((await promisify(execFile)("wrangler", ["d1", "--config", LOCAL_CONFIG, "execute", "DB", "--local", "--persist-to", s.dir, "--json", "--command", q],
+  { cwd: ROOT, encoding: "utf8" })).stdout)[0].results;
 const ok = (r, status = 200) => { assert.equal(r.status, status, JSON.stringify(r.body)); return r.body; };
 
 // Node can't set Host on fetch(); talk to the content host over loopback with an explicit Host header.
@@ -80,6 +84,9 @@ test("a browser frame asking for /render is sent to a view link on the content h
   assert.equal(im.status, 200); assert.equal(im.headers["content-type"], "image/png");
   assert.equal((await content(path.replace(/$/, `/m/${otherImg}`))).status, 404, "another project's file");
   assert.equal((await content(path.replace(/$/, `/m/${pdf}`))).status, 404, "not an image or video");
+  // A same-project image the page doesn't show isn't reachable through its link either.
+  const unrelated = await upload(tok, PID, "Unrelated", "image/png", makePng(4, 4));
+  assert.equal((await content(path.replace(/$/, `/m/${unrelated}`))).status, 404, "not referenced by the page");
   // fetch() (offline copy: Sec-Fetch-Dest empty) and an agent get the page from the app host, as before.
   const f = await fetch(APP + `/api/projects/${PID}/artifacts/${html}/render?rev=1`, { headers: { cookie: alice.cookie, "sec-fetch-dest": "empty" }, redirect: "manual" });
   assert.equal(f.status, 200); assert.match(await f.text(), /synthetic heron/);
@@ -111,6 +118,19 @@ test("the content host has no app: no API, no sign-in, no cookies; unknown links
     assert.equal(r.headers["set-cookie"], undefined);
   }
   assert.equal((await content("/robots.txt")).body.toString(), "User-agent: *\nDisallow: /\n");
+  const post = await content("/c/vl_unknownunknownunknown00", { method: "POST" });
+  assert.equal(post.status, 405); assert.equal(post.headers["x-content-type-options"], "nosniff");
+});
+
+test("links expire (pages after 5 minutes, PDFs after 30) and the cleanup removes them", async () => {
+  const r = await nav(alice, `/api/projects/${PID}/artifacts/${html}/render?rev=1`);
+  const path = linkPath(r.headers.get("location"));
+  const row = (await sql(`SELECT expires_at - CAST(strftime('%s','now') AS INTEGER) * 1000 AS left, purpose FROM view_links WHERE token_hash = '${sha256(path.slice(3))}'`))[0];
+  assert.equal(row.purpose, "render"); assert.ok(row.left > 4 * 60e3 && row.left <= 5 * 60e3 + 2000, String(row.left));
+  await sql(`UPDATE view_links SET expires_at = 1 WHERE token_hash = '${sha256(path.slice(3))}'`);
+  assert.equal((await content(path)).status, 401, "expired");
+  ok(await alice.req("POST", `/api/projects/${PID}/maintenance/reconcile-uploads`, {}));
+  assert.equal((await sql(`SELECT COUNT(*) AS n FROM view_links WHERE token_hash = '${sha256(path.slice(3))}'`))[0].n, 0, "removed by cleanup");
 });
 
 test("links stop working when the person loses access, the project is deleted, or they sign out", async () => {

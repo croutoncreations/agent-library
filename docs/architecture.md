@@ -58,19 +58,27 @@ that site instead, so a browser bug in rendering them can't reach the app's cook
 
 - When the app's preview frame (or a tab opening a PDF with `?open=1`) navigates to `/render` or `/content`, the app
   host checks access as usual and answers `302` to `https://CONTENT_HOST/c/<link>`. The link (`view_links`, migration
-  0025) names one revision of one document, the session that asked for it and its person; only its SHA-256 is stored,
-  and it lasts 30 minutes.
-- Every request to the content host re-checks that the session is still signed in and that its person can still read
-  the project (removed members, deleted projects and suspended-workspace rules apply at once), with the same rate limits.
-  Images and videos inside a page are served through the same link (`/c/<link>/m/<file>`), only from that project.
+  0025) names one revision of one document, the session that asked for it and its person; only its SHA-256 is stored.
+  It lasts 5 minutes for a page (the frame asks for a new one each time it opens) and 30 minutes for a PDF tab (the
+  viewer's range requests reuse it).
+- Every request to the content host re-checks that the session hasn't been signed out or expired and that its person
+  can still read the project (removed members, deleted projects and suspended-workspace rules apply at once), with the
+  same rate limits. Images and videos the page shows are served through the same link (`/c/<link>/m/<file>`): only
+  files that revision references, from that project.
+- **Limits.** A link works for whoever holds it until it expires, like a signed URL: a PDF tab's address copied to
+  someone else gives them that one PDF, as its creator, for the rest of the 30 minutes. The sign-in provider's own
+  check (self-host: the Access JWT) runs when the link is issued, not on the content host, which never sees that
+  provider's cookies; signing out of the app ends the link at once.
 - The content host has no app: no sign-in, API, MCP or cookies; anything else is `404`. Rendered pages keep the strict
   CSP and sandbox and may be framed only by `APP_HOST` (`frame-ancestors`).
 - `fetch()` callers (the offline copy reads the rendered page with `Sec-Fetch-Dest: empty`), agents and browsers that
   don't send `Sec-Fetch-Dest` get the app-host response as before. Downloads (`?download=1`) and images stay on the
   app host.
 
-To turn it on: add the hostname to the Worker's routes (a custom domain on its own zone) and set `CONTENT_HOST`. Rolling
-back to a Worker without it simply serves everything from the app host again.
+To turn it on: add the hostname to the Worker's routes (a custom domain on its own zone; **not** behind Cloudflare
+Access, since the frame can't carry an Access sign-in) and set `CONTENT_HOST`. It is ignored if it equals `APP_HOST`
+or `MCP_HOST`, and needs `APP_HOST` set (pages may only be framed by it). Rolling back to a Worker without it serves
+everything from the app host again.
 
 ## How the Worker is built
 
