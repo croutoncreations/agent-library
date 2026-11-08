@@ -19,6 +19,7 @@ import { listAccess, listConnections, revokeConnection, revokeConnectionById } f
 import { handleFileTransfer } from "./oauth/mcp.js";
 import { handleOAuthHost, originFor } from "./oauth/server.js";
 import { servePwa } from "./pwa.js";
+import { contentOrigin, handleContentHost, projectMedia, viewLinkRedirect, wantsContentHost } from "./view-links.js";
 import { deleteProject, listDeletedProjects, purgeDueProjects, purgeProjectNow, restoreProject } from "./project-deletion.js";
 import { acceptInvite, createInvite, createWorkspace, deleteWorkspace, listMembers, listWorkspaces, multiUser, previewInvite, removeMember, revokeInvite, setMemberRole, updateWorkspace } from "./workspaces.js";
 import { __name } from "./runtime.js";
@@ -33,21 +34,7 @@ var SEC_HEADERS = {
   "referrer-policy": "no-referrer",
   "content-security-policy": "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' blob:; media-src 'self' blob:; connect-src 'self'; frame-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'; manifest-src 'self'; worker-src 'self'"
 };
-async function projectMedia(env, pid, refs) {
-  const ok2 = /* @__PURE__ */ new Map();
-  if (refs.length) {
-    const types = [...IMAGE_TYPES, ...VIDEO_TYPES];
-    const q = await env.DB.prepare(
-      `SELECT a.id, v.mime FROM artifacts a JOIN revisions v ON v.id = a.head_revision_id
-       WHERE a.project_id = ? AND a.trashed_at IS NULL AND v.mime IN (${types.map(() => "?").join(",")}) AND a.id IN (${refs.map(() => "?").join(",")})`
-    ).bind(pid, ...types, ...refs).all();
-    for (const row of q.results) ok2.set(row.id, row.mime);
-  }
-  return (ref) => {
-    const mime = ok2.get(ref);
-    return mime ? { url: `/api/projects/${encodeURIComponent(pid)}/artifacts/${encodeURIComponent(ref)}/content`, mime } : null;
-  };
-}
+const appMedia = (env, pid, refs) => projectMedia(env, pid, refs, (ref) => `/api/projects/${encodeURIComponent(pid)}/artifacts/${encodeURIComponent(ref)}/content`);
 /**
  * The app shell's CSP. With the email-link human check on (TURNSTILE_SITE_KEY) and browser sign-in, Cloudflare's
  * Turnstile script and frame are allowed on the shell only; every other response keeps the strict default.
@@ -58,9 +45,12 @@ function emailTurnstile(env) {
   return browserSignInEnabled(env) && signinChoices(env).some((c) => c.email) ? turnstileSiteKey(env) : null;
 }
 function appShellCsp(env) {
-  if (!emailTurnstile(env)) return {};
-  return { "content-security-policy": SEC_HEADERS["content-security-policy"]
-    .replace("script-src 'self'", `script-src 'self' ${TURNSTILE_ORIGIN}`).replace("frame-src 'self'", `frame-src 'self' ${TURNSTILE_ORIGIN}`) };
+  const ts = emailTurnstile(env), co = contentOrigin(env);
+  if (!ts && !co) return {};
+  let csp = SEC_HEADERS["content-security-policy"];
+  if (ts) csp = csp.replace("script-src 'self'", `script-src 'self' ${TURNSTILE_ORIGIN}`);
+  // Frames: Turnstile's widget, and rendered pages on the user-content host.
+  return { "content-security-policy": csp.replace("frame-src 'self'", ["frame-src 'self'", ts ? TURNSTILE_ORIGIN : "", co ?? ""].filter(Boolean).join(" ")) };
 }
 function withCookies(res, cookies) {
   for (const c of cookies) res.headers.append("set-cookie", c);
@@ -302,15 +292,17 @@ async function route3(req, env, url, requestId, seen = {}) {
       const r = await getArtifact(ctx, pid, aid, revQ ? Number(revQ) : void 0);
       if (r.artifact.kind !== "markdown") throw new HttpError(400, "invalid_input", "Not Markdown");
       const src = r.body;
-      const media = await projectMedia(env, pid, imageRefs(src));
+      const media = await appMedia(env, pid, imageRefs(src));
       const html = renderMarkdown(src, (ref) => media(ref));
       return json({ revision: r.revision.rev, html });
     }
     if (sub === "render" && m === "GET") {
       const r = await getArtifact(ctx, pid, aid, revQ ? Number(revQ) : void 0);
       if (r.artifact.kind !== "html") throw new HttpError(400, "invalid_input", "Not an HTML document");
+      // A person's browser opens the page on the user-content host (another site), never on this origin.
+      if (wantsContentHost(env, req, ctx)) return viewLinkRedirect(ctx, pid, aid, r.revision.rev, "render");
       const src = r.body;
-      const media = await projectMedia(env, pid, htmlRefs(src));
+      const media = await appMedia(env, pid, htmlRefs(src));
       const page2 = renderHtmlDocument(src, (ref) => media(ref), r.artifact.title);
       return new Response(page2, { status: 200, headers: {
         "content-type": "text/html; charset=utf-8",
@@ -322,6 +314,11 @@ async function route3(req, env, url, requestId, seen = {}) {
         "x-frame-options": "SAMEORIGIN",
         "x-revision": String(r.revision.rev)
       } });
+    }
+    if (sub === "content" && m === "GET" && url.searchParams.get("open") === "1" && url.searchParams.get("download") !== "1" && wantsContentHost(env, req, ctx)) {
+      // A PDF opened in a tab: the browser's viewer shows it from the user-content host.
+      const r = await getArtifact(ctx, pid, aid, revQ ? Number(revQ) : void 0);
+      if (r.revision.mime === "application/pdf") return viewLinkRedirect(ctx, pid, aid, r.revision.rev, "file");
     }
     if (sub === "content" && (m === "GET" || m === "HEAD")) return serveContent(ctx, req, pid, aid, revQ);
     if (sub === "history" && m === "GET") return json(await history(ctx, pid, aid, { cursor: url.searchParams.get("cursor") ?? void 0 }));
@@ -381,6 +378,9 @@ var coreWorker = {
     const requestId = randomId("req", 9);
     const host = url.host.toLowerCase();
     const e2 = env;
+    // The user-content host serves view links only (no cookies, no app or API routes).
+    // Not withSec: its X-Frame-Options DENY would stop the app from framing rendered pages (they set frame-ancestors).
+    if (contentOrigin(env) && host === e2.CONTENT_HOST.toLowerCase()) return handleContentHost(req, env, url);
     if (e2.MCP_HOST && host === e2.MCP_HOST.toLowerCase()) {
       const publisherRoute = env.APP_CONNECT_ENABLED === "1" && /^\/v1\/publisher(\/|$)/.test(url.pathname);
       if (url.pathname.startsWith("/files/")) return withSec(await handleFileTransfer(req, env, url));

@@ -79,10 +79,11 @@ async function authenticateInner(req, env, requestId) {
   // issued before this release, and on http (local dev, where __Host- is not allowed).
   const sid = (new URL(req.url).protocol === "https:" ? cookie(req, HOST_SESSION_COOKIE) : null) ?? cookie(req, SESSION_COOKIE);
   if (sid) {
+    const sessionHash = await sha256Hex(sid);
     const row = await env.DB.prepare(
       `SELECT s.csrf, s.expires_at, s.revoked_at, p.id, p.kind, p.label FROM sessions s
        JOIN principals p ON p.id = s.principal_id WHERE s.id_hash = ?`
-    ).bind(await sha256Hex(sid)).first();
+    ).bind(sessionHash).first();
     if (row && row.revoked_at === null && row.expires_at > nowMs() && row.kind === "human") {
       // The provider's current identity must still be this session's person (self-host: the Access JWT on every request).
       const identity = adapters(env).identity;
@@ -92,7 +93,7 @@ async function authenticateInner(req, env, requestId) {
         const p = await env.DB.prepare("SELECT issuer, subject FROM principals WHERE id = ?").bind(row.id).first();
         if (!p || p.issuer !== id.issuer || p.subject !== id.subject) throw new HttpError(401, "unauthenticated", "Session does not match Access identity");
       }
-      return { env, requestId, principal: { id: row.id, kind: "human", label: row.label }, csrf: row.csrf };
+      return { env, requestId, principal: { id: row.id, kind: "human", label: row.label }, csrf: row.csrf, sessionHash };
     }
   }
   throw new HttpError(401, "unauthenticated", "Login or bearer token required");

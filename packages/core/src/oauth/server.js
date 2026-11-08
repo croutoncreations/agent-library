@@ -15,7 +15,8 @@ import { ROLE_RANK, memberRoleSql, personalWorkspaceId, visibleProjects, workspa
 import { nowIso, nowMs, randomId } from "../util.js";
 
 function originFor(host) {
-  return /^(127\.0\.0\.1|localhost)(:\d+)?$/.test(host) ? `http://${host}` : `https://${host}`;
+  // Loopback (local dev and tests; *.localhost names a second local site, e.g. the user-content host) is plain http.
+  return /^(127\.0\.0\.1|([a-z0-9-]+\.)?localhost)(:\d+)?$/.test(host) ? `http://${host}` : `https://${host}`;
 }
 function servers(origin, appConnect = false) {
   const cacheKey = origin + (appConnect ? "#ac" : "");

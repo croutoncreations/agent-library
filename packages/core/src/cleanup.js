@@ -36,6 +36,8 @@ async function reconcileUploads(env, opts = {}) {
   await DB.prepare("DELETE FROM rate_counters WHERE win < ?").bind(Math.floor(now / 6e4) - 2).run();
   await DB.prepare("DELETE FROM transfer_links WHERE expires_at < ?").bind(now).run().catch(() => {
   });
+  await DB.prepare("DELETE FROM view_links WHERE expires_at < ?").bind(now).run().catch(() => {
+  });
   await DB.prepare("DELETE FROM oauth_code_redemptions WHERE redeemed_at < ?").bind(now - 31 * 24 * 36e5).run().catch(() => {
   });
   return { expired: (e1.meta.changes ?? 0) + (e2.meta.changes ?? 0) + (e3.meta.changes ?? 0), purged_staging: purgedStaging, purged_final: purgedFinal };

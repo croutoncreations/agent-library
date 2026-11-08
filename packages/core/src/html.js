@@ -103,7 +103,7 @@ var RENDER_CSP = "default-src 'none'; script-src 'none'; img-src 'self'; media-s
 var FRAME_SANDBOX = "allow-same-origin allow-popups allow-popups-to-escape-sandbox";
 function renderHtmlDocument(src, media, title) {
   const { html, css } = sanitizeHtml(src, media);
-  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>${esc3(title)}</title><style>html{color-scheme:light dark}body{margin:0;padding:16px;font:16px/1.55 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;overflow-wrap:anywhere}img,video{max-width:100%;height:auto}video{display:block}table{border-collapse:collapse}td,th{border:1px solid #8884;padding:.3em .5em}pre{overflow:auto}</style>` + (css ? `<style>${css}</style>` : "") + `</head><body>${html}</body></html>`;
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>${esc3(title)}</title><style>html{color-scheme:light dark;background:Canvas;color:CanvasText}body{margin:0;padding:16px;font:16px/1.55 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;overflow-wrap:anywhere}img,video{max-width:100%;height:auto}video{display:block}table{border-collapse:collapse}td,th{border:1px solid #8884;padding:.3em .5em}pre{overflow:auto}</style>` + (css ? `<style>${css}</style>` : "") + `</head><body>${html}</body></html>`;
 }
 
 export { FRAME_SANDBOX, RENDER_CSP, htmlRefs, renderHtmlDocument };

@@ -12,6 +12,8 @@ One Cloudflare Worker (`packages/core/src/index.js`) answers on two hostnames:
 
   Consent sign-in goes through an Access for SaaS OIDC application (`ACCESS_OIDC_*`), so only the owner can approve a connection.
 
+- **`CONTENT_HOST` (optional; user content).** See [User-content host](#user-content-host).
+
 Storage:
 
 | Binding | Holds |
@@ -45,6 +47,30 @@ Artifact kinds are `markdown`, `html` (sanitized and rendered sandboxed, never e
 Binary uploads go through `upload_begin`, then an authenticated PUT of the bytes, then `upload_finish`. Finish verifies the size and SHA-256 and moves the object to a final immutable key before publishing a version. A presigned URL can never overwrite a published version. OAuth (MCP) connections use the same flow; their `put_url` and file `download_url` are short-lived single-purpose links on the MCP host (`/files/u/…`, `/files/d/…`, stored hashed in `transfer_links`, migration `0013`), re-authorized against the live connection on every request. See [upload-finalization.md](upload-finalization.md).
 
 Every artifact has a stable owner URL: `https://APP_HOST/p/<project>/a/<artifact>` (add `?v=N` for a specific version). MCP and API responses include it, so agents can hand links to people or to each other.
+
+## User-content host
+
+Uploaded HTML documents and PDFs are written by agents and other people, so they are never run on the app's origin.
+Without `CONTENT_HOST`, HTML pages are sanitized and shown in a sandboxed frame with `script-src 'none'` on the app
+host, and PDFs open there as sandboxed attachments. With `CONTENT_HOST` set to a hostname on a **different registrable
+domain** (for example `usercontent.example.net`, the googleusercontent.com pattern), a person's browser gets them from
+that site instead, so a browser bug in rendering them can't reach the app's cookies, storage or same-site requests:
+
+- When the app's preview frame (or a tab opening a PDF with `?open=1`) navigates to `/render` or `/content`, the app
+  host checks access as usual and answers `302` to `https://CONTENT_HOST/c/<link>`. The link (`view_links`, migration
+  0025) names one revision of one document, the session that asked for it and its person; only its SHA-256 is stored,
+  and it lasts 30 minutes.
+- Every request to the content host re-checks that the session is still signed in and that its person can still read
+  the project (removed members, deleted projects and suspended-workspace rules apply at once), with the same rate limits.
+  Images and videos inside a page are served through the same link (`/c/<link>/m/<file>`), only from that project.
+- The content host has no app: no sign-in, API, MCP or cookies; anything else is `404`. Rendered pages keep the strict
+  CSP and sandbox and may be framed only by `APP_HOST` (`frame-ancestors`).
+- `fetch()` callers (the offline copy reads the rendered page with `Sec-Fetch-Dest: empty`), agents and browsers that
+  don't send `Sec-Fetch-Dest` get the app-host response as before. Downloads (`?download=1`) and images stay on the
+  app host.
+
+To turn it on: add the hostname to the Worker's routes (a custom domain on its own zone) and set `CONTENT_HOST`. Rolling
+back to a Worker without it simply serves everything from the app host again.
 
 ## How the Worker is built
 
@@ -87,7 +113,7 @@ Nothing installation-specific is compiled in. Each installation sets these Worke
 - `ACCESS_TEAM_DOMAIN`, `ACCESS_AUD` and `OWNER_EMAIL`;
 - `ACCESS_OIDC_ISSUER` and `ACCESS_OIDC_CLIENT_ID` (with the `ACCESS_OIDC_CLIENT_SECRET` Worker secret);
 - `APP_CONNECT_ENABLED`;
-- optionally, `OAUTH_EXTRA_REDIRECT_URIS`.
+- optionally, `OAUTH_EXTRA_REDIRECT_URIS` and `CONTENT_HOST`.
 
 Rate limits and upload TTLs have defaults and optional vars. See [wrangler.example.toml](../wrangler.example.toml).
 

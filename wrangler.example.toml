@@ -59,6 +59,9 @@ crons = ["*/15 * * * *"]
 [env.hosted.vars]
 APP_HOST = "library.example.com"
 MCP_HOST = "library-mcp.example.com"
+# Optional: a hostname on another registrable domain that serves rendered HTML pages and opened PDFs (no cookies),
+# docs/architecture.md#user-content-host. Add it to routes too.
+# CONTENT_HOST = "usercontent.example.net"
 # Cloudflare Access self-hosted application protecting APP_HOST (owner sign-in).
 ACCESS_TEAM_DOMAIN = "your-team.cloudflareaccess.com"
 ACCESS_AUD = "replace-with-your-access-application-audience-tag"

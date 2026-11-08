@@ -133,6 +133,7 @@ const STILL_DUE = "EXISTS (SELECT 1 FROM projects d WHERE d.id = ?1 AND d.delete
 // crash never leaves a file nobody can find. Each step deletes at most `n` rows.
 const STEPS = [
   ["transfer_links", "project_id = ?1"],
+  ["view_links", "project_id = ?1"],
   ["idempotency", "project_id = ?1"],
   ["comments", "project_id = ?1"],
   ["meta_versions", "project_id = ?1"],
