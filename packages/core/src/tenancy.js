@@ -116,6 +116,7 @@ export async function requireProjectRole(ctx, projectId, need, allowSuspended = 
  * Driven from the person's memberships: projects_workspace serves current rows, projects_owner_legacy (0018) the
  * rows a rolled-back Worker wrote without workspace_id (they belong to the owner's personal workspace).
  */
+export const VISIBLE_PROJECTS_MAX = 1000;
 export async function visibleProjects(env, principalId) {
   const cols = `t_p.id, t_p.title, t_p.slug, t_p.created_at, t_w.id AS workspace_id, t_w.name AS workspace_name, t_w.handle AS workspace_handle, t_w.personal, t_w.status AS workspace_status, t_w.created_at AS ws_created, t_m.role AS ws_role,
        CASE MIN(${rankCase("t_m.role")}, CASE WHEN t_pm.role IS NULL THEN 4 ELSE ${rankCase("t_pm.role")} END)
@@ -127,7 +128,10 @@ export async function visibleProjects(env, principalId) {
   const r = await env.DB.prepare(
     `SELECT * FROM (SELECT ${cols} ${from("t_p.workspace_id = t_w.id")}
      UNION ALL SELECT ${cols} ${from("t_p.workspace_id IS NULL AND t_w.personal = 1 AND t_p.owner_id = substr(t_w.id, 5)")})
-     ORDER BY personal DESC, ws_created, created_at LIMIT 1000`
+     ORDER BY personal DESC, ws_created, created_at LIMIT ${VISIBLE_PROJECTS_MAX + 1}`
   ).bind(principalId, principalId).all();
-  return r.results.filter((p) => p.role);
+  const out = r.results.slice(0, VISIBLE_PROJECTS_MAX).filter((p) => p.role);
+  // True when the person can see more than VISIBLE_PROJECTS_MAX projects (only the first ones are listed).
+  out.truncated = r.results.length > VISIBLE_PROJECTS_MAX;
+  return out;
 }

@@ -26,7 +26,7 @@ import { __name } from "./runtime.js";
 import { IMAGE_TYPES, VIDEO_TYPES, addComment, appConnectEnabled, chQuery, cleanupChanges, createFile, createFolder, createFromTemplate, createGrant, createMarkdown, createProject, updateProject, diffRevisions, getArtifact, history, listArtifacts, listAudit, listChanges, listComments, listFolders, listGrants, listProjects, listTemplates, metaHistory, previewTemplate, readRecords, readTextChunk, requireAppConnect, restoreMetadata, restoreRevision, rsQuery, rsReady, rtQuery, saveAsTemplate, saveFile, saveMarkdown, searchArtifacts, updateGrant, updateMetadata } from "./service.js";
 import { APP_CSS, APP_HTML, APP_JS } from "./ui.js";
 import { serveContent, uploadBegin, uploadFinish, uploadPut } from "./uploads.js";
-import { HttpError, errorBody, idemKey, json, nowIso, nowMs, randomId, sha256Hex, str } from "./util.js";
+import { HttpError, errorBody, idemKey, json, nowIso, nowMs, randomId, readTextCapped, sha256Hex, str } from "./util.js";
 
 var SEC_HEADERS = {
   "x-content-type-options": "nosniff",
@@ -61,9 +61,11 @@ function withSec(res) {
   for (const [k, v] of Object.entries(SEC_HEADERS)) if (!r.headers.has(k)) r.headers.set(k, v);
   return r;
 }
+// App JSON request bodies: at most 2 MiB of UTF-8 bytes.
+var APP_BODY_BYTES = 2 * 1024 * 1024;
 async function body(req) {
-  const t = await req.text();
-  if (t.length > 2 * 1024 * 1024) throw new HttpError(413, "too_large", "Request body too large");
+  const t = await readTextCapped(req, APP_BODY_BYTES);
+  if (t === null) throw new HttpError(413, "too_large", "Request body too large");
   try {
     return t ? JSON.parse(t) : {};
   } catch {
@@ -327,7 +329,7 @@ async function route3(req, env, url, requestId, seen = {}) {
     if (sub === "meta-history" && m === "GET") return json(await metaHistory(ctx, pid, aid, false, url.searchParams.get("cursor") ?? void 0));
     if (sub === "meta-restore" && m === "POST") return out(await restoreMetadata(ctx, pid, aid, await body(req), key()));
     if (sub === "restore" && m === "POST") return out(await restoreRevision(ctx, pid, aid, await body(req), key()));
-    if (sub === "comments" && m === "GET") return json(await listComments(ctx, pid, aid));
+    if (sub === "comments" && m === "GET") return json(await listComments(ctx, pid, aid, url.searchParams.get("cursor") ?? void 0));
     if (sub === "comments" && m === "POST") return out(await addComment(ctx, pid, aid, await body(req), key()));
   }
   return extraRoute(req, env, url, requestId, ctx);

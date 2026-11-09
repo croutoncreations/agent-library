@@ -10,7 +10,7 @@ var APP_MANAGER = `((c.owner_principal_id = ? AND ${workspaceRoleSql(APP_WS, "vi
 var APP_EDITOR = `((c.owner_principal_id = ? AND ${workspaceRoleSql(APP_WS, "viewer", "?", false)}) OR ${workspaceRoleSql(APP_WS, "admin")})`;
 import { _servers, originFor } from "../oauth/server.js";
 import { requireAppConnect } from "../service.js";
-import { HttpError, nowIso, nowMs, randomId, str } from "../util.js";
+import { HttpError, cutLists, nowIso, nowMs, randomId, str } from "../util.js";
 
 var LOOPBACK_CB = /^http:\/\/(localhost|127\.0\.0\.1)(:\d{1,5})?\/[A-Za-z0-9/_.~-]*$/;
 var HTTPS_CB = /^https:\/\/[a-z0-9.-]+(:\d{1,5})?\/[A-Za-z0-9/_.~-]*$/;
@@ -84,14 +84,18 @@ async function registerAppClient(ctx, input) {
 async function listAppClients(ctx) {
   requireHuman(ctx);
   requireAppConnect(ctx);
-  const r = await ctx.env.DB.prepare(`SELECT c.* FROM app_clients c WHERE ${APP_MANAGER} ORDER BY c.created_at DESC LIMIT 100`).bind(ctx.principal.id, ctx.principal.id, ctx.principal.id).all();
+  const r = await ctx.env.DB.prepare(`SELECT c.* FROM app_clients c WHERE ${APP_MANAGER} ORDER BY c.created_at DESC LIMIT 101`).bind(ctx.principal.id, ctx.principal.id, ctx.principal.id).all();
+  const appsCut = r.results.length > 100;
+  r.results = r.results.slice(0, 100);
   // Publishers of these apps, plus any publisher connected into a project where I'm an admin or connected it myself.
   const pubs = await ctx.env.DB.prepare(
     `SELECT pb.id, pb.app_client_id, pb.project_id, pb.folder_id, pb.created_at, pb.revoked_at, pb.current_source_revision, pb.current_snapshot_id
      FROM publishers pb WHERE (pb.app_client_id IN (SELECT c.id FROM app_clients c WHERE ${APP_MANAGER})
          AND (COALESCE(pb.created_by, pb.owner_principal_id) = ? OR ${memberRoleSql("pb.project_id", "viewer")}))
-       OR COALESCE(pb.created_by, pb.owner_principal_id) = ? OR ${memberRoleSql("pb.project_id", "admin", "?", true)} ORDER BY pb.created_at DESC LIMIT 500`
+       OR COALESCE(pb.created_by, pb.owner_principal_id) = ? OR ${memberRoleSql("pb.project_id", "admin", "?", true)} ORDER BY pb.created_at DESC LIMIT 501`
   ).bind(ctx.principal.id, ctx.principal.id, ctx.principal.id, ctx.principal.id, ctx.principal.id, ctx.principal.id, ctx.principal.id).all();
+  const pubsCut = pubs.results.length > 500;
+  pubs.results = pubs.results.slice(0, 500);
   const pv = (p) => ({
     publisher_id: p.id,
     project_id: p.project_id,
@@ -105,7 +109,8 @@ async function listAppClients(ctx) {
   return {
     app_clients: r.results.map((c) => ({ ...view(c), workspace_id: c.workspace_id ?? `wsp_${c.owner_principal_id}`, publishers: pubs.results.filter((p) => p.app_client_id === c.id).map(pv) })),
     // Publishers of someone else's app that I can revoke (connected by me, or in a project where I'm an admin).
-    other_publishers: pubs.results.filter((p) => !mine.has(p.app_client_id)).map(pv)
+    other_publishers: pubs.results.filter((p) => !mine.has(p.app_client_id)).map(pv),
+    truncated: cutLists({ app_clients: appsCut, publishers: pubsCut })
   };
 }
 async function disableAppClient(ctx, id) {

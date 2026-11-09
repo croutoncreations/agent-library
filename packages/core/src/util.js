@@ -85,6 +85,40 @@ HttpError = class extends Error {
 nowIso = () => (/* @__PURE__ */ new Date()).toISOString();
 nowMs = () => Date.now();
 
+/**
+ * A request body as UTF-8 text, refused once it passes maxBytes (UTF-8 bytes, not characters): a Content-Length over the
+ * cap is refused before reading, and the stream is counted as it arrives (a missing or understated length can't pass).
+ * Returns null when the body is too large (the caller answers in its own error format).
+ */
+async function readTextCapped(req, maxBytes) {
+  const declared = req.headers.get("content-length");
+  if (declared !== null && !(Number(declared) <= maxBytes)) return null;
+  const reader = req.body?.getReader();
+  if (!reader) return "";
+  const parts = [];
+  let n = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    n += value.byteLength;
+    if (n > maxBytes) {
+      await reader.cancel().catch(() => {});
+      return null;
+    }
+    parts.push(value);
+  }
+  const all = new Uint8Array(n);
+  let at = 0;
+  for (const p of parts) { all.set(p, at); at += p.byteLength; }
+  return new TextDecoder().decode(all);
+}
+
+/**
+ * The `truncated` field of a capped list response: the names of the lists that hit their cap (each query fetches cap+1
+ * rows and returns cap). An empty array means every list is complete. { members: true, invites: false } -> ["members"].
+ */
+const cutLists = (flags) => Object.keys(flags).filter((k) => flags[k]);
+
 /** expires_at for credentials that never expire (OAuth connections, "never" API keys): 9999-01-01. */
 const NEVER_EXPIRES_AT = Date.UTC(9999, 0, 1);
-export { NEVER_EXPIRES_AT, CHANGE_NOTE_MAX, CHANGE_NOTE_SCHEMA, HttpError, errorBody, hex, idemKey, int, json, mcpClientInfo, nowIso, nowMs, randomId, rememberClientInfo, sha256Hex, sha256HexStream, str };
+export { NEVER_EXPIRES_AT, CHANGE_NOTE_MAX, CHANGE_NOTE_SCHEMA, HttpError, b64url, cutLists, errorBody, hex, idemKey, int, json, mcpClientInfo, nowIso, nowMs, randomId, readTextCapped, rememberClientInfo, sha256Hex, sha256HexStream, str };

@@ -10,7 +10,7 @@ import { TURNSTILE_ORIGIN, requireHuman, turnstileSiteKey } from "../identity/tu
 import { limitGuard } from "../limits.js";
 import { HttpError } from "../util.js";
 import { __name } from "../runtime.js";
-import { folderName } from "../service.js";
+import { FOLDERS_PER_PROJECT, FOLDER_ROOM_SQL, folderName } from "../service.js";
 import { ROLE_RANK, memberRoleSql, personalWorkspaceId, visibleProjects, workspaceRoleSql } from "../tenancy.js";
 import { NEVER_EXPIRES_AT, nowIso, nowMs, randomId } from "../util.js";
 
@@ -158,9 +158,10 @@ async function consentProjects(env, principalId) {
   const list = (await visibleProjects(env, principalId)).slice(0, 500).map((p) => ({ id: p.id, title: p.title, workspace_id: p.workspace_id,
     workspace_name: p.personal ? null : p.workspace_name, can_write: ROLE_RANK[p.role] >= ROLE_RANK.member && p.workspace_status === "active" }));
   // Active workspaces where the signer may create projects (admin+), including ones with no projects yet.
-  list.adminWorkspaces = (await env.DB.prepare(`SELECT w.id, w.name, w.personal FROM workspace_members m JOIN workspaces w ON w.id = m.workspace_id
-    WHERE m.principal_id = ? AND w.status = 'active' AND m.role IN ('owner','admin') ORDER BY w.personal DESC, w.created_at LIMIT 50`).bind(principalId).all()).results
-    .map((w) => ({ id: w.id, name: w.personal ? null : w.name }));
+  const admin = (await env.DB.prepare(`SELECT w.id, w.name, w.personal FROM workspace_members m JOIN workspaces w ON w.id = m.workspace_id
+    WHERE m.principal_id = ? AND w.status = 'active' AND m.role IN ('owner','admin') ORDER BY w.personal DESC, w.created_at LIMIT 51`).bind(principalId).all()).results;
+  list.adminWorkspaces = admin.slice(0, 50).map((w) => ({ id: w.id, name: w.personal ? null : w.name }));
+  list.adminWorkspaces.truncated = admin.length > 50;
   return list;
 }
 async function liveConnection(env, id) {
@@ -291,7 +292,7 @@ function cxGrantPage(d, email, projects, prev, consent, values = null, error = "
   // New projects: by default they go in the workspace of the picked projects (else Personal); any other active
   // workspace where the signer is an admin can be chosen, including ones without projects yet.
   const admin = projects.adminWorkspaces ?? [];
-  const wsPick = admin.length > 1 ? `<label class="field"><span>New projects go in</span><select name="new_workspace"><option value="">Same as picked projects (else Personal)</option>${admin.map((w) => `<option value="${esc(w.id)}"${pick("new_workspace", "") === w.id ? " selected" : ""}>${esc(w.name ?? "Personal")}</option>`).join("")}</select></label>` : "";
+  const wsPick = admin.length > 1 ? `<label class="field"><span>New projects go in</span><select name="new_workspace"><option value="">Same as picked projects (else Personal)</option>${admin.map((w) => `<option value="${esc(w.id)}"${pick("new_workspace", "") === w.id ? " selected" : ""}>${esc(w.name ?? "Personal")}</option>`).join("")}</select></label>${admin.truncated ? '<p class="fine">Showing the first 50 workspaces.</p>' : ""}` : "";
   // Rows reveal one at a time: every filled row stays visible, plus exactly one empty row (CSS).
   const fresh = Array.from({ length: NEW_PROJECT_SLOTS }, (_, k) => {
     const sfx = k === 0 ? "" : `_${k + 1}`;
@@ -672,7 +673,7 @@ async function cxPublishPage(env, app, principalId, email, projects, consent, va
   const chosenProject = pick("project_id", (cxSuggestedProject(projects, suggest?.project) ?? projects[0]).id);
   const dupe = cxDupes(projects);
   const projOpts = projects.map((p) => `<option value="${esc(p.id)}"${p.id === chosenProject ? " selected" : ""}>${esc(p.title)}${dupe(p) ? ` (${esc(p.id)})` : ""}</option>`).join("");
-  const folders = await env.DB.prepare(`SELECT f.id, f.name, f.project_id FROM folders f JOIN projects p ON p.id = f.project_id WHERE ${memberRoleSql("p.id", "member")} ORDER BY f.name_key LIMIT 500`).bind(principalId).all();
+  const folders = await env.DB.prepare(`SELECT f.id, f.name, f.project_id FROM folders f JOIN projects p ON p.id = f.project_id WHERE ${memberRoleSql("p.id", "member")} ORDER BY f.name_key LIMIT ?`).bind(principalId, FOLDERS_PER_PROJECT).all();
   const byProject = /* @__PURE__ */ new Map();
   for (const f of folders.results) byProject.set(f.project_id, [...byProject.get(f.project_id) ?? [], f]);
   // One folder field for all projects (a hidden control still submits, and /authorize caps bodies at 16 KiB), with
@@ -725,7 +726,7 @@ async function publishConsentPost(req, env, oauth, form, handle, origin) {
   const resume = String(form.get("resume") ?? "new");
   const at = nowIso(), rid = randomId("req", 9);
   const audit2 = /* @__PURE__ */ __name((projectId, action, object, result) => env.DB.prepare("INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(at, sess.principal_id, projectId, action, object, result, rid), "audit");
-  let publisherId, epoch;
+  let publisherId, epoch, newFolder = null;
   const stmts = [];
   if (resume !== "new") {
     const prev = await env.DB.prepare("SELECT * FROM publishers WHERE id = ? AND app_client_id = ? AND owner_principal_id = ? AND revoked_at IS NULL").bind(resume, app.id, sess.principal_id).first();
@@ -759,8 +760,13 @@ async function publishConsentPost(req, env, oauth, form, handle, origin) {
       }
       const ex = await env.DB.prepare("SELECT id FROM folders WHERE project_id = ? AND name_key = ?").bind(projectId, nm.key).first("id");
       if (ex) return retry(`A folder named \u201C${nm.name}\u201D already exists in this project. Pick it from the folder list, or choose another name.`);
+      const FULL = "This project already has 1,000 folders, the most a project can have. Pick one of its folders, or publish to the project root.";
+      if (await env.DB.prepare("SELECT COUNT(*) AS n FROM folders WHERE project_id = ?").bind(projectId).first("n") >= FOLDERS_PER_PROJECT) return retry(FULL);
       folderId = randomId("fld");
-      stmts.push(env.DB.prepare("INSERT INTO folders (id, project_id, name, name_key, created_at, created_by, publisher_id) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(folderId, projectId, nm.name, nm.key, at, sess.principal_id, publisherId), audit2(projectId, "folder.create", folderId, "ok:publisher-consent"));
+      // Checked again inside the INSERT (concurrent creates). A refused folder refuses the principal insert below too,
+      // so the publisher row's foreign key fails and the batch rolls back.
+      newFolder = folderId;
+      stmts.push(env.DB.prepare(`INSERT INTO folders (id, project_id, name, name_key, created_at, created_by, publisher_id) SELECT ?, ?, ?, ?, ?, ?, ? WHERE ${FOLDER_ROOM_SQL}`).bind(folderId, projectId, nm.name, nm.key, at, sess.principal_id, publisherId, projectId, FOLDERS_PER_PROJECT), audit2(projectId, "folder.create", folderId, "ok:publisher-consent"));
     } else return retry("Choose a folder option.");
     // Connected-agents limit (Phase 4): checked now (the person can go back), and again in the principal insert; a
     // refused principal makes the publisher row's foreign key fail, rolling the batch back.
@@ -768,7 +774,8 @@ async function publishConsentPost(req, env, oauth, form, handle, origin) {
     if (pg.sql !== "1" && !await env.DB.prepare(`SELECT ${pg.sql} AS ok`).bind(...pg.params).first("ok"))
       return retry("This workspace has reached its limit of connected apps and API keys. Disconnect one you no longer use (Connections), then try again.");
     stmts.push(
-      env.DB.prepare(`INSERT INTO principals (id, kind, issuer, subject, label, created_at) SELECT ?, 'agent', 'agent-library-publisher', ?, ?, ? WHERE ${pg.sql}`).bind(principalId, publisherId, `publisher:${app.display_name}`.slice(0, 200), at, ...pg.params),
+      env.DB.prepare(`INSERT INTO principals (id, kind, issuer, subject, label, created_at) SELECT ?, 'agent', 'agent-library-publisher', ?, ?, ? WHERE ${pg.sql}${newFolder ? " AND EXISTS (SELECT 1 FROM folders WHERE id = ?)" : ""}`)
+        .bind(principalId, publisherId, `publisher:${app.display_name}`.slice(0, 200), at, ...pg.params, ...newFolder ? [newFolder] : []),
       env.DB.prepare(`INSERT INTO publishers (id, owner_principal_id, principal_id, app_client_id, display_name, project_id, folder_id, created_at, workspace_id, created_by)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(publisherId, sess.principal_id, principalId, app.id, app.display_name, projectId, folderId, at, proj.workspace_id, sess.principal_id),
       audit2(projectId, "publisher.connect", publisherId, folderId ? "ok:folder" : "ok:root")
@@ -780,6 +787,8 @@ async function publishConsentPost(req, env, oauth, form, handle, origin) {
   try {
     res = await env.DB.batch(stmts);
   } catch (e) {
+    if (/FOREIGN KEY/i.test(String(e?.message)) && newFolder && await env.DB.prepare("SELECT COUNT(*) AS n FROM folders WHERE project_id = ?").bind(form.get("project_id")).first("n") >= FOLDERS_PER_PROJECT)
+      return errorPage("This project reached 1,000 folders, the most a project can have, while you were deciding. Start connecting again from the app and pick an existing folder or the project root.", 409);
     if (/FOREIGN KEY/i.test(String(e?.message))) return errorPage("Your access to that project, or its workspace's plan limits, changed. Start connecting again from the app.", 403);
     if (/UNIQUE/i.test(String(e?.message))) return errorPage("A folder with that name was just created in this project. Start connecting again from the app and choose it as an existing folder, or pick another name.");
     throw e;

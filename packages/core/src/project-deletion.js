@@ -13,7 +13,7 @@ import { deleteBlob, listBlobKeys } from "./content-store.js";
 import { explainLimit, limitGuard } from "./limits.js";
 import { ensureSlug } from "./paths.js";
 import { memberRoleSql, projectWorkspaceSql, requireWorkspaceRole, workspaceRoleSql } from "./tenancy.js";
-import { HttpError, nowIso, nowMs } from "./util.js";
+import { HttpError, cutLists, nowIso, nowMs } from "./util.js";
 
 export const RETENTION_DAYS = 30;
 // Restore closes an hour before purge_at, so a restore and a purge running on different clocks can't overlap.
@@ -63,9 +63,9 @@ export async function listDeletedProjects(ctx, workspaceId) {
     `SELECT p.id, p.title, p.deleted_at, p.purge_at, pr.label AS deleted_by_label,
        (SELECT COUNT(*) FROM artifacts a WHERE a.project_id = p.id AND a.head_rev > 0 AND a.trashed_at IS NULL) AS items
      FROM projects p LEFT JOIN principals pr ON pr.id = p.deleted_by
-     WHERE p.workspace_id = ? AND p.deleted_at IS NOT NULL AND p.purged_at IS NULL AND p.purge_at > ? ORDER BY p.deleted_at DESC LIMIT 200`
+     WHERE p.workspace_id = ? AND p.deleted_at IS NOT NULL AND p.purged_at IS NULL AND p.purge_at > ? ORDER BY p.deleted_at DESC LIMIT 201`
   ).bind(workspaceId, nowMs()).all();
-  return { projects: r.results.map((p) => ({ id: p.id, title: p.title, items: p.items, deleted_by: p.deleted_by_label ?? null,
+  return { truncated: cutLists({ projects: r.results.length > 200 }), projects: r.results.slice(0, 200).map((p) => ({ id: p.id, title: p.title, items: p.items, deleted_by: p.deleted_by_label ?? null,
     deleted_at: new Date(p.deleted_at).toISOString(), purge_at: new Date(p.purge_at).toISOString() })) };
 }
 

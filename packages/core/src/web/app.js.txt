@@ -633,6 +633,10 @@ var ROLE_HELP = {
 var ROLE_ORDER = ["viewer", "member", "admin", "owner"];
 function wsLabel(w) { return w.personal ? "Personal" : w.name; }
 function sectionMsg() { return h("p", { class: "msg", role: "status", "aria-live": "polite" }); }
+// A capped server list (r.truncated names the lists that hit their cap): a muted "Showing the first N" line, else null.
+function truncatedNote(r, name, n, noun) {
+  return r && Array.isArray(r.truncated) && r.truncated.indexOf(name) >= 0 ? h("p", { class: "muted small truncated-note", text: "Showing the first " + n.toLocaleString("en-US") + " " + noun + "." }) : null;
+}
 // Show an error next to the control that caused it, and bring it into view.
 function sectionErr(el, err) { showErr(el, err); try { el.scrollIntoView({ block: "nearest" }); } catch (e) {} }
 
@@ -677,13 +681,13 @@ async function viewWorkspace(id) {
   var linkBox = h("div", { class: "card", hidden: true }); // kept across reloads while an invitation link is shown
   var focusAfter = null; // selector of the element to focus after the next reload
   async function load() {
-    var d, projects, usage, deleted;
+    var d, projects, usage, deleted, projResp, delResp;
     try {
       var r = await Promise.all([api("GET", "/api/workspaces/" + enc(id) + "/members"), api("GET", "/api/projects"),
         api("GET", "/api/workspaces/" + enc(id) + "/usage").catch(function () { return null; }),
         api("GET", "/api/workspaces/" + enc(id) + "/deleted-projects").catch(function () { return null; })]);
       d = r[0]; noteProjects(r[1].projects); projects = r[1].projects.filter(function (p) { return p.workspace_id === id; }); usage = r[2];
-      deleted = r[3] && r[3].projects;
+      deleted = r[3] && r[3].projects; projResp = r[1]; delResp = r[3];
     } catch (err) {
       if (err.status === 401) return;
       setCrumbs([{ t: "Home", href: "#/" }, { t: "Workspaces", href: "#/workspaces" }, { t: "Not available" }]);
@@ -789,7 +793,7 @@ async function viewWorkspace(id) {
       deletedList = h("section", { class: "recently-deleted", "aria-labelledby": "deleted-h" }, h("h3", { id: "deleted-h", text: "Recently deleted" }),
         h("p", { class: "muted small", text: "Deleted projects stay here for 30 days. Nobody can open them, and they don't count toward the projects limit; their files still count toward storage until they're removed." +
           (suspended ? " While the workspace is read-only, they can't be restored or deleted permanently." : "") }),
-        delMsg, dl);
+        delMsg, dl, truncatedNote(delResp, "projects", 200, "deleted projects"));
     }
 
     // Members. Role changes are a pending choice saved with a button, and promotions to admin/owner are confirmed.
@@ -841,8 +845,8 @@ async function viewWorkspace(id) {
       suspended ? suspendedBanner(owner, usage && usage.billing) : null,
       ws.handle ? h("p", { class: "proj-addr" }, h("span", { class: "muted small", text: "Project links start with" }), h("code", { text: "/" + ws.handle + "/" })) : null,
       usagePanel(usage, admin, realAdmin && suspended),
-      h("h2", { id: "projects-h", tabIndex: -1, text: "Projects" }), projMsg, projList, newProj, deletedList,
-      h("h2", { id: "members-h", tabIndex: -1, text: "Members" }), memMsg, members];
+      h("h2", { id: "projects-h", tabIndex: -1, text: "Projects" }), projMsg, projList, truncatedNote(projResp, "projects", 1000, "projects you can open"), newProj, deletedList,
+      h("h2", { id: "members-h", tabIndex: -1, text: "Members" }), memMsg, members, truncatedNote(d, "members", 500, "members")];
 
     if (admin && !ws.personal) {
       var invMsg = sectionMsg();
@@ -874,7 +878,7 @@ async function viewWorkspace(id) {
             catch (err) { sectionErr(invMsg, err); e.target.disabled = false; }
           } }, "Cancel invitation")));
       });
-      parts.push(h("h2", { text: "Invite someone" }), invMsg, inviteForm, linkBox, h("h2", { id: "pending-h", tabIndex: -1, text: "Pending invitations" }), pending);
+      parts.push(h("h2", { text: "Invite someone" }), invMsg, inviteForm, linkBox, h("h2", { id: "pending-h", tabIndex: -1, text: "Pending invitations" }), pending, truncatedNote(d, "invites", 200, "pending invitations"));
     }
     if (owner && !suspended) parts.push(handleForm(ws, function () { focusAfter = "#ws-handle"; load(); }));
     if (owner && !ws.personal) {
@@ -1481,7 +1485,7 @@ async function viewHome() {
 // ---------- projects ----------
 async function viewProjects() {
   var msg = h("p", { class: "msg", role: "status", "aria-live": "polite" });
-  var list = h("ul", { class: "list", "aria-label": "Projects" }), empty = h("div", { hidden: true }), groups = h("div", { hidden: true });
+  var list = h("ul", { class: "list", "aria-label": "Projects" }), empty = h("div", { hidden: true }), groups = h("div", { hidden: true }), projCut = h("div");
   var title = h("input", { type: "text", placeholder: "Project name", required: true, maxLength: 200, "aria-label": "New project name" });
   var createBtn = h("button", { type: "submit" }, "Create project");
   // Where the new project goes: only workspaces where I can create projects (admin or owner). Hidden with one choice.
@@ -1493,7 +1497,7 @@ async function viewProjects() {
     catch (err) { showErr(msg, err); createBtn.disabled = false; }
   } }, title, wsField, createBtn, h("button", { type: "button", class: "secondary", onclick: function () { form.hidden = true; newBtn.hidden = false; newBtn.focus(); } }, "Cancel"));
   var newBtn = h("button", { type: "button", onclick: function () { form.hidden = false; newBtn.hidden = true; title.focus(); } }, icon("plus"), "New project");
-  shell([{ t: "Home", href: "#/" }, { t: "Projects" }], pageHead("Projects", { sub: "Each project keeps its own documents, files and access. Apps only see the projects you share with them.", actions: newBtn }), form, msg, list, groups, empty);
+  shell([{ t: "Home", href: "#/" }, { t: "Projects" }], pageHead("Projects", { sub: "Each project keeps its own documents, files and access. Apps only see the projects you share with them.", actions: newBtn }), form, msg, list, groups, projCut, empty);
   skeletonRows(list, 3);
   async function load() {
     try {
@@ -1522,6 +1526,7 @@ async function viewProjects() {
         target.append(h("li", { class: "link" }, h("span", { class: "ficon-sm", "aria-hidden": "true" }, icon("folder")),
           h("div", { class: "grow" }, rowLink(href, p.title), p.role === "viewer" ? h("small", { class: "muted", text: "View only" }) : null), h("span", { class: "chev", "aria-hidden": "true" }, icon("chevron"))));
       });
+      projCut.replaceChildren(); var pcut = truncatedNote(r, "projects", 1000, "projects you can open"); if (pcut) projCut.append(pcut);
       resumeApply("projects");
     } catch (err) {
       doneLoading(list); list.hidden = true; empty.hidden = false;
@@ -1624,8 +1629,8 @@ async function uploadDataFile(pid, file, kind, target, keys, status) {
   try { if (kind === "csv") csvParse(text); else JSON.parse(text); }
   catch (e) { throw localUploadError(file.name + ": " + (kind === "csv" ? e.message : jsonErrorText(e, text)) + ". Fix the file and upload it again"); }
   // The content travels as a JSON string; quote-heavy files grow when escaped and the API caps the whole request
-  // body at 2,097,152 characters (UTF-16 length, like this check). 2,000,000 leaves room for the other fields.
-  if (JSON.stringify(text).length > 2000000) throw localUploadError(file.name + " is too large to upload once encoded (lots of quotes or special characters). Split it or remove some rows");
+  // body at 2 MiB (2,097,152 UTF-8 bytes, like this check). 2,000,000 leaves room for the other fields.
+  if (utf8Len(JSON.stringify(text)) > 2000000) throw localUploadError(file.name + " is too large to upload once encoded (lots of quotes or special characters). Split it or remove some rows");
   var base = "/api/projects/" + enc(pid) + "/artifacts";
   var sha = hex(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)));
   var fp = [file.name, file.size, file.lastModified, sha, kind, target.artifact_id || "", target.expected_revision || "", target.title || ""].join("|");
@@ -1974,6 +1979,8 @@ async function viewApps() {
         foot: [c.files === false && c.status === "active" ? "Documents only: reconnect to include files" : null, c.last_used_at ? "Last used " + fmtDate(c.last_used_at) : "Not used yet", "Connected " + fmtDate(c.created_at), c.status === "active" ? (new Date(c.expires_at).getUTCFullYear() >= 9000 ? "Until you disconnect" : "Expires " + fmtDate(c.expires_at)) : null].filter(Boolean),
         actions: btn ? [btn] : [] }));
     });
+    var cut = truncatedNote(data, "connections", 200, "connections");
+    if (cut) conns.append(cut);
   }
   async function load() {
     try { data = await api("GET", "/api/access"); data.checked_at = new Date().toISOString(); draw(); }
@@ -2052,11 +2059,12 @@ async function viewTokens() {
   var canWrite = h("input", { type: "checkbox" });
   var ttl = h("input", { type: "number", min: 1, max: 720, value: 24, "aria-label": "Expires after (hours)" });
   ttl.size = 4;
-  var tokenBox = h("div", { class: "card", hidden: true });
+  var tokenBox = h("div", { class: "card", hidden: true }), grantsCut = h("div");
   function draw() {
     list.replaceChildren();
     var gs = data.grants.filter(function (g) { return showAll.checked || g.status === "active"; });
     if (!gs.length) list.append(h("li", { class: "empty", text: showAll.checked ? "No agent tokens." : "No active agent tokens. That's normal: most apps connect by signing in." }));
+    grantsCut.replaceChildren(); var gcut = truncatedNote(data, "grants", 200, "agent tokens"); if (gcut) grantsCut.append(gcut);
     gs.forEach(function (g) {
       var li = h("li", null,
         h("div", { class: "grow" }, h("strong", { text: g.label }), h("small", { text: g.project_title + " (" + accessText(g.access) + ")" }),
@@ -2116,7 +2124,7 @@ async function viewTokens() {
   } }, icon("download"), "Download backup");
   shell([{ t: "Connections" }], connHead(), connectionHelp(), settingsTabs("tokens"),
     h("div", { class: "callout" }, icon("key"), h("span", null, h("strong", { text: "Agent tokens (advanced)" }), " are for your own scripts or local agents that can't sign in. Each token covers one project, expires, and can be revoked immediately. Most apps should connect as a reader app instead.")),
-    msg, list, h("p", null, h("label", { class: "muted small" }, showAll, "Show revoked and expired")),
+    msg, list, grantsCut, h("p", null, h("label", { class: "muted small" }, showAll, "Show revoked and expired")),
     h("details", null, h("summary", { text: "Create a token" }), h("div", { class: "card" }, form)), tokenBox,
     h("details", null, h("summary", { text: "Backup" }), h("div", { class: "card" }, h("p", { class: "muted small", text: "Download a JSON backup of a project's documents and history." }), h("div", { class: "row" }, bproj, backupBtn), bmsg)));
   load().then(function () { projects.filter(function (p) { return !p.role || p.role === "owner" || p.role === "admin"; }).forEach(function (p) { bproj.append(h("option", { value: p.id, text: p.title })); }); });
@@ -2159,7 +2167,7 @@ function scopePicker(projects, current) {
 }
 async function viewApiKeys() {
   var msg = h("p", { class: "msg", role: "status" });
-  var list = h("ul", { class: "list" });
+  var list = h("ul", { class: "list" }), keysCut = h("div");
   var showAll = h("input", { type: "checkbox" });
   var box = h("div", { class: "card", hidden: true });
   var data = null, projects = [];
@@ -2198,6 +2206,7 @@ async function viewApiKeys() {
     list.replaceChildren();
     var ks = data.keys.filter(function (k) { return showAll.checked || k.status === "active"; });
     if (!ks.length) list.append(h("li", { class: "empty", text: "No active API keys." }));
+    keysCut.replaceChildren(); var kcut = truncatedNote(data, "keys", 200, "API keys"); if (kcut) keysCut.append(kcut);
     ks.forEach(function (k) {
       var left = daysLeft(k.expires_at);
       var never = Date.parse(k.expires_at) >= Date.UTC(9999, 0, 1);
@@ -2292,7 +2301,7 @@ async function viewApiKeys() {
     h("div", { class: "row" }, h("span", { class: "spacer" }), h("button", { type: "submit" }, "Create key")));
   shell([{ t: "Connections" }], connHead(), connectionHelp(), settingsTabs("api-keys"),
     h("div", { class: "callout" }, icon("key"), h("span", null, h("strong", { text: "API keys" }), " are for apps that use the REST API (for example Muse). Each key covers only the projects you pick, expires after the lifetime you choose (the workspace's plan may cap it) and can be replaced or revoked at any time. The key itself is shown once.")),
-    msg, box, list, h("p", null, h("label", { class: "muted small" }, showAll, "Show revoked and expired")),
+    msg, box, list, keysCut, h("p", null, h("label", { class: "muted small" }, showAll, "Show revoked and expired")),
     h("details", null, h("summary", { text: "Create an API key" }), h("div", { class: "card" }, form)));
   load();
 }
@@ -2756,15 +2765,29 @@ async function viewArtifact(pid, aid, initialTab) {
   }
   // comments
   var comMsg = h("p", { class: "msg", role: "status" }), comList = h("ul", { class: "list" }), comText = h("textarea", { class: "half", maxLength: 4000, placeholder: "Comment on the current revision" });
-  var comPending = null;
+  var comPending = null, comCursor = null;
+  // The newest page first (oldest first within it); "Show older comments" prepends the page before it.
+  var comOlder = h("button", { type: "button", class: "secondary com-older", hidden: true, onclick: async function () {
+    comOlder.disabled = true;
+    try {
+      var r = await api("GET", base + "/comments?cursor=" + enc(comCursor));
+      var first = comList.firstChild;
+      r.comments.forEach(function (c) { comList.insertBefore(commentRow(c), first); });
+      comCursor = r.next_cursor; comOlder.hidden = !comCursor;
+      if (first && first.focus) { first.tabIndex = -1; first.focus(); }
+    } catch (err) { showErr(comMsg, err); }
+    comOlder.disabled = false;
+  } }, "Show older comments");
+  function commentRow(c) {
+    return h("li", null, h("div", { class: "grow" }, h("div", { class: "muted small", text: (c.author || "") + " - rev " + c.revision + " - " + fmtDate(c.created_at) }), h("div", { class: "raw-text", text: c.body })));
+  }
   async function loadComments() {
     try {
       var r = await api("GET", base + "/comments");
       comList.replaceChildren();
       if (!r.comments.length) comList.append(h("li", { class: "empty", text: "No comments yet." }));
-      r.comments.forEach(function (c) {
-        comList.append(h("li", null, h("div", { class: "grow" }, h("div", { class: "muted small", text: (c.author || "") + " - rev " + c.revision + " - " + fmtDate(c.created_at) }), h("div", { class: "raw-text", text: c.body }))));
-      });
+      r.comments.forEach(function (c) { comList.append(commentRow(c)); });
+      comCursor = r.next_cursor || null; comOlder.hidden = !comCursor;
     } catch (err) { showErr(comMsg, err); }
   }
   var comForm = h("form", { onsubmit: async function (e) {
@@ -2783,7 +2806,7 @@ async function viewArtifact(pid, aid, initialTab) {
   addTab("history", "History", VH.load);
   panels.history.append(VH.root);
   addTab("comments", "Comments", loadComments);
-  panels.comments.append(comList, comForm, comMsg);
+  panels.comments.append(comOlder, comList, comForm, comMsg);
   for (var k in panels) app.append(panels[k]);
   app.append(below);
   // Documents open on the rendered view; Edit is one tap away (and /edit deep links open the editor).

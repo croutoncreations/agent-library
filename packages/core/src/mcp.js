@@ -4,7 +4,7 @@ import { addressLinks, resolveProjectRef } from "./paths.js";
 import { __name } from "./runtime.js";
 import { RS_SCHEMA, RT_ID_TOO_LONG, addComment, auditDenied, createMarkdown, diffRevisions, getArtifact, history, legacyConnectionInfo, listArtifacts, listChanges, listComments, listProjects, readTextChunk, restoreMetadata, restoreRevision, rsToolReady, rtChunkLimit, rtFit, rtIdBytes, saveMarkdown, searchArtifacts, tplTools, updateMetadata } from "./service.js";
 import { uploadBegin, uploadFinish } from "./uploads.js";
-import { CHANGE_NOTE_SCHEMA, HttpError, idemKey, mcpClientInfo, rememberClientInfo } from "./util.js";
+import { CHANGE_NOTE_SCHEMA, HttpError, idemKey, mcpClientInfo, readTextCapped, rememberClientInfo } from "./util.js";
 
 var SUPPORTED2 = ["2025-11-25", "2025-06-18", "2025-03-26"];
 var S2 = /* @__PURE__ */ __name((props, required) => ({ type: "object", properties: props, required, additionalProperties: false }), "S");
@@ -75,9 +75,9 @@ var TOOLS2 = [
   },
   {
     name: "list_comments",
-    description: "List comments.",
-    inputSchema: S2({ project_id: P2, artifact_id: A2 }, ["project_id", "artifact_id"]),
-    run: (c, a) => listComments(c, a.project_id, a.artifact_id)
+    description: "List comments, oldest first: the newest 200, then pass next_cursor for the 200 before them.",
+    inputSchema: S2({ project_id: P2, artifact_id: A2, cursor: { type: "string", maxLength: 512 } }, ["project_id", "artifact_id"]),
+    run: (c, a) => listComments(c, a.project_id, a.artifact_id, a.cursor)
   },
   {
     name: "upload_begin",
@@ -127,8 +127,9 @@ async function handleMcp(req, env, requestId, origin) {
   if (ctx.principal.kind !== "agent") return unauth();
   const pv = req.headers.get("mcp-protocol-version");
   if (pv && !SUPPORTED2.includes(pv)) return new Response(JSON.stringify(rpcErr2(null, -32600, "Unsupported protocol version")), { status: 400, headers: hdr });
-  const text = await req.text();
-  if (text.length > 2 * 1024 * 1024) return new Response(JSON.stringify(rpcErr2(null, -32600, "Payload too large")), { status: 413, headers: hdr });
+  // At most 2 MiB of UTF-8 bytes.
+  const text = await readTextCapped(req, 2 * 1024 * 1024);
+  if (text === null) return new Response(JSON.stringify(rpcErr2(null, -32600, "Payload too large")), { status: 413, headers: hdr });
   let msg;
   try {
     msg = JSON.parse(text);

@@ -8,7 +8,7 @@ import { __name } from "./runtime.js";
 import { RS_SCHEMA, rsQuery, rsReady, rsToolReady, searchArtifacts } from "./search/service.js";
 import { createFromTemplate, listTemplates, previewTemplate, saveAsTemplate, tplAssertMaintenance, tplDate, tplProvenance, tplTools } from "./templates/service.js";
 import { ROLE_RANK, memberRoleSql, personalWorkspaceId, projectRole, workspaceRoleSql, requireProjectRole, requireWorkspaceRole, visibleProjects } from "./tenancy.js";
-import { HttpError, int, nowIso, nowMs, randomId, sha256Hex, str } from "./util.js";
+import { HttpError, b64url, cutLists, int, nowIso, nowMs, randomId, sha256Hex, str } from "./util.js";
 import { checkSlug, ensureHandle, ensureSlug, projectPaths, slugify } from "./paths.js";
 import { explainLimit, limitGuard, projectLimitGuard } from "./limits.js";
 
@@ -85,7 +85,7 @@ async function listProjects(ctx) {
     const r = credentialGate(ctx, ctx.grant.project_id, "read"), w = credentialGate(ctx, ctx.grant.project_id, "write");
     const p = await db(ctx).prepare(`SELECT id, title, ${w.sql} AS can_write FROM projects WHERE id = ? AND ${r.sql}`).bind(...w.params, ctx.grant.project_id, ...r.params).first();
     const paths = p ? await projectPaths(ctx.env, [p.id]) : new Map();
-    return { projects: p ? [{ id: p.id, title: p.title, ...paths.has(p.id) ? { path: paths.get(p.id) } : {}, can_write: !!p.can_write && !!ctx.grant.can_write }] : [] };
+    return { projects: p ? [{ id: p.id, title: p.title, ...paths.has(p.id) ? { path: paths.get(p.id) } : {}, can_write: !!p.can_write && !!ctx.grant.can_write }] : [], truncated: [] };
   }
   // Every project in every active workspace I belong to (minus per-project 'none'), with my effective role.
   const ps = await visibleProjects(ctx.env, ctx.principal.id);
@@ -94,7 +94,7 @@ async function listProjects(ctx) {
   const fill = missing.length ? await projectPaths(ctx.env, missing) : new Map();
   const pathOf = (p) => p.slug && p.workspace_handle ? `${p.workspace_handle}/${p.slug}` : fill.get(p.id);
   return { projects: ps.map((p) => ({ id: p.id, title: p.title, path: pathOf(p), workspace_id: p.workspace_id, role: p.role, can_write: ROLE_RANK[p.role] >= ROLE_RANK.member && p.workspace_status === "active",
-    ...p.workspace_status !== "active" ? { read_only_reason: "workspace_suspended" } : {} })) };
+    ...p.workspace_status !== "active" ? { read_only_reason: "workspace_suspended" } : {} })), truncated: cutLists({ projects: ps.truncated }) };
 }
 async function createProject(ctx, input) {
   requireHuman(ctx);
@@ -469,7 +469,7 @@ async function updateMetadata(ctx, projectId, artifactId, input, key, internal) 
   let tags = a.tags;
   if (input.tags !== void 0) {
     if (!Array.isArray(input.tags) || input.tags.length > 20) throw new HttpError(400, "invalid_input", "tags must be an array (max 20)");
-    tags = JSON.stringify(input.tags.map((t) => str(t, "tag", 40, { min: 1 })));
+    tags = JSON.stringify(input.tags.map((t) => str(t, "tag", 50, { min: 1 })));
   }
   let trashed = a.trashed_at;
   if (input.trashed === true) trashed = trashed ?? nowIso();
@@ -508,6 +508,11 @@ async function updateMetadata(ctx, projectId, artifactId, input, key, internal) 
   }
   return { status: 200, body: body2 };
 }
+// Folders per project: checked inside the INSERT (FOLDER_ROOM_SQL binds the project id, then the cap) on every path
+// that creates one (createFolder here, the publishing consent page in oauth/server.js). Lists show them all.
+var FOLDERS_PER_PROJECT = 1000;
+var FOLDER_ROOM_SQL = "(SELECT COUNT(*) FROM folders WHERE project_id = ?) < ?";
+var tooManyFolders = () => new HttpError(409, "too_many_folders", "A project can have up to 1,000 folders", { limit: FOLDERS_PER_PROJECT });
 function folderName(v) {
   const raw = str(v, "name", 200, { min: 1 }).trim();
   if (raw.length < 1 || raw.length > 80) throw new HttpError(400, "invalid_input", "Folder name must be 1-80 characters");
@@ -517,7 +522,7 @@ function folderName(v) {
 async function listFolders(ctx, projectId) {
   requireAppConnect(ctx);
   await authorizeProject(ctx, projectId, false);
-  const r = await db(ctx).prepare("SELECT id, name, publisher_id, created_at FROM folders WHERE project_id = ? ORDER BY name_key LIMIT 500").bind(projectId).all();
+  const r = await db(ctx).prepare("SELECT id, name, publisher_id, created_at FROM folders WHERE project_id = ? ORDER BY name_key LIMIT ?").bind(projectId, FOLDERS_PER_PROJECT).all();
   return { folders: r.results };
 }
 async function createFolder(ctx, projectId, input, key) {
@@ -537,7 +542,7 @@ async function createFolder(ctx, projectId, input, key) {
   let out2;
   try {
     out2 = await runBatch(ctx, [
-      db(ctx).prepare(`INSERT INTO folders (id, project_id, name, name_key, created_at, created_by) SELECT ?, ?, ?, ?, ?, ? WHERE ${az.sql}`).bind(id, projectId, name, nameKey, nowIso(), ctx.principal.id, ...az.params),
+      db(ctx).prepare(`INSERT INTO folders (id, project_id, name, name_key, created_at, created_by) SELECT ?, ?, ?, ?, ?, ? WHERE ${az.sql} AND ${FOLDER_ROOM_SQL}`).bind(id, projectId, name, nameKey, nowIso(), ctx.principal.id, ...az.params, projectId, FOLDERS_PER_PROJECT),
       idemInsert(ctx, i, 201, body2, gate, [id]),
       audit(ctx, projectId, "folder.create", id, null, "ok", gate, [id])
     ], i);
@@ -549,7 +554,11 @@ async function createFolder(ctx, projectId, input, key) {
     throw e;
   }
   if (!Array.isArray(out2)) return out2;
-  if (!out2[0].meta.changes) throw new HttpError(403, "forbidden", "Grant no longer valid");
+  if (!out2[0].meta.changes) {
+    const n = await db(ctx).prepare("SELECT COUNT(*) AS n FROM folders WHERE project_id = ?").bind(projectId).first("n");
+    if (n >= FOLDERS_PER_PROJECT) throw tooManyFolders();
+    throw new HttpError(403, "forbidden", "Grant no longer valid");
+  }
   return { status: 201, body: body2 };
 }
 async function readRecords(ctx, projectId, artifactId, q) {
@@ -615,22 +624,46 @@ async function addComment(ctx, projectId, artifactId, input, key) {
   if (!out2[0].meta.changes) throw new HttpError(404, "not_found", "Revision not found");
   return { status: 201, body: body2 };
 }
-async function listComments(ctx, projectId, artifactId) {
+// Comments page newest-first, COMMENTS_PAGE at a time (order created_at, id); each page is returned oldest first.
+// next_cursor names the oldest comment returned; passing it returns the page of comments before that one.
+var COMMENTS_PAGE = 200;
+function commentCursor(c) {
+  return b64url(new TextEncoder().encode(JSON.stringify([c.created_at, c.id])));
+}
+function parseCommentCursor(v) {
+  const bad = () => new HttpError(400, "invalid_cursor", "Malformed comments cursor");
+  if (typeof v !== "string" || v.length > 512 || !/^[A-Za-z0-9_-]+$/.test(v)) throw bad();
+  let at, id;
+  try {
+    [at, id] = JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(v.replace(/-/g, "+").replace(/_/g, "/")), (ch) => ch.charCodeAt(0))));
+  } catch {
+    throw bad();
+  }
+  if (typeof at !== "string" || typeof id !== "string") throw bad();
+  return { at, id };
+}
+async function listComments(ctx, projectId, artifactId, cursor) {
   await authorizeProject(ctx, projectId, false);
   await loadArtifact(ctx, projectId, artifactId);
+  const before = cursor === void 0 || cursor === null || cursor === "" ? null : parseCommentCursor(cursor);
   const r = await db(ctx).prepare(
     `SELECT c.id, c.rev_no AS revision, c.body, c.created_at, p.label AS author FROM comments c JOIN principals p ON p.id = c.author_id
-     WHERE c.artifact_id = ? AND c.project_id = ? ORDER BY c.created_at LIMIT 200`
-  ).bind(artifactId, projectId).all();
-  return { comments: r.results.map((c) => ({ ...c, body: readText(c.body) })) };
+     WHERE c.artifact_id = ? AND c.project_id = ?${before ? " AND (c.created_at < ? OR (c.created_at = ? AND c.id < ?))" : ""}
+     ORDER BY c.created_at DESC, c.id DESC LIMIT ?`
+  ).bind(artifactId, projectId, ...before ? [before.at, before.at, before.id] : [], COMMENTS_PAGE + 1).all();
+  const page = r.results.slice(0, COMMENTS_PAGE).reverse();
+  return {
+    comments: page.map((c) => ({ ...c, body: readText(c.body) })),
+    next_cursor: r.results.length > COMMENTS_PAGE ? commentCursor(page[0]) : null
+  };
 }
 async function listAudit(ctx, projectId) {
   requireHuman(ctx);
   await requireProjectRole(ctx, projectId, "admin", true);
   const r = await db(ctx).prepare(
-    "SELECT seq, at, actor_id, action, object_id, rev_no, result, request_id FROM audits WHERE project_id = ? ORDER BY seq DESC LIMIT 200"
+    "SELECT seq, at, actor_id, action, object_id, rev_no, result, request_id FROM audits WHERE project_id = ? ORDER BY seq DESC LIMIT 201"
   ).bind(projectId).all();
-  return { audits: r.results };
+  return { audits: r.results.slice(0, 200), truncated: r.results.length > 200 ? ["audits"] : [] };
 }
 var appConnectEnabled, LIMITS, ascii, BINARY_TYPES, IMAGE_TYPES, VIDEO_TYPES, TEXT_MIME, db, artifactView, ART_COLS;
 appConnectEnabled = (env) => env?.APP_CONNECT_ENABLED === "1";
@@ -638,7 +671,6 @@ LIMITS = {
   markdownBytes: 1024 * 1024,
   // File size and documents per project are workspace limits (limits.js: file_bytes, items_per_project).
   pageSize: 50,
-  uploadTtlMs: 15 * 60 * 1e3,
   commentChars: 1e4
 };
 ascii = (b, from, to) => String.fromCharCode(...b.slice(from, to));
@@ -678,4 +710,4 @@ artifactView = (a, appConnect = true) => ({
 });
 ART_COLS = "a.*, (SELECT display_name FROM publishers WHERE id = a.publisher_id) AS pub_name";
 
-export { BINARY_TYPES, IMAGE_TYPES, LIMITS, RS_SCHEMA, RT_ID_TOO_LONG, RT_KINDS_ALL, RT_KINDS_DOCS, VIDEO_TYPES, addComment, appConnectEnabled, assertWritable, audit, auditDenied, chQuery, cleanupChanges, connectionInfo, createFile, createFolder, createFromTemplate, createGrant, createMarkdown, createProject, updateProject, db, diffRevisions, folderCheck, folderName, getArtifact, history, idemInsert, idemLookup, legacyConnectionInfo, listArtifacts, listAudit, listChanges, listComments, listFolders, listGrants, listProjects, listTemplates, loadArtifact, mdBody, metaHistory, previewTemplate, provenance, publishRevision, readRecords, readTextChunk, requireAppConnect, restoreMetadata, restoreRevision, rsQuery, rsReady, rsToolReady, rtChunkLimit, rtFit, rtIdBytes, rtQuery, rtReadAuthzSql, runBatch, saveAsTemplate, saveFile, saveMarkdown, searchArtifacts, tplDate, tplTools, updateGrant, updateMetadata };
+export { BINARY_TYPES, FOLDERS_PER_PROJECT, FOLDER_ROOM_SQL, IMAGE_TYPES, LIMITS, RS_SCHEMA, RT_ID_TOO_LONG, RT_KINDS_ALL, RT_KINDS_DOCS, VIDEO_TYPES, addComment, appConnectEnabled, assertWritable, audit, auditDenied, chQuery, cleanupChanges, connectionInfo, createFile, createFolder, createFromTemplate, createGrant, createMarkdown, createProject, updateProject, db, diffRevisions, folderCheck, folderName, getArtifact, history, idemInsert, idemLookup, legacyConnectionInfo, listArtifacts, listAudit, listChanges, listComments, listFolders, listGrants, listProjects, listTemplates, loadArtifact, mdBody, metaHistory, previewTemplate, provenance, publishRevision, readRecords, readTextChunk, requireAppConnect, restoreMetadata, restoreRevision, rsQuery, rsReady, rsToolReady, rtChunkLimit, rtFit, rtIdBytes, rtQuery, rtReadAuthzSql, runBatch, saveAsTemplate, saveFile, saveMarkdown, searchArtifacts, tplDate, tplTools, tooManyFolders, updateGrant, updateMetadata };

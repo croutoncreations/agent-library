@@ -3,7 +3,7 @@
 import { requireHuman } from "./auth.js";
 import { adapters, notify } from "./adapters.js";
 import { ROLES, ROLE_RANK, multiUserInstall, requireWorkspaceRole, workspaceRoleSql } from "./tenancy.js";
-import { HttpError, nowIso, nowMs, randomId, sha256Hex, str } from "./util.js";
+import { HttpError, cutLists, nowIso, nowMs, randomId, sha256Hex, str } from "./util.js";
 import { checkHandle, ensureHandle } from "./paths.js";
 import { explainLimit, guardSql, limitError, limitGuard, ownedWorkspacesGuard, usageOf, usageSql } from "./limits.js";
 const isUnique = (e) => /UNIQUE|constraint/i.test(String(e?.message ?? e));
@@ -35,11 +35,11 @@ export async function listWorkspaces(ctx) {
     `SELECT w.id, w.name, w.handle, w.personal, w.status, w.plan, w.created_at, m.role,
        (SELECT COUNT(*) FROM workspace_members x WHERE x.workspace_id = w.id) AS member_count
      FROM workspaces w JOIN workspace_members m ON m.workspace_id = w.id AND m.principal_id = ?
-     WHERE w.status <> 'deleting' ORDER BY w.personal DESC, w.created_at LIMIT 200`
+     WHERE w.status <> 'deleting' ORDER BY w.personal DESC, w.created_at LIMIT 201`
   ).bind(ctx.principal.id).all();
   const out = [];
-  for (const w of r.results) out.push({ ...w, personal: !!w.personal, handle: await ensureHandle(ctx.env, w) });
-  return { workspaces: out };
+  for (const w of r.results.slice(0, 200)) out.push({ ...w, personal: !!w.personal, handle: await ensureHandle(ctx.env, w) });
+  return { workspaces: out, truncated: cutLists({ workspaces: r.results.length > 200 }) };
 }
 
 export async function createWorkspace(ctx, input) {
@@ -108,18 +108,19 @@ export async function listMembers(ctx, id) {
   const ws = await requireWorkspaceRole(ctx, id, "viewer");
   const m = await ctx.env.DB.prepare(
     `SELECT m.principal_id, m.role, m.created_at, p.label, p.email FROM workspace_members m JOIN principals p ON p.id = m.principal_id
-     WHERE m.workspace_id = ? ORDER BY CASE m.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 WHEN 'member' THEN 2 ELSE 3 END, m.created_at LIMIT 500`
+     WHERE m.workspace_id = ? ORDER BY CASE m.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 WHEN 'member' THEN 2 ELSE 3 END, m.created_at LIMIT 501`
   ).bind(id).all();
   const admin = ROLE_RANK[ws.role] >= ROLE_RANK.admin;
   const inv = admin ? await ctx.env.DB.prepare(
     `SELECT id, email, role, created_at, expires_at FROM workspace_invites WHERE workspace_id = ? AND accepted_at IS NULL AND revoked_at IS NULL AND expires_at > ?
-     ORDER BY created_at DESC LIMIT 200`
+     ORDER BY created_at DESC LIMIT 201`
   ).bind(id, nowMs()).all() : { results: [] };
   return {
     workspace: { id: ws.id, name: ws.name, handle: await ensureHandle(ctx.env, ws), personal: !!ws.personal, role: ws.role, status: ws.status },
     // Emails are shown to admins only; everyone sees names and roles.
-    members: m.results.map((x) => ({ principal_id: x.principal_id, label: x.label, email: admin ? x.email : null, role: x.role, created_at: x.created_at, me: x.principal_id === ctx.principal.id })),
-    invites: inv.results.map((i) => ({ ...i, expires_at: new Date(i.expires_at).toISOString() }))
+    members: m.results.slice(0, 500).map((x) => ({ principal_id: x.principal_id, label: x.label, email: admin ? x.email : null, role: x.role, created_at: x.created_at, me: x.principal_id === ctx.principal.id })),
+    invites: inv.results.slice(0, 200).map((i) => ({ ...i, expires_at: new Date(i.expires_at).toISOString() })),
+    truncated: cutLists({ members: m.results.length > 500, invites: inv.results.length > 200 })
   };
 }
 
