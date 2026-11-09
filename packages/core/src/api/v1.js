@@ -1,6 +1,6 @@
 import { readOnlyError } from "../tenancy.js";
 import { verifyApiKey } from "./credentials.js";
-import { limitsFor, rateLimit } from "../auth.js";
+import { agentRate, limitsFor, rateLimit } from "../auth.js";
 import { appOrigin, artifactWebUrl, previewWebUrl, projectWebUrl } from "../links.js";
 import { addressLinksResponse, projectPaths, resolveProjectRef } from "../paths.js";
 import { __name } from "../runtime.js";
@@ -117,8 +117,7 @@ async function route2(req, env, url, requestId, seen = {}) {
   }
   seen.k = k;
   const write = m !== "GET" && m !== "HEAD";
-  const lim2 = limitsFor(env);
-  await rateLimit(env, `${write ? "w" : "r"}:${k.principalId}`, write ? lim2.writesPerMin : lim2.readsPerMin);
+  await rateLimit(env, `${write ? "w" : "r"}:${k.principalId}`, await agentRate(env, k.workspaceId, write));
   const origin = appOrigin(env.APP_HOST);
   let g;
   if (R2.search.test(path)) {

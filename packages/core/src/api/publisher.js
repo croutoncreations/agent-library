@@ -1,9 +1,9 @@
 import { readText, storeText } from "../content-store.js";
-import { authzSql, limitsFor, rateLimit } from "../auth.js";
+import { agentRate, authzSql, rateLimit } from "../auth.js";
 import { CONTENT_TYPE, MIME, byteLength, checkFile } from "../formats.js";
 import { appOrigin, artifactWebUrl, previewWebUrl } from "../links.js";
 import { addressLinksResponse } from "../paths.js";
-import { explainLimit, projectLimitGuard } from "../limits.js";
+import { explainLimit, projectLimitGuard, projectWorkspaceId } from "../limits.js";
 import { SCOPES, livePublisher } from "../oauth/server.js";
 import { LIMITS, connectionInfo, idemLookup } from "../service.js";
 import { memberRoleSql, readOnlyError } from "../tenancy.js";
@@ -854,8 +854,7 @@ async function route(req, env, p, requestId) {
   const path = url.pathname.replace(/\/$/, "");
   const m = req.method;
   const write = m !== "GET" && m !== "HEAD";
-  const lim = limitsFor(env);
-  await rateLimit(env, `${write ? "w" : "r"}:${p.principal_id}`, write ? lim.writesPerMin : lim.readsPerMin);
+  await rateLimit(env, `${write ? "w" : "r"}:${p.principal_id}`, await agentRate(env, await projectWorkspaceId(env, p.project_id), write));
   const only = (method) => {
     if (m !== method && !(method === "GET" && m === "HEAD")) throw new HttpError(405, "method_not_allowed", "Method not allowed");
   };

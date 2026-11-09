@@ -193,8 +193,10 @@ test('transaction failure rolls back artifacts/revision/audit/idempotency; quota
   await sql('DROP TRIGGER fail_template_test');
   assert.equal((await api('POST', `/projects/${P}/files/from-template`, args, apiKey, idem)).status, 201);
   const [{ n }] = await sql(`SELECT COUNT(*) AS n FROM artifacts WHERE project_id='${P}'`);
-  await sql(`WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n < ${100 - n}) INSERT INTO artifacts (id, project_id, kind, title, created_at, updated_at) SELECT 'quota_'||n, '${P}', 'markdown', 'Quota fixture', '2026-01-01', '2026-01-01' FROM seq`);
-  const quotaKey = key(); assert.equal((await api('POST', `/projects/${P}/files/from-template`, use(), apiKey, quotaKey)).status, 413);
+  await sql(`WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n < ${10000 - n}) INSERT INTO artifacts (id, project_id, kind, title, created_at, updated_at) SELECT 'quota_'||n, '${P}', 'markdown', 'Quota fixture', '2026-01-01', '2026-01-01' FROM seq`);
+  // Full at the default items_per_project (PROJECT_ITEMS_MAX, 10000): 402 limit_reached, nothing written.
+  const quotaKey = key(); const full = await api('POST', `/projects/${P}/files/from-template`, use(), apiKey, quotaKey);
+  assert.equal(full.status, 402); assert.equal(full.body.error.limit, 'items_per_project');
   assert.equal((await sql(`SELECT COUNT(*) AS n FROM idempotency WHERE key='${quotaKey}'`))[0].n, 0);
   await sql("DELETE FROM artifacts WHERE id LIKE 'quota_%'");
   assert.equal((await api('POST', `/projects/${P}/files/from-template`, use(), apiKey, quotaKey)).status, 201);

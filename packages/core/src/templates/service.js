@@ -4,7 +4,7 @@ import { provenance } from "../history/service.js";
 import { appOrigin, artifactWebUrl, previewWebUrl } from "../links.js";
 import { renderMarkdown } from "../markdown.js";
 import { rtReadAuthzSql } from "../reads/service.js";
-import { LIMITS, audit, db, folderCheck, idemInsert, idemLookup, mdBody, runBatch } from "../service.js";
+import { audit, db, folderCheck, idemInsert, idemLookup, mdBody, runBatch } from "../service.js";
 import { HttpError, idemKey, int, nowIso, randomId, sha256Hex, str } from "../util.js";import { explainLimit, projectLimitGuard } from "../limits.js";
 
 
@@ -82,12 +82,12 @@ async function tplCopy(ctx, projectId, input, key, definition = false) {
   const az = authzSql(ctx, projectId);
   // All writes share this fence inside a single serialized D1 transaction. The idempotency insert is first,
   // so competing identical requests roll back rather than leaving a second copy/revision/audit behind.
-  const lg = await projectLimitGuard(ctx.env, projectId, { storage_bytes: new TextEncoder().encode(body).length }); // workspace storage (Phase 4)
+  const adds = { storage_bytes: new TextEncoder().encode(body).length, items_per_project: 1 };
+  const lg = await projectLimitGuard(ctx.env, projectId, adds); // workspace storage and items per project (limits.js)
   const gate = `${az.sql} AND EXISTS (SELECT 1 FROM artifacts WHERE id = ? AND project_id = ? AND kind = 'markdown'
     AND trashed_at IS NULL AND publisher_id IS NULL ${definition ? "" : "AND is_template = 1"})
-    AND (? IS NULL OR EXISTS (SELECT 1 FROM folders WHERE id = ? AND project_id = ?))
-    AND (SELECT COUNT(*) FROM artifacts WHERE project_id = ? AND publisher_id IS NULL) < ? AND ${lg.sql}`;
-  const gp = [...az.params, sourceId, projectId, folderId, folderId, projectId, projectId, LIMITS.artifactsPerProject, ...lg.params];
+    AND (? IS NULL OR EXISTS (SELECT 1 FROM folders WHERE id = ? AND project_id = ?)) AND ${lg.sql}`;
+  const gp = [...az.params, sourceId, projectId, folderId, folderId, projectId, ...lg.params];
   const result = { status: 201, body: { artifact_id: id, kind: "markdown", revision: 1, revision_id: rid, sha256: hash,
     ...tplLinks(ctx, projectId, id), source_artifact_id: sourceId, source_revision: revision,
     ...definition ? { is_template: true } : { source_template_id: sourceId, source_template_revision: revision, date } } };
@@ -110,9 +110,7 @@ async function tplCopy(ctx, projectId, input, key, definition = false) {
     const replay = await idemLookup(ctx, i); if (replay) return replay;
     await tplSource(ctx, projectId, sourceId, revision, !definition);
     await folderCheck(ctx, projectId, folderId);
-    const n = await db(ctx).prepare("SELECT COUNT(*) AS n FROM artifacts WHERE project_id = ? AND publisher_id IS NULL").bind(projectId).first("n");
-    if (n >= LIMITS.artifactsPerProject) throw new HttpError(413, "quota_exceeded", "Artifact limit reached");
-    if (lg.workspaceId) await explainLimit(ctx.env, lg.workspaceId, { storage_bytes: new TextEncoder().encode(body).length }, lg.limits);
+    if (lg.workspaceId) await explainLimit(ctx.env, lg.workspaceId, adds, lg.limits, projectId);
     throw new HttpError(403, "forbidden", "Grant no longer valid");
   }
   return result;

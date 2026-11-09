@@ -1,9 +1,10 @@
 import { personalWorkspaceId } from "./tenancy.js";
 import { deleteBlob, getBlob, putBlob, readText, storeText } from "./content-store.js";
-import { requireHuman } from "./auth.js";
+import { limitsFor, requireHuman } from "./auth.js";
 import { BINARY_TYPES, LIMITS, tplDate } from "./service.js";
 import { requireProjectRole, requireWorkspaceRole, workspaceRoleSql } from "./tenancy.js";
-import { HttpError, int, nowIso, randomId, sha256Hex, str } from "./util.js";import { explainLimit, limitGuard } from "./limits.js";
+import { HttpError, int, nowIso, randomId, sha256Hex, str } from "./util.js";
+import { explainLimit, limitGuard, workspaceLimits } from "./limits.js";
 
 
 var SCHEMA = "agent-library-backup/1";
@@ -130,10 +131,12 @@ async function restoreBackup(ctx, backup) {
 const IMPORT_KINDS = new Set(["markdown", "html", "json", "csv", "binary"]);
 // The via_kind values the code writes (history/service.js viaFields); null for versions from before 0010.
 const VIA_KINDS = new Set(["browser", "oauth", "api_key", "grant", "publisher"]);
-function checkImportRows(backup, decoded) {
+// One import is one D1 batch: at most this many versions, comments or details versions each.
+var IMPORT_MAX_ROWS = 2000;
+function checkImportRows(env, backup, decoded, limits) {
   const bad = (m) => { throw new HttpError(400, "bad_backup", m); };
-  if (backup.artifacts.length > LIMITS.artifactsPerProject) bad(`A project holds at most ${LIMITS.artifactsPerProject} documents and files`);
-  if (backup.revisions.length > 20 * LIMITS.artifactsPerProject || backup.comments.length > 20 * LIMITS.artifactsPerProject || (backup.meta_versions ?? []).length > 20 * LIMITS.artifactsPerProject) bad("Too many versions or comments to import at once");
+  if (backup.artifacts.length > limits.items_per_project) bad(`A project holds at most ${limits.items_per_project} documents and files on this plan`);
+  if (backup.revisions.length > IMPORT_MAX_ROWS || backup.comments.length > IMPORT_MAX_ROWS || (backup.meta_versions ?? []).length > IMPORT_MAX_ROWS) bad("Too many versions or comments to import at once");
   const ids = new Set(), revKeys = new Set(), revIds = new Set();
   for (const a of backup.artifacts) {
     if (typeof a.id !== "string" || ids.has(a.id)) bad("Duplicate or missing document id");
@@ -166,7 +169,8 @@ function checkImportRows(backup, decoded) {
       binBytes += r.size;
     }
   }
-  if (binBytes > LIMITS.projectBinaryBytes) bad("Files exceed the per-project storage limit");
+  const cap = limitsFor(env).projectBinaryBytes; // "0" = no per-project file cap
+  if (cap > 0 && binBytes > cap) bad("Files exceed the per-project storage limit");
   for (const a of backup.artifacts) {
     const head = backup.revisions.find((r) => r.id === a.head_revision_id);
     if (!head || head.artifact_id !== a.id || head.rev_no !== a.head_rev) bad("A document's current version is missing or inconsistent");
@@ -195,7 +199,7 @@ async function importBackup(ctx, workspaceId, input, idemKeyValue, digest = "") 
   };
   if (idemKeyValue) { const prior = await replay(); if (prior) return prior; }
   const { pid: oldPid, decoded } = await validateBackup(backup);
-  checkImportRows(backup, decoded);
+  checkImportRows(ctx.env, backup, decoded, await workspaceLimits(ctx.env, workspaceId));
   const DB = ctx.env.DB, me = ctx.principal.id, at = nowIso();
   const title = input?.title !== void 0 ? str(input.title, "title", 200, { min: 1 }) : str(String(backup.project?.title ?? "Imported project"), "title", 200, { min: 1 });
   const pid = randomId("prj");

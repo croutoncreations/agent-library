@@ -1,10 +1,12 @@
 import { requireHuman } from "../auth.js";
 import { ROLE_RANK, memberRoleSql, projectRole, workspaceRoleSql, readOnlyError } from "../tenancy.js";
-import { HttpError, nowIso, nowMs, randomId, sha256Hex, str } from "../util.js";
-import { explainLimit, limitGuard } from "../limits.js";
+import { HttpError, NEVER_EXPIRES_AT, nowIso, nowMs, randomId, sha256Hex, str } from "../util.js";
+import { explainLimit, limitGuard, workspaceLimits } from "../limits.js";
 
 
-var KEY_LIFETIMES_DAYS = [1, 7, 30, 90];
+// "never": expires_at = NEVER_EXPIRES_AT (the same far-future value as OAuth connections). A plan's
+// max_key_lifetime_days caps the choice (absent = any, including never).
+var KEY_LIFETIMES_DAYS = [1, 7, 30, 90, 365, "never"];
 var DEFAULT_LIFETIME_DAYS = 90;
 var MAX_PROJECTS_PER_KEY = 50;
 var KEY_RE = /^alk_[A-Za-z0-9_-]{43}$/;
@@ -34,9 +36,16 @@ async function validateScope(env, ownerId, raw) {
   return out2;
 }
 function lifetime(raw) {
-  const d = raw === void 0 ? DEFAULT_LIFETIME_DAYS : Number(raw);
+  const d = raw === void 0 ? DEFAULT_LIFETIME_DAYS : raw === "never" ? "never" : Number(raw);
   if (!KEY_LIFETIMES_DAYS.includes(d)) throw new HttpError(400, "invalid_input", `lifetime_days must be one of ${KEY_LIFETIMES_DAYS.join(", ")}`);
   return d;
+}
+/** The workspace plan's max_key_lifetime_days: refuses a longer lifetime (402 limit_reached). */
+async function checkLifetime(env, workspaceId, days) {
+  const max = (await workspaceLimits(env, workspaceId)).max_key_lifetime_days;
+  if (max === undefined || (days !== "never" && days <= max)) return;
+  throw new HttpError(402, "limit_reached", `Keys on this plan can last up to ${max} day${max === 1 ? "" : "s"}. Choose a shorter lifetime and replace the key before it expires, or ask the workspace owner about a bigger plan.`,
+    { limit: "max_key_lifetime_days", allowed: max });
 }
 function auditStmt(env, ctx, projectId, action, objectId, result, gate, gateParams = []) {
   if (gate) return env.DB.prepare(`INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id) SELECT ?, ?, ?, ?, ?, ?, ? WHERE ${gate}`).bind(nowIso(), ctx.principal.id, projectId, action, objectId, result, ctx.requestId, ...gateParams);
@@ -47,7 +56,8 @@ async function insertKey(ctx, label, days, scope, replacesId) {
   const secret = randomId("alk", 32);
   const id = randomId("akey", 12);
   const principalId = randomId("agt");
-  const expires = nowMs() + days * 864e5;
+  await checkLifetime(env, scope.workspaceId, days);
+  const expires = days === "never" ? NEVER_EXPIRES_AT : nowMs() + days * 864e5;
   // Connected-agents limit (Phase 4), checked in the INSERT; the rows after it are gated on the key existing.
   const lg = await limitGuard(env, scope.workspaceId, { agents: 1 });
   const exists = "EXISTS (SELECT 1 FROM api_credentials WHERE id = ?)";
@@ -184,6 +194,7 @@ async function verifyApiKey(env, authz) {
     lastActivityAt: row.last_used_at,
     credentialId: row.id,
     ownerId: row.owner_principal_id,
+    workspaceId: row.workspace_id ?? `wsp_${row.owner_principal_id}`,
     principalId: row.principal_id,
     label: row.label,
     projects: ps.results.map((p) => ({ id: p.id, title: p.title, can_write: !!p.can_write, read_only: !!p.read_only }))

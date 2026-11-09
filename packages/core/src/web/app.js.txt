@@ -950,7 +950,7 @@ function billingBlock(b) {
     buttons.length ? h("div", { class: "row" }, buttons) : null, msg);
 }
 // Plan usage (hosted installations with plan limits). Nothing is shown when the workspace has no limits.
-var USAGE_ROWS = [["storage_bytes", "Storage"], ["projects", "Projects"], ["members", "Members and invitations"], ["agents", "Connected apps and API keys"]];
+var USAGE_ROWS = [["storage_bytes", "Storage"], ["projects", "Projects"], ["members", "Members"], ["pending_invites", "Pending invitations"], ["agents", "Connected apps and API keys"]];
 function usagePanel(u, canManage, suspendedAdmin) {
   var limited = u && USAGE_ROWS.some(function (r) { return u[r[0]] && u[r[0]].limit != null; });
   if (!u || (!limited && !u.billing)) return null;
@@ -1829,8 +1829,16 @@ async function viewList(pid, trash) {
         startLabel, templateHelp, templateRetry, dateLabel, templateInfo, templatePreview,
         h("div", { class: "row" }, createBtn, h("button", { type: "button", class: "secondary", onclick: function () { newDoc.hidden = true; newDocBtn.setAttribute("aria-expanded", "false"); } }, "Cancel"))), cmsg);
     loadTemplates();
-    var upHelp = h("p", { class: "muted small", text: "Images (PNG, JPEG, WebP, GIF), videos (MP4, WebM) or PDF, up to 5 MB. CSV or JSON data files (UTF-8), up to 1 MB." });
-    dataFilesEnabled(pid).then(function (on) { if (on === false) upHelp.textContent = "Images (PNG, JPEG, WebP, GIF), videos (MP4, WebM) or PDF, up to 5 MB."; });
+    // The file size limit is the workspace plan's (usage endpoint: file_bytes); without it, no number.
+    var upHelp = h("p", { class: "muted small" }), fileMax = null, dataOn = true;
+    function drawUpHelp() {
+      upHelp.textContent = "Images (PNG, JPEG, WebP, GIF), videos (MP4, WebM) or PDF" + (fileMax ? ", up to " + fmtBytes(fileMax).replace(".0 ", " ") : "") + "." + (dataOn ? " CSV or JSON data files (UTF-8), up to 1 MB." : "");
+    }
+    drawUpHelp();
+    dataFilesEnabled(pid).then(function (on) { if (on === false) { dataOn = false; drawUpHelp(); } });
+    var upWs = projectAccess[pid] && projectAccess[pid].workspace_id;
+    if (upWs) api("GET", "/api/workspaces/" + enc(upWs) + "/usage", undefined, { noAuthRedirect: true })
+      .then(function (u) { fileMax = u && u.file_bytes && u.file_bytes.limit; drawUpHelp(); }, function () {});
     var upload = h("div", { class: "card", hidden: true }, upHelp, uploadForm(pid, null, function () { load(true); }, "all"));
     var keepBtn = h("button", { type: "button", class: "ghost", title: "Save every document and file in this project on this device, and keep them up to date" }, icon("offline"), "Keep offline");
     OFF.get("projects", pid).then(function (p) { if (p) { keepBtn.classList.add("on"); keepBtn.lastChild.textContent = "Kept offline"; } }).catch(function () {});
@@ -2156,42 +2164,61 @@ async function viewApiKeys() {
   var box = h("div", { class: "card", hidden: true });
   var data = null, projects = [];
   var label = h("input", { type: "text", placeholder: "Label, e.g. Muse", required: true, maxLength: 80, "aria-label": "Key label" });
-  function lifeSelect(dflt) {
-    var s = h("select", { "aria-label": "Lifetime" }, [1, 7, 30, 90].map(function (d) { return h("option", { value: String(d), text: d === 1 ? "1 day" : d + " days" }); }));
-    s.value = String(dflt || 90); return s;
+  // Lifetimes the key's workspace plan allows (usage endpoint: max_key_lifetime_days; null = any, including never).
+  var LIFETIMES = [1, 7, 30, 90, 365, "never"], maxLife = {};
+  function lifeOptions(wsId) {
+    var max = maxLife[wsId];
+    return LIFETIMES.filter(function (d) { return max == null || (d !== "never" && d <= max); });
   }
-  var life = lifeSelect(90);
+  function lifeSelect(dflt, wsId) {
+    var s = h("select", { "aria-label": "Lifetime" });
+    fillLife(s, wsId, dflt); return s;
+  }
+  function fillLife(s, wsId, dflt) {
+    var keep = dflt || s.value || "90";
+    s.replaceChildren.apply(s, lifeOptions(wsId).map(function (d) { return h("option", { value: String(d), text: d === "never" ? "Never expires" : d === 1 ? "1 day" : d === 365 ? "1 year" : d + " days" }); }));
+    s.value = String(keep); if (!s.value) s.value = String(lifeOptions(wsId).filter(function (d) { return d !== "never"; }).pop());
+  }
+  async function loadMaxLife(wsId) {
+    if (!wsId || wsId in maxLife) return;
+    maxLife[wsId] = null;
+    try { var u = await api("GET", "/api/workspaces/" + enc(wsId) + "/usage", undefined, { noAuthRedirect: true }); maxLife[wsId] = u && u.max_key_lifetime_days ? u.max_key_lifetime_days.limit : null; } catch (e) { /* any lifetime; the server still checks */ }
+  }
+  function lifeValue(s) { return s.value === "never" ? "never" : Number(s.value); }
+  var life = lifeSelect("90");
   var picker = null, pickerHost = h("div");
   var wsSel = h("select", { "aria-label": "Workspace" }), wsRow = h("label", { hidden: true }, "Workspace", wsSel);
   function drawPicker() {
     var only = wsRow.hidden ? projects : projects.filter(function (p) { return p.workspace_id === wsSel.value; });
     picker = scopePicker(only, []); pickerHost.replaceChildren(picker.el);
   }
-  wsSel.addEventListener("change", drawPicker);
+  function wsForNewKey() { return wsRow.hidden ? (projects[0] && projects[0].workspace_id) : wsSel.value; }
+  wsSel.addEventListener("change", function () { drawPicker(); fillLife(life, wsForNewKey()); });
   function draw() {
     list.replaceChildren();
     var ks = data.keys.filter(function (k) { return showAll.checked || k.status === "active"; });
     if (!ks.length) list.append(h("li", { class: "empty", text: "No active API keys." }));
     ks.forEach(function (k) {
       var left = daysLeft(k.expires_at);
-      var exp = k.status === "active" ? (left <= 1 ? "expires within a day" : "expires in " + left + " days") + " (" + fmtDate(k.expires_at) + ")" : k.status;
+      var never = Date.parse(k.expires_at) >= Date.UTC(9999, 0, 1);
+      var exp = k.status === "active" ? (never ? "never expires" : (left <= 1 ? "expires within a day" : "expires in " + left + " days") + " (" + fmtDate(k.expires_at) + ")") : k.status;
       var li = h("li", null,
         h("div", { class: "grow" }, h("strong", { text: k.label }),
           h("small", { text: k.projects.map(function (p) { return p.title + " (" + (p.access === "read_write" ? "read & edit" : "read") + ")"; }).join(", ") || "no projects" }),
-          h("small", { class: "muted" + (k.status === "active" && left <= 14 ? " warn" : ""), text: exp + " · " + (k.last_used_at ? "last used " + fmtDate(k.last_used_at) : "never used") + (k.replaces_id ? " · replacement key" : "") })),
+          h("small", { class: "muted" + (k.status === "active" && !never && left <= 14 ? " warn" : ""), text: exp + " · " + (k.last_used_at ? "last used " + fmtDate(k.last_used_at) : "never used") + (k.replaces_id ? " · replacement key" : "") })),
         statusBadge(k.status));
       if (k.status === "active") {
         var editHost = h("div", { class: "card", hidden: true });
         li.append(h("span", { class: "row" },
           h("button", { type: "button", class: "secondary", onclick: async function (e) {
-            var nl = lifeSelect(90);
+            var nl = lifeSelect("90", k.workspace_id);
             editHost.hidden = false;
             editHost.replaceChildren(h("p", { class: "small", text: "Create a replacement with the same projects and access. The current key keeps working until you revoke it, so you can update the app first." }),
               h("div", { class: "row" }, h("label", null, "New key lifetime", nl), h("span", { class: "spacer" }),
                 h("button", { type: "button", onclick: async function (ev) {
                   ev.target.disabled = true;
                   try {
-                    var r = await api("POST", "/api/api-keys/" + enc(k.id) + "/replace", { lifetime_days: Number(nl.value) });
+                    var r = await api("POST", "/api/api-keys/" + enc(k.id) + "/replace", { lifetime_days: lifeValue(nl) });
                     editHost.hidden = true;
                     secretBox(box, "Replacement key for " + r.label, r.secret, "Copy it now; it won't be shown again. Put it in the app, check it works, then revoke the old key (listed below).");
                     load();
@@ -2242,6 +2269,9 @@ async function viewApiKeys() {
         }
         drawPicker();
       }
+      var wsAll = []; data.keys.forEach(function (k) { if (wsAll.indexOf(k.workspace_id) < 0) wsAll.push(k.workspace_id); });
+      await Promise.all(wsIds.concat(wsAll).map(loadMaxLife));
+      fillLife(life, wsForNewKey());
       draw();
     } catch (err) { showErr(msg, err); }
   }
@@ -2251,7 +2281,7 @@ async function viewApiKeys() {
     var scope = picker ? picker.value() : [];
     if (!scope.length) { showErr(msg, { message: "Pick at least one project." }); return; }
     try {
-      var r = await api("POST", "/api/api-keys", { label: label.value.trim(), lifetime_days: Number(life.value), projects: scope });
+      var r = await api("POST", "/api/api-keys", { label: label.value.trim(), lifetime_days: lifeValue(life), projects: scope });
       label.value = "";
       secretBox(box, "API key for " + r.label, r.secret, "Copy it now; it won't be shown again. Base URL: " + API_BASE_HINT + " · expires " + fmtDate(r.expires_at) + ".");
       load();
@@ -2261,7 +2291,7 @@ async function viewApiKeys() {
     pickerHost,
     h("div", { class: "row" }, h("span", { class: "spacer" }), h("button", { type: "submit" }, "Create key")));
   shell([{ t: "Connections" }], connHead(), connectionHelp(), settingsTabs("api-keys"),
-    h("div", { class: "callout" }, icon("key"), h("span", null, h("strong", { text: "API keys" }), " are for apps that use the REST API (for example Muse). Each key covers only the projects you pick, expires (90 days at most) and can be replaced or revoked at any time. The key itself is shown once.")),
+    h("div", { class: "callout" }, icon("key"), h("span", null, h("strong", { text: "API keys" }), " are for apps that use the REST API (for example Muse). Each key covers only the projects you pick, expires after the lifetime you choose (the workspace's plan may cap it) and can be replaced or revoked at any time. The key itself is shown once.")),
     msg, box, list, h("p", null, h("label", { class: "muted small" }, showAll, "Show revoked and expired")),
     h("details", null, h("summary", { text: "Create an API key" }), h("div", { class: "card" }, form)));
   load();

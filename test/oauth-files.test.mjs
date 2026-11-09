@@ -48,7 +48,8 @@ async function agentUpload(agent, args, bytes, { put = bytes } = {}) {
 
 before(async () => {
   fx = makeFixtures();
-  h = await startAppConnectServer({ port: SERVER_PORTS["oauth-files"], vars: { PROJECT_BINARY_BYTES: String(4 * 1024 * 1024) } });
+  // Default agent rate limits (240 reads / 60 writes a minute per connection): the rate-limit test measures them.
+  h = await startAppConnectServer({ port: SERVER_PORTS["oauth-files"], vars: { PROJECT_BINARY_BYTES: String(4 * 1024 * 1024), RATE_READS_PER_MIN: "240", RATE_WRITES_PER_MIN: "60" } });
   owner = await h.owner();
   for (const [id, title] of [[P, "Files"], [Q, "Other"]]) assert.equal((await owner.req("POST", "/api/projects", { id, title })).status, 201);
   ids.png = await ownerUpload(P, "Chart.png", "image/png", readFileSync(fx.png));
@@ -89,7 +90,8 @@ test("tools: read connections get read_file and no upload tools; edit connection
   assert.equal(by.upload_begin.annotations.readOnlyHint, false);
   assert.match(by.read_file.description, /not a share link/);
   assert.match(by.read_file.description, /web_url is for the user's browser/);
-  assert.match(by.upload_begin.description, /5 MiB/);
+  assert.match(by.upload_begin.description, /up to the workspace plan's file size limit .*never more than 90 MiB/);
+  assert.equal(by.upload_begin.inputSchema.properties.size.maximum, 90 * 1024 * 1024);
   assert.match(sdk.getInstructions() ?? "", /read_file returns images inline/);
 });
 
@@ -215,10 +217,11 @@ test("edit: one active upload per connection; idempotent begin replay keeps the 
 });
 
 test("limits and safety: size, MIME outside BINARY_TYPES, signature mismatch, SVG/HTML never served inline, upload link only PUT", async () => {
-  // A fresh connection: the OAuth MCP endpoint allows 20 writes per minute per connection.
+  // A fresh connection: the OAuth MCP endpoint counts writes per minute per connection.
   const rw = await h.connectMcpAgent({ [P]: "write" }, { clientName: "Limits" });
-  const big = await rw.call("upload_begin", { project_id: P, title: "big", mime: "video/mp4", size: 5 * 1024 * 1024 + 1, sha256: "a".repeat(64), change_note: "x", idempotency_key: key("ub") });
+  const big = await rw.call("upload_begin", { project_id: P, title: "big", mime: "video/mp4", size: 25 * 1024 * 1024 + 1, sha256: "a".repeat(64), change_note: "x", idempotency_key: key("ub") });
   assert.ok(big.isError);
+  assert.equal(big.data.error.code, "too_large");
   for (const mime of ["image/svg+xml", "text/html"]) {
     const bad = await rw.call("upload_begin", { project_id: P, title: "bad", mime, size: 10, sha256: "a".repeat(64), change_note: "x", idempotency_key: key("ub") });
     assert.ok(bad.isError, mime);
@@ -255,7 +258,7 @@ test("limits: an expired upload refuses the PUT; quota is enforced", async () =>
   assert.equal((await fetch(b.data.put_url, { method: "PUT", body: bytes })).status, 401, "expired link");
   const fin = await rw.call("upload_finish", { project_id: P, upload_id: b.data.upload_id, idempotency_key: key("uf") });
   assert.ok(fin.isError);
-  // Quota: this server allows 4 MiB of files per project; a 5 MiB file (at the per-file cap) is refused.
+  // Quota: this server allows 4 MiB of files per project; a 5 MiB file (within the per-file cap) is refused.
   const q = await rw.call("upload_begin", { project_id: P, title: "too much", mime: "application/octet-stream", size: 5 * 1024 * 1024, sha256: "b".repeat(64), change_note: "q", idempotency_key: key("ub") });
   assert.equal(q.data.error.code, "quota_exceeded");
 });
@@ -327,20 +330,21 @@ test("rate limit: the agent gets a readable tool error with the limit and how lo
   const c = new Client({ name: "busy", version: "1" });
   await c.connect(new StreamableHTTPClientTransport(new URL(`${h.issuer}/mcp`), { requestInit: { headers: { authorization: `Bearer ${agent.access_token}` } } }));
   try {
-    // The limiter counts calendar minutes: start well inside one so all 25 calls share a window.
+    // The limiter counts calendar minutes: start well inside one so all calls share a window.
     const left = 60_000 - (Date.now() % 60_000);
-    if (left < 20_000) await new Promise((r) => setTimeout(r, left + 200));
-    let limited = null;
-    for (let i = 0; i < 25 && !limited; i++) {
+    if (left < 30_000) await new Promise((r) => setTimeout(r, left + 200));
+    let limited = null, n = 0;
+    for (let i = 0; i < 70 && !limited; i++) {
       const r = await c.callTool({ name: "upload_finish", arguments: { upload_id: "upl_none", idempotency_key: key("uf") } });
-      if (r.structuredContent?.error?.code === "rate_limited") limited = r;
+      if (r.structuredContent?.error?.code === "rate_limited") limited = r; else n++;
     }
-    assert.ok(limited, "21st write in a minute is limited");
+    assert.ok(limited, "61st write in a minute is limited");
+    assert.equal(n, 60);
     assert.equal(limited.isError, true);
     const e = limited.structuredContent.error;
-    assert.equal(e.limit_per_minute, 20);
+    assert.equal(e.limit_per_minute, 60);
     assert.ok(e.retry_after_seconds >= 1 && e.retry_after_seconds <= 60);
-    assert.match(e.message, /20 changes .* per minute\. Wait \d+ seconds, then retry/);
+    assert.match(e.message, /60 changes .* per minute\. Wait \d+ seconds, then retry/);
     assert.match(limited.content[0].text, /rate_limited/, "the model sees it in the text content too");
     assert.equal((await c.callTool({ name: "list_artifacts", arguments: {} })).isError, false, "reads have their own budget");
   } finally { await c.close(); }

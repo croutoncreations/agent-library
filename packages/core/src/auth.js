@@ -1,14 +1,17 @@
 import { adapters } from "./adapters.js";
+import { projectWorkspaceId, rateMultiplier } from "./limits.js";
 import { humanGate, memberRoleSql, requireProjectRole, readOnlyError } from "./tenancy.js";
 import { HttpError, nowMs, sha256Hex } from "./util.js";
 
 function limitsFor(env) {
   const n = (v, d) => v && /^\d{1,12}$/.test(v) ? Number(v) : d;
   return {
-    readsPerMin: n(env.RATE_READS_PER_MIN, 60),
-    writesPerMin: n(env.RATE_WRITES_PER_MIN, 20),
+    // Per agent identity per minute (× the workspace plan's rate_multiplier); people get 3× these.
+    readsPerMin: n(env.RATE_READS_PER_MIN, 240),
+    writesPerMin: n(env.RATE_WRITES_PER_MIN, 60),
     authFailPerMin: n(env.RATE_AUTHFAIL_PER_MIN, 30),
     uploadTtlMs: n(env.UPLOAD_TTL_SECONDS, 15 * 60) * 1e3,
+    // Files per project (bytes); "0" = no per-project cap (workspace storage still applies).
     projectBinaryBytes: n(env.PROJECT_BINARY_BYTES, 100 * 1024 * 1024),
     cleanupGraceMs: n(env.UPLOAD_CLEANUP_GRACE_SECONDS, 10 * 60) * 1e3
   };
@@ -24,10 +27,16 @@ async function rateLimit(env, key, limit) {
   if ((n ?? 0) > limit)
     throw new HttpError(429, "rate_limited", "Too many requests; slow down", { retry_after_seconds: 60 - Math.floor(now % 6e4 / 1e3) });
 }
+/** Per-minute budget for an agent in a workspace: limitsFor(env) × the plan's rate_multiplier. */
+async function agentRate(env, workspaceId, write) {
+  const l = limitsFor(env);
+  return (write ? l.writesPerMin : l.readsPerMin) * await rateMultiplier(env, workspaceId);
+}
 async function enforceRate(ctx, write) {
   const l = limitsFor(ctx.env);
-  const mult = ctx.principal.kind === "human" ? 3 : 1;
-  await rateLimit(ctx.env, `${write ? "w" : "r"}:${ctx.principal.id}`, (write ? l.writesPerMin : l.readsPerMin) * mult);
+  const limit = ctx.principal.kind === "human" ? (write ? l.writesPerMin : l.readsPerMin) * 3
+    : await agentRate(ctx.env, ctx.grant?.project_id ? await projectWorkspaceId(ctx.env, ctx.grant.project_id) : null, write);
+  await rateLimit(ctx.env, `${write ? "w" : "r"}:${ctx.principal.id}`, limit);
 }
 function cookie(req, name) {
   const h = req.headers.get("cookie") ?? "";
@@ -185,4 +194,4 @@ function sessionCookie(url, sid, maxAge) {
     `${SESSION_COOKIE}=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0`];
 }
 
-export { HOST_SESSION_COOKIE, SESSION_COOKIE, sessionCookie, authenticate, authorizeProject, authzSql, credentialGate, contentWriteSql, enforceRate, limitsFor, protectSql, rateLimit, requireCsrf, requireHuman };
+export { HOST_SESSION_COOKIE, SESSION_COOKIE, sessionCookie, agentRate, authenticate, authorizeProject, authzSql, credentialGate, contentWriteSql, enforceRate, limitsFor, protectSql, rateLimit, requireCsrf, requireHuman };

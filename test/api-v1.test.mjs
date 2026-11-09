@@ -61,9 +61,16 @@ test("owner creates a multi-project key: per-project access, secret shown once, 
   assert.equal(row.status, "active");
   assert.ok(!JSON.stringify(list.body).includes(k.secret), "list never returns the secret");
   assert.ok(!sql("SELECT * FROM api_credentials").includes(k.secret), "DB stores only the hash");
-  // Lifetime choices only; never unlimited or > 90 days.
-  for (const lifetime_days of [0, 91, 365, "forever"])
+  // Listed lifetime choices only (1, 7, 30, 90, 365 days or "never"; a plan may cap them, none here).
+  for (const lifetime_days of [0, 91, 400, "forever"])
     assert.equal((await owner.req("POST", "/api/api-keys", { label: "x", lifetime_days, projects: [{ project_id: PA, access: "read" }] })).status, 400);
+  const yr = await owner.req("POST", "/api/api-keys", { label: "year", lifetime_days: 365, projects: [{ project_id: PA, access: "read" }] });
+  assert.equal(yr.status, 201, JSON.stringify(yr.body));
+  assert.ok(Math.abs((Date.parse(yr.body.expires_at) - Date.now()) / 86400000 - 365) < 0.1);
+  const nv = await owner.req("POST", "/api/api-keys", { label: "never", lifetime_days: "never", projects: [{ project_id: PA, access: "read" }] });
+  assert.equal(nv.status, 201, JSON.stringify(nv.body));
+  assert.equal(nv.body.expires_at, "9999-01-01T00:00:00.000Z");
+  for (const id of [yr.body.id, nv.body.id]) assert.equal((await owner.req("POST", `/api/api-keys/${id}/revoke`, {})).status, 200);
   const d = await owner.req("POST", "/api/api-keys", { label: "default", projects: [{ project_id: PA, access: "read" }] });
   const days = (Date.parse(d.body.expires_at) - Date.now()) / 86400000;
   assert.ok(days > 89.9 && days <= 90, "default lifetime is 90 days");

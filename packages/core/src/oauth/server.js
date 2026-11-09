@@ -12,7 +12,7 @@ import { HttpError } from "../util.js";
 import { __name } from "../runtime.js";
 import { folderName } from "../service.js";
 import { ROLE_RANK, memberRoleSql, personalWorkspaceId, visibleProjects, workspaceRoleSql } from "../tenancy.js";
-import { nowIso, nowMs, randomId } from "../util.js";
+import { NEVER_EXPIRES_AT, nowIso, nowMs, randomId } from "../util.js";
 
 function originFor(host) {
   // Loopback (local dev and tests; *.localhost names a second local site, e.g. the user-content host) is plain http.
@@ -898,7 +898,7 @@ lim = (env, k) => LIM[k] * (env.OAUTH_RATE_MULTIPLIER && /^\d{1,6}$/.test(env.OA
 SCOPES = { read: "agentlib:read", write: "agentlib:write", offline: "offline_access", publish: "agentlib:publish" };
 CATALOGUE = [SCOPES.read, SCOPES.write, SCOPES.offline];
 AC_CATALOGUE = [SCOPES.read, SCOPES.write, SCOPES.offline, SCOPES.publish];
-CONNECTION_EXPIRES_AT = Date.UTC(9999, 0, 1);
+CONNECTION_EXPIRES_AT = NEVER_EXPIRES_AT;
 cache = /* @__PURE__ */ new Map();
 HOSTED_CALLBACKS = /* @__PURE__ */ new Set([
   "https://chatgpt.com/connector_platform_oauth_redirect",

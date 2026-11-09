@@ -5,7 +5,7 @@ import { adapters, notify } from "./adapters.js";
 import { ROLES, ROLE_RANK, multiUserInstall, requireWorkspaceRole, workspaceRoleSql } from "./tenancy.js";
 import { HttpError, nowIso, nowMs, randomId, sha256Hex, str } from "./util.js";
 import { checkHandle, ensureHandle } from "./paths.js";
-import { explainLimit, limitError, limitGuard, ownedWorkspacesGuard, usageSql } from "./limits.js";
+import { explainLimit, guardSql, limitError, limitGuard, ownedWorkspacesGuard, usageOf, usageSql } from "./limits.js";
 const isUnique = (e) => /UNIQUE|constraint/i.test(String(e?.message ?? e));
 const handleTaken = () => new HttpError(409, "handle_taken", "That address is already taken; choose another");
 
@@ -192,11 +192,13 @@ export async function createInvite(ctx, id, input, origin) {
   if (already) throw new HttpError(409, "already_member", "That person is already a member");
   await adapters(ctx.env).entitlements.check(ctx.env, "invite.create", { principalId: ctx.principal.id, workspaceId: id });
   const token = randomId("inv", 32), inviteId = randomId("inv", 12), expires = nowMs() + INVITE_DAYS * 864e5;
-  // Members limit: members + pending invitations. Replacing a pending invite for the same address doesn't add one.
-  const lg = await limitGuard(ctx.env, id, { members: 1 });
-  // The replaced invite is revoked only if the new one will fit (usage <= limit before the swap), so a refused
-  // re-invite leaves the pending one working.
-  const lg0 = await limitGuard(ctx.env, id, { members: 0 });
+  // Limits: pending invitations (one more), and, as a courtesy, a members limit that already has no room (members
+  // count only once they accept; accepting checks it again). Replacing a pending invite for the same address doesn't
+  // add one: the replaced invite is revoked only if the new one will fit (usage <= limit before the swap), so a
+  // refused re-invite leaves the pending one working.
+  const adds = { pending_invites: 1, members: 1 };
+  const lg = await limitGuard(ctx.env, id, adds);
+  const lg0 = guardSql(lg.limits, id, { pending_invites: 0, members: 1 });
   const [, ins] = await ctx.env.DB.batch([
     // A new invitation for the same address replaces any pending one (its link stops working).
     ctx.env.DB.prepare(`UPDATE workspace_invites AS wi SET revoked_at = ? WHERE wi.workspace_id = ? AND wi.email = ? AND wi.accepted_at IS NULL AND wi.revoked_at IS NULL
@@ -207,7 +209,7 @@ export async function createInvite(ctx, id, input, origin) {
     wsAudit(ctx.env, ctx, id, "invite.create", inviteId, `ok:${r}`, "changes() = 1")
   ]);
   if (!ins.meta.changes) {
-    await explainLimit(ctx.env, id, { members: 1 }, lg.limits);
+    await explainLimit(ctx.env, id, adds, lg.limits);
     throw new HttpError(403, "forbidden", "Needs the admin role in this workspace");
   }
   // The link is returned once. It is a path (not a #fragment) so it survives a sign-in redirect; the token alone
@@ -252,9 +254,13 @@ export async function acceptInvite(ctx, input) {
   // The verified sign-in email must match: a forwarded link alone grants nothing.
   if (!email || email !== inv.email) throw new HttpError(403, "email_mismatch", "This invitation was sent to a different email address. Sign in with that address.");
   const at = nowIso(), ms = nowMs();
+  // Members limit (accepted members only), checked in the claim. Someone already a member takes no new slot.
+  const lg = await limitGuard(ctx.env, inv.workspace_id, { members: 1 });
+  const already = "EXISTS (SELECT 1 FROM workspace_members WHERE workspace_id = wi.workspace_id AND principal_id = ?)";
   const [claim, add] = await ctx.env.DB.batch([
     ctx.env.DB.prepare(`UPDATE workspace_invites AS wi SET accepted_at = ?, accepted_by = ? WHERE wi.id = ? AND wi.accepted_at IS NULL AND wi.revoked_at IS NULL AND wi.expires_at > ?
-        AND EXISTS (SELECT 1 FROM workspaces w WHERE w.id = wi.workspace_id AND w.status = 'active')`).bind(ms, ctx.principal.id, inv.id, ms),
+        AND EXISTS (SELECT 1 FROM workspaces w WHERE w.id = wi.workspace_id AND w.status = 'active')
+        AND (${already} OR ${lg.sql})`).bind(ms, ctx.principal.id, inv.id, ms, ctx.principal.id, ...lg.params),
     // Never lowers an existing role: an owner accepting a viewer invite stays owner.
     ctx.env.DB.prepare(`INSERT INTO workspace_members (workspace_id, principal_id, role, added_by, created_at) SELECT ?, ?, ?, ?, ? WHERE changes() = 1
         ON CONFLICT (workspace_id, principal_id) DO NOTHING`).bind(inv.workspace_id, ctx.principal.id, inv.role, inv.invited_by, at),
@@ -262,7 +268,16 @@ export async function acceptInvite(ctx, input) {
         SELECT ?, ?, NULL, 'invite.accept', ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM workspace_invites WHERE id = ? AND accepted_by = ? AND accepted_at = ?)`)
       .bind(at, ctx.principal.id, inv.id, `ok:${inv.role}`, ctx.requestId, inv.workspace_id, inv.id, ctx.principal.id, ms)
   ]);
-  if (!claim.meta.changes) throw new HttpError(410, "invite_used", "This invitation was already used, revoked or has expired");
+  if (!claim.meta.changes) {
+    const still = await ctx.env.DB.prepare("SELECT 1 FROM workspace_invites WHERE id = ? AND accepted_at IS NULL AND revoked_at IS NULL AND expires_at > ?").bind(inv.id, nowMs()).first();
+    if (still && lg.limits.members !== undefined) {
+      const used = await usageOf(ctx.env, "members", inv.workspace_id);
+      if (used + 1 > lg.limits.members) throw new HttpError(402, "limit_reached",
+        `This workspace is full: its plan allows ${lg.limits.members} members. Ask the person who invited you to make room or move to a bigger plan, then open this invitation again.`,
+        { limit: "members", used, allowed: lg.limits.members });
+    }
+    throw new HttpError(410, "invite_used", "This invitation was already used, revoked or has expired");
+  }
   void add;
   return { ok: true, workspace_id: inv.workspace_id };
 }

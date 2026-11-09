@@ -3,8 +3,8 @@ import { authenticate, authorizeProject, authzSql, enforceRate, limitsFor, requi
 import { reconcileUploads } from "./cleanup.js";
 import { CONTENT_TYPE, spreadsheetSafeCsv } from "./formats.js";
 import { __name } from "./runtime.js";
-import { explainLimit, projectLimitGuard } from "./limits.js";
-import { BINARY_TYPES, IMAGE_TYPES, LIMITS, VIDEO_TYPES, assertWritable, audit, idemLookup, loadArtifact, publishRevision } from "./service.js";
+import { explainLimit, fileTooLarge, guardSql, projectLimitGuard } from "./limits.js";
+import { BINARY_TYPES, IMAGE_TYPES, VIDEO_TYPES, assertWritable, audit, idemLookup, loadArtifact, publishRevision } from "./service.js";
 import { HttpError, int, nowIso, nowMs, randomId, sha256Hex, str } from "./util.js";
 
 var db2 = /* @__PURE__ */ __name((ctx) => ctx.env.DB, "db");
@@ -27,7 +27,11 @@ async function uploadBegin(ctx, projectId, input, key) {
   const mime = str(input.mime, "mime", 100);
   if (!BINARY_TYPES[mime]) throw new HttpError(415, "unsupported_type", "Allowed: " + Object.keys(BINARY_TYPES).join(", "));
   const size = int(input.size, "size", 1, Number.MAX_SAFE_INTEGER);
-  if (size > LIMITS.binaryBytes) throw new HttpError(413, "too_large", `Binary exceeds ${LIMITS.binaryBytes} bytes`);
+  // Workspace limits (limits.js): file size, storage (the reservation counts as used until it publishes or is
+  // released) and, for a new file, its placeholder document counts toward the project's items.
+  const adds = input.artifact_id ? { storage_bytes: size } : { storage_bytes: size, items_per_project: 1 };
+  const lg = await projectLimitGuard(ctx.env, projectId, adds);
+  if (size > lg.limits.file_bytes) throw fileTooLarge(lg.limits.file_bytes);
   const sha2 = str(input.sha256, "sha256", 64);
   if (!/^[0-9a-f]{64}$/.test(sha2)) throw new HttpError(400, "invalid_input", "sha256 must be 64 lowercase hex chars");
   const i = { op: "upload.begin", key, projectId, digest: await sha256Hex(JSON.stringify([mime, size, sha2, input.artifact_id ?? null, input.expected_revision ?? null, input.title ?? null])) };
@@ -50,7 +54,7 @@ async function uploadBegin(ctx, projectId, input, key) {
     artifactId = randomId("art");
     baseRev = 0;
     stmts.push(db2(ctx).prepare(`INSERT INTO artifacts (id, project_id, kind, title, folder, head_rev, created_at, updated_at)
-      SELECT ?, ?, 'binary', ?, ?, 0, ?, ? WHERE ${az.sql}`).bind(artifactId, projectId, title, str(input.folder, "folder", 200, { optional: true }), nowIso(), nowIso(), ...az.params));
+      SELECT ?, ?, 'binary', ?, ?, 0, ?, ? WHERE ${az.sql} AND ${lg.sql}`).bind(artifactId, projectId, title, str(input.folder, "folder", 200, { optional: true }), nowIso(), nowIso(), ...az.params, ...lg.params));
   }
   const uploadId = randomId("upl", 18);
   const expires = nowMs() + limits.uploadTtlMs;
@@ -64,14 +68,16 @@ async function uploadBegin(ctx, projectId, input, key) {
     instructions: "PUT the raw file bytes to put_url with the same Authorization, then call upload_finish."
   };
   const gate = "EXISTS (SELECT 1 FROM uploads WHERE id = ?)";
-  // Workspace storage limit (Phase 4): the reservation counts as used until it publishes or is released.
-  const lg = await projectLimitGuard(ctx.env, projectId, { storage_bytes: size });
+  // The reservation re-checks storage only: a new file's placeholder (above) already passed the items limit, and the
+  // reservation needs it to exist. PROJECT_BINARY_BYTES "0" = no per-project file cap (workspace storage governs).
+  const sg = guardSql(lg.limits, lg.workspaceId, { storage_bytes: size }, projectId);
   stmts.push(
     // Reservation: inserted only if the project quota still has room, evaluated in the same statement.
     // The partial unique index uploads_one_active rejects a second concurrent active upload outright.
     db2(ctx).prepare(`INSERT INTO uploads (id, project_id, artifact_id, principal_id, base_rev, expected_size, expected_sha256, mime, state, staging_key, expires_at, created_at)
       SELECT ?2, ?1, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', ?9, ?10, ?11
-      WHERE ${quotaUsedSql(nowMs())} + ?6 <= ?12 AND ${az.sql} AND ${lg.sql}`).bind(projectId, uploadId, artifactId, ctx.principal.id, baseRev, size, sha2, mime, `staging/${projectId}/${uploadId}`, expires, nowIso(), limits.projectBinaryBytes, ...az.params, ...lg.params),
+      WHERE (?12 = 0 OR ${quotaUsedSql(nowMs())} + ?6 <= ?12) AND EXISTS (SELECT 1 FROM artifacts WHERE id = ?3 AND project_id = ?1)
+        AND ${az.sql} AND ${sg.sql}`).bind(projectId, uploadId, artifactId, ctx.principal.id, baseRev, size, sha2, mime, `staging/${projectId}/${uploadId}`, expires, nowIso(), limits.projectBinaryBytes, ...az.params, ...sg.params),
     db2(ctx).prepare(`INSERT INTO idempotency (principal_id, project_id, op, key, digest, status, response, created_at)
       SELECT ?, ?, ?, ?, ?, 201, ?, ? WHERE ${gate}`).bind(ctx.principal.id, projectId, i.op, i.key, i.digest, JSON.stringify(body2), nowIso(), uploadId),
     audit(ctx, projectId, "upload.begin", artifactId, baseRev, "ok", gate, [uploadId])
@@ -88,9 +94,9 @@ async function uploadBegin(ctx, projectId, input, key) {
   if (!uploadRow.meta.changes) {
     if (!input.artifact_id) await db2(ctx).prepare("DELETE FROM artifacts WHERE id = ? AND head_rev = 0 AND NOT EXISTS (SELECT 1 FROM uploads WHERE artifact_id = ?)").bind(artifactId, artifactId).run();
     const used = await db2(ctx).prepare(`SELECT ${quotaUsedSql(nowMs())} AS n`).bind(projectId).first("n");
-    if ((used ?? 0) + size > limits.projectBinaryBytes)
+    if (limits.projectBinaryBytes > 0 && (used ?? 0) + size > limits.projectBinaryBytes)
       throw new HttpError(413, "quota_exceeded", "Project binary storage quota exceeded", { used_bytes: used, limit_bytes: limits.projectBinaryBytes });
-    if (lg.workspaceId) await explainLimit(ctx.env, lg.workspaceId, { storage_bytes: size }, lg.limits);
+    if (lg.workspaceId) await explainLimit(ctx.env, lg.workspaceId, adds, lg.limits, projectId);
     throw new HttpError(403, "forbidden", "Grant no longer valid");
   }
   return { status: 201, body: body2 };

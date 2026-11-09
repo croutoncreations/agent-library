@@ -1,12 +1,13 @@
 import { getBlob } from "../content-store.js";
 import { insufficientScope } from "@cloudflare/workers-oauth-provider";
-import { limitsFor, rateLimit } from "../auth.js";
+import { agentRate, limitsFor, rateLimit } from "../auth.js";
 import { byteLength } from "../formats.js";
 import { WEB_URL_OUTPUT_SCHEMAS, WEB_URL_TOOL_NOTE, appOrigin, artifactWebUrl, withWebUrls } from "../links.js";
 import { addressLinks, projectPaths, resolveProjectRef } from "../paths.js";
 import { SCOPES, liveConnection } from "./server.js";
 import { __name } from "../runtime.js";
-import { BINARY_TYPES, IMAGE_TYPES, LIMITS, RS_SCHEMA, RT_ID_TOO_LONG, RT_KINDS_ALL, RT_KINDS_DOCS, appConnectEnabled, connectionInfo, createMarkdown, db, diffRevisions, getArtifact, history, listArtifacts, listChanges, loadArtifact, provenance, readRecords, readTextChunk, restoreMetadata, restoreRevision, rsToolReady, rtChunkLimit, rtFit, rtIdBytes, saveMarkdown, searchArtifacts, tplTools } from "../service.js";
+import { FILE_BYTES_CEILING } from "../limits.js";
+import { BINARY_TYPES, IMAGE_TYPES, RS_SCHEMA, RT_ID_TOO_LONG, RT_KINDS_ALL, RT_KINDS_DOCS, appConnectEnabled, connectionInfo, createMarkdown, db, diffRevisions, getArtifact, history, listArtifacts, listChanges, loadArtifact, provenance, readRecords, readTextChunk, restoreMetadata, restoreRevision, rsToolReady, rtChunkLimit, rtFit, rtIdBytes, saveMarkdown, searchArtifacts, tplTools } from "../service.js";
 import { serveContent, uploadBegin, uploadFinish, uploadPut } from "../uploads.js";
 import { CHANGE_NOTE_SCHEMA, HttpError, errorBody, idemKey, json, mcpClientInfo, nowIso, nowMs, randomId, rememberClientInfo, sha256Hex, str } from "../util.js";
 
@@ -30,7 +31,7 @@ function toolsFor(env) {
   } : t), READ_RECORDS];
 }
 async function handleOAuthMcp(req, env, ctx) {
-  let rtLim = null;
+  let rtLim = null, rateBudget = 0;
   const reply = (body2, status = 200) => new Response(rtFit(body2, rtLim), { status, headers: HDR });
   const o = req.headers.get("origin");
   if (o && o !== new URL(req.url).origin && o !== "https://chatgpt.com") return reply(rpcErr(null, -32600, "Origin not allowed"), 403);
@@ -74,9 +75,11 @@ async function handleOAuthMcp(req, env, ctx) {
   const tool = msg.method === "tools/call" ? ftToolsFor(env, conn).filter(t => t.name !== "search_artifacts" || searchReady).find((t) => t.name === msg.params?.name) : void 0;
   if (tool?.write && !tokenScopes.has(SCOPES.write)) return insufficientScope(ctx.auth, [SCOPES.read, SCOPES.write]);
   try {
-    await rateLimit(env, `${tool?.write ? "w" : "r"}:oauth:${conn.id}`, tool?.write ? 20 : 60);
+    rateBudget = await agentRate(env, conn.workspace_id ?? `wsp_${conn.owner_principal_id}`, !!tool?.write);
+    await rateLimit(env, `${tool?.write ? "w" : "r"}:oauth:${conn.id}`, rateBudget);
   } catch (e) {
-    return ftRateLimited(msg, tool, !!tool?.write, e, rtLim);
+    if (!(e instanceof HttpError) || e.status !== 429) throw e;
+    return ftRateLimited(msg, tool, !!tool?.write, e, rtLim, rateBudget);
   }
   switch (msg.method) {
     case "initialize": {
@@ -328,7 +331,7 @@ toolError = (err2) => ({ content: [{ type: "text", text: JSON.stringify({ error:
 // 0013_oauth_file_access.sql.
 //  - Only connections approved on a consent page that offered files (oauth_connections.file_access = 1) get these
 //    tools. Older connections keep exactly what they were shown (documents and history) until the owner reconnects.
-//  - Uploads reuse uploadBegin/uploadPut/uploadFinish (quota, BINARY_TYPES, LIMITS.binaryBytes, finalize lease).
+//  - Uploads reuse uploadBegin/uploadPut/uploadFinish (quota, BINARY_TYPES, file_bytes limit, finalize lease).
 //    They run as a per-connection agent principal, so "one active upload per identity" applies per connection and
 //    an agent's upload never blocks the owner's own uploads. Authorship in History is the connection (via oauth).
 //  - Transfer links are capabilities for one revision (download) or one upload (PUT). Only their SHA-256 is stored.
@@ -372,8 +375,7 @@ async function ftReadCapped(req, max) {
   return new TextDecoder().decode(all);
 }
 // Rate limits answered as a tool result the model can read (limit, budget, seconds to wait), not a bare HTTP 429.
-function ftRateLimited(msg, tool, write, e, lim) {
-  const limit = write ? 20 : 60;
+function ftRateLimited(msg, tool, write, e, lim, limit) {
   const wait = Math.max(1, Math.min(60, Number(e?.extra?.retry_after_seconds) || 60));
   const what = write ? "changes (create, save, upload, restore)" : "reads";
   const err2 = { status: 429, code: "rate_limited", message: `Rate limit: this connection allows ${limit} ${what} per minute. Wait ${wait} seconds, then retry the same call (reuse its idempotency_key).`, retry_after_seconds: wait, limit_per_minute: limit, budget: write ? "write" : "read" };
@@ -481,7 +483,7 @@ async function ftUploadFinish(c, p, a) {
 }
 function ftDecodeBase64(v) {
   const s = str(v, "content_base64", FT_INLINE_B64_MAX + 4096).replace(/\s+/g, "");
-  const tooBig = () => new HttpError(413, "too_large", `upload_file takes up to ${FT_INLINE_UPLOAD_BYTES} bytes; use upload_begin + HTTP PUT for larger files (up to ${LIMITS.binaryBytes} bytes)`);
+  const tooBig = () => new HttpError(413, "too_large", `upload_file takes up to ${FT_INLINE_UPLOAD_BYTES} bytes; use upload_begin + HTTP PUT for larger files (up to this plan's file size limit)`);
   if (s.length > FT_INLINE_B64_MAX + 4) throw tooBig();
   if (!s || s.length % 4 === 1 || !/^[A-Za-z0-9+/]*={0,2}$/.test(s)) throw new HttpError(400, "invalid_input", "content_base64 must be non-empty standard base64");
   let out2;
@@ -557,7 +559,7 @@ function ftToolsFor(env, conn) {
     upload_begin: {
       name: "upload_begin",
       title: "Upload a file",
-      description: `Start uploading a new file (pass title) or a new version of a file (pass artifact_id and expected_revision; revision_conflict if it is stale). Allowed: PNG, JPEG, WebP, GIF, PDF, MP4, WebM or other binary (application/octet-stream, download-only), up to ${LIMITS.binaryBytes / 1048576} MiB. Declare the exact size and SHA-256 of the bytes. Then HTTP PUT the raw bytes to the returned put_url (single-use upload link, expires in minutes) and call upload_finish. If you cannot make HTTP requests, use upload_file instead (up to ${FT_INLINE_UPLOAD_BYTES / 1048576} MiB). Each version is kept; always set change_note to why.`,
+      description: `Start uploading a new file (pass title) or a new version of a file (pass artifact_id and expected_revision; revision_conflict if it is stale). Allowed: PNG, JPEG, WebP, GIF, PDF, MP4, WebM or other binary (application/octet-stream, download-only), up to the workspace plan's file size limit (too_large says it; never more than ${FILE_BYTES_CEILING / 1048576} MiB). Declare the exact size and SHA-256 of the bytes. Then HTTP PUT the raw bytes to the returned put_url (single-use upload link, expires in minutes) and call upload_finish. If you cannot make HTTP requests, use upload_file instead (up to ${FT_INLINE_UPLOAD_BYTES / 1048576} MiB). Each version is kept; always set change_note to why.`,
       inputSchema: S({
         project_id: P,
         title: { type: "string", minLength: 1, maxLength: 200, description: "Title of a new file" },
@@ -565,7 +567,7 @@ function ftToolsFor(env, conn) {
         artifact_id: { ...A, description: "File to add a new version to" },
         expected_revision: { type: "integer", minimum: 1, description: "Current revision of artifact_id" },
         mime: { type: "string", enum: Object.keys(BINARY_TYPES) },
-        size: { type: "integer", minimum: 1, maximum: LIMITS.binaryBytes },
+        size: { type: "integer", minimum: 1, maximum: FILE_BYTES_CEILING },
         sha256: { type: "string", pattern: "^[0-9a-f]{64}$", description: "SHA-256 of the bytes, lowercase hex" },
         change_note: NOTE,
         idempotency_key: K
@@ -577,7 +579,7 @@ function ftToolsFor(env, conn) {
     upload_file: {
       name: "upload_file",
       title: "Upload a small file",
-      description: `Upload a file in one call, bytes as content_base64 (up to ${FT_INLINE_UPLOAD_BYTES / 1048576} MiB decoded). New file: pass title. New version: pass artifact_id and expected_revision (revision_conflict if stale). Allowed: PNG, JPEG, WebP, GIF, PDF, MP4, WebM or application/octet-stream. For larger files (up to ${LIMITS.binaryBytes / 1048576} MiB), use upload_begin + HTTP PUT + upload_finish. Safe to retry with the same idempotency_key. Returns artifact_id, revision and web_url (for the user's browser). Always set change_note to why.`,
+      description: `Upload a file in one call, bytes as content_base64 (up to ${FT_INLINE_UPLOAD_BYTES / 1048576} MiB decoded). New file: pass title. New version: pass artifact_id and expected_revision (revision_conflict if stale). Allowed: PNG, JPEG, WebP, GIF, PDF, MP4, WebM or application/octet-stream. For larger files (up to the plan's file size limit), use upload_begin + HTTP PUT + upload_finish. Safe to retry with the same idempotency_key. Returns artifact_id, revision and web_url (for the user's browser). Always set change_note to why.`,
       inputSchema: S({
         project_id: P,
         title: { type: "string", minLength: 1, maxLength: 200, description: "Title of a new file" },

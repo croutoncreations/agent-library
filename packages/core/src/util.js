@@ -79,4 +79,6 @@ HttpError = class extends Error {
 nowIso = () => (/* @__PURE__ */ new Date()).toISOString();
 nowMs = () => Date.now();
 
-export { CHANGE_NOTE_MAX, CHANGE_NOTE_SCHEMA, HttpError, errorBody, idemKey, int, json, mcpClientInfo, nowIso, nowMs, randomId, rememberClientInfo, sha256Hex, str };
+/** expires_at for credentials that never expire (OAuth connections, "never" API keys): 9999-01-01. */
+const NEVER_EXPIRES_AT = Date.UTC(9999, 0, 1);
+export { NEVER_EXPIRES_AT, CHANGE_NOTE_MAX, CHANGE_NOTE_SCHEMA, HttpError, errorBody, idemKey, int, json, mcpClientInfo, nowIso, nowMs, randomId, rememberClientInfo, sha256Hex, str };

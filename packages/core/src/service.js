@@ -296,13 +296,12 @@ async function createMarkdown(ctx, projectId, input, key, kind = "markdown") {
   const i = { op: "artifact.create", key, projectId, digest: await sha256Hex(JSON.stringify(digestParts)) };
   const prior = await idemLookup(ctx, i);
   if (prior) return prior;
-  const count = await db(ctx).prepare("SELECT COUNT(*) AS n FROM artifacts WHERE project_id = ? AND publisher_id IS NULL").bind(projectId).first("n");
-  if ((count ?? 0) >= LIMITS.artifactsPerProject) throw new HttpError(413, "quota_exceeded", "Artifact limit reached");
   const artId = randomId("art");
   const revId = randomId("rev");
   const sha2 = await sha256Hex(body2);
   const bytes = new TextEncoder().encode(body2).length;
-  const lg = await projectLimitGuard(ctx.env, projectId, { storage_bytes: bytes });
+  const adds = { storage_bytes: bytes, items_per_project: 1 };
+  const lg = await projectLimitGuard(ctx.env, projectId, adds);
   const az0 = authzSql(ctx, projectId);
   const az = { sql: `${az0.sql} AND ${lg.sql}`, params: [...az0.params, ...lg.params] };
   const now = nowIso();
@@ -319,7 +318,7 @@ async function createMarkdown(ctx, projectId, input, key, kind = "markdown") {
   ], i);
   if (!Array.isArray(out2)) return out2;
   if (!out2[1].meta.changes) {
-    if (lg.workspaceId) await explainLimit(ctx.env, lg.workspaceId, { storage_bytes: bytes }, lg.limits);
+    if (lg.workspaceId) await explainLimit(ctx.env, lg.workspaceId, adds, lg.limits, projectId);
     throw new HttpError(403, "forbidden", "Grant no longer valid");
   }
   return result;
@@ -637,10 +636,7 @@ var appConnectEnabled, LIMITS, ascii, BINARY_TYPES, IMAGE_TYPES, VIDEO_TYPES, TE
 appConnectEnabled = (env) => env?.APP_CONNECT_ENABLED === "1";
 LIMITS = {
   markdownBytes: 1024 * 1024,
-  binaryBytes: 5 * 1024 * 1024,
-  // owner envelope: <= 5 MiB synthetic fixtures
-  projectBinaryBytes: 100 * 1024 * 1024,
-  artifactsPerProject: 100,
+  // File size and documents per project are workspace limits (limits.js: file_bytes, items_per_project).
   pageSize: 50,
   uploadTtlMs: 15 * 60 * 1e3,
   commentChars: 1e4

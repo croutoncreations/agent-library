@@ -88,9 +88,12 @@ test("A7 wrong declared hash -> finish 422 and no visible version", async () => 
 });
 
 test("A7 oversize declaration -> 413; body larger than declared -> 413 then correct retry succeeds", async () => {
-  const big = await mA.call("upload_begin", { project_id: P, title: "big", mime: "image/png", size: 5 * 1024 * 1024 + 1, sha256: "b".repeat(64), idempotency_key: key("ub") });
+  // Over the default file size limit (FILE_MAX_BYTES, 25 MiB).
+  const big = await mA.call("upload_begin", { project_id: P, title: "big", mime: "image/png", size: 25 * 1024 * 1024 + 1, sha256: "b".repeat(64), idempotency_key: key("ub") });
   assert.equal(big.isError, true);
   assert.equal(big.data.error.status, 413);
+  assert.deepEqual([big.data.error.limit, big.data.error.allowed], ["file_bytes", 25 * 1024 * 1024]);
+  assert.match(big.data.error.message, /^Files can be up to 25 MB on this plan/);
   const bytes = readFileSync(fx.png);
   const b = await begin("overflow", "image/png", bytes);
   const over = await put(b.data.put_url, Buffer.concat([bytes, Buffer.alloc(1024)]));
