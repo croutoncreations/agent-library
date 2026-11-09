@@ -35,7 +35,8 @@ before(async () => {
   await buildWorker({ entry: join(ROOT, "test/fixtures/limits-worker.js"), outfile: out });
   s = await startServer("plan-limits", PORT, { worker: out, readyBase: APP, vars: {
     // Default rate limits (agents 240 reads / 60 writes a minute, people 3×): the rate test measures them.
-    MCP_HOST: `127.0.0.1:${PORT}`, APP_HOST: `localhost:${PORT}`, PLAN_LIMITS: JSON.stringify(PLANS), RATE_AUTHFAIL_PER_MIN: "100000" } });
+    // PROJECT_BINARY_BYTES "0" (as hosted): no per-project file cap, so uploads here are governed by storage_bytes.
+    MCP_HOST: `127.0.0.1:${PORT}`, APP_HOST: `localhost:${PORT}`, PLAN_LIMITS: JSON.stringify(PLANS), RATE_AUTHFAIL_PER_MIN: "100000", PROJECT_BINARY_BYTES: "0" } });
   alice = await s.loginAt(APP, "alice"); bob = await s.loginAt(APP, "bob");
 });
 after(async () => { await s?.stop(); });
