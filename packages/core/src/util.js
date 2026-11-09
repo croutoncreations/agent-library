@@ -15,6 +15,12 @@ async function sha256Hex(data) {
   const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
   return hex(await crypto.subtle.digest("SHA-256", bytes));
 }
+/** SHA-256 (hex) of a byte stream, consumed chunk by chunk without buffering it (workerd DigestStream). */
+async function sha256HexStream(stream) {
+  const d = new crypto.DigestStream("SHA-256");
+  await stream.pipeTo(d);
+  return hex(await d.digest);
+}
 function json(data, status = 200, headers = {}) {
   return new Response(JSON.stringify(data), {
     status,
@@ -81,4 +87,4 @@ nowMs = () => Date.now();
 
 /** expires_at for credentials that never expire (OAuth connections, "never" API keys): 9999-01-01. */
 const NEVER_EXPIRES_AT = Date.UTC(9999, 0, 1);
-export { NEVER_EXPIRES_AT, CHANGE_NOTE_MAX, CHANGE_NOTE_SCHEMA, HttpError, errorBody, idemKey, int, json, mcpClientInfo, nowIso, nowMs, randomId, rememberClientInfo, sha256Hex, str };
+export { NEVER_EXPIRES_AT, CHANGE_NOTE_MAX, CHANGE_NOTE_SCHEMA, HttpError, errorBody, hex, idemKey, int, json, mcpClientInfo, nowIso, nowMs, randomId, rememberClientInfo, sha256Hex, sha256HexStream, str };

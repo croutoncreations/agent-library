@@ -1,11 +1,11 @@
-import { deleteBlob, getBlob, headBlob, putBlob, readText } from "./content-store.js";
+import { deleteBlob, getBlob, getBlobHead, headBlob, putBlobStream, readText } from "./content-store.js";
 import { authenticate, authorizeProject, authzSql, enforceRate, limitsFor, requireCsrf } from "./auth.js";
 import { reconcileUploads } from "./cleanup.js";
 import { CONTENT_TYPE, spreadsheetSafeCsv } from "./formats.js";
 import { __name } from "./runtime.js";
 import { explainLimit, fileTooLarge, guardSql, projectLimitGuard } from "./limits.js";
 import { BINARY_TYPES, IMAGE_TYPES, VIDEO_TYPES, assertWritable, audit, idemLookup, loadArtifact, publishRevision } from "./service.js";
-import { HttpError, int, nowIso, nowMs, randomId, sha256Hex, str } from "./util.js";
+import { HttpError, hex, int, nowIso, nowMs, randomId, sha256Hex, sha256HexStream, str } from "./util.js";
 
 var db2 = /* @__PURE__ */ __name((ctx) => ctx.env.DB, "db");
 var quotaUsedSql = (now) => `(SELECT COALESCE(SUM(size),0) FROM revisions WHERE project_id = ?1 AND blob_key IS NOT NULL)
@@ -117,27 +117,32 @@ async function uploadPut(req, env, requestId, uploadId, linkCtx) {
     const declared = Number(req.headers.get("content-length") ?? "NaN");
     if (Number.isFinite(declared) && declared > u.expected_size) throw new HttpError(413, "too_large", "Body exceeds declared size");
     if (!req.body) throw new HttpError(400, "invalid_input", "Missing body");
-    const reader = req.body.getReader();
-    const chunks = [];
+    // Streamed to R2 in constant memory (files reach FILE_BYTES_CEILING, Workers have 128 MB): each chunk is counted,
+    // hashed and passed on in turn, so backpressure reaches the client. R2 needs the length up front: Content-Length
+    // when sent (a shorter body is stored and reported as not matching, as before), else the declared size.
+    const length = Number.isFinite(declared) ? declared : u.expected_size;
+    const digest = new crypto.DigestStream("SHA-256");
+    const hashing = digest.getWriter();
     let n = 0;
-    for (; ; ) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      n += value.byteLength;
-      if (n > u.expected_size) {
-        await reader.cancel();
-        throw new HttpError(413, "too_large", "Body exceeds declared size");
+    const counted = req.body.pipeThrough(new TransformStream({
+      async transform(chunk, out) {
+        n += chunk.byteLength;
+        if (n > length) throw new HttpError(413, "too_large", "Body exceeds declared size");
+        await hashing.write(chunk);
+        out.enqueue(chunk);
       }
-      chunks.push(value);
+    }));
+    try {
+      await putBlobStream(env, u.staging_key, counted, length, { httpMetadata: { contentType: "application/octet-stream" } });
+    } catch (e) {
+      hashing.abort().catch(() => {
+      });
+      if (n > length) throw new HttpError(413, "too_large", "Body exceeds declared size");
+      if (n < length) throw new HttpError(400, "incomplete_body", "Body ended before the declared size; PUT the whole file again");
+      throw e;
     }
-    const bytes = new Uint8Array(n);
-    let off = 0;
-    for (const c of chunks) {
-      bytes.set(c, off);
-      off += c.byteLength;
-    }
-    const sha2 = await sha256Hex(bytes);
-    await putBlob(env, u.staging_key, bytes, { httpMetadata: { contentType: "application/octet-stream" } });
+    await hashing.close();
+    const sha2 = hex(await digest.digest);
     const rec = await env.DB.prepare("UPDATE uploads SET state = 'received', received_size = ?, received_sha256 = ? WHERE id = ? AND state = 'receiving'").bind(n, sha2, uploadId).run();
     if (!rec.meta.changes) {
       await purgeStaging(env, u);
@@ -256,18 +261,25 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
       if (row && (row.state === "failed" || row.state === "conflict")) await dropUnpublished();
       return lost();
     };
+    // No whole-object reads (files reach FILE_BYTES_CEILING): the staged object is hashed as a stream, the type
+    // signature needs only its first bytes (BINARY_TYPES checks need at most 13), and the copy below streams it.
     const staged = await getBlob(ctx.env, u.staging_key);
     if (!staged) return fail(409, "missing_bytes", "Staged bytes missing", "failed");
-    const bytes = new Uint8Array(await staged.arrayBuffer());
-    const sha2 = await sha256Hex(bytes);
-    if (bytes.length !== u.expected_size || sha2 !== u.expected_sha256)
-      return fail(422, "integrity_mismatch", "Byte length or SHA-256 does not match declaration", "failed", { received_size: bytes.length, received_sha256: sha2 });
-    if (!BINARY_TYPES[u.mime](bytes)) return fail(415, "signature_mismatch", `Bytes are not a valid ${u.mime}`, "failed");
+    const size = staged.size;
+    const sha2 = await sha256HexStream(staged.body);
+    if (size !== u.expected_size || sha2 !== u.expected_sha256)
+      return fail(422, "integrity_mismatch", "Byte length or SHA-256 does not match declaration", "failed", { received_size: size, received_sha256: sha2 });
+    const head = await getBlobHead(ctx.env, u.staging_key, Math.min(16, size));
+    if (!head) return fail(409, "missing_bytes", "Staged bytes missing", "failed");
+    if (!BINARY_TYPES[u.mime](head)) return fail(415, "signature_mismatch", `Bytes are not a valid ${u.mime}`, "failed");
     // Register the write before it starts, only while still the finisher of a sealed upload.
     const begin = await db2(ctx).prepare("UPDATE uploads SET final_writes = final_writes + 1 WHERE id = ? AND state = 'sealed' AND finalize_token = ?").bind(uploadId, token).run();
     if (!begin.meta.changes) return lost();
     try {
-      await putBlob(ctx.env, finalKey, bytes, { httpMetadata: { contentType: u.mime }, sha256: sha2 });
+      // R2 re-checks the SHA-256 of what it stores against the verified hash.
+      const source = await getBlob(ctx.env, u.staging_key);
+      if (!source) throw new HttpError(500, "publish_failed", "Staged bytes missing during copy");
+      await putBlobStream(ctx.env, finalKey, source.body, size, { httpMetadata: { contentType: u.mime }, sha256: sha2 });
     } finally {
       // A release failure leaves accounting raised (fail closed). Log it without replacing the PUT's own error;
       // reconciliation also reports retained terminal uploads for operator recovery. Never log blob keys or errors.
@@ -276,11 +288,11 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
       });
     }
     const check = await headBlob(ctx.env, finalKey);
-    if (!check || check.size !== bytes.length) return fail(500, "publish_failed", "Final object verification failed", "failed");
+    if (!check || check.size !== size) return fail(500, "publish_failed", "Final object verification failed", "failed");
     // Still the finisher after the write? Renew the lease for the publication.
     const renew = await db2(ctx).prepare("UPDATE uploads SET finalize_until = ? WHERE id = ? AND state = 'sealed' AND finalize_token = ?").bind(nowMs() + FINALIZE_LEASE_MS, uploadId, token).run();
     if (!renew.meta.changes) return lostAfterWrite();
-    const ok2 = { artifact_id: u.artifact_id, revision: u.base_rev + 1, revision_id: revId, sha256: sha2, size: bytes.length };
+    const ok2 = { artifact_id: u.artifact_id, revision: u.base_rev + 1, revision_id: revId, sha256: sha2, size };
     const gate = "EXISTS (SELECT 1 FROM revisions WHERE id = ?)";
     try {
       const res = await publishRevision(
@@ -290,7 +302,7 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
         u.base_rev,
         i,
         // change_note: recorded at upload_begin by OAuth connections (migration 0013); undefined on older schemas.
-        { blobKey: finalKey, size: bytes.length, sha256: sha2, mime: u.mime, revId, change_note: u.change_note ?? void 0, fence: { sql: fenced, params: [uploadId, token] } },
+        { blobKey: finalKey, size, sha256: sha2, mime: u.mime, revId, change_note: u.change_note ?? void 0, fence: { sql: fenced, params: [uploadId, token] } },
         [db2(ctx).prepare(`UPDATE uploads SET state = 'published', final_revision_id = ?, result = ?, finalize_token = NULL, finalize_until = NULL WHERE id = ? AND state = 'sealed' AND finalize_token = ? AND ${gate}`).bind(revId, JSON.stringify({ status: 200, body: ok2 }), uploadId, token, revId)],
         "upload.publish"
       );

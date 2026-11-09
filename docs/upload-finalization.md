@@ -2,6 +2,8 @@
 
 Upload finalization lives in `packages/core/src/uploads.js` (`uploadFinish`) with the cron reconciler in `packages/core/src/cleanup.js`.
 
+Files reach 90 MiB (`FILE_BYTES_CEILING`) and a Worker has 128 MB, so no step holds a whole file in memory. The PUT streams the body to the staging object (through `FixedLengthStream`, counting and hashing each chunk; a body longer than declared is `413`, a chunked body that ends early is `400 incomplete_body` and the upload stays writable). Finish hashes the staged object as a stream, checks the type signature on its first 16 bytes and copies it to the final key as a stream, with R2 checking the SHA-256 again on write.
+
 Migration `0011_upload_finalize_lease.sql` must precede the new Worker. It adds:
 
 - `finalize_token` and `finalize_until`: exclusive, expiring finalization ownership.

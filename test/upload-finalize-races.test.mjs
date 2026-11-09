@@ -15,6 +15,23 @@ import { loadWorker } from "./load-worker.mjs";
 const dir = mkdtempSync(join(tmpdir(), "al-upload-races-"));
 after(() => rmSync(dir, { recursive: true, force: true }));
 const lib = await loadWorker({ "uploads.js": ["uploadFinish"], "cleanup.js": ["reconcileUploads"] });
+// workerd stream classes uploadFinish uses, minimal Node stand-ins: FixedLengthStream (errors unless exactly n bytes)
+// and crypto.DigestStream (a WritableStream whose .digest resolves to the hash).
+globalThis.FixedLengthStream ??= class extends TransformStream {
+  constructor(n) {
+    let seen = 0;
+    super({ transform(c, out) { seen += c.byteLength; if (seen > n) throw new Error("FixedLengthStream: too long"); out.enqueue(c); }, flush() { if (seen !== n) throw new Error("FixedLengthStream: too short"); } });
+  }
+};
+crypto.DigestStream ??= class extends WritableStream {
+  constructor() {
+    const h = createHash("sha256");
+    let done;
+    const digest = new Promise((r) => (done = r));
+    super({ write(c) { h.update(c); }, close() { done(new Uint8Array(h.digest()).buffer); } });
+    this.digest = digest;
+  }
+};
 
 const PNG = Buffer.from("89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000b49444154789c636000020000050001a5f645400000000049454e44ae426082", "hex");
 const SHA = createHash("sha256").update(PNG).digest("hex");
@@ -42,8 +59,18 @@ function world() {
   const blobs = new Map();
   const r2 = { onPut: null, beforeCommit: null, failHead: false };
   const BLOBS = {
-    async get(k) { const b = blobs.get(k); return b ? { async arrayBuffer() { return b; } } : null; },
-    async put(k, b) { if (r2.beforeCommit) await r2.beforeCommit(k); blobs.set(k, b); if (r2.onPut) await r2.onPut(k); },
+    // R2ObjectBody-like: size, a byte stream and arrayBuffer, optionally of a range; put consumes a stream.
+    async get(k, opts) {
+      const whole = blobs.get(k);
+      if (!whole) return null;
+      const b = opts?.range ? whole.subarray(opts.range.offset, opts.range.offset + opts.range.length) : whole;
+      return { size: whole.length, body: new Blob([b]).stream(), async arrayBuffer() { return b; } };
+    },
+    async put(k, b) {
+      if (r2.beforeCommit) await r2.beforeCommit(k);
+      blobs.set(k, b instanceof ReadableStream ? Buffer.from(await new Response(b).arrayBuffer()) : b);
+      if (r2.onPut) await r2.onPut(k);
+    },
     async head(k) { if (r2.failHead) throw new Error("synthetic R2 head failure"); return blobs.has(k) ? { size: blobs.get(k).length } : null; },
     async delete(k) { blobs.delete(k); },
   };

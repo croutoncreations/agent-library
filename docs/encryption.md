@@ -9,7 +9,7 @@ end-to-end encryption: the Worker reads plaintext to serve people and agents.
 ## The seam for per-workspace encryption
 
 Stored file bytes (R2 `BLOBS`) are read and written only through `packages/core/src/content-store.js` (`getBlob`,
-`getBlobBytes`, `putBlob`, `headBlob`, `deleteBlob`). `test/content-store.test.mjs` fails if any other module
+`getBlobBytes`, `getBlobHead`, `putBlob`, `putBlobStream`, `headBlob`, `deleteBlob`). `test/content-store.test.mjs` fails if any other module
 touches `env.BLOBS`. Per-workspace envelope encryption replaces those functions with ones that:
 
 - look up the object's workspace data key through a `KeyProvider` (data keys wrapped by a versioned master key held

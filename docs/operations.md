@@ -15,6 +15,8 @@ How to upgrade, back up and roll back your installation. Keep your config, the r
 
 Project backups cover projects, documents and files you and your agents create, through the browser, MCP or `/v1` keys.
 
+**Projects with more than 16 MB of files can't be backed up as one file yet.** A backup embeds every file (base64) in one JSON response built in Worker memory, so the export is refused (`413 backup_too_large`) when the project's distinct file versions add up to more than 16 MB; download large files individually. (A streamed backup format is planned.)
+
 **Projects that contain App Connect files can't be backed up yet.** If any file in a project was created by a publishing app, the whole project's export is refused (`backup_unsupported`), even after you revoke the app or trash the file. Keep app data in its own project, and don't use App Connect for content you need to restore from these backups. (Exporting app files safely needs a new backup format that preserves which app owns each file; that's planned.)
 
 ## Backup and recovery

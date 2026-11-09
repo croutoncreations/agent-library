@@ -17,9 +17,24 @@ export async function getBlobBytes(env, key) {
   return o ? new Uint8Array(await o.arrayBuffer()) : null;
 }
 
+/** The first `length` bytes of a stored object (fewer if it is shorter), or null if missing. */
+export async function getBlobHead(env, key, length) {
+  const o = await env.BLOBS.get(key, { range: { offset: 0, length } });
+  return o ? new Uint8Array(await o.arrayBuffer()) : null;
+}
+
 /** Write bytes under an immutable key. */
 export async function putBlob(env, key, bytes, options) {
   return options ? env.BLOBS.put(key, bytes, options) : env.BLOBS.put(key, bytes);
+}
+
+/**
+ * Write a stream of exactly `length` bytes under an immutable key without buffering it (R2 accepts a stream only
+ * with a known length, hence FixedLengthStream). Rejects, storing nothing, if the stream errors or is not exactly
+ * `length` bytes long.
+ */
+export async function putBlobStream(env, key, stream, length, options) {
+  return env.BLOBS.put(key, stream.pipeThrough(new FixedLengthStream(length)), options);
 }
 
 /** Object metadata (size), or null. */

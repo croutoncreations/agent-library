@@ -25,7 +25,7 @@ export const SERVER_PORTS = range({
   diagnostics: 21048, "file-types": 21049, "marketing-capture": 21045, "marketing-clips": 21046, tenancy: 21050, "tenancy-oauth": 21051, "tenancy-browser": 21052, "tenancy-matrix": 21053, "oidc-signin": 21054,
   // Used by the hosted (private) repository's tests, which run its bundle through this harness.
   "hosted-supabase": 21055,
-  addresses: 21056, "addresses-browser": 21057, "plan-limits": 21058, "project-deletion": 21059, "content-host": 21060,
+  addresses: 21056, "addresses-browser": 21057, "plan-limits": 21058, "project-deletion": 21059, "content-host": 21060, "large-uploads": 21061,
 });
 
 /** Plain node:http listeners that tests start next to a server. */
