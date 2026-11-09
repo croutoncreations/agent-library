@@ -329,23 +329,25 @@ async function listChanges(ctx, projectId, opts = {}) {
   );
   return out;
 }
+// Rows deleted per 15-minute run (960,000 a day): above what a busy installation writes, so retention keeps up.
+var CH_CLEANUP_BATCH = 10000;
 async function cleanupChanges(env) {
   // Bounded work on the existing 15 minute cron. Deletion trigger preserves the oldest usable sequence.
   const [result, count] = await env.DB.batch([
     env.DB.prepare(
       `DELETE FROM project_changes WHERE seq IN
-    (SELECT seq FROM project_changes WHERE at < ? ORDER BY at,seq LIMIT 1000)`,
+    (SELECT seq FROM project_changes WHERE at < ? ORDER BY at,seq LIMIT ${CH_CLEANUP_BATCH})`,
     ).bind(new Date(nowMs() - CH_RETENTION_MS).toISOString()),
     // D1 meta.changes includes the retention-floor trigger writes. Measure direct deletes instead.
     env.DB.prepare("SELECT changes() AS deleted"),
   ]);
   const deleted = count.results[0].deleted;
-  if (deleted === 1000)
+  if (deleted === CH_CLEANUP_BATCH)
     console.warn(
       JSON.stringify({
         event: "project_changes_cleanup_batch_full",
         deleted,
-        limit: 1000,
+        limit: CH_CLEANUP_BATCH,
       }),
     );
   return result;

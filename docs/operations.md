@@ -36,4 +36,4 @@ Note the current Worker version ID before each upgrade. To roll back the code, r
 
 ## Monitoring
 
-Watch Worker errors and your D1, R2 and KV usage in the Cloudflare dashboard, and check that the 15-minute cleanup job runs. Free tiers cover a typical personal library, but usage above them is billed to your account. Review connected agents now and then, and revoke the ones you no longer use. Never widen your Access policy to work around a sign-in problem.
+Watch Worker errors and your D1, R2 and KV usage in the Cloudflare dashboard, and check that the 15-minute cleanup job runs. Each run also removes, at most 5,000 rows per table, expired sign-in sessions, idempotency records older than 30 days (a retried request older than that is treated as new) and audit rows older than `AUDIT_RETENTION_DAYS` (default 365; `0` keeps them forever). A `retention_cleanup_batch_full` warning means a table had more to remove; the next runs catch up. Free tiers cover a typical personal library, but usage above them is billed to your account. Review connected agents now and then, and revoke the ones you no longer use. Never widen your Access policy to work around a sign-in problem.

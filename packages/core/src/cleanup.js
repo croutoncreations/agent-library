@@ -43,4 +43,32 @@ async function reconcileUploads(env, opts = {}) {
   return { expired: (e1.meta.changes ?? 0) + (e2.meta.changes ?? 0) + (e3.meta.changes ?? 0), purged_staging: purgedStaging, purged_final: purgedFinal };
 }
 
-export { reconcileUploads };
+// Retention (cron, every 15 minutes): each table loses at most PRUNE_BATCH rows per run, oldest first, through its index
+// (migration 0026). 5000 rows a run is 480,000 a day per table, far above what a busy installation writes.
+// - sessions: expired ones (expires_at, ms). A signed-out session has a past expiry or revoked_at; revoked ones go
+//   when they expire (at most 30 days later).
+// - idempotency: records older than 30 days (created_at, ISO text). Replays are for retries of the same request:
+//   upload begin/finish retries happen within the upload's lifetime (UPLOAD_TTL_SECONDS, default 15 minutes; a finished
+//   upload also replays from uploads.result), publisher snapshot and backup import retries within minutes. A key
+//   reused after 30 days is treated as a new request.
+// - audits: older than AUDIT_RETENTION_DAYS (default 365; "0" keeps them forever). Nothing reads old audits back:
+//   the project audit list shows the newest 200, and project purge only adds one.
+var PRUNE_BATCH = 5e3;
+var IDEMPOTENCY_RETENTION_DAYS = 30;
+function auditRetentionDays(env) {
+  const v = env.AUDIT_RETENTION_DAYS;
+  return v !== void 0 && /^\d{1,6}$/.test(v) ? Number(v) : 365;
+}
+async function pruneExpiredRows(env, { batch = PRUNE_BATCH } = {}) {
+  const now = nowMs(), day = 864e5, DB = env.DB;
+  const del = (table, where, value) => DB.prepare(`DELETE FROM ${table} WHERE rowid IN (SELECT rowid FROM ${table} WHERE ${where} < ? ORDER BY ${where} LIMIT ?)`).bind(value, batch).run();
+  const out = {};
+  out.sessions = (await del("sessions", "expires_at", now)).meta.changes ?? 0;
+  out.idempotency = (await del("idempotency", "created_at", new Date(now - IDEMPOTENCY_RETENTION_DAYS * day).toISOString())).meta.changes ?? 0;
+  const keep = auditRetentionDays(env);
+  out.audits = keep > 0 ? (await del("audits", "at", new Date(now - keep * day).toISOString())).meta.changes ?? 0 : 0;
+  for (const [table, n] of Object.entries(out)) if (n >= batch) console.warn(JSON.stringify({ event: "retention_cleanup_batch_full", table, deleted: n, limit: batch }));
+  return out;
+}
+
+export { pruneExpiredRows, reconcileUploads };

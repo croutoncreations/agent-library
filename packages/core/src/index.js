@@ -6,7 +6,7 @@ import { createApiKey, listApiKeys, replaceApiKey, revokeApiKey, setApiKeyScope 
 import { handleV1, isV1Path } from "./api/v1.js";
 import { authenticate, enforceRate, requireCsrf, requireHuman, sessionCookie } from "./auth.js";
 import { exportBackup, importBackup, restoreBackup } from "./backup.js";
-import { reconcileUploads } from "./cleanup.js";
+import { pruneExpiredRows, reconcileUploads } from "./cleanup.js";
 import { EDITOR_JS, EDITOR_JS_SHA256 } from "./editor-bundle.js";
 import { RENDER_CSP, htmlRefs, renderHtmlDocument } from "./html.js";
 import { WEB_ROUTE } from "./links.js";
@@ -372,6 +372,8 @@ var coreWorker = {
   async scheduled(_ev, env, ctx) {
     ctx.waitUntil(cleanupChanges(env));
     ctx.waitUntil(reconcileUploads(env, { limit: 100 }).then((r) => console.log("reconcile", JSON.stringify(r))));
+    // Expired sessions, idempotency records past 30 days, audits past AUDIT_RETENTION_DAYS (bounded per run).
+    ctx.waitUntil(pruneExpiredRows(env).then((r) => { if (r.sessions || r.idempotency || r.audits) console.log("retention", JSON.stringify(r)); }));
     // Deleted projects past their 30 days (D21): bounded per run, finished by later runs.
     ctx.waitUntil(purgeDueProjects(env).then((r) => { if (r.projects || r.rows || r.files) console.log("project_purge", JSON.stringify({ projects: r.projects, rows: r.rows, files: r.files })); }));
   },

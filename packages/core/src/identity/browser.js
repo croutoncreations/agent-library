@@ -62,7 +62,7 @@ export async function limitSigninStart(env, req, email) {
   await rateLimit(env, "signin:" + ip, n(env.RATE_SIGNIN_PER_MIN, 20));
   if (email) {
     await rateLimit(env, "signinmail:" + ip, n(env.RATE_SIGNIN_EMAIL_PER_MIN, 5));
-    await rateLimit(env, "signinmail:" + await sha256Hex(email), Math.min(2 * mult, n(env.RATE_SIGNIN_EMAIL_PER_MIN, 5)));
+    await rateLimit(env, "signinmail:" + await sha256Hex(email), n(env.RATE_SIGNIN_EMAIL_PER_ADDRESS_PER_MIN, 2));
   }
 }
 

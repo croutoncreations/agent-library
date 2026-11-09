@@ -97,12 +97,12 @@ test("folder rename emits artifact organization events; new empty folder and unc
   assert.equal(rows.at(-1).changed_fields, '["folder"]');
   d.close();
 });
-test("cleanup deletes at most 1000 rows; preserves monotonic high and records floor even when all events expire", async () => {
+test("cleanup deletes at most 10000 rows; preserves monotonic high and records floor even when all events expire", async () => {
   const d = db();
-  for (let n = 0; n < 1005; n++)
-    d.exec(
-      `INSERT INTO project_changes(project_id,artifact_id,kind,type,changed_fields,at) VALUES('p','a','markdown','artifact.created','[]','1900-01-01');`,
-    );
+  const ins = d.prepare(
+    "INSERT INTO project_changes(project_id,artifact_id,kind,type,changed_fields,at) VALUES('p','a','markdown','artifact.created','[]','1900-01-01')",
+  );
+  for (let n = 0; n < 10005; n++) ins.run();
   const code = moduleScript("packages/core/src/changes/service.js");
   const warnings = [];
   const cleanup = vm.runInNewContext(code + ";cleanupChanges", {
@@ -132,15 +132,15 @@ test("cleanup deletes at most 1000 rows; preserves monotonic high and records fl
   await cleanup(env);
   assert.equal(d.prepare("SELECT count(*) n FROM project_changes").get().n, 5);
   let state = d.prepare("SELECT * FROM project_change_state").get();
-  assert.equal(state.high, 1005);
-  assert.equal(state.floor, 1000);
+  assert.equal(state.high, 10005);
+  assert.equal(state.floor, 10000);
   assert.deepEqual(warnings, [
-    { event: "project_changes_cleanup_batch_full", deleted: 1000, limit: 1000 },
+    { event: "project_changes_cleanup_batch_full", deleted: 10000, limit: 10000 },
   ]);
   await cleanup(env);
   state = d.prepare("SELECT * FROM project_change_state").get();
-  assert.equal(state.high, 1005);
-  assert.equal(state.floor, 1005);
+  assert.equal(state.high, 10005);
+  assert.equal(state.floor, 10005);
   assert.equal(
     warnings.length,
     1,
