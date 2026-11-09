@@ -337,6 +337,9 @@ function onUnauthenticated() {
 function runCleanups(discard) { var c = S.cleanups; S.cleanups = []; c.forEach(function (f) { try { f(discard); } catch (e) {} }); }
 function setCrumbs(items) {
   crumbsEl.replaceChildren();
+  // No empty "Breadcrumb" landmark (sign-in); the element keeps its layout space.
+  if (items.length) { crumbsEl.removeAttribute("role"); crumbsEl.setAttribute("aria-label", "Breadcrumb"); }
+  else { crumbsEl.setAttribute("role", "presentation"); crumbsEl.removeAttribute("aria-label"); }
   items.forEach(function (it, i) {
     if (i) crumbsEl.append(h("span", { class: "sep", "aria-hidden": "true", text: "/" }));
     var last = i === items.length - 1;
