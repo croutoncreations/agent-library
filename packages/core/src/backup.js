@@ -1,5 +1,5 @@
 import { personalWorkspaceId } from "./tenancy.js";
-import { commitTextWrites, deleteBlob, getBlob, putBlob, getText, mapContent, stageTextWrites, storeText, textKey, textWriteComplete } from "./content-store.js";
+import { commitTextWrites, deleteBlob, getBlob, putBlob, getText, mapContent, stageTextWrites, textKey, textWriteComplete } from "./content-store.js";
 import { textSearchBridge } from "./search/service.js";
 import { limitsFor, requireHuman } from "./auth.js";
 import { BINARY_TYPES, LIMITS, tplDate } from "./service.js";
@@ -111,6 +111,7 @@ async function restoreBackup(ctx, backup) {
   const attempt = randomId("restore");
   // Validate every resulting key, including the attempt segment, before writing any bytes or intents.
   for (const r of backup.revisions) if (r.blob_key === null) textKey(pid, r.artifact_id, r.id, attempt);
+  for (const c of backup.comments) textKey(pid, c.artifact_id, c.id, attempt);
   for (const [k, bytes] of decoded) await putBlob(ctx.env, k, bytes);
   const authors = new Set([...backup.revisions, ...backup.comments, ...backup.meta_versions ?? []].map((x) => x.author_id));
   const stmts = [];
@@ -132,8 +133,12 @@ async function restoreBackup(ctx, backup) {
   for (const v of backup.meta_versions ?? [])
     stmts.push(DB.prepare(`INSERT INTO meta_versions (id, artifact_id, project_id, version, title, folder, tags, trashed, author_id, via_kind, via_id, via_label, client_info, change_note, restored_from, created_at, template_description)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(v.id, v.artifact_id, pid, v.version, v.title, v.folder, v.tags, v.trashed ? 1 : 0, v.author_id, v.via_kind ?? null, v.via_id ?? null, v.via_label ?? null, v.client_info ?? null, v.change_note ?? null, v.restored_from ?? null, v.created_at, v.template_description ?? ""));
-  for (const c of backup.comments)
-    stmts.push(DB.prepare("INSERT INTO comments (id, project_id, artifact_id, rev_no, author_id, body, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(c.id, pid, c.artifact_id, c.rev_no, c.author_id, storeText(c.body), c.created_at));
+  for (const c of backup.comments) {
+    const bodyKey = textKey(pid, c.artifact_id, c.id, attempt);
+    textWrites.push({ projectId: pid, artifactId: c.artifact_id, revisionId: c.id, text: c.body, attempt });
+    textKeys.push(bodyKey); bridges.push(textWriteComplete(ctx.env, bodyKey));
+    stmts.push(DB.prepare("INSERT INTO comments (id, project_id, artifact_id, rev_no, author_id, body, body_key, created_at) VALUES (?, ?, ?, ?, ?, '', ?, ?)").bind(c.id, pid, c.artifact_id, c.rev_no, c.author_id, bodyKey, c.created_at));
+  }
   stmts.push(DB.prepare("INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id) VALUES (?, ?, ?, 'backup.restore', ?, 'ok', ?)").bind(nowIso(), ctx.principal.id, pid, pid, ctx.requestId));
   await stageTextWrites(ctx.env, textWrites);
   try {
@@ -273,8 +278,12 @@ async function importBackup(ctx, workspaceId, input, idemKeyValue, digest = "") 
   for (const v of backup.meta_versions ?? [])
     stmts.push(DB.prepare(`INSERT INTO meta_versions (id, artifact_id, project_id, version, title, folder, tags, trashed, author_id, via_kind, via_id, via_label, client_info, change_note, restored_from, created_at, template_description)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(randomId("mv"), artId.get(v.artifact_id), pid, v.version, v.title ?? "", v.folder ?? "", v.tags ?? "[]", v.trashed ? 1 : 0, me, v.via_kind ?? null, null, v.via_label ?? null, v.client_info ?? null, v.change_note ?? null, v.restored_from ?? null, v.created_at, v.template_description ?? ""));
-  for (const c of backup.comments)
-    stmts.push(DB.prepare("INSERT INTO comments (id, project_id, artifact_id, rev_no, author_id, body, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(randomId("cmt"), pid, artId.get(c.artifact_id), c.rev_no, me, storeText(c.body), c.created_at));
+  for (const c of backup.comments) {
+    const aid = artId.get(c.artifact_id), cid = randomId("cmt"), bodyKey = textKey(pid, aid, cid);
+    textWrites.push({ projectId: pid, artifactId: aid, revisionId: cid, text: c.body });
+    textKeys.push(bodyKey); bridges.push(textWriteComplete(ctx.env, bodyKey));
+    stmts.push(DB.prepare("INSERT INTO comments (id, project_id, artifact_id, rev_no, author_id, body, body_key, created_at) VALUES (?, ?, ?, ?, ?, '', ?, ?)").bind(cid, pid, aid, c.rev_no, me, bodyKey, c.created_at));
+  }
   const result = { project_id: pid, workspace_id: workspaceId, title, artifacts: backup.artifacts.length, revisions: backup.revisions.length, comments: backup.comments.length, blobs: decoded.size };
   const exists = "EXISTS (SELECT 1 FROM projects WHERE id = ?)";
   stmts.push(DB.prepare(`INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id, workspace_id) SELECT ?, ?, ?, 'backup.import', ?, 'ok', ?, ? WHERE ${exists}`).bind(at, me, pid, pid, ctx.requestId, workspaceId, pid));

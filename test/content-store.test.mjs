@@ -59,10 +59,8 @@ test("revision INSERTs bind NULL bodies except allow-listed generation copies; c
         const values = sql.slice(sql.indexOf(")") + 1).match(/(?:SELECT|VALUES\s*\()\s*([\s\S]*?)(?:\bWHERE\b|\)\s*`)/i)?.[1].split(",").map(v => v.trim());
         if (/\bbody_key\b/.test(m[2]) && values?.[bodyIndex] === "NULL") continue;
       } else {
-        // Backup writers stay inline until their conversion in the next commit.
-        if (f.endsWith("/backup.js") && /storeText\(/.test(bind)) continue;
         const sql = after.slice(0, after.indexOf(".bind("));
-        if (/\bbody_key\b/.test(m[2]) && /SELECT \?, \?, \?, \?, \?, '',/.test(sql)) continue;
+        if (/\bbody_key\b/.test(m[2]) && /(?:SELECT\s+|VALUES\s*\(\s*)\?, \?, \?, \?, \?, '',/.test(sql)) continue;
       }
       bad.push(`${f.slice(ROOT.length + 1)}:${text.slice(0, m.index).split("\n").length}`);
     }
@@ -120,5 +118,8 @@ test("main JS write and read paths of text bodies go through storeText/readText 
   sql2.prepare("INSERT INTO principals (id, kind, issuer, subject, label, created_at) VALUES ('hum_s','human','synthetic','s','Owner',?)").run(at);
   const DB2 = mkDB(sql2);
   await lib.restoreBackup({ ...ctx, env: E({ DB: DB2 }) }, bk);
-  for (const r of sql2.prepare("SELECT body FROM revisions WHERE body IS NOT NULL UNION ALL SELECT body FROM comments").all()) assert.ok(r.body.startsWith("ENC:"), "restored bodies are encoded");
+  for (const r of sql2.prepare("SELECT body FROM revisions WHERE body IS NOT NULL").all()) assert.ok(r.body.startsWith("ENC:"), "restored inline bodies are encoded");
+  const restoredComment = sql2.prepare("SELECT body, body_key FROM comments").get();
+  assert.equal(restoredComment.body, "");
+  assert.equal(new TextDecoder().decode(objects.get(restoredComment.body_key)), "ENC:a comment");
 });

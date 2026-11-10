@@ -181,6 +181,7 @@ export async function purgeDueProjects(env, { projectId, rowBudget = 5000, blobB
       const keys = (await env.DB.prepare(
         `SELECT k FROM (SELECT blob_key AS k FROM revisions WHERE project_id = ?1 AND blob_key IS NOT NULL
            UNION SELECT body_key FROM revisions WHERE project_id = ?1 AND body_key IS NOT NULL
+           UNION SELECT body_key FROM comments WHERE project_id = ?1 AND body_key IS NOT NULL
            UNION SELECT key FROM content_writes WHERE project_id = ?1
            UNION SELECT staging_key FROM uploads WHERE project_id = ?1 AND staging_key IS NOT NULL AND staging_purged_at IS NULL
            UNION SELECT final_key FROM uploads WHERE project_id = ?1 AND final_key IS NOT NULL AND final_purged_at IS NULL) LIMIT ?2`
@@ -196,6 +197,7 @@ export async function purgeDueProjects(env, { projectId, rowBudget = 5000, blobB
       await env.DB.batch([
         env.DB.prepare("UPDATE revisions SET blob_key = NULL WHERE project_id = ? AND blob_key IN (SELECT value FROM json_each(?))").bind(id, JSON.stringify(keys)),
         env.DB.prepare("UPDATE revisions SET body_key = NULL WHERE project_id = ? AND body_key IN (SELECT value FROM json_each(?))").bind(id, JSON.stringify(keys)),
+        env.DB.prepare("UPDATE comments SET body_key = NULL WHERE project_id = ? AND body_key IN (SELECT value FROM json_each(?))").bind(id, JSON.stringify(keys)),
         env.DB.prepare("DELETE FROM content_writes WHERE project_id = ? AND key IN (SELECT value FROM json_each(?))").bind(id, JSON.stringify(keys)),
         env.DB.prepare("UPDATE uploads SET staging_purged_at = ? WHERE project_id = ? AND staging_key IN (SELECT value FROM json_each(?))").bind(now, id, JSON.stringify(keys)),
         env.DB.prepare("UPDATE uploads SET final_purged_at = ? WHERE project_id = ? AND final_key IN (SELECT value FROM json_each(?))").bind(now, id, JSON.stringify(keys))

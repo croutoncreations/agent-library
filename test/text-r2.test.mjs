@@ -10,7 +10,7 @@ import { SERVER_PORTS } from "./ports.mjs";
 import { commitTextWrites, isTextWriteFenceError } from "../packages/core/src/content-store.js";
 
 async function harness() {
-  const lib = await loadWorker({ "service.js": ["createMarkdown", "saveMarkdown", "getArtifact", "restoreRevision", "updateMetadata", "listArtifacts", "addComment", "listComments"], "reads/service.js": ["readTextChunk"], "uploads.js": ["serveContent"], "history/service.js": ["diffRevisions"], "backup.js": ["exportBackup", "restoreBackup", "importBackup"], "cleanup.js": ["reconcileUploads"], "content-store.js": ["stageTextWrites", "commitTextWrites"], "adapters.js": ["withAdapters", "defaultAdapters"] });
+  const lib = await loadWorker({ "service.js": ["createMarkdown", "saveMarkdown", "getArtifact", "restoreRevision", "updateMetadata", "listArtifacts", "addComment", "listComments"], "reads/service.js": ["readTextChunk"], "uploads.js": ["serveContent"], "history/service.js": ["diffRevisions"], "backup.js": ["exportBackup", "restoreBackup", "importBackup"], "cleanup.js": ["reconcileUploads"], "project-deletion.js": ["purgeDueProjects"], "content-store.js": ["stageTextWrites", "commitTextWrites"], "adapters.js": ["withAdapters", "defaultAdapters"] });
   const sql = new DatabaseSync(":memory:");
   for (const f of readdirSync(join(ROOT, "migrations")).filter(f => f.endsWith(".sql")).sort()) sql.exec(readFileSync(join(ROOT, "migrations", f), "utf8"));
   const stmt = (q, p = []) => ({ q, p, bind: (...p) => stmt(q, p), async first(c) { const r = sql.prepare(q).get(...p); return c ? r?.[c] ?? null : r ?? null; }, async all() { return { results: sql.prepare(q).all(...p) }; }, async run() { return { meta: { changes: sql.prepare(q).run(...p).changes } }; } });
@@ -478,15 +478,57 @@ test("bulk disposal splits R2 deletes at 1000 and retains referenced text and in
   assert.ok(target.sql.prepare("SELECT 1 FROM content_writes WHERE key = ?").get(key));
 });
 
-async function twoVersionBackup() {
+test("comment backups keep their JSON shape and restore/import old inline and new R2 sources", async () => {
+  for (const legacy of [true, false]) {
+    const source = await harness();
+    const c = await source.lib.createMarkdown(source.ctx, "proj-s", { title: "Backup comments", body: "document" }, "backup-create");
+    await source.lib.addComment(source.ctx, "proj-s", c.body.artifact_id, { revision: 1, body: "backup comment café🙂" }, "backup-comment");
+    if (legacy) source.sql.exec("UPDATE comments SET body = 'backup comment café🙂', body_key = NULL");
+    const backup = await source.lib.exportBackup(source.ctx, "proj-s");
+    assert.deepEqual(Object.keys(backup.comments[0]).sort(), ["id", "artifact_id", "rev_no", "author_id", "body", "created_at"].sort());
+    assert.equal(backup.comments[0].body, "backup comment café🙂");
+    for (const operation of ["restore", "import"]) {
+      const target = await harness();
+      let pid = "proj-s";
+      if (operation === "restore") {
+        target.sql.exec("DELETE FROM projects");
+        await target.lib.restoreBackup(target.ctx, backup);
+      } else {
+        pid = (await target.lib.importBackup(target.ctx, "wsp_hum_s", { backup }, `comment-import-${legacy}`)).project_id;
+      }
+      const row = target.sql.prepare("SELECT * FROM comments WHERE project_id = ?").get(pid);
+      assert.equal(row.body, "");
+      assert.equal(new TextDecoder().decode(target.objects.get(row.body_key)), backup.comments[0].body);
+      assert.equal(row.body_key.split("/").length, operation === "restore" ? 5 : 4);
+      assert.equal(target.sql.prepare("SELECT COUNT(*) AS n FROM content_writes").get().n, 0);
+      const exported = await target.lib.exportBackup(target.ctx, pid);
+      assert.equal(exported.comments[0].body, backup.comments[0].body);
+      if (operation === "restore") assert.deepEqual(exported.comments, backup.comments);
+      assert.equal((await target.lib.listComments(target.ctx, pid, row.artifact_id)).comments[0].body, backup.comments[0].body);
+    }
+  }
+});
+
+test("project purge deletes referenced comment objects before deleting comment rows", async () => {
+  const target = await harness();
+  const c = await target.lib.createMarkdown(target.ctx, "proj-s", { title: "Purge", body: "document" }, "purge-create");
+  await target.lib.addComment(target.ctx, "proj-s", c.body.artifact_id, { revision: 1, body: "purge comment" }, "purge-comment");
+  target.sql.exec("UPDATE projects SET deleted_at = 1, purge_at = 1");
+  await target.lib.purgeDueProjects(target.env, { projectId: "proj-s", rowBudget: 0, blobBudget: 10 });
+  assert.equal(target.objects.size, 0);
+  assert.equal(target.sql.prepare("SELECT body_key FROM comments").get().body_key, null);
+});
+
+async function twoVersionBackup(withComments = false) {
   const source = await harness();
   const created = await source.lib.createMarkdown(source.ctx, "proj-s", { title: "Retry", body: "first café" }, "retry-create");
   await source.lib.saveMarkdown(source.ctx, "proj-s", created.body.artifact_id, { expected_revision: 1, body: "second 🙂" }, "retry-save");
+  if (withComments) await source.lib.addComment(source.ctx, "proj-s", created.body.artifact_id, { revision: 2, body: "retry comment café🙂" }, "retry-comment");
   return source.lib.exportBackup(source.ctx, "proj-s");
 }
 
 test("failed restore retries immediately with distinct immutable keys and every version intact", async () => {
-  const backup = await twoVersionBackup();
+  const backup = await twoVersionBackup(true);
   const target = await harness();
   target.sql.exec("DELETE FROM projects");
   const put = target.env.BLOBS.put;
@@ -496,8 +538,10 @@ test("failed restore retries immediately with distinct immutable keys and every 
   const abandoned = [...target.objects.keys()];
   target.env.BLOBS.put = put;
   await target.lib.restoreBackup(target.ctx, backup);
-  assert.deepEqual((await target.lib.exportBackup(target.ctx, "proj-s")).revisions, backup.revisions);
-  for (const r of target.sql.prepare("SELECT body_key FROM revisions").all()) assert.ok(!abandoned.includes(r.body_key));
+  const exported = await target.lib.exportBackup(target.ctx, "proj-s");
+  assert.deepEqual(exported.revisions, backup.revisions);
+  assert.deepEqual(exported.comments, backup.comments);
+  for (const r of target.sql.prepare("SELECT body_key FROM revisions UNION ALL SELECT body_key FROM comments").all()) assert.ok(!abandoned.includes(r.body_key));
 });
 
 test("concurrent restores publish once and refuse the loser cleanly without overwriting bytes", async () => {
