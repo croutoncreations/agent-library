@@ -25,7 +25,7 @@ remove. A string that's too long is `413 too_large`; a number out of range is `4
 | Limit | Default | Scope | Configure | When you hit it |
 |---|---|---|---|---|
 | Text document size (Markdown, HTML, JSON, CSV) | 1 MiB (UTF-8 bytes) | document version | fixed; _ceiling_: text is stored in a D1 row (2 MB max) until text moves to file storage (D23) | `413 too_large` "Markdown exceeds 1 MiB" |
-| File size (images, PDF, video, other uploads) | 25 MiB | file version | `FILE_MAX_BYTES`; plan `file_bytes`. Never above 90 MiB (_ceiling_: Cloudflare refuses requests over 100 MB, and a file is sent in one PUT) | `413 too_large` "Files can be up to 25 MB on this plan", `{ limit: "file_bytes", allowed }` |
+| File size (images, PDF, video, other uploads) | 25 MiB | file version | `FILE_MAX_BYTES`; plan `file_bytes`. Never above 90 MiB (_ceiling_: Cloudflare refuses requests over 100 MB, and a file is sent in one PUT). Measured on Cloudflare (Workers Paid, 2026-11-10): 25 MiB works; 50 and 80 MiB uploads fail with 1102 (resource limits), so keep `file_bytes` at 25 MiB or less until uploads stop passing the file through the Worker twice | `413 too_large` "Files can be up to 25 MB on this plan", `{ limit: "file_bytes", allowed }` |
 | Storage | unlimited | workspace | plan `storage_bytes` | `402 limit_reached` |
 | JSON nesting | 64 levels | document | fixed | `422 invalid_content` |
 | Measurement records | 100,000 per file | document | fixed | `422 invalid_content` |
@@ -230,7 +230,7 @@ The hosted Worker uses core's `planEntitlements`, configured by the `PLAN_LIMITS
 { "free": { "storage_bytes": 524288000, "projects": 10, "members": 2, "pending_invites": 2, "agents": 5,
             "owned_workspaces": 1, "items_per_project": 500, "file_bytes": 26214400, "max_key_lifetime_days": 90 },
   "pro":  { "storage_bytes": 21474836480, "projects": 500, "members": 5, "pending_invites": 20, "agents": 50,
-            "owned_workspaces": 20, "items_per_project": 5000, "file_bytes": 94371840, "rate_multiplier": 2 } }
+            "owned_workspaces": 20, "items_per_project": 5000, "file_bytes": 26214400, "rate_multiplier": 2 } }
 ```
 
 - A workspace's plan is `workspaces.plan` (`free` by default; billing sets it).
