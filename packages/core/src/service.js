@@ -1,11 +1,11 @@
-import { getText, readText, storeText } from "./content-store.js";
+import { commitTextWrites, getText, isTextWriteFenceError, readText, stageTextWrite, storeText, textWriteComplete } from "./content-store.js";
 import { authorizeProject, authzSql, contentWriteSql, credentialGate, protectSql, requireHuman } from "./auth.js";
 import { chQuery, cleanupChanges, listChanges } from "./changes/service.js";
 import { MEASUREMENTS, MIME, checkFile, isCalendarDate } from "./formats.js";
 import { diffRevisions, historyPage, lineDiff, metaBaselineInsert, metaHistory, metaVersionInsert, provenance, restoreMetadata } from "./history/service.js";
 import { RT_ID_TOO_LONG, RT_KINDS_ALL, RT_KINDS_DOCS, readTextChunk, rtChunkLimit, rtFit, rtIdBytes, rtQuery, rtReadAuthzSql } from "./reads/service.js";
 import { __name } from "./runtime.js";
-import { RS_SCHEMA, rsQuery, rsReady, rsToolReady, searchArtifacts } from "./search/service.js";
+import { RS_SCHEMA, refreshTextSearch, rsQuery, rsReady, rsToolReady, searchArtifacts, textSearchBridge } from "./search/service.js";
 import { createFromTemplate, listTemplates, previewTemplate, saveAsTemplate, tplAssertMaintenance, tplDate, tplProvenance, tplTools } from "./templates/service.js";
 import { ROLE_RANK, memberRoleSql, personalWorkspaceId, projectRole, workspaceRoleSql, requireProjectRole, requireWorkspaceRole, visibleProjects } from "./tenancy.js";
 import { HttpError, b64url, cutLists, int, nowIso, nowMs, randomId, sha256Hex, str } from "./util.js";
@@ -50,6 +50,7 @@ async function runBatch(ctx, stmts, i) {
   try {
     return await db(ctx).batch(stmts);
   } catch (e) {
+    if (isTextWriteFenceError(e)) throw e;
     if (/UNIQUE|PRIMARY KEY|constraint/i.test(String(e?.message ?? e))) {
       const prior = await idemLookup(ctx, i);
       if (prior) return prior;
@@ -306,16 +307,18 @@ async function createMarkdown(ctx, projectId, input, key, kind = "markdown") {
   const az = { sql: `${az0.sql} AND ${lg.sql}`, params: [...az0.params, ...lg.params] };
   const now = nowIso();
   const result = { status: 201, body: kind === "markdown" && folderId === null ? { artifact_id: artId, revision: 1, revision_id: revId, sha256: sha2 } : { artifact_id: artId, kind, folder_id: folderId, schema, revision: 1, revision_id: revId, sha256: sha2 } };
-  const out2 = await runBatch(ctx, [
+  const bodyKey = await stageTextWrite(ctx.env, projectId, artId, revId, body2);
+  const out2 = await commitTextWrites(ctx.env, [bodyKey], (guarded) => runBatch(ctx, guarded([
     // Idempotency row first: a duplicate concurrent retry fails here and rolls back the whole batch.
     idemInsert(ctx, i, 201, result.body, az.sql, az.params),
     db(ctx).prepare(`INSERT INTO artifacts (id, project_id, kind, title, folder, folder_id, schema_id, head_rev, head_revision_id, created_at, updated_at)
       SELECT ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ? WHERE ${az.sql}
         AND (? IS NULL OR EXISTS (SELECT 1 FROM folders WHERE id = ? AND project_id = ?))`).bind(artId, projectId, kind, title, folder, folderId, schema, revId, now, now, ...az.params, folderId, folderId, projectId),
-    db(ctx).prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, size, sha256, mime, created_at, via_kind, via_id, via_label, client_info, change_note)
-      SELECT ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM artifacts WHERE id = ?)`).bind(revId, artId, projectId, ctx.principal.id, storeText(body2), new TextEncoder().encode(body2).length, sha2, mime, now, ...provenance(ctx, input), artId),
-    audit(ctx, projectId, "artifact.create", artId, 1, "ok", "EXISTS (SELECT 1 FROM artifacts WHERE id = ?)", [artId])
-  ], i);
+    db(ctx).prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, body_key, size, sha256, mime, created_at, via_kind, via_id, via_label, client_info, change_note)
+      SELECT ?, ?, ?, 1, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM artifacts WHERE id = ?)`).bind(revId, artId, projectId, ctx.principal.id, bodyKey, new TextEncoder().encode(body2).length, sha2, mime, now, ...provenance(ctx, input), artId),
+    audit(ctx, projectId, "artifact.create", artId, 1, "ok", "EXISTS (SELECT 1 FROM artifacts WHERE id = ?)", [artId]),
+    textSearchBridge(ctx.env, artId, revId, body2), textWriteComplete(ctx.env, bodyKey)
+  ]), i));
   if (!Array.isArray(out2)) return out2;
   if (!out2[1].meta.changes) {
     if (lg.workspaceId) await explainLimit(ctx.env, lg.workspaceId, adds, lg.limits, projectId);
@@ -336,16 +339,17 @@ async function publishRevision(ctx, projectId, artifactId, expected, i, rev, ext
   const now = nowIso();
   const gate = "EXISTS (SELECT 1 FROM revisions WHERE id = ?)";
   const body2 = { artifact_id: artifactId, revision: next, revision_id: revId, sha256: rev.sha256 };
-  const out2 = await runBatch(ctx, [
-    db(ctx).prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, blob_key, size, sha256, mime, restored_from, created_at, via_kind, via_id, via_label, client_info, change_note)
-      SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+  const bodyKey = rev.body == null ? null : await stageTextWrite(ctx.env, projectId, artifactId, revId, rev.body);
+  const out2 = await commitTextWrites(ctx.env, [bodyKey], (guarded) => runBatch(ctx, guarded([
+    db(ctx).prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, body_key, blob_key, size, sha256, mime, restored_from, created_at, via_kind, via_id, via_label, client_info, change_note)
+      SELECT ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
       WHERE EXISTS (SELECT 1 FROM artifacts WHERE id = ? AND project_id = ? AND head_rev = ? AND trashed_at IS NULL) AND ${az.sql}`).bind(
       revId,
       artifactId,
       projectId,
       next,
       ctx.principal.id,
-      rev.body === void 0 || rev.body === null ? null : storeText(rev.body),
+      bodyKey,
       rev.blobKey ?? null,
       rev.size,
       rev.sha256,
@@ -361,9 +365,10 @@ async function publishRevision(ctx, projectId, artifactId, expected, i, rev, ext
     db(ctx).prepare(`UPDATE artifacts SET head_rev = ?, head_revision_id = ?, updated_at = ? WHERE id = ? AND project_id = ? AND head_rev = ? AND ${gate}`).bind(next, revId, now, artifactId, projectId, expected, revId),
     idemInsert(ctx, i, 200, body2, gate, [revId]),
     audit(ctx, projectId, action, artifactId, next, "ok", gate, [revId]),
-    ...extra.map((s) => s)
+    ...extra.map((s) => s),
+    ...bodyKey ? [textSearchBridge(ctx.env, artifactId, revId, rev.body), textWriteComplete(ctx.env, bodyKey)] : []
     // callers gate their own extra statements on the same predicate
-  ], i);
+  ]), i));
   if (!Array.isArray(out2)) return out2;
   if (!out2[0].meta.changes) {
     // A concurrent retry with the same idempotency key may have won: replay its stored result.
@@ -506,6 +511,7 @@ async function updateMetadata(ctx, projectId, artifactId, input, key, internal) 
     if (cur === expected) throw new HttpError(403, "forbidden", "Grant no longer valid");
     throw new HttpError(409, "metadata_conflict", "Expected metadata version is stale", { current_meta_version: cur });
   }
+  await refreshTextSearch(ctx.env, artifactId);
   return { status: 200, body: body2 };
 }
 // Folders per project: checked inside the INSERT (FOLDER_ROOM_SQL binds the project id, then the cap) on every path

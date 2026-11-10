@@ -1,10 +1,12 @@
+import { HttpError } from "./util.js";
+
 // ContentStore: the one place the Worker reads or writes stored file bytes (R2 `BLOBS`).
 //
 // Today content is encrypted at rest by the storage provider (Cloudflare D1/R2), so these are pass-throughs.
 // Per-workspace envelope encryption (hosted plan, "Encryption at rest") plugs in here: a KeyProvider wraps
 // per-workspace data keys and R2 objects become chunked AES-GCM so Range reads keep working.
-// test/content-store.test.mjs fails if any other module touches env.BLOBS. Text bodies stored inline in D1 go
-// through storeText/readText below.
+// test/content-store.test.mjs fails if any other module touches env.BLOBS. Text versions use putText/getText;
+// comments and legacy inline bodies still pass through storeText/readText.
 
 /** Read a stored object, optionally a byte range ({ offset, length }). Returns an R2ObjectBody or null. */
 export async function getBlob(env, key, range) {
@@ -60,11 +62,8 @@ export async function listBlobKeys(env, prefix, limit = 100) {
 }
 
 
-// Text bodies stored inline in D1 (revisions.body, comments.body). Every JS write passes the plaintext through
-// storeText before binding it, and every JS read passes the column through readText. Identity until per-workspace
-// encryption lands; then storeText encrypts (and sets a key_version column) and readText decrypts. Bodies also read
-// inside SQL (search index, chunked reads, publisher batch copies, owner LIKE filter) are listed in
-// docs/encryption.md; test/content-store.test.mjs keeps the JS paths on these two functions.
+// Inline compatibility codec: comments and publisher generation copies still write inline; legacy text versions
+// are decoded here by getText/getTextRange. SQL-side plaintext uses are listed in docs/encryption.md.
 export function storeText(text) {
   return text;
 }
@@ -96,4 +95,62 @@ export async function getText(env, row) {
   const bytes = await getBlobBytes(env, row.body_key);
   if (!bytes) throw new Error("Missing text object");
   return new TextDecoder().decode(bytes);
+}
+
+/** Persist intent before bytes: a dead request remains sweepable even if put succeeds after it dies. */
+export async function stageTextWrite(env, projectId, artifactId, revisionId, text) {
+  const key = `text/${projectId}/${artifactId}/${revisionId}`;
+  await env.DB.prepare("INSERT INTO content_writes (key, project_id, created_at) VALUES (?, ?, ?)").bind(key, projectId, Date.now()).run();
+  await putText(env, { projectId }, key, text);
+  return key;
+}
+
+/** Include in the same transaction that references the immutable key. */
+export function textWriteComplete(env, key) {
+  return env.DB.prepare("DELETE FROM content_writes WHERE key = ? AND EXISTS (SELECT 1 FROM revisions WHERE body_key = ?)").bind(key, key);
+}
+
+// The sweep age must stay well above the publish deadline: an intent eligible for deletion can never publish.
+export const TEXT_WRITE_DEADLINE_MS = 10 * 60 * 1000;
+export const TEXT_WRITE_STALE_MS = 60 * 60 * 1000;
+
+// Depends on D1's SQLite constraint text; tested against local D1, not just a simulated error.
+export function isTextWriteFenceError(error) {
+  return /NOT NULL constraint failed: content_writes\.(?:project_id|created_at)\b/.test(String(error?.message ?? error));
+}
+
+/** Atomic publication fence and best-effort disposal of objects known not to have published. */
+export async function commitTextWrites(env, keys, commit) {
+  keys = keys.filter(Boolean);
+  let settled = false;
+  try {
+    const guarded = (statements) => {
+      if (!keys.length) return statements;
+      // Intentionally violate NOT NULL if any intent expired/disappeared: D1 rolls the whole batch back,
+      // including metadata, so a sweep racing a slow R2 write cannot leave a published but missing object.
+      const fence = env.DB.prepare(`INSERT INTO content_writes (key, project_id, created_at)
+        SELECT NULL, NULL, NULL WHERE EXISTS (SELECT 1 FROM json_each(?) j
+          LEFT JOIN content_writes w ON w.key = j.value WHERE w.key IS NULL OR w.created_at < ?)`)
+        .bind(JSON.stringify(keys), Date.now() - TEXT_WRITE_DEADLINE_MS);
+      return [fence, ...statements];
+    };
+    const result = await commit(guarded);
+    settled = true;
+    return keys.length && Array.isArray(result) ? result.slice(1) : result;
+  } catch (error) {
+    if (!isTextWriteFenceError(error)) throw error;
+    settled = true;
+    throw new HttpError(503, "text_write_expired", "Text write expired before publication; retry with the same idempotency key");
+  } finally {
+    // Unknown errors may be a lost acknowledgement of a successful commit. Leave their intent/bytes to cron.
+    if (settled) for (const key of keys) {
+      try {
+        const referenced = await env.DB.prepare("SELECT 1 FROM revisions WHERE body_key = ? LIMIT 1").bind(key).first();
+        if (!referenced) {
+          await deleteBlob(env, key);
+          await env.DB.prepare("DELETE FROM content_writes WHERE key = ?").bind(key).run();
+        }
+      } catch { console.error(JSON.stringify({ event: "text_write_cleanup_failed" })); }
+    }
+  }
 }

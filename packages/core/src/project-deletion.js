@@ -180,19 +180,23 @@ export async function purgeDueProjects(env, { projectId, rowBudget = 5000, blobB
       if (blobBudget <= 0) return out;
       const keys = (await env.DB.prepare(
         `SELECT k FROM (SELECT blob_key AS k FROM revisions WHERE project_id = ?1 AND blob_key IS NOT NULL
+           UNION SELECT body_key FROM revisions WHERE project_id = ?1 AND body_key IS NOT NULL
+           UNION SELECT key FROM content_writes WHERE project_id = ?1
            UNION SELECT staging_key FROM uploads WHERE project_id = ?1 AND staging_key IS NOT NULL AND staging_purged_at IS NULL
            UNION SELECT final_key FROM uploads WHERE project_id = ?1 AND final_key IS NOT NULL AND final_purged_at IS NULL) LIMIT ?2`
       ).bind(id, Math.min(100, blobBudget)).all()).results.map((r) => r.k);
       if (!keys.length) break;
       if (!await stillDue()) return out;
       for (const k of keys) {
-        if (!k.startsWith(`blobs/${id}/`) && !k.startsWith(`staging/${id}/`)) { console.error("purge_foreign_key_skipped"); continue; }
+        if (!k.startsWith(`blobs/${id}/`) && !k.startsWith(`staging/${id}/`) && !k.startsWith(`text/${id}/`)) { console.error("purge_foreign_key_skipped"); continue; }
         await deleteBlob(env, k);
       }
       blobBudget -= keys.length; out.files += keys.length;
       // Forget the deleted keys so the next round moves on (rows go in the steps below).
       await env.DB.batch([
         env.DB.prepare("UPDATE revisions SET blob_key = NULL WHERE project_id = ? AND blob_key IN (SELECT value FROM json_each(?))").bind(id, JSON.stringify(keys)),
+        env.DB.prepare("UPDATE revisions SET body_key = NULL WHERE project_id = ? AND body_key IN (SELECT value FROM json_each(?))").bind(id, JSON.stringify(keys)),
+        env.DB.prepare("DELETE FROM content_writes WHERE project_id = ? AND key IN (SELECT value FROM json_each(?))").bind(id, JSON.stringify(keys)),
         env.DB.prepare("UPDATE uploads SET staging_purged_at = ? WHERE project_id = ? AND staging_key IN (SELECT value FROM json_each(?))").bind(now, id, JSON.stringify(keys)),
         env.DB.prepare("UPDATE uploads SET final_purged_at = ? WHERE project_id = ? AND final_key IN (SELECT value FROM json_each(?))").bind(now, id, JSON.stringify(keys))
       ]);
@@ -211,7 +215,7 @@ export async function purgeDueProjects(env, { projectId, rowBudget = 5000, blobB
     // Then sweep both prefixes for anything no row names (a write that landed after its row went, or an earlier
     // crash). The run waits while an upload is inside its finish lease or writing (see `due`), so nothing new arrives
     // after this.
-    for (const prefix of [`blobs/${id}/`, `staging/${id}/`]) {
+    for (const prefix of [`blobs/${id}/`, `staging/${id}/`, `text/${id}/`]) {
       for (;;) {
         if (blobBudget <= 0) return out;
         if (!await stillDue()) return out;

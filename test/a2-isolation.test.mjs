@@ -47,15 +47,15 @@ test("foreign artifact ID addressed through an authorized project is 404", async
 });
 
 test("search is scoped to the authorized project", async () => {
-  const r = await A("GET", "/api/projects/proj-one/artifacts?q=zebracorn");
+  const r = await A("GET", "/api/projects/proj-one/artifacts?q=Foreign%20secret");
   assert.equal(r.status, 200);
   assert.equal(r.body.artifacts.length, 0);
-  const m = await mA.call("list_artifacts", { project_id: "proj-one", query: "zebracorn" });
+  const m = await mA.call("list_artifacts", { project_id: "proj-one", query: "Foreign secret" });
   assert.equal(m.data.artifacts.length, 0);
-  const own = await A("GET", "/api/projects/proj-one/artifacts?q=plain%20own");
+  const own = await A("GET", "/api/projects/proj-one/artifacts?q=Own%20doc");
   assert.deepEqual(own.body.artifacts.map((a) => a.id), [ownId]);
   // owner sees the foreign doc in its own project
-  const ho = await h.req("GET", "/api/projects/proj-two/artifacts?q=zebracorn");
+  const ho = await h.req("GET", "/api/projects/proj-two/artifacts?q=Foreign%20secret");
   assert.deepEqual(ho.body.artifacts.map((a) => a.id), [foreignId]);
 });
 

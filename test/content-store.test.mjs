@@ -35,7 +35,7 @@ test("only packages/core/src/content-store.js touches the R2 binding", () => {
 //    and read paths (documents, comments, history, restore, templates, JSON files and records, backup export and
 //    restore) run against the migrated schema in node:sqlite. A covered path that skips the seam leaves the marker
 //    out of the stored row or leaks it into a response. Paths not exercised here are covered only by check 1 (writes).
-test("every INSERT of a text body binds storeText or is a marked SQL-side copy", () => {
+test("revision INSERTs bind NULL bodies except allow-listed generation copies; comments bind storeText", () => {
   const bad = [];
   for (const f of jsFiles(join(ROOT, "packages", "core", "src"))) {
     const text = readFileSync(f, "utf8");
@@ -44,16 +44,24 @@ test("every INSERT of a text body binds storeText or is a marked SQL-side copy",
       if (!/\bbody\b/.test(m[2])) continue;
       const before = text.slice(Math.max(0, m.index - 300), m.index), after = text.slice(m.index, m.index + 1500);
       const bind = after.slice(after.indexOf(".bind("), after.indexOf(".bind(") + 600);
-      if (/content-store: sql-side/.test(before)) continue;
-      if (after.indexOf(".bind(") < 0 || !/storeText\(/.test(bind)) bad.push(`${f.slice(ROOT.length + 1)}:${text.slice(0, m.index).split("\n").length}`);
+      if (m[1] === "revisions") {
+        const sql = after.slice(0, after.indexOf(".bind("));
+        const generationCommit = f.endsWith("/api/publisher.js") && text.lastIndexOf("async function commit(", m.index) > text.lastIndexOf("async function commitSnapshot(", m.index);
+        if (generationCommit && /content-store: sql-side/.test(before) && /t\.body, t\.bytes, t\.sha256/.test(sql)) continue;
+        if (generationCommit && /storeText\(manifestText\)/.test(bind)) continue;
+        const bodyIndex = m[2].split(",").map(c => c.trim()).indexOf("body");
+        const values = sql.slice(sql.indexOf(")") + 1).match(/(?:SELECT|VALUES\s*\()\s*([\s\S]*?)(?:\bWHERE\b|\)\s*`)/i)?.[1].split(",").map(v => v.trim());
+        if (/\bbody_key\b/.test(m[2]) && values?.[bodyIndex] === "NULL") continue;
+      } else if (/storeText\(/.test(bind)) continue;
+      bad.push(`${f.slice(ROOT.length + 1)}:${text.slice(0, m.index).split("\n").length}`);
     }
   }
-  assert.deepEqual(bad, [], "text-body INSERT without storeText(...) in its bind (or a 'content-store: sql-side' marker)");
+  assert.deepEqual(bad, [], "text-body INSERT outside the explicit inline generation allow-list");
 });
 test("main JS write and read paths of text bodies go through storeText/readText (marker codec)", async () => {
   const { loadWorker } = await import("./load-worker.mjs");
   const lib = await loadWorker({ "service.js": ["createMarkdown", "createFile", "saveFile", "readRecords", "saveMarkdown", "getArtifact", "addComment", "listComments", "restoreRevision"], "templates/service.js": ["saveAsTemplate", "createFromTemplate"], "backup.js": ["exportBackup", "restoreBackup"], "history/service.js": ["diffRevisions"], "adapters.js": ["withAdapters", "defaultAdapters"] },
-    { "content-store.js": "export * from \"./packages/core/src/content-store.js\"; import { getText as actualGetText } from \"./packages/core/src/content-store.js\"; export async function getText(env, row) { return row.body_key ? actualGetText(env, row) : readText(row.body); } export function storeText(t) { return \"ENC:\" + t; } export function readText(s) { if (!String(s).startsWith(\"ENC:\")) throw new Error(\"unencoded body read: \" + String(s).slice(0, 20)); return String(s).slice(4); }" });
+    { "content-store.js": "export * from \"./packages/core/src/content-store.js\"; import { getText as actualGetText, stageTextWrite as actualStage } from \"./packages/core/src/content-store.js\"; export async function stageTextWrite(env, p, a, r, t) { return actualStage(env, p, a, r, storeText(t)); } export async function getText(env, row) { return readText(await actualGetText(env, row)); } export function storeText(t) { return \"ENC:\" + t; } export function readText(s) { if (!String(s).startsWith(\"ENC:\")) throw new Error(\"unencoded body read: \" + String(s).slice(0, 20)); return String(s).slice(4); }" });
   const { DatabaseSync } = await import("node:sqlite");
   const sql = new DatabaseSync(":memory:");
   for (const f of readdirSync(join(ROOT, "migrations")).filter((f) => f.endsWith(".sql")).sort()) sql.exec(readFileSync(join(ROOT, "migrations", f), "utf8"));
@@ -63,14 +71,17 @@ test("main JS write and read paths of text bodies go through storeText/readText 
   const at = new Date().toISOString();
   sql.prepare("INSERT INTO principals (id, kind, issuer, subject, label, created_at) VALUES ('hum_s','human','synthetic','s','Owner',?)").run(at);
   sql.prepare("INSERT INTO projects (id, owner_id, title, created_at) VALUES ('proj-s','hum_s','Synthetic',?)").run(at);
-  const E = (env) => lib.withAdapters(env, lib.defaultAdapters());
+  const objects = new Map();
+  const BLOBS = { async put(k, b) { objects.set(k, new Uint8Array(b)); }, async delete(k) { objects.delete(k); }, async get(k) { const b = objects.get(k); return b ? { async arrayBuffer() { return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength); } } : null; } };
+  const E = (env) => lib.withAdapters({ ...env, BLOBS }, lib.defaultAdapters());
   const ctx = { env: E({ DB }), requestId: "req_s", principal: { id: "hum_s", kind: "human", label: "Owner" } };
   const c = await lib.createMarkdown(ctx, "proj-s", { title: "Doc", body: "first body" }, "idem-create-1");
   const aid = c.body.artifact_id;
   await lib.saveMarkdown(ctx, "proj-s", aid, { expected_revision: 1, body: "second body" }, "idem-save-1");
   await lib.addComment(ctx, "proj-s", aid, { revision: 2, body: "a comment" }, "idem-comment-1");
   await lib.restoreRevision(ctx, "proj-s", aid, { from_revision: 1, expected_revision: 2 }, "idem-restore-1");
-  assert.deepEqual(sql.prepare("SELECT body FROM revisions ORDER BY rev_no").all().map((r) => r.body), ["ENC:first body", "ENC:second body", "ENC:first body"]);
+  assert.deepEqual(sql.prepare("SELECT body FROM revisions ORDER BY rev_no").all().map((r) => r.body), [null, null, null]);
+  assert.deepEqual(sql.prepare("SELECT body_key FROM revisions ORDER BY rev_no").all().map(r => new TextDecoder().decode(objects.get(r.body_key))), ["ENC:first body", "ENC:second body", "ENC:first body"]);
   assert.equal(sql.prepare("SELECT body FROM comments").get().body, "ENC:a comment");
   assert.equal((await lib.getArtifact(ctx, "proj-s", aid, 2)).body, "second body");
   assert.deepEqual((await lib.listComments(ctx, "proj-s", aid)).comments.map((x) => x.body), ["a comment"]);
@@ -84,7 +95,7 @@ test("main JS write and read paths of text bodies go through storeText/readText 
   const actx = { ...ctx, env: E({ DB, APP_CONNECT_ENABLED: "1" }) };
   const records = JSON.stringify({ schema: "agentlib.measurements/1", records: [{ id: "r1", recorded_at: "2026-01-02T08:00:00Z", date: "2026-01-02", metric: "steps", value: 1, unit: "count" }] });
   const jf = await lib.createFile(actx, "proj-s", { kind: "json", title: "M", content: records, schema: "agentlib.measurements/1" }, "idem-json-1");
-  assert.equal(sql.prepare("SELECT body FROM revisions WHERE artifact_id = ?").get(jf.body.artifact_id).body, "ENC:" + records);
+  assert.equal(new TextDecoder().decode(objects.get(sql.prepare("SELECT body_key FROM revisions WHERE artifact_id = ?").get(jf.body.artifact_id).body_key)), "ENC:" + records);
   assert.equal((await lib.getArtifact(actx, "proj-s", jf.body.artifact_id)).content, records);
   await lib.readRecords(actx, "proj-s", jf.body.artifact_id, {});
   await lib.saveFile(actx, "proj-s", jf.body.artifact_id, { expected_revision: 1, content: records }, "idem-json-2");

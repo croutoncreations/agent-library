@@ -1,5 +1,6 @@
 import { personalWorkspaceId } from "./tenancy.js";
-import { deleteBlob, getBlob, putBlob, getText, readText, storeText } from "./content-store.js";
+import { commitTextWrites, deleteBlob, getBlob, putBlob, getText, readText, stageTextWrite, storeText, textWriteComplete } from "./content-store.js";
+import { textSearchBridge } from "./search/service.js";
 import { limitsFor, requireHuman } from "./auth.js";
 import { BINARY_TYPES, LIMITS, tplDate } from "./service.js";
 import { requireProjectRole, requireWorkspaceRole, workspaceRoleSql } from "./tenancy.js";
@@ -115,16 +116,21 @@ async function restoreBackup(ctx, backup) {
   for (const a of backup.artifacts)
     stmts.push(DB.prepare(`INSERT INTO artifacts (id, project_id, kind, title, folder, tags, head_rev, head_revision_id, meta_version, trashed_at, created_at, updated_at, is_template, template_description, source_artifact_id, source_revision, source_role, template_date)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(a.id, pid, a.kind, a.title, a.folder, a.tags, a.head_rev, a.head_revision_id, a.meta_version, a.trashed_at, a.created_at, a.updated_at, a.is_template ?? 0, a.template_description ?? "", a.source_artifact_id ?? null, a.source_revision ?? null, a.source_role ?? null, a.template_date ?? null));
-  for (const r of backup.revisions)
-    stmts.push(DB.prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, blob_key, size, sha256, mime, restored_from, created_at, via_kind, via_id, via_label, client_info, change_note)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(r.id, r.artifact_id, pid, r.rev_no, r.author_id, r.body === null ? null : storeText(r.body), r.blob_key, r.size, r.sha256, r.mime, r.restored_from, r.created_at, r.via_kind ?? null, r.via_id ?? null, r.via_label ?? null, r.client_info ?? null, r.change_note ?? null));
+  const textKeys = [];
+  const bridges = [];
+  for (const r of backup.revisions) {
+    const bodyKey = r.blob_key ? null : await stageTextWrite(ctx.env, pid, r.artifact_id, r.id, r.body);
+    if (bodyKey) { textKeys.push(bodyKey); bridges.push(textSearchBridge(ctx.env, r.artifact_id, r.id, r.body), textWriteComplete(ctx.env, bodyKey)); }
+    stmts.push(DB.prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, body_key, blob_key, size, sha256, mime, restored_from, created_at, via_kind, via_id, via_label, client_info, change_note)
+      VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(r.id, r.artifact_id, pid, r.rev_no, r.author_id, bodyKey, r.blob_key, r.size, r.sha256, r.mime, r.restored_from, r.created_at, r.via_kind ?? null, r.via_id ?? null, r.via_label ?? null, r.client_info ?? null, r.change_note ?? null));
+  }
   for (const v of backup.meta_versions ?? [])
     stmts.push(DB.prepare(`INSERT INTO meta_versions (id, artifact_id, project_id, version, title, folder, tags, trashed, author_id, via_kind, via_id, via_label, client_info, change_note, restored_from, created_at, template_description)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(v.id, v.artifact_id, pid, v.version, v.title, v.folder, v.tags, v.trashed ? 1 : 0, v.author_id, v.via_kind ?? null, v.via_id ?? null, v.via_label ?? null, v.client_info ?? null, v.change_note ?? null, v.restored_from ?? null, v.created_at, v.template_description ?? ""));
   for (const c of backup.comments)
     stmts.push(DB.prepare("INSERT INTO comments (id, project_id, artifact_id, rev_no, author_id, body, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(c.id, pid, c.artifact_id, c.rev_no, c.author_id, storeText(c.body), c.created_at));
   stmts.push(DB.prepare("INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id) VALUES (?, ?, ?, 'backup.restore', ?, 'ok', ?)").bind(nowIso(), ctx.principal.id, pid, pid, ctx.requestId));
-  await DB.batch(stmts);
+  await commitTextWrites(ctx.env, textKeys, (guarded) => DB.batch(guarded([...stmts, ...bridges])));
   return { restored_project: pid, artifacts: backup.artifacts.length, revisions: backup.revisions.length, blobs: decoded.size, grants: 0 };
 }
 
@@ -243,9 +249,15 @@ async function importBackup(ctx, workspaceId, input, idemKeyValue, digest = "") 
     stmts.push(DB.prepare(`INSERT INTO artifacts (id, project_id, kind, title, folder, tags, head_rev, head_revision_id, meta_version, trashed_at, created_at, updated_at, is_template, template_description, source_artifact_id, source_revision, source_role, template_date)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(artId.get(a.id), pid, a.kind, a.title, a.folder ?? "", a.tags ?? "[]", a.head_rev, revId.get(a.head_revision_id) ?? null, a.meta_version, a.trashed_at ?? null, a.created_at, a.updated_at, a.is_template ?? 0, a.template_description ?? "", src ? artId.get(a.source_artifact_id) : null, src ? a.source_revision : null, src ? a.source_role : null, a.template_date ?? null));
   }
-  for (const r of backup.revisions)
-    stmts.push(DB.prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, blob_key, size, sha256, mime, restored_from, created_at, via_kind, via_id, via_label, client_info, change_note)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(revId.get(r.id), artId.get(r.artifact_id), pid, r.rev_no, me, r.body === null ? null : storeText(r.body), r.blob_key === null ? null : keyMap.get(r.blob_key), r.size, r.sha256, r.mime, r.restored_from ?? null, r.created_at, r.via_kind ?? null, null, r.via_label ? `${r.via_label} (imported)` : "imported", r.client_info ?? null, r.change_note ?? null));
+  const textKeys = [];
+  const bridges = [];
+  for (const r of backup.revisions) {
+    const aid = artId.get(r.artifact_id), rid = revId.get(r.id);
+    const bodyKey = r.blob_key ? null : await stageTextWrite(ctx.env, pid, aid, rid, r.body);
+    if (bodyKey) { textKeys.push(bodyKey); bridges.push(textSearchBridge(ctx.env, aid, rid, r.body), textWriteComplete(ctx.env, bodyKey)); }
+    stmts.push(DB.prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, body_key, blob_key, size, sha256, mime, restored_from, created_at, via_kind, via_id, via_label, client_info, change_note)
+      VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(rid, aid, pid, r.rev_no, me, bodyKey, r.blob_key === null ? null : keyMap.get(r.blob_key), r.size, r.sha256, r.mime, r.restored_from ?? null, r.created_at, r.via_kind ?? null, null, r.via_label ? `${r.via_label} (imported)` : "imported", r.client_info ?? null, r.change_note ?? null));
+  }
   for (const v of backup.meta_versions ?? [])
     stmts.push(DB.prepare(`INSERT INTO meta_versions (id, artifact_id, project_id, version, title, folder, tags, trashed, author_id, via_kind, via_id, via_label, client_info, change_note, restored_from, created_at, template_description)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(randomId("mv"), artId.get(v.artifact_id), pid, v.version, v.title ?? "", v.folder ?? "", v.tags ?? "[]", v.trashed ? 1 : 0, me, v.via_kind ?? null, null, v.via_label ?? null, v.client_info ?? null, v.change_note ?? null, v.restored_from ?? null, v.created_at, v.template_description ?? ""));
@@ -262,7 +274,7 @@ async function importBackup(ctx, workspaceId, input, idemKeyValue, digest = "") 
   try { for (const [k, bytes] of decoded) { await putBlob(ctx.env, keyMap.get(k), bytes); written.push(keyMap.get(k)); } }
   catch (e) { await dropBlobs(); throw e; }
   let res;
-  try { res = await DB.batch(stmts); }
+  try { res = await commitTextWrites(ctx.env, textKeys, (guarded) => DB.batch(guarded([...stmts, ...bridges]))); }
   catch (e) {
     await dropBlobs();
     // The admin check lost a race (no project row): the dependent rows fail their foreign key and nothing is written.

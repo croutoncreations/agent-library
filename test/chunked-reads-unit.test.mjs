@@ -9,6 +9,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { ROOT } from "./helpers.mjs";
 import { moduleScript } from "./module-source.mjs";
+import { getTextRange } from "../packages/core/src/content-store.js";
 
 class HttpError extends Error { constructor(status, code, message) { super(message); this.status = status; this.code = code; } }
 let clock = Date.now();
@@ -24,8 +25,8 @@ function load() {
   const T = new Function("HttpError", moduleScript("packages/core/src/tenancy.js") + "\nreturn { humanGate, memberRoleSql, requireProjectRole };")(HttpError);
   const credentialGate = new Function("HttpError", "nowMs", "humanGate", "memberRoleSql", "requireProjectRole", "adapters", "sha256Hex",
     moduleScript("packages/core/src/auth.js") + "\nreturn credentialGate;")(HttpError, () => clock, T.humanGate, T.memberRoleSql, T.requireProjectRole, null, null);
-  return new Function("HttpError", "nowMs", "int", "authorizeProject", "credentialGate", "db",
-    src + "\nreturn { readTextChunk, rtQuery, rtIdBytes, rtChunkLimit, rtFit, RT_ID_TOO_LONG, RT_KINDS_ALL, RT_KINDS_DOCS };")(HttpError, () => clock, int, authorizeProject, credentialGate, db);
+  return new Function("HttpError", "nowMs", "int", "authorizeProject", "credentialGate", "db", "getTextRange",
+    src + "\nreturn { readTextChunk, rtQuery, rtIdBytes, rtChunkLimit, rtFit, RT_ID_TOO_LONG, RT_KINDS_ALL, RT_KINDS_DOCS };")(HttpError, () => clock, int, authorizeProject, credentialGate, db, getTextRange);
 }
 const M = load();
 const sha = (s) => createHash("sha256").update(s).digest("hex");

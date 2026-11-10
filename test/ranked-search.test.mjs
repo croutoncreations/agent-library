@@ -57,9 +57,17 @@ test('create/save/rename/trash/untrash/restore and bounded idempotent existing-d
  assert.equal((await search({query:'newsearchword'})).body.results.length,1);
  r=await owner.req('POST',`/api/projects/search-notes/artifacts/${id}/restore`,{from_revision:1,expected_revision:2});assert.equal(r.status,200,JSON.stringify(r.body));
  assert.equal((await search({query:'oldsearchword'})).body.results[0].revision,3);
+ // The SQL-only backfill is for legacy inline data. Convert these synthetic fixtures explicitly; the lifecycle
+ // above ran against R2 versions, and new writes below must still exercise the R2 bridge after backfill.
+ for(const pid of ['search-planning','search-notes','search-private']){
+  const backup=(await owner.req('GET',`/api/projects/${pid}/backup`)).body;
+  for(const rev of backup.revisions) if(rev.blob_key===null) await sql(`UPDATE revisions SET body='${rev.body.replace(/'/g,"''")}',body_key=NULL WHERE id='${rev.id}'`);
+ }
  await sql('DELETE FROM artifact_search;');assert.equal((await search({query:'oldsearchword'})).status,503);
  for(let pass=0;pass<2;pass++){let after=0;while(true){const x=(await sql(backfillSql(after,2))).at(-1).results[0];if(!x.processed)break;after=x.next_after_rowid;}}
  assert.equal((await search({query:'oldsearchword'})).body.results.length,1);
+ const afterBackfill=await create('search-notes','After backfill','freshbridgeword');
+ assert.equal((await search({query:'freshbridgeword'})).body.results[0].artifact_id,afterBackfill);
  const counts=(await sql('SELECT count(*) AS n,count(DISTINCT artifact_id) AS u FROM artifact_search;'))[0].results[0];assert.equal(counts.n,counts.u);
 });
 test('literal operators, Unicode, punctuation, HTML-like text and invalid inputs',async()=>{
@@ -73,6 +81,8 @@ test('literal operators, Unicode, punctuation, HTML-like text and invalid inputs
 test('OAuth searches multiple live projects; publisher tokens never gain general search',async()=>{
  const c=await server.connectMcpAgent({'search-planning':'read','search-notes':'read'});
  assert.ok((await c.list()).find(x=>x.name==='search_artifacts'));
+ const r2=await create('search-notes','OAuth R2 fixture','oauthbridgeword');
+ assert.equal((await c.call('search_artifacts',{query:'oauthbridgeword'})).data.results[0].artifact_id,r2);
  let r=await c.call('search_artifacts',{query:'annual subscriptions'});assert.equal(r.isError,false,JSON.stringify(r));assert.equal(new Set(r.data.results.map(x=>x.project_id)).size,2);
  r=await c.call('search_artifacts',{query:'annual',project_ids:['search-private']});assert.equal(r.isError,true);assert.equal(r.data.error.status,404);
  const app=await server.registerApp({display_name:'Synthetic search publisher',redirect_uris:['http://localhost:5173/callback'],origins:['http://localhost:5173']});
@@ -165,7 +175,7 @@ test('stale index revisions are excluded until repaired; HTML and CSV remain sou
  const id=await create('search-notes','Freshness check','freshnessneedle');
  await sql(`UPDATE artifact_search SET revision_id='stale_revision' WHERE artifact_id='${id}';`);
  assert.equal((await search({query:'freshnessneedle'})).status,503);
- await sql(`UPDATE artifacts SET title=title WHERE id='${id}';`);
+ assert.equal((await owner.req('PATCH',`/api/projects/search-notes/artifacts/${id}`,{expected_meta_version:1,title:'Freshness check'})).status,200);
  assert.equal((await search({query:'freshnessneedle'})).body.results.length,1);
  for(const [kind,body] of [['html','<h1>formatneedle</h1>'],['csv','name\nformatneedle\n']]){
  const made=await owner.req('POST','/api/projects/search-notes/artifacts',{kind,title:'Format fixture '+kind,body,content:body});assert.equal(made.status,201,JSON.stringify(made.body));
@@ -207,6 +217,18 @@ test('stable search keys survive artifacts rowid reassignment and later updates'
  assert.equal((await search({query:'stablekeyneedle'})).body.results[0].artifact_id,id);
  assert.equal((await owner.req('PUT',`/api/projects/search-notes/artifacts/${id}`,{expected_revision:1,body:'stablekeysecondneedle'})).status,200);
  assert.equal((await search({query:'stablekeysecondneedle'})).body.results[0].revision,2);
+});
+
+test('known gap: SQL-only backfill retains R2 title matching but loses body matching until a save',async()=>{
+ const id=await create('search-notes','Gapfixturetitle','gapfixturebody');
+ assert.equal((await search({query:'gapfixturebody'})).body.results[0].artifact_id,id);
+ const row=(await sql(`SELECT rowid AS n FROM artifacts WHERE id='${id}'`))[0].results[0].n;
+ await sql(backfillSql(row-1,1));
+ assert.equal((await search({query:'Gapfixturetitle'})).body.results[0].artifact_id,id);
+ assert.equal((await search({query:'gapfixturebody'})).body.results.length,0);
+ assert.equal((await owner.req('GET','/api/search/status')).body.ready,true);
+ assert.equal((await owner.req('PUT',`/api/projects/search-notes/artifacts/${id}`,{expected_revision:1,body:'gapfixturebody'})).status,200);
+ assert.equal((await search({query:'gapfixturebody'})).body.results[0].artifact_id,id);
 });
 
 test('standalone backfill resolves the pinned local Wrangler without global Wrangler in PATH',async()=>{

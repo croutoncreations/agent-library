@@ -82,11 +82,6 @@ function rtEncodedSize(result, mcp, idBytes) {
   const enc = new TextEncoder(), j = JSON.stringify(result);
   return mcp ? enc.encode(JSON.stringify(j)).length + enc.encode(j).length + RT_RPC_FIXED + idBytes : enc.encode(j).length;
 }
-function rtHexBytes(hx) {
-  const out = new Uint8Array(hx.length >> 1);
-  for (let i = 0; i < out.length; i++) out[i] = parseInt(hx.substr(i * 2, 2), 16);
-  return out;
-}
 // Query-string options for the HTTP routes (?revision=&cursor=&max_bytes=).
 function rtQuery(sp) {
   const n = (k) => sp.get(k) === null ? void 0 : Number(sp.get(k));

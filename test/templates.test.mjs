@@ -186,10 +186,12 @@ test('concurrent identical requests yield one revision, provenance, audit and id
 
 test('transaction failure rolls back artifacts/revision/audit/idempotency; quota leaves no orphan and allows retry', async () => {
   const idem = key(); const args = use({ title: 'Failure fixture' });
-  await sql("CREATE TRIGGER fail_template_test BEFORE INSERT ON revisions WHEN NEW.body LIKE '# Failure fixture%' BEGIN SELECT RAISE(ABORT, 'synthetic transaction failure'); END");
+  await sql("CREATE TRIGGER fail_template_test BEFORE INSERT ON revisions WHEN EXISTS (SELECT 1 FROM artifacts WHERE id = NEW.artifact_id AND title = 'Failure fixture') BEGIN SELECT RAISE(ABORT, 'synthetic transaction failure'); END");
   assert.equal((await api('POST', `/projects/${P}/files/from-template`, args, apiKey, idem)).status, 409);
   assert.equal((await sql("SELECT COUNT(*) AS n FROM artifacts WHERE title='Failure fixture'"))[0].n, 0);
   assert.equal((await sql(`SELECT COUNT(*) AS n FROM idempotency WHERE key='${idem}'`))[0].n, 0);
+  // The generic constraint failure is deliberately treated as uncertain: durable intent retains the R2 cleanup backstop.
+  assert.equal((await sql(`SELECT COUNT(*) AS n FROM content_writes WHERE project_id='${P}'`))[0].n, 1);
   await sql('DROP TRIGGER fail_template_test');
   assert.equal((await api('POST', `/projects/${P}/files/from-template`, args, apiKey, idem)).status, 201);
   const [{ n }] = await sql(`SELECT COUNT(*) AS n FROM artifacts WHERE project_id='${P}'`);

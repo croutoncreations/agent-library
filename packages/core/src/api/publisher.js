@@ -1,4 +1,5 @@
-import { getText, storeText } from "../content-store.js";
+import { commitTextWrites, getText, stageTextWrite, storeText, textWriteComplete } from "../content-store.js";
+import { textSearchBridge } from "../search/service.js";
 import { agentRate, authzSql, rateLimit } from "../auth.js";
 import { CONTENT_TYPE, MIME, byteLength, checkFile } from "../formats.js";
 import { appOrigin, artifactWebUrl, previewWebUrl } from "../links.js";
@@ -758,7 +759,9 @@ async function commitSnapshot(env, p, req, requestId) {
   const gp = [p.id, snapshotId];
   await testPause(env, req);
   const outFiles = [];
-  const writeFile = (name, kind, schema, content, sha, size) => {
+  const textKeys = [];
+  const bridges = [];
+  const writeFile = async (name, kind, schema, content, sha, size) => {
     const ex = byName.get(name);
     const artId = ex?.id ?? randomId("art");
     const nextRev = (ex?.head_rev ?? 0) + 1;
@@ -769,12 +772,15 @@ async function commitSnapshot(env, p, req, requestId) {
     } else {
       stmts.push(env.DB.prepare(`UPDATE artifacts SET head_rev = ?, head_revision_id = ?, updated_at = ? WHERE id = ? AND head_rev = ? AND trashed_at IS NULL AND ${gate}`).bind(nextRev, revId, now, artId, ex.head_rev, ...gp));
     }
-    stmts.push(env.DB.prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, size, sha256, mime, created_at, via_kind, via_id, via_label)
-      SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'publisher', ?, ? WHERE ${gate} AND EXISTS (SELECT 1 FROM artifacts WHERE id = ? AND head_revision_id = ?)`).bind(revId, artId, p.project_id, nextRev, p.principal_id, storeText(content), size, sha, MIME[kind], now, p.id, String(p.display_name ?? "").slice(0, 120) || null, ...gp, artId, revId));
+    const bodyKey = await stageTextWrite(env, p.project_id, artId, revId, content);
+    textKeys.push(bodyKey);
+    bridges.push(textSearchBridge(env, artId, revId, content), textWriteComplete(env, bodyKey));
+    stmts.push(env.DB.prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, body_key, size, sha256, mime, created_at, via_kind, via_id, via_label)
+      SELECT ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, 'publisher', ?, ? WHERE ${gate} AND EXISTS (SELECT 1 FROM artifacts WHERE id = ? AND head_revision_id = ?)`).bind(revId, artId, p.project_id, nextRev, p.principal_id, bodyKey, size, sha, MIME[kind], now, p.id, String(p.display_name ?? "").slice(0, 120) || null, ...gp, artId, revId));
     return { artId, nextRev };
   };
   for (const c of checked) {
-    const w = writeFile(c.name, c.kind, c.schema, c.content, c.sha256, c.size);
+    const w = await writeFile(c.name, c.kind, c.schema, c.content, c.sha256, c.size);
     outFiles.push({
       name: c.name,
       file_id: w.artId,
@@ -801,7 +807,7 @@ async function commitSnapshot(env, p, req, requestId) {
   };
   const manifestText = JSON.stringify(manifestDoc, null, 2) + "\n";
   const manSha = await sha256Hex(manifestText);
-  const mw = writeFile(MANIFEST, "json", null, manifestText, manSha, byteLength(manifestText));
+  const mw = await writeFile(MANIFEST, "json", null, manifestText, manSha, byteLength(manifestText));
   const row = {
     id: snapshotId,
     publisher_id: p.id,
@@ -821,7 +827,7 @@ async function commitSnapshot(env, p, req, requestId) {
   stmts.push(env.DB.prepare(`INSERT INTO audits (at, actor_id, project_id, action, object_id, rev_no, result, request_id) SELECT ?, ?, ?, 'snapshot.commit', ?, ?, 'ok', ? WHERE ${gate}`).bind(now, p.principal_id, p.project_id, snapshotId, snap.source_revision, requestId, ...gp));
   let res;
   try {
-    res = await env.DB.batch(stmts);
+    res = await commitTextWrites(env, textKeys, (guarded) => env.DB.batch(guarded([...stmts, ...bridges])));
   } catch (e) {
     const replay = await idemLookup(ctx, i).catch(() => null);
     if (replay) return replay;

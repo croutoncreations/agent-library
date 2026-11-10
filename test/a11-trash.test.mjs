@@ -30,7 +30,7 @@ test("agent trashes via MCP; hidden from list, read and content", async () => {
   assert.equal(t.isError, false, JSON.stringify(t.data));
   assert.equal(t.data.trashed, true);
   assert.equal((await A("GET", `/api/projects/${P}/artifacts`)).body.artifacts.length, 0);
-  assert.equal((await A("GET", `/api/projects/${P}/artifacts?q=second`)).body.artifacts.length, 0);
+  assert.equal((await A("GET", `/api/projects/${P}/artifacts?q=trash`)).body.artifacts.length, 0);
   assert.equal((await A("GET", `/api/projects/${P}/artifacts/${aid}`)).status, 404);
   assert.equal((await A("GET", `/api/projects/${P}/artifacts/${aid}/content`)).status, 404);
   const r = await mA.call("read_artifact", { project_id: P, artifact_id: aid });

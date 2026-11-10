@@ -1,7 +1,25 @@
+import { getText } from "../content-store.js";
 import { appOrigin, artifactWebUrl, previewWebUrl } from "../links.js";
 import { appConnectEnabled, db, rtReadAuthzSql } from "../service.js";
 import { HttpError, nowMs, sha256Hex } from "../util.js";
 import { addressLinks, resolveProjectRef } from "../paths.js";
+
+/** Temporary plaintext FTS bridge for R2 text heads, until the blind index replaces it. */
+export function textSearchBridge(env, artifactId, revisionId, text) {
+  return env.DB.prepare(`UPDATE artifact_search SET body = ? WHERE rowid =
+    (SELECT search_id FROM artifact_search_keys WHERE artifact_id = ?) AND revision_id = ?
+    AND EXISTS (SELECT 1 FROM artifacts WHERE id = ? AND head_revision_id = ?)`)
+    .bind(text, artifactId, revisionId, artifactId, revisionId);
+}
+
+/** Metadata triggers rebuild FTS from the legacy column; restore its R2 body without overwriting a newer head. */
+export async function refreshTextSearch(env, artifactId) {
+  try {
+    const row = await env.DB.prepare(`SELECT r.* FROM artifacts a JOIN revisions r ON r.id = a.head_revision_id
+      WHERE a.id = ? AND a.trashed_at IS NULL AND r.blob_key IS NULL AND r.body_key IS NOT NULL`).bind(artifactId).first();
+    if (row) await textSearchBridge(env, artifactId, row.id, await getText(env, row)).run();
+  } catch { console.error(JSON.stringify({ event: "text_search_refresh_failed" })); }
+}
 
 // Ranked lexical search. See docs/ranked-search.md for semantics, rollout and live pagination.
 const RS_SCHEMA = { type: "object", additionalProperties: false, required: ["query"], properties: {

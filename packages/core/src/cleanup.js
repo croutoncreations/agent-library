@@ -1,4 +1,4 @@
-import { deleteBlob } from "./content-store.js";
+import { deleteBlob, TEXT_WRITE_STALE_MS } from "./content-store.js";
 import { limitsFor } from "./auth.js";
 import { nowMs } from "./util.js";
 
@@ -56,6 +56,7 @@ async function reconcileUploads(env, opts = {}) {
     console.error(JSON.stringify({ event: "placeholder_cleanup_failed" }));
     return 0;
   });
+  await sweepContentWrites(env, { projectId: opts.projectId, limit });
   // rate_counters.win is a minute number. Only past windows are deleted: longer counters (hosted daily email caps) use
   // the minute their period ends, so keep this "older than" and never delete future windows.
   await DB.prepare("DELETE FROM rate_counters WHERE win < ?").bind(Math.floor(now / 6e4) - 2).run();
@@ -128,6 +129,19 @@ async function pruneExpiredRows(env, { batch = PRUNE_BATCH } = {}) {
   out.audits = keep > 0 ? (await del("audits", "at", new Date(now - keep * day).toISOString())).meta.changes ?? 0 : 0;
   for (const [table, n] of Object.entries(out)) if (n >= batch) console.warn(JSON.stringify({ event: "retention_cleanup_batch_full", table, deleted: n, limit: batch }));
   return out;
+}
+
+// The one-hour sweep age exceeds the ten-minute SQL publication deadline. A reclaimed intent cannot publish,
+// even if its R2 put is still in flight. Failed deletes leave the intent for a later run.
+async function sweepContentWrites(env, { projectId, limit = 50 } = {}) {
+  const cutoff = nowMs() - TEXT_WRITE_STALE_MS;
+  const rows = await env.DB.prepare(`SELECT key FROM content_writes WHERE created_at < ?${projectId ? " AND project_id = ?" : ""} ORDER BY created_at LIMIT ?`)
+    .bind(cutoff, ...projectId ? [projectId] : [], limit).all();
+  for (const { key } of rows.results) {
+    const referenced = await env.DB.prepare("SELECT 1 FROM revisions WHERE body_key = ? UNION ALL SELECT 1 FROM comments WHERE body_key = ? LIMIT 1").bind(key, key).first();
+    if (!referenced) await deleteBlob(env, key);
+    await env.DB.prepare("DELETE FROM content_writes WHERE key = ? AND created_at < ?").bind(key, cutoff).run();
+  }
 }
 
 export { PUT_MARGIN_MS, pruneExpiredRows, reconcileUploads, staleWritesBefore };

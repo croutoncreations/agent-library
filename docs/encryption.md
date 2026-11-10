@@ -21,23 +21,42 @@ touches `env.BLOBS`. Per-workspace envelope encryption replaces those functions 
 Objects are immutable and keyed per version, so existing objects can be re-encrypted in the background by writing a
 new key and updating the revision's `blob_key` in a revision-guarded statement.
 
-## Text stored inline in D1
+## Text versions and inline compatibility
 
-Markdown, HTML, JSON and CSV bodies live in `revisions.body`; comments in `comments.body`. JavaScript writes bind
-`storeText(text)` and JavaScript reads of a selected body go through `readText(stored)` (both in
-`packages/core/src/content-store.js`). `test/content-store.test.mjs` checks this two ways: a static check that every `INSERT` of a
-body binds `storeText` (or is a marked SQL-side copy), and a run of the main write and read paths (documents,
-comments, history, restore, templates, JSON files and records, backup export and restore) with a marker codec in
-place of the two functions. Reads on paths outside that run are not checked mechanically yet.
+New Markdown, HTML, JSON and CSV versions live in immutable R2 objects at `text/{project}/{artifact}/{revision}`.
+D1 keeps `revisions.body = NULL` and `body_key` names the object. All JavaScript version reads use `getText` or
+`getTextRange`, which fall back to legacy inline bodies. Ranges return raw bytes, including partial UTF-8 sequences;
+chunked readers choose character boundaries only after fetching the bytes. Text writes record a `content_writes`
+intent before `putText`; the revision batch clears it. No encryption codec is enabled yet, and the text limit remains
+1 MiB.
+
+### Text write deadline and orphan safety
+
+Every text publication batch begins with a shared SQL assertion: every intent key must still exist and be no older
+than ten minutes, measured immediately before the batch. A missing or expired intent deliberately violates the
+`content_writes` NOT NULL constraint, rolling back the entire batch (including metadata), and becomes a retryable
+`503 text_write_expired`. The cron sweeps intents older than one hour, deleting unreferenced R2 objects before their
+rows. The fifty-minute gap prevents a reclaimed intent from publishing, even if an R2 put outlives its request.
+Referenced keys are never deleted. Best-effort conflict cleanup retains the intent if deleting the object fails;
+unknown batch errors retain bytes because the transaction may have committed despite a lost acknowledgement.
+
+One leak remains: if a put lands after the sweep deleted its intent, and the Worker dies before best-effort cleanup,
+the late unreferenced object has no intent left for another sweep. It can never publish; project purge sweeps the
+text prefix. Multi-put imports and snapshots remain sequential: an operation taking over ten minutes expires its
+early intents and rolls back atomically rather than publishing partial data.
+
+Comments remain inline through `storeText`/`readText`. Publisher generation commits also remain inline until a later
+slice. `test/content-store.test.mjs` checks NULL revision inserts (with explicit generation exceptions), restricts R2
+binding access to the seam, and exercises main body paths with a marker codec. `test/text-r2.test.mjs` covers R2 and
+legacy reads, byte ranges, conflicts, orphan cleanup, search and backup round trips.
 
 Some features also read the body **inside SQL**, which a JavaScript codec can't reach. These need their own change
 when text encryption is built:
 
 | Where | What reads the body in SQL |
 |---|---|
-| `migrations/0014_ranked_search.sql` triggers, `packages/core/src/search/service.js` | FTS5 index of title and body |
-| `packages/core/src/reads/service.js` | byte-range `substr` of the body for chunked reads |
-| `packages/core/src/service.js` (`listArtifacts`) | owner `LIKE` filter over the head body |
+| `migrations/0014_ranked_search.sql` triggers, `packages/core/src/search/service.js` | FTS5 index of title and body; temporary plaintext R2 bridge refreshed after version and metadata writes |
+| `packages/core/src/service.js` (`listArtifacts`) | owner `LIKE` filter over the legacy head body (R2 versions match titles only until blind search) |
 | `packages/core/src/api/publisher.js` | generation commit copies staged part bodies into revisions with `INSERT … SELECT` (marked `content-store: sql-side`) and refreshes the search index from them; `json_extract` over staged parts |
 | `publisher_generation_parts.body` | staged App Connect parts are plaintext in D1 from upload until commit (then cleared) |
 

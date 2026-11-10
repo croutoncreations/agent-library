@@ -1,4 +1,5 @@
-import { getText, storeText } from "../content-store.js";
+import { commitTextWrites, getText, stageTextWrite, textWriteComplete } from "../content-store.js";
+import { textSearchBridge } from "../search/service.js";
 import { authorizeProject, authzSql, requireHuman } from "../auth.js";
 import { provenance } from "../history/service.js";
 import { appOrigin, artifactWebUrl, previewWebUrl } from "../links.js";
@@ -94,17 +95,19 @@ async function tplCopy(ctx, projectId, input, key, definition = false) {
   const ownGate = "EXISTS (SELECT 1 FROM idempotency WHERE principal_id = ? AND project_id = ? AND op = ? AND key = ? AND response = ?)";
   const ownParams = [ctx.principal.id, projectId, i.op, key, JSON.stringify(result.body)];
   const created = "EXISTS (SELECT 1 FROM artifacts WHERE id = ?)";
-  const out = await runBatch(ctx, [
+  const bodyKey = await stageTextWrite(ctx.env, projectId, id, rid, body);
+  const out = await commitTextWrites(ctx.env, [bodyKey], (guarded) => runBatch(ctx, guarded([
     idemInsert(ctx, i, 201, result.body, gate, gp),
     db(ctx).prepare(`INSERT INTO artifacts (id, project_id, kind, title, folder, folder_id, head_rev, head_revision_id, created_at, updated_at,
       is_template, template_description, source_artifact_id, source_revision, source_role, template_date)
       SELECT ?, ?, 'markdown', ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${ownGate}`)
       .bind(id, projectId, title, folder, folderId, rid, now, now, definition ? 1 : 0, description, sourceId, revision, definition ? "document" : "template", date, ...ownParams),
-    db(ctx).prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, size, sha256, mime, created_at, via_kind, via_id, via_label, client_info, change_note)
-      SELECT ?, ?, ?, 1, ?, ?, ?, ?, 'text/markdown', ?, ?, ?, ?, ?, ? WHERE ${created}`)
-      .bind(rid, id, projectId, ctx.principal.id, storeText(body), new TextEncoder().encode(body).length, hash, now, ...provenance(ctx, { change_note: note }), id),
-    audit(ctx, projectId, definition ? "template.create" : "template.use", id, 1, "ok", created, [id])
-  ], i);
+    db(ctx).prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, body_key, size, sha256, mime, created_at, via_kind, via_id, via_label, client_info, change_note)
+      SELECT ?, ?, ?, 1, ?, NULL, ?, ?, ?, 'text/markdown', ?, ?, ?, ?, ?, ? WHERE ${created}`)
+      .bind(rid, id, projectId, ctx.principal.id, bodyKey, new TextEncoder().encode(body).length, hash, now, ...provenance(ctx, { change_note: note }), id),
+    audit(ctx, projectId, definition ? "template.create" : "template.use", id, 1, "ok", created, [id]),
+    textSearchBridge(ctx.env, id, rid, body), textWriteComplete(ctx.env, bodyKey)
+  ]), i));
   if (!Array.isArray(out)) return out;
   if (!out[1].meta.changes) {
     const replay = await idemLookup(ctx, i); if (replay) return replay;
