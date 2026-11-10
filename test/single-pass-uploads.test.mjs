@@ -87,6 +87,22 @@ test("Content-Length other than the declared size is refused before any R2 write
   assert.equal((await raw(PNG)).status, 200);
 });
 
+// F2: final_key is set at begin, so a terminal row matches both "staging not purged" and "final_key not purged".
+const quotaUsed = (w) => w.env.DB.prepare(`SELECT ${lib.quotaUsedSql(Date.now())} AS n`).bind(P).first("n");
+test("quota: one failed upload is charged exactly once (staging and final_key both unpurged), and old staging-only rows once", async () => {
+  const w = world();
+  const { id } = w.upload({ state: "failed", expiresAt: Date.now() - 1000 });
+  assert.deepEqual([w.row(id).staging_purged_at, w.row(id).final_purged_at], [null, null]);
+  assert.equal(await quotaUsed(w), PNG.length, "charged once");
+  // An old-Worker row: bytes at staging_key, no final_key.
+  const old = w.upload({ state: "failed", expiresAt: Date.now() - 1000 });
+  w.sql.prepare("UPDATE uploads SET final_key = NULL WHERE id = ?").run(old.id);
+  assert.equal(await quotaUsed(w), 2 * PNG.length, "the old row once too");
+  // Purged in R2: no longer charged.
+  w.sql.prepare("UPDATE uploads SET staging_purged_at = 1, final_purged_at = 1").run();
+  assert.equal(await quotaUsed(w), 0);
+});
+
 test("finish fails closed (500 publish_failed) when R2 recorded no SHA-256, and leaves final_key purgeable", async () => {
   const w = world();
   const id = await beginAs(w, PNG);

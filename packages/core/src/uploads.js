@@ -8,13 +8,15 @@ import { BINARY_TYPES, IMAGE_TYPES, VIDEO_TYPES, assertWritable, audit, idemLook
 import { HttpError, int, nowIso, nowMs, randomId, sha256Hex, str } from "./util.js";
 
 var db2 = /* @__PURE__ */ __name((ctx) => ctx.env.DB, "db");
+// Bytes charged to a project: published revisions, live reservations, and each ended (or expired) upload once while
+// any object it may have written is not yet deleted: its staging_key (written only by an older Worker, which a rollback
+// can bring back, so an unpurged one counts) or its final_key. One SUM with an OR, so a row is never charged twice.
 var quotaUsedSql = (now) => `(SELECT COALESCE(SUM(size),0) FROM revisions WHERE project_id = ?1 AND blob_key IS NOT NULL)
   + (SELECT COALESCE(SUM(expected_size),0) FROM uploads WHERE project_id = ?1
        AND (state IN ('receiving','sealed') OR (state IN ('pending','received') AND expires_at > ${Math.trunc(now)})))
-  + (SELECT COALESCE(SUM(expected_size),0) FROM uploads WHERE project_id = ?1 AND staging_purged_at IS NULL
-       AND (state IN ('failed','conflict') OR (state IN ('pending','received') AND expires_at <= ${Math.trunc(now)})))
-  + (SELECT COALESCE(SUM(expected_size),0) FROM uploads WHERE project_id = ?1 AND final_key IS NOT NULL AND final_purged_at IS NULL
-       AND state IN ('failed','conflict'))`;
+  + (SELECT COALESCE(SUM(expected_size),0) FROM uploads WHERE project_id = ?1
+       AND (state IN ('failed','conflict') OR (state IN ('pending','received') AND expires_at <= ${Math.trunc(now)}))
+       AND (staging_purged_at IS NULL OR (final_key IS NOT NULL AND final_purged_at IS NULL)))`;
 async function purgeStaging(env, u) {
   try {
     await deleteBlob(env, u.staging_key);
@@ -418,4 +420,4 @@ async function serveContent(ctx, req, projectId, artifactId, revParam) {
   return new Response(obj2.body, { status, headers });
 }
 
-export { serveContent, uploadBegin, uploadFinish, uploadPut };
+export { quotaUsedSql, serveContent, uploadBegin, uploadFinish, uploadPut };

@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { ROOT } from "./helpers.mjs";
 import { loadWorker } from "./load-worker.mjs";
 
-export const lib = await loadWorker({ "uploads.js": ["uploadBegin", "uploadFinish", "uploadPut"], "cleanup.js": ["reconcileUploads"], "adapters.js": ["withAdapters", "defaultAdapters"] });
+export const lib = await loadWorker({ "uploads.js": ["quotaUsedSql", "uploadBegin", "uploadFinish", "uploadPut"], "cleanup.js": ["reconcileUploads"], "adapters.js": ["withAdapters", "defaultAdapters"] });
 // The workerd stream class uploadPut uses, a minimal Node stand-in with workerd's messages: FixedLengthStream (errors
 // unless exactly n bytes).
 globalThis.FixedLengthStream ??= class extends TransformStream {
