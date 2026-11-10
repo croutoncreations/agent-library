@@ -1591,6 +1591,8 @@ async function uploadFile(pid, file, target, keys, status) {
     var put = await api("PUT", b.put_url, buf, { raw: true, headers: { "content-type": "application/octet-stream" } });
     if (!put.matches_declared) throw new Error("Server received bytes that do not match the declared size/hash");
   } catch (e) {
+    // integrity_mismatch ends the upload: forget the begin key so a retry starts a new upload.
+    if (e && e.code === "integrity_mismatch") keys.fp = null;
     // A retried begin can return an upload whose bytes already arrived; finish will verify.
     if (!(e && e.status === 409 && e.code === "upload_not_writable")) throw e;
   }

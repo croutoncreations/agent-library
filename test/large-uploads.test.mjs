@@ -90,15 +90,17 @@ test("declared image/png with random bytes still fails 415 signature_mismatch", 
   assert.equal(f.body.error.code, "signature_mismatch");
 });
 
-test("one tampered byte fails 422 integrity_mismatch at PUT; the correct bytes then publish", async () => {
+test("one tampered byte fails 422 integrity_mismatch at PUT and ends the upload; a new upload of the correct bytes publishes", async () => {
   const bytes = pngLike(8 * MiB);
   const b = await begin("tampered", "image/png", bytes.length, sha256(bytes));
   const evil = Buffer.from(bytes); evil[6 * MiB] ^= 0xff;
   const p = await put(b.body.put_url, evil);
   assert.equal(p.status, 422);
   assert.equal(p.body.error.code, "integrity_mismatch");
-  assert.equal((await put(b.body.put_url, bytes)).status, 200);
-  assert.equal((await finish(b.body.upload_id)).status, 200);
+  assert.equal((await finish(b.body.upload_id)).status, 422, "finish replays the 422 (re-PUT 409: single-pass-uploads, a6)");
+  const b2 = await begin("tampered", "image/png", bytes.length, sha256(bytes));
+  assert.equal((await put(b2.body.put_url, bytes)).status, 200);
+  assert.equal((await finish(b2.body.upload_id)).status, 200);
 });
 
 test("a file over the configured limit is refused 413 at begin", async () => {

@@ -559,7 +559,7 @@ function ftToolsFor(env, conn) {
     upload_begin: {
       name: "upload_begin",
       title: "Upload a file",
-      description: `Start uploading a new file (pass title) or a new version of a file (pass artifact_id and expected_revision; revision_conflict if it is stale). Allowed: PNG, JPEG, WebP, GIF, PDF, MP4, WebM or other binary (application/octet-stream, download-only), up to the workspace plan's file size limit (too_large says it; never more than ${FILE_BYTES_CEILING / 1048576} MiB). Declare the exact size and SHA-256 of the bytes. Then HTTP PUT the raw bytes to the returned put_url (single-use upload link, expires in minutes) and call upload_finish. If you cannot make HTTP requests, use upload_file instead (up to ${FT_INLINE_UPLOAD_BYTES / 1048576} MiB). Each version is kept; always set change_note to why.`,
+      description: `Start uploading a new file (pass title) or a new version of a file (pass artifact_id and expected_revision; revision_conflict if it is stale). Allowed: PNG, JPEG, WebP, GIF, PDF, MP4, WebM or other binary (application/octet-stream, download-only), up to the workspace plan's file size limit (too_large says it; never more than ${FILE_BYTES_CEILING / 1048576} MiB). Declare the exact size and SHA-256 of the bytes. Then HTTP PUT the raw bytes to the returned put_url (single-use upload link, expires in minutes) and call upload_finish. If the PUT answers 422 integrity_mismatch, this upload has ended: call upload_begin again with a new idempotency_key. If you cannot make HTTP requests, use upload_file instead (up to ${FT_INLINE_UPLOAD_BYTES / 1048576} MiB). Each version is kept; always set change_note to why.`,
       inputSchema: S({
         project_id: P,
         title: { type: "string", minLength: 1, maxLength: 200, description: "Title of a new file" },
@@ -598,7 +598,7 @@ function ftToolsFor(env, conn) {
     upload_finish: {
       name: "upload_finish",
       title: "Finish upload",
-      description: "Finish an upload after the PUT (the PUT itself refuses bytes whose size or SHA-256 differ from upload_begin: 422 integrity_mismatch, 400 incomplete_body or 413; PUT the whole file again): checks the file type, then publishes exactly one new version (shown in History with your change_note). Safe to retry; returns artifact_id, revision and web_url (for the user's browser).",
+      description: "Finish an upload after the PUT (the PUT itself refuses bytes whose size or SHA-256 differ from upload_begin: on 400 incomplete_body or 413 PUT the whole file again; on 422 integrity_mismatch the upload has ended, and finish returns the same 422, so start a new upload_begin): checks the file type, then publishes exactly one new version (shown in History with your change_note). Safe to retry; returns artifact_id, revision and web_url (for the user's browser).",
       inputSchema: S({ project_id: P, upload_id: { type: "string", maxLength: 64 }, idempotency_key: K }, ["upload_id", "idempotency_key"]),
       annotations: RW,
       write: true,

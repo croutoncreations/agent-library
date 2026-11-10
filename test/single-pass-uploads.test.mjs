@@ -26,6 +26,7 @@ async function beginAs(w, bytes, sha = SHA) {
   assert.equal(b.status, 201, JSON.stringify(b.body));
   return b.body.upload_id;
 }
+const quotaUsed = (w) => w.env.DB.prepare(`SELECT ${lib.quotaUsedSql(Date.now())} AS n`).bind(P).first("n");
 function spy(w) {
   const calls = { put: [], get: [], head: [] };
   const { put, get, head } = w.env.BLOBS;
@@ -56,16 +57,23 @@ test("begin -> PUT -> finish: one R2 put (to final_key, with sha256), no full ge
   assert.equal(w.row(id).state, "published");
 });
 
-test("wrong bytes at the right length: 422 integrity_mismatch, nothing stored, back to pending; a correct re-PUT publishes", async () => {
+test("wrong bytes at the right length: 422 integrity_mismatch ends the upload; re-PUT 409, finish replays 422, a new begin succeeds", async () => {
   const w = world();
   const id = await beginAs(w, PNG);
   const key = w.row(id).final_key;
   const evil = Buffer.from(PNG); evil[PNG.length - 3] ^= 0xff;
   await assert.rejects(w.put(id, evil), (e) => e.status === 422 && e.code === "integrity_mismatch");
   assert.equal(w.blobs.has(key), false, "nothing at final_key");
-  assert.deepEqual([w.row(id).state, w.row(id).final_writes], ["pending", 0]);
-  assert.equal((await w.put(id, PNG)).status, 200);
-  const f = await lib.uploadFinish(w.ctx, P, id, "finish-retry");
+  const row = w.row(id);
+  assert.deepEqual([row.state, row.final_writes, JSON.parse(row.result).code], ["failed", 0, "integrity_mismatch"]);
+  assert.ok(row.final_purged_at > 0 && row.staging_purged_at > 0, "nothing stored, so nothing left to purge");
+  assert.equal(await quotaUsed(w), 0, "quota freed at once");
+  await assert.rejects(w.put(id, PNG), (e) => e.status === 409 && e.code === "upload_not_writable");
+  await assert.rejects(lib.uploadFinish(w.ctx, P, id, "finish-after-422"), (e) => e.status === 422 && e.code === "integrity_mismatch");
+  // The identity's one upload slot is free again.
+  const again = await beginAs(w, PNG);
+  assert.equal((await w.put(again, PNG)).status, 200);
+  const f = await lib.uploadFinish(w.ctx, P, again, "finish-new");
   assert.equal(f.status, 200);
   assert.equal(f.body.sha256, SHA);
 });
@@ -88,7 +96,6 @@ test("Content-Length other than the declared size is refused before any R2 write
 });
 
 // F2: final_key is set at begin, so a terminal row matches both "staging not purged" and "final_key not purged".
-const quotaUsed = (w) => w.env.DB.prepare(`SELECT ${lib.quotaUsedSql(Date.now())} AS n`).bind(P).first("n");
 test("quota: one failed upload is charged exactly once (staging and final_key both unpurged), and old staging-only rows once", async () => {
   const w = world();
   const { id } = w.upload({ state: "failed", expiresAt: Date.now() - 1000 });
@@ -147,17 +154,22 @@ const begin = (title, size, digest) => A("POST", `/api/projects/${E}/uploads`, {
 const putHttp = (url, body) => A("PUT", url, undefined, { raw: body, headers: { "content-type": "application/octet-stream" } });
 const finish = (id) => A("POST", `/api/projects/${E}/uploads/${id}/finish`);
 
-test("local R2: wrong bytes at the right length are refused 422 at PUT; a correct re-PUT publishes", async () => {
+test("local R2: wrong bytes at the right length are refused 422 at PUT and end the upload; a new begin publishes", async () => {
   const bytes = pngLike(2 * MiB);
   const b = await begin("tampered", bytes.length, sha256(bytes));
   const evil = Buffer.from(bytes); evil[MiB] ^= 0xff;
   const bad = await putHttp(b.body.put_url, evil);
   assert.equal(bad.status, 422, JSON.stringify(bad.body));
   assert.equal(bad.body.error.code, "integrity_mismatch");
-  assert.equal((await finish(b.body.upload_id)).status, 409, "nothing received, so finish refuses");
-  const ok = await putHttp(b.body.put_url, bytes);
+  // (Re-PUT 409 is checked in the unit test above and in a6: local wrangler answers the request after a refused, unread
+  // multi-MiB body with 503 "worker restarted mid-request".)
+  const f1 = await finish(b.body.upload_id);
+  assert.deepEqual([f1.status, f1.body?.error?.code], [422, "integrity_mismatch"], JSON.stringify(f1.body));
+  const b2 = await begin("tampered", bytes.length, sha256(bytes));
+  assert.equal(b2.status, 201, JSON.stringify(b2.body));
+  const ok = await putHttp(b2.body.put_url, bytes);
   assert.equal(ok.status, 200, JSON.stringify(ok.body));
-  const f = await finish(b.body.upload_id);
+  const f = await finish(b2.body.upload_id);
   assert.equal(f.status, 200, JSON.stringify(f.body));
   assert.equal(f.body.sha256, sha256(bytes));
 });

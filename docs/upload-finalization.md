@@ -10,9 +10,11 @@ file passes through the Worker once:
 - `uploadPut` refuses a `Content-Length` other than the declared size before writing (`413` longer, `400
   incomplete_body` shorter). It claims the upload (`pending → receiving`) and registers the write
   (`final_writes + 1`) in one statement, then pipes the body through `FixedLengthStream(expected_size)` into
-  `R2.put(final_key, { sha256: expected_sha256 })`. R2 stores nothing if the length or the SHA-256 is wrong: `422
-  integrity_mismatch`, `400 incomplete_body` or `413`, and the upload goes back to `pending` so the whole file can be
-  PUT again. `final_writes - 1` runs when the put settles. On success it records R2's `size` and `checksums.sha256`.
+  `R2.put(final_key, { sha256: expected_sha256 })`. R2 stores nothing if the length or the SHA-256 is wrong. On `400
+  incomplete_body` or `413` the upload goes back to `pending` so the whole file can be PUT again. On `422
+  integrity_mismatch` the same guarded update (`state = 'receiving'`) ends it `failed` with that result: finish replays
+  the 422, a re-PUT gets `409`, and the identity's upload slot and the quota are freed at once (nothing was stored).
+  Start again with a new `upload_begin`. `final_writes - 1` runs when the put settles. On success it records R2's `size` and `checksums.sha256`.
   Each PUT has a deadline: the body is aborted at the upload's `expires_at`, and the put is abandoned at `expires_at +
   PUT_MARGIN_MS` (60 s; `410 upload_expired`), so no put commits later than that.
 - `uploadFinish` writes nothing. Under its lease it checks `head(final_key)` (size equals the declaration and the

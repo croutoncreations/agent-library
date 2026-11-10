@@ -158,7 +158,7 @@ test("expired upload with received bytes: counted until deleted, then R2 object 
   assert.deepEqual([r3.body.purged_staging, r3.body.purged_final], [0, 0], JSON.stringify([r2.body, r3.body]));
 });
 
-test("integrity failure at PUT stores nothing", async () => {
+test("integrity failure at PUT stores nothing and ends the upload", async () => {
   const A = agent(tokA);
   const b = pngOf(1000);
   const begin = await A("POST", `/api/projects/${P}/uploads`, { title: "bad", mime: "image/png", size: b.length, sha256: "0".repeat(64) });
@@ -167,10 +167,9 @@ test("integrity failure at PUT stores nothing", async () => {
   assert.equal(put.status, 422, JSON.stringify(put.body));
   assert.equal(put.body.error.code, "integrity_mismatch");
   const row = d1(`SELECT state, final_writes, final_key, staging_key FROM uploads WHERE id = '${begin.body.upload_id}'`)[0];
-  assert.deepEqual([row.state, row.final_writes], ["pending", 0]);
+  assert.deepEqual([row.state, row.final_writes], ["failed", 0], "the upload ends, freeing this identity's slot");
   assert.equal(await r2Has(row.final_key), false);
   assert.equal(await r2Has(row.staging_key), false);
-  await sleep(2500); // let the reservation expire so this identity can begin again below
 });
 
 test("failed-but-undeleted bytes are quota-charged; space is freed only by a real R2 delete", async () => {

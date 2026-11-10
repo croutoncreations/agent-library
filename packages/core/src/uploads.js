@@ -24,6 +24,15 @@ async function purgeStaging(env, u) {
   } catch {
   }
 }
+// An object this upload wrote that no revision references. Deleted only when the upload is terminal (so no new write
+// can start) and no write is in flight (so none can re-create it afterwards); otherwise cleanup purges it once the last
+// write settles. Absent is harmless (R2 delete of a missing key is a no-op).
+async function dropUnpublished(env, uploadId, finalKey) {
+  const idle = await env.DB.prepare("SELECT 1 AS x FROM uploads u WHERE id = ? AND state IN ('failed','conflict') AND final_writes = 0 AND final_purged_at IS NULL AND NOT EXISTS (SELECT 1 FROM revisions r WHERE r.blob_key = u.final_key)").bind(uploadId).first("x");
+  if (!idle) return;
+  await deleteBlob(env, finalKey);
+  await env.DB.prepare("UPDATE uploads SET final_purged_at = ? WHERE id = ? AND final_purged_at IS NULL").bind(nowMs(), uploadId).run();
+}
 // The immutable R2 key of an upload's bytes, which the revision publishing them references.
 var finalKeyFor = (projectId, artifactId) => `blobs/${projectId}/${artifactId}/${randomId("rev")}`;
 async function uploadBegin(ctx, projectId, input, key) {
@@ -153,7 +162,7 @@ async function uploadPut(req, env, requestId, uploadId, linkCtx) {
     } catch (e) {
       if (timedOut) throw expired();
       const m = String(e?.message ?? e);
-      if (/SHA-256 checksum you specified did not match|10037/.test(m)) throw new HttpError(422, "integrity_mismatch", "The body's SHA-256 does not match the declared sha256; PUT the whole file again");
+      if (/SHA-256 checksum you specified did not match|10037/.test(m)) throw new HttpError(422, "integrity_mismatch", "The body's SHA-256 does not match the declared sha256; this upload has ended, start a new one with upload_begin");
       if (/too many bytes/i.test(m)) throw new HttpError(413, "too_large", "Body exceeds declared size");
       if (/did not see all expected bytes/i.test(m)) throw new HttpError(400, "incomplete_body", "Body ended before the declared size; PUT the whole file again");
       throw e;
@@ -178,6 +187,18 @@ async function uploadPut(req, env, requestId, uploadId, linkCtx) {
       headers: { "content-type": "application/json", "cache-control": "private, no-store" }
     });
   } catch (e) {
+    // The declared SHA-256 can't match on any retry of these bytes: end the upload so finish replays the 422 and a new
+    // upload_begin can start. Nothing was stored, so the slot and quota are freed at once. 400 and 413 stay retryable.
+    if (e instanceof HttpError && e.code === "integrity_mismatch") {
+      const failed = await env.DB.prepare("UPDATE uploads SET state = 'failed', result = ? WHERE id = ? AND state = 'receiving'")
+        .bind(JSON.stringify({ status: e.status, code: e.code, message: e.message }), uploadId).run();
+      if (failed.meta.changes) {
+        await audit(ctx, u.project_id, "upload.put", u.artifact_id, null, "failed:" + e.code).run();
+        await dropUnpublished(env, uploadId, finalKey);
+        await purgeStaging(env, u);
+      }
+      throw e;
+    }
     await env.DB.prepare("UPDATE uploads SET state = 'pending' WHERE id = ? AND state = 'receiving'").bind(uploadId).run();
     throw e;
   }
@@ -268,24 +289,15 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
     };
     const fail = async (status, code, message, state, extra) => {
       if (!await end(status, code, message, state, extra)) return lost();
-      await dropUnpublished();
+      await dropUnpublished(ctx.env, uploadId, finalKey);
       await purgeStaging(ctx.env, u);
       throw new HttpError(status, code, message, extra);
-    };
-    // An object this upload wrote that no revision references (cleanup may already have ended the upload).
-    // Deleted only when the upload is terminal (so no new write can start) and no write is in flight (so none can
-    // re-create it afterwards); otherwise cleanup purges it once the last write settles.
-    const dropUnpublished = async () => {
-      const idle = await db2(ctx).prepare("SELECT 1 AS x FROM uploads u WHERE id = ? AND state IN ('failed','conflict') AND final_writes = 0 AND final_purged_at IS NULL AND NOT EXISTS (SELECT 1 FROM revisions r WHERE r.blob_key = u.final_key)").bind(uploadId).first("x");
-      if (!idle) return;
-      await deleteBlob(ctx.env, finalKey);
-      await db2(ctx).prepare("UPDATE uploads SET final_purged_at = ? WHERE id = ? AND final_purged_at IS NULL").bind(nowMs(), uploadId).run();
     };
     // Lost the lease before publishing: if cleanup ended the upload, remove the unreferenced object now (cleanup would
     // too). A takeover finisher (upload still sealed) publishes the same object.
     const lostAfterWrite = async () => {
       const row = await current();
-      if (row && (row.state === "failed" || row.state === "conflict")) await dropUnpublished();
+      if (row && (row.state === "failed" || row.state === "conflict")) await dropUnpublished(ctx.env, uploadId, finalKey);
       return lost();
     };
     // No write and no whole-object read: the upload's PUT already stored the bytes at final_key, and R2 checked their
@@ -329,7 +341,7 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
       if (!row || row.state !== "sealed" || row.finalize_token !== token) return lostAfterWrite();
       if (e instanceof HttpError && (e.status === 409 || e.code === "protected_source")) {
         if (!await end(e.status, e.code, e.message, "conflict", e.extra)) return lost();
-        await dropUnpublished();
+        await dropUnpublished(ctx.env, uploadId, finalKey);
         await purgeStaging(ctx.env, u);
         throw new HttpError(e.status, e.code, e.message, e.extra);
       }
