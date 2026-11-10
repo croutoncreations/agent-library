@@ -57,7 +57,7 @@ Then [connect your agents](docs/agent-setup.md).
 Agent Library is a personal library: one owner, many agents.
 
 - There are no other human users, public links or real-time co-editing. Agents edit one revision at a time, and conflicting saves are rejected rather than merged.
-- Limits: 1 MiB per Markdown or HTML document; 5 MiB per binary file (PNG, JPEG, WebP, GIF, PDF, MP4, WebM) and 100 MiB of binaries per project (adjustable with `PROJECT_BINARY_BYTES`). A project stops accepting new documents once it holds 100 items, counting uploads and trashed items.
+- Limits: by default 1 MiB per text document, 25 MiB per file (PNG, JPEG, WebP, GIF, PDF, MP4, WebM; up to 90 MiB with `FILE_MAX_BYTES`), 100 MiB of files per project (`PROJECT_BINARY_BYTES`) and 10,000 documents and files per project (`PROJECT_ITEMS_MAX`). Every limit, its setting and the error you see are in [Limits](docs/limits.md).
 - Backups are per project and exclude App Connect projects. See [Operations](docs/operations.md).
 - Cloudflare's free tiers cover a typical personal library, but usage beyond them is billed to your account.
 
@@ -70,6 +70,7 @@ Agent Library is a personal library: one owner, many agents.
 - [Document templates](docs/templates.md): save a Markdown structure once, then start new documents from it in the app or through MCP and the API.
 - [Changes feed](docs/project-changes.md): checkpoints, incremental polling, retention and resync.
 - [Operations](docs/operations.md): upgrades, backup and restore, rollback.
+- [Limits](docs/limits.md): every size, count, rate and retention limit, how to change it and what you see when you hit it.
 - [Deploy pipeline](docs/deploy-pipeline.md) (optional): auto-deploy your installation from GitHub on every push to `main`.
 - [Version history](docs/version-history.md) and [upload finalization](docs/upload-finalization.md): design notes.
 

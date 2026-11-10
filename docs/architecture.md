@@ -123,7 +123,7 @@ Nothing installation-specific is compiled in. Each installation sets these Worke
 - `APP_CONNECT_ENABLED`;
 - optionally, `OAUTH_EXTRA_REDIRECT_URIS` and `CONTENT_HOST`.
 
-Rate limits and upload TTLs have defaults and optional vars. See [wrangler.example.toml](../wrangler.example.toml).
+Limits (sizes, counts, rate limits, upload TTLs, retention) have defaults and optional vars. See [Limits](limits.md) and [wrangler.example.toml](../wrangler.example.toml).
 
 ## Ranked search
 

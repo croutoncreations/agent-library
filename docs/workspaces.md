@@ -98,7 +98,7 @@ shared workspace exists, or accept this for the rollback window.
   collides with or reveals another workspace's ids. Authors in the backup aren't trusted as accounts: every version
   and comment is attributed to the importer, keeping the original provenance labels. The workspace page offers it as
   "Import a project from a backup". The whole backup is checked (hashes, kinds, tags, version numbers, the
-  100-document and 100 MB per-project limits) before anything is written, and file bytes are removed again if the
+  per-project document and file limits, see [Limits](limits.md#import--export)) before anything is written, and file bytes are removed again if the
   database write fails. Requests are capped at 2 MB (`413 backup_too_large`; about 1.5 MB of files, since backups
   embed files as base64), so larger projects can't be imported yet. At most 2,000 versions and 2,000 comments per import. Send an `Idempotency-Key` to make retries safe (reusing
   it with a different backup is `422 idempotency_key_reused`).

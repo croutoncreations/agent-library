@@ -24,7 +24,7 @@ Project backups cover projects, documents and files you and your agents create, 
 **Connections → Agent tokens → Backup** (owner only) downloads one project as a JSON file: its documents and files, every revision, comments and the binary data they reference, each with a hash. It never includes credentials, sessions or agent grants. Store backups privately and encrypted, outside your Cloudflare account, and try a restore with test data before you rely on them.
 
 Limits:
-- It's one project at a time, held in memory, so very large projects may exceed Worker limits. There's no whole-account backup yet.
+- It's one project at a time, held in memory, so projects with more than 16 MB of files are refused (see above and [Limits](limits.md#import--export)). There's no whole-account backup yet.
 - Folders and App Connect data aren't included (see above).
 - Cloudflare D1's own point-in-time recovery restores the database but not R2 files, so it isn't a complete backup on its own.
 

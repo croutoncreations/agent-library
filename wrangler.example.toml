@@ -90,6 +90,17 @@ APP_CONNECT_ENABLED = "1"
 # OIDC_TRUST_EMAIL = "1"   # only for providers that never send email_verified and only issue verified emails
 # Optional human check (Cloudflare Turnstile, free) on email sign-in links; also needs the secret TURNSTILE_SECRET_KEY.
 # TURNSTILE_SITE_KEY = "0x4AAAAAAA..."
+# Optional limits (docs/limits.md lists every limit and its default). Leave unset for the defaults shown.
+# FILE_MAX_BYTES = "26214400"         # largest file in bytes (25 MiB); never more than 94371840 (90 MiB)
+# PROJECT_ITEMS_MAX = "10000"          # documents and files per project
+# PROJECT_BINARY_BYTES = "104857600"   # file bytes per project (100 MiB); "0" = no per-project cap
+# RATE_READS_PER_MIN = "240"           # per agent per minute (people get 3x)
+# RATE_WRITES_PER_MIN = "60"           # per agent per minute (people get 3x)
+# RATE_SIGNIN_PER_MIN = "20"           # sign-in starts per IP
+# RATE_SIGNIN_EMAIL_PER_MIN = "5"      # sign-in emails per IP
+# RATE_SIGNIN_EMAIL_PER_ADDRESS_PER_MIN = "2"   # sign-in emails per address
+# AUDIT_RETENTION_DAYS = "365"         # audit log retention; "0" = keep forever
+# UPLOAD_TTL_SECONDS = "900"           # upload reservation lifetime
 #
 # Worker secret (never in this file):
 #   ACCESS_OIDC_CLIENT_SECRET  (wrangler secret put ACCESS_OIDC_CLIENT_SECRET --env hosted)
