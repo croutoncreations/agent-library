@@ -301,6 +301,38 @@ test("publication fence matches real local D1 constraint text and rolls back a m
   } finally { await mf.dispose(); }
 });
 
+test("real D1 purge key query bounds all six key sources within the global blob budget", async () => {
+  const { Miniflare, convertV4MiniflareOptions } = await import("miniflare");
+  const mf = new Miniflare(convertV4MiniflareOptions({ port: SERVER_PORTS["text-r2"], name: "purge-keys", modules: true, script: "export default { fetch() { return new Response('test'); } }", compatibilityDate: "2026-10-24", d1Databases: { DB: "purge-keys" } }));
+  try {
+    const DB = await mf.getD1Database("DB");
+    await DB.batch([
+      DB.prepare("CREATE TABLE projects (id TEXT PRIMARY KEY, deleted_at INTEGER, purged_at INTEGER, purge_at INTEGER)"),
+      DB.prepare("CREATE TABLE revisions (project_id TEXT, blob_key TEXT, body_key TEXT)"),
+      DB.prepare("CREATE TABLE comments (project_id TEXT, body_key TEXT)"),
+      DB.prepare("CREATE TABLE content_writes (key TEXT PRIMARY KEY, project_id TEXT, created_at INTEGER)"),
+      DB.prepare("CREATE TABLE uploads (project_id TEXT, staging_key TEXT, final_key TEXT, staging_purged_at INTEGER, final_purged_at INTEGER, finalize_until INTEGER, final_writes INTEGER, state TEXT, expires_at INTEGER)"),
+      DB.prepare("INSERT INTO projects (id, deleted_at, purge_at) VALUES ('p', 1, 1)"),
+      DB.prepare("INSERT INTO revisions (project_id, blob_key, body_key) VALUES ('p', 'blobs/p/a/r', 'text/p/a/rev')"),
+      DB.prepare("INSERT INTO comments (project_id, body_key) VALUES ('p', 'text/p/a/cmt')"),
+      DB.prepare("INSERT INTO content_writes (key, project_id, created_at) VALUES ('text/p/a/intent', 'p', 0)"),
+      DB.prepare("INSERT INTO uploads (project_id, staging_key, final_key, finalize_until, final_writes, state, expires_at) VALUES ('p', 'staging/p/u', 'blobs/p/a/u', 0, 0, 'done', 0)")
+    ]);
+    const objects = new Set(["blobs/p/a/r", "text/p/a/rev", "text/p/a/cmt", "text/p/a/intent", "staging/p/u", "blobs/p/a/u"]);
+    const deleted = [];
+    const env = { DB, BLOBS: { async delete(key) { assert.ok(objects.delete(key), `only delete a referenced object once: ${key}`); deleted.push(key); } } };
+    const lib = await loadWorker({ "project-deletion.js": ["purgeDueProjects"] });
+    for (let i = 0; i < 3; i++) {
+      const result = await lib.purgeDueProjects(env, { projectId: "p", rowBudget: 0, blobBudget: 2 });
+      assert.equal(result.files, 2);
+      assert.equal(deleted.length, (i + 1) * 2);
+      assert.equal(objects.size, 6 - deleted.length);
+    }
+    assert.equal(await DB.prepare("SELECT body_key FROM comments").first("body_key"), null);
+    assert.equal(await DB.prepare("SELECT COUNT(*) AS n FROM content_writes").first("n"), 0);
+  } finally { await mf.dispose(); }
+});
+
 test("restore preserves unusual legacy IDs without aliasing text keys and refuses oversized keys before writing", async () => {
   const source = await harness();
   await source.lib.createMarkdown(source.ctx, "proj-s", { title: "First", body: "first distinct body" }, "key-first");

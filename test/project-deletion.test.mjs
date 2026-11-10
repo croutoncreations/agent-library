@@ -186,8 +186,12 @@ test("delete permanently: rows and R2 files are removed, a tombstone stays, cred
   assert.equal((await fetch(h.appUi + kb.put_url, { method: "PUT", headers: { cookie: owner.cookie, "x-csrf-token": owner.csrf, "content-type": "application/octet-stream" }, body: png })).status, 200);
   ok(await owner.req("POST", `/api/projects/${keep}/uploads/${kb.upload_id}/finish`));
   ok(await bob.req("DELETE", `/api/projects/${P.id}`, { confirm_title: "Old Notes" }));
-  const keys = (await sql(`SELECT blob_key FROM revisions WHERE project_id = '${P.id}' AND blob_key IS NOT NULL`)).map((r) => r.blob_key);
-  assert.ok(keys.length >= 1 && keys.every((k) => k.startsWith(`blobs/${P.id}/`)));
+  const keys = (await sql(`SELECT blob_key AS key FROM revisions WHERE project_id = '${P.id}' AND blob_key IS NOT NULL
+    UNION SELECT body_key FROM revisions WHERE project_id = '${P.id}' AND body_key IS NOT NULL
+    UNION SELECT body_key FROM comments WHERE project_id = '${P.id}' AND body_key IS NOT NULL`)).map((r) => r.key);
+  assert.ok(keys.some(k => k.startsWith(`blobs/${P.id}/`)), "binary object is covered");
+  assert.ok(keys.some(k => k.startsWith(`text/${P.id}/`) && k.includes("/cmt_")), "comment object is covered");
+  assert.ok(keys.every(k => k.startsWith(`blobs/${P.id}/`) || k.startsWith(`text/${P.id}/`)));
   const e = await bob.req("POST", `/api/projects/${P.id}/purge`, { confirm_title: "nope" });
   assert.equal(e.status, 400);
   assert.equal((await carol.req("POST", `/api/projects/${P.id}/purge`, { confirm_title: "Old Notes" })).status, 404);
@@ -224,7 +228,7 @@ test("delete permanently: rows and R2 files are removed, a tombstone stays, cred
     const r2keys = r2.prepare("SELECT key FROM _mf_objects").all().map((r) => r.key);
     assert.ok(r2keys.some((k) => k.startsWith(`blobs/${keep}/`)), "control: another project's file is still there");
     for (const k of keys) assert.ok(!r2keys.includes(k), `R2 object ${k} removed`);
-    assert.ok(!r2keys.some((k) => k.startsWith(`blobs/${P.id}/`) || k.startsWith(`staging/${P.id}/`)), "nothing left under the project's prefixes");
+    assert.ok(!r2keys.some((k) => k.startsWith(`blobs/${P.id}/`) || k.startsWith(`staging/${P.id}/`) || k.startsWith(`text/${P.id}/`)), "nothing left under the project's prefixes");
   } finally { r2.close(); }
 });
 

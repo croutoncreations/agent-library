@@ -178,10 +178,12 @@ export async function purgeDueProjects(env, { projectId, rowBudget = 5000, blobB
     // R2 first: files named by this project's revisions and uploads (keys always start blobs/<id>/ or staging/<id>/).
     for (;;) {
       if (blobBudget <= 0) return out;
+      // D1 allows five compound SELECT terms per level; group referenced content before the other key sources.
       const keys = (await env.DB.prepare(
-        `SELECT k FROM (SELECT blob_key AS k FROM revisions WHERE project_id = ?1 AND blob_key IS NOT NULL
+        `SELECT k FROM (SELECT k FROM (
+           SELECT blob_key AS k FROM revisions WHERE project_id = ?1 AND blob_key IS NOT NULL
            UNION SELECT body_key FROM revisions WHERE project_id = ?1 AND body_key IS NOT NULL
-           UNION SELECT body_key FROM comments WHERE project_id = ?1 AND body_key IS NOT NULL
+           UNION SELECT body_key FROM comments WHERE project_id = ?1 AND body_key IS NOT NULL)
            UNION SELECT key FROM content_writes WHERE project_id = ?1
            UNION SELECT staging_key FROM uploads WHERE project_id = ?1 AND staging_key IS NOT NULL AND staging_purged_at IS NULL
            UNION SELECT final_key FROM uploads WHERE project_id = ?1 AND final_key IS NOT NULL AND final_purged_at IS NULL) LIMIT ?2`
