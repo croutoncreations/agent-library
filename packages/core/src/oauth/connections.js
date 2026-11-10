@@ -35,15 +35,17 @@ var safeHost = (u) => {
     return "";
   }
 };
+/** Connections settings list at most this many connections and agent tokens each (the UI's notes use the same number). */
+const ACCESS_LIST_MAX = 200;
 async function listAccess(ctx) {
   requireHuman(ctx);
   const me2 = ctx.principal.id;
   const conns = await ctx.env.DB.prepare(
     `SELECT id, client_name, client_id, redirect_uri, created_at, expires_at, revoked_at, last_used_at, file_access, workspace_id, created_by, owner_principal_id
-     FROM oauth_connections c WHERE ${MANAGE} ORDER BY created_at DESC LIMIT 201`
+     FROM oauth_connections c WHERE ${MANAGE} ORDER BY created_at DESC LIMIT ${ACCESS_LIST_MAX + 1}`
   ).bind(me2, me2).all();
-  const connsCut = conns.results.length > 200;
-  conns.results = conns.results.slice(0, 200);
+  const connsCut = conns.results.length > ACCESS_LIST_MAX;
+  conns.results = conns.results.slice(0, ACCESS_LIST_MAX);
   const cps = await ctx.env.DB.prepare(
     `SELECT cp.connection_id, cp.project_id, cp.can_write, p.title FROM oauth_connection_projects cp
      JOIN oauth_connections c ON c.id = cp.connection_id JOIN projects p ON p.id = cp.project_id AND p.deleted_at IS NULL
@@ -58,10 +60,10 @@ async function listAccess(ctx) {
   const grants = await ctx.env.DB.prepare(
     `SELECT g.id, g.project_id, pr.title, pl.label, g.can_write, g.expires_at, g.revoked_at, g.created_at
      FROM grants g JOIN projects pr ON pr.id = g.project_id AND pr.deleted_at IS NULL JOIN principals pl ON pl.id = g.principal_id
-     WHERE (g.created_by = ? OR ${memberRoleSql("pr.id", "admin", "?", true)}) ORDER BY g.created_at DESC LIMIT 201`
+     WHERE (g.created_by = ? OR ${memberRoleSql("pr.id", "admin", "?", true)}) ORDER BY g.created_at DESC LIMIT ${ACCESS_LIST_MAX + 1}`
   ).bind(me2, me2).all();
-  const grantsCut = grants.results.length > 200;
-  grants.results = grants.results.slice(0, 200);
+  const grantsCut = grants.results.length > ACCESS_LIST_MAX;
+  grants.results = grants.results.slice(0, ACCESS_LIST_MAX);
   const now = nowMs();
   return {
     connections: conns.results.map((c) => ({
@@ -124,4 +126,4 @@ async function revokeConnection(ctx, projectId, connectionId) {
   return { ok: true, oauth_grant: kv };
 }
 
-export { listAccess, listConnections, revokeConnection, revokeConnectionById };
+export { ACCESS_LIST_MAX, listAccess, listConnections, revokeConnection, revokeConnectionById };

@@ -88,10 +88,12 @@ async function ownKey(ctx, id) {
   if (!k) throw new HttpError(404, "not_found", "API key not found");
   return k;
 }
+/** The API keys list shows at most this many keys (the UI's "Showing the first N" note uses the same number). */
+const API_KEYS_LIST_MAX = 200;
 async function listApiKeys(ctx) {
   requireHuman(ctx);
   // Keys I created, plus every key in workspaces where I'm an admin.
-  const mine = `SELECT k.id FROM api_credentials k WHERE ${KEY_MANAGER} ORDER BY k.created_at DESC LIMIT 201`;
+  const mine = `SELECT k.id FROM api_credentials k WHERE ${KEY_MANAGER} ORDER BY k.created_at DESC LIMIT ${API_KEYS_LIST_MAX + 1}`;
   const keys = await ctx.env.DB.prepare(`SELECT * FROM api_credentials WHERE id IN (${mine}) ORDER BY created_at DESC`).bind(ctx.principal.id, ctx.principal.id).all();
   const scopes = await ctx.env.DB.prepare(
     `SELECT acp.credential_id, acp.project_id, acp.can_write, p.title FROM api_credential_projects acp
@@ -99,7 +101,7 @@ async function listApiKeys(ctx) {
      WHERE acp.credential_id IN (${mine})`
   ).bind(ctx.principal.id, ctx.principal.id).all();
   const now = nowMs();
-  return { keys: keys.results.slice(0, 200).map((k) => ({
+  return { keys: keys.results.slice(0, API_KEYS_LIST_MAX).map((k) => ({
     id: k.id,
     label: k.label,
     created_at: k.created_at,
@@ -110,7 +112,7 @@ async function listApiKeys(ctx) {
     workspace_id: k.workspace_id ?? `wsp_${k.owner_principal_id}`,
     created_by: k.created_by ?? k.owner_principal_id,
     projects: scopes.results.filter((s) => s.credential_id === k.id).map((s) => ({ project_id: s.project_id, title: s.title, access: s.can_write ? "read_write" : "read" }))
-  })), truncated: cutLists({ keys: keys.results.length > 200 }) };
+  })), truncated: cutLists({ keys: keys.results.length > API_KEYS_LIST_MAX }) };
 }
 async function replaceApiKey(ctx, id, input) {
   requireHuman(ctx);
@@ -201,4 +203,4 @@ async function verifyApiKey(env, authz) {
   };
 }
 
-export { createApiKey, listApiKeys, replaceApiKey, revokeApiKey, setApiKeyScope, verifyApiKey };
+export { API_KEYS_LIST_MAX, createApiKey, listApiKeys, replaceApiKey, revokeApiKey, setApiKeyScope, verifyApiKey };

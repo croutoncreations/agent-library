@@ -634,8 +634,10 @@ var ROLE_ORDER = ["viewer", "member", "admin", "owner"];
 function wsLabel(w) { return w.personal ? "Personal" : w.name; }
 function sectionMsg() { return h("p", { class: "msg", role: "status", "aria-live": "polite" }); }
 // A capped server list (r.truncated names the lists that hit their cap): a muted "Showing the first N" line, else null.
-function truncatedNote(r, name, n, noun) {
-  return r && Array.isArray(r.truncated) && r.truncated.indexOf(name) >= 0 ? h("p", { class: "muted small truncated-note", text: "Showing the first " + n.toLocaleString("en-US") + " " + noun + "." }) : null;
+// newestFirst: the server lists newest first, so the note says "the N most recent".
+function truncatedNote(r, name, n, noun, newestFirst) {
+  var count = n.toLocaleString("en-US");
+  return r && Array.isArray(r.truncated) && r.truncated.indexOf(name) >= 0 ? h("p", { class: "muted small truncated-note", text: "Showing the " + (newestFirst ? count + " most recent " : "first " + count + " ") + noun + "." }) : null;
 }
 // Show an error next to the control that caused it, and bring it into view.
 function sectionErr(el, err) { showErr(el, err); try { el.scrollIntoView({ block: "nearest" }); } catch (e) {} }
@@ -878,7 +880,7 @@ async function viewWorkspace(id) {
             catch (err) { sectionErr(invMsg, err); e.target.disabled = false; }
           } }, "Cancel invitation")));
       });
-      parts.push(h("h2", { text: "Invite someone" }), invMsg, inviteForm, linkBox, h("h2", { id: "pending-h", tabIndex: -1, text: "Pending invitations" }), pending, truncatedNote(d, "invites", 200, "pending invitations"));
+      parts.push(h("h2", { text: "Invite someone" }), invMsg, inviteForm, linkBox, h("h2", { id: "pending-h", tabIndex: -1, text: "Pending invitations" }), pending, truncatedNote(d, "invites", 200, "pending invitations", true));
     }
     if (owner && !suspended) parts.push(handleForm(ws, function () { focusAfter = "#ws-handle"; load(); }));
     if (owner && !ws.personal) {
@@ -2133,6 +2135,9 @@ async function viewTokens() {
 // ---------- settings: API keys (alk_ credentials for REST clients such as Muse) ----------
 var API_BASE_HINT = "See your installation configuration";
 function daysLeft(iso) { return Math.ceil((Date.parse(iso) - Date.now()) / 86400000); }
+// Keys that never expire are stored with expires_at 9999-01-01 (NEVER_EXPIRES_AT in util.js).
+function neverExpires(iso) { return Date.parse(iso) >= Date.UTC(9999, 0, 1); }
+function expiryNote(iso) { return neverExpires(iso) ? "never expires" : "expires " + fmtDate(iso); }
 function secretBox(box, title, secret, note) {
   var tok = h("input", { class: "token", type: "text", readOnly: true, value: secret, "aria-label": "API key" });
   box.replaceChildren(h("p", null, h("strong", { text: title }), h("br"), h("span", { class: "muted small", text: note })), tok,
@@ -2178,14 +2183,21 @@ async function viewApiKeys() {
     var max = maxLife[wsId];
     return LIFETIMES.filter(function (d) { return max == null || (d !== "never" && d <= max); });
   }
+  // The select's lifeHint (a muted line under it) explains a plan maximum; lifeField puts the two together.
   function lifeSelect(dflt, wsId) {
     var s = h("select", { "aria-label": "Lifetime" });
+    s.lifeHint = h("small", { class: "muted life-hint", hidden: true });
     fillLife(s, wsId, dflt); return s;
+  }
+  function lifeField(label, s) {
+    return h("label", null, label, s, s.lifeHint);
   }
   function fillLife(s, wsId, dflt) {
     var keep = dflt || s.value || "90";
     s.replaceChildren.apply(s, lifeOptions(wsId).map(function (d) { return h("option", { value: String(d), text: d === "never" ? "Never expires" : d === 1 ? "1 day" : d === 365 ? "1 year" : d + " days" }); }));
     s.value = String(keep); if (!s.value) s.value = String(lifeOptions(wsId).filter(function (d) { return d !== "never"; }).pop());
+    var hint = s.lifeHint;
+    if (hint) { var max = maxLife[wsId]; hint.hidden = max == null; hint.textContent = max == null ? "" : "This workspace's plan allows keys up to " + max + " day" + (max === 1 ? "" : "s") + "."; }
   }
   async function loadMaxLife(wsId) {
     if (!wsId || wsId in maxLife) return;
@@ -2209,7 +2221,7 @@ async function viewApiKeys() {
     keysCut.replaceChildren(); var kcut = truncatedNote(data, "keys", 200, "API keys"); if (kcut) keysCut.append(kcut);
     ks.forEach(function (k) {
       var left = daysLeft(k.expires_at);
-      var never = Date.parse(k.expires_at) >= Date.UTC(9999, 0, 1);
+      var never = neverExpires(k.expires_at);
       var exp = k.status === "active" ? (never ? "never expires" : (left <= 1 ? "expires within a day" : "expires in " + left + " days") + " (" + fmtDate(k.expires_at) + ")") : k.status;
       var li = h("li", null,
         h("div", { class: "grow" }, h("strong", { text: k.label }),
@@ -2223,13 +2235,13 @@ async function viewApiKeys() {
             var nl = lifeSelect("90", k.workspace_id);
             editHost.hidden = false;
             editHost.replaceChildren(h("p", { class: "small", text: "Create a replacement with the same projects and access. The current key keeps working until you revoke it, so you can update the app first." }),
-              h("div", { class: "row" }, h("label", null, "New key lifetime", nl), h("span", { class: "spacer" }),
+              h("div", { class: "row" }, lifeField("New key lifetime", nl), h("span", { class: "spacer" }),
                 h("button", { type: "button", onclick: async function (ev) {
                   ev.target.disabled = true;
                   try {
                     var r = await api("POST", "/api/api-keys/" + enc(k.id) + "/replace", { lifetime_days: lifeValue(nl) });
                     editHost.hidden = true;
-                    secretBox(box, "Replacement key for " + r.label, r.secret, "Copy it now; it won't be shown again. Put it in the app, check it works, then revoke the old key (listed below).");
+                    secretBox(box, "Replacement key for " + r.label, r.secret, "Copy it now; it won't be shown again. It " + expiryNote(r.expires_at) + ". Put it in the app, check it works, then revoke the old key (listed below).");
                     load();
                   } catch (err) { showErr(msg, err); ev.target.disabled = false; }
                 } }, "Create replacement"),
@@ -2292,15 +2304,15 @@ async function viewApiKeys() {
     try {
       var r = await api("POST", "/api/api-keys", { label: label.value.trim(), lifetime_days: lifeValue(life), projects: scope });
       label.value = "";
-      secretBox(box, "API key for " + r.label, r.secret, "Copy it now; it won't be shown again. Base URL: " + API_BASE_HINT + " · expires " + fmtDate(r.expires_at) + ".");
+      secretBox(box, "API key for " + r.label, r.secret, "Copy it now; it won't be shown again. Base URL: " + API_BASE_HINT + " · " + expiryNote(r.expires_at) + ".");
       load();
     } catch (err) { showErr(msg, err); }
   } },
-    h("div", { class: "grid2" }, h("label", null, "Label", label), h("label", null, "Lifetime", life), wsRow),
+    h("div", { class: "grid2" }, h("label", null, "Label", label), lifeField("Lifetime", life), wsRow),
     pickerHost,
     h("div", { class: "row" }, h("span", { class: "spacer" }), h("button", { type: "submit" }, "Create key")));
   shell([{ t: "Connections" }], connHead(), connectionHelp(), settingsTabs("api-keys"),
-    h("div", { class: "callout" }, icon("key"), h("span", null, h("strong", { text: "API keys" }), " are for apps that use the REST API (for example Muse). Each key covers only the projects you pick, expires after the lifetime you choose (the workspace's plan may cap it) and can be replaced or revoked at any time. The key itself is shown once.")),
+    h("div", { class: "callout" }, icon("key"), h("span", null, h("strong", { text: "API keys" }), " are for apps that use the REST API (for example Muse). Each key covers only the projects you pick, lasts as long as you choose (the workspace's plan may set a maximum) and can be replaced or revoked at any time. The key itself is shown once.")),
     msg, box, list, keysCut, h("p", null, h("label", { class: "muted small" }, showAll, "Show revoked and expired")),
     h("details", null, h("summary", { text: "Create an API key" }), h("div", { class: "card" }, form)));
   load();
@@ -2767,19 +2779,23 @@ async function viewArtifact(pid, aid, initialTab) {
   var comMsg = h("p", { class: "msg", role: "status" }), comList = h("ul", { class: "list" }), comText = h("textarea", { class: "half", maxLength: 4000, placeholder: "Comment on the current revision" });
   var comPending = null, comCursor = null;
   // The newest page first (oldest first within it); "Show older comments" prepends the page before it.
+  // Its status line (comOlderMsg, next to it) announces what loaded or why it failed; focus moves to the first loaded comment.
+  var comOlderMsg = sectionMsg();
   var comOlder = h("button", { type: "button", class: "secondary com-older", hidden: true, onclick: async function () {
-    comOlder.disabled = true;
+    comOlder.disabled = true; comOlder.textContent = "Loading…"; comList.setAttribute("aria-busy", "true"); showMsg(comOlderMsg, "", true);
     try {
       var r = await api("GET", base + "/comments?cursor=" + enc(comCursor));
-      var first = comList.firstChild;
-      r.comments.forEach(function (c) { comList.insertBefore(commentRow(c), first); });
+      var first = comList.firstChild, added = null;
+      r.comments.forEach(function (c) { var row = commentRow(c); if (!added) added = row; comList.insertBefore(row, first); });
       comCursor = r.next_cursor; comOlder.hidden = !comCursor;
-      if (first && first.focus) { first.tabIndex = -1; first.focus(); }
-    } catch (err) { showErr(comMsg, err); }
-    comOlder.disabled = false;
+      var n = r.comments.length;
+      showMsg(comOlderMsg, "Loaded " + n + " older comment" + (n === 1 ? "" : "s"), true); comOlderMsg.setAttribute("aria-live", "polite");
+      if (added) { added.tabIndex = -1; added.focus(); }
+    } catch (err) { sectionErr(comOlderMsg, err); }
+    comList.removeAttribute("aria-busy"); comOlder.textContent = "Show older comments"; comOlder.disabled = false;
   } }, "Show older comments");
   function commentRow(c) {
-    return h("li", null, h("div", { class: "grow" }, h("div", { class: "muted small", text: (c.author || "") + " - rev " + c.revision + " - " + fmtDate(c.created_at) }), h("div", { class: "raw-text", text: c.body })));
+    return h("li", null, h("div", { class: "grow" }, h("div", { class: "muted small", text: (c.author || "") + " · rev " + c.revision + " · " + fmtDate(c.created_at) }), h("div", { class: "raw-text", text: c.body })));
   }
   async function loadComments() {
     try {
@@ -2806,7 +2822,7 @@ async function viewArtifact(pid, aid, initialTab) {
   addTab("history", "History", VH.load);
   panels.history.append(VH.root);
   addTab("comments", "Comments", loadComments);
-  panels.comments.append(comOlder, comList, comForm, comMsg);
+  panels.comments.append(comOlder, comOlderMsg, comList, comForm, comMsg);
   for (var k in panels) app.append(panels[k]);
   app.append(below);
   // Documents open on the rendered view; Edit is one tap away (and /edit deep links open the editor).

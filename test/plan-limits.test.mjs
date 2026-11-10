@@ -206,7 +206,7 @@ test("members: only accepted members count; pending invitations have their own l
   sql(`INSERT INTO workspace_members (workspace_id, principal_id, role, created_at) SELECT '${W.team}', id, 'viewer', '2026-01-01T00:00:00Z' FROM principals WHERE email = 'dave@example.test'`);
   const full = await bob.req("POST", "/api/invites/accept", { token: bobNew.accept_url.split("/").pop() });
   const fe = refused(full, "members");
-  assert.match(fe.message, /This workspace is full/);
+  assert.match(fe.message, /^This workspace is full: its plan allows 3 members\. Ask the person who invited you to free up a spot or upgrade the plan, then open this invitation again\.$/);
   assert.equal(sql(`SELECT COUNT(*) AS n FROM workspace_members WHERE workspace_id = '${W.team}' AND principal_id = (SELECT id FROM principals WHERE email = 'bob@example.test')`)[0].n, 0);
   assert.equal(sql(`SELECT COUNT(*) AS n FROM workspace_invites WHERE id = '${bobNew.id}' AND accepted_at IS NULL AND revoked_at IS NULL`)[0].n, 1, "the invitation still works once there's room");
   // Room again: the same link works.
@@ -317,11 +317,14 @@ test("browser: the workspace page shows plan usage; a refused project says why",
       await page.setViewport({ width: w, height: 1000 });
       await page.goto(APP + "/");
       await page.evaluate(async (passphrase) => fetch("/auth/dev-login", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ passphrase, user: "alice" }) }), s.passphrase());
+      await page.emulateMediaFeatures([{ name: "prefers-reduced-motion", value: "reduce" }]);
       await page.goto(`${APP}/#/workspaces/${W.team}`); await page.reload();
       await page.waitForSelector(".usage");
       const txt = await page.$eval(".usage", (e) => e.innerText);
       assert.match(txt, /Storage\s+[\d.]+ KB of [\d.]+ KB/);
       assert.match(txt, /Projects\s+6 of 3 · over the limit/);
+      assert.match(txt, /Members\s+\d+ of 3/);
+      assert.match(txt, /Pending invitations\s+\d+ of 2/);
       if (w === 1280) {
         await page.type("input[aria-label='New project name']", "One too many");
         await (await page.waitForSelector("xpath/.//button[normalize-space()='Create project']")).click();
@@ -330,7 +333,63 @@ test("browser: the workspace page shows plan usage; a refused project says why",
       }
       await new Promise((r) => setTimeout(r, 400));
       await page.screenshot({ path: `tmp/test-evidence/${name}.png`, fullPage: true });
+      await (await page.$(".usage")).screenshot({ path: `tmp/test-evidence/${name}-members.png` });
       await page.close();
     }
   } finally { await browser.close(); }
+});
+
+test("browser: the API key form explains the plan's lifetime maximum; a never-expiring key says so", async (t) => {
+  const { createRequire } = await import("node:module");
+  const { existsSync, mkdirSync } = await import("node:fs");
+  const CHROME = process.env.CHROME_PATH ?? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+  const PUP = `${process.env.HOME}/.npm-packages/lib/node_modules/puppeteer`;
+  if (!existsSync(CHROME) || !existsSync(PUP)) return t.skip("Chrome/puppeteer not installed");
+  mkdirSync("tmp/test-evidence", { recursive: true });
+  // The form's workspace picker starts on Personal (listed first), so the hint follows the personal workspace's plan.
+  const personal = ok(await alice.req("GET", "/api/workspaces")).workspaces.find((w) => w.personal).id;
+  sql(`UPDATE workspaces SET plan = 'free' WHERE id = '${personal}'`);
+  const browser = await createRequire(import.meta.url)(PUP).launch({ executablePath: CHROME, headless: true, args: ["--no-first-run"] });
+  const openForm = async (page) => {
+    await page.goto(`${APP}/#/settings/api-keys`); await page.reload();
+    await page.waitForSelector("details summary");
+    await page.evaluate(() => { const d = [...document.querySelectorAll("details")].find((x) => /Create an API key/.test(x.textContent)); d.open = true; d.scrollIntoView({ block: "start" }); });
+  };
+  try {
+    const page = await browser.newPage();
+    await page.emulateMediaFeatures([{ name: "prefers-reduced-motion", value: "reduce" }]);
+    await page.setViewport({ width: 1280, height: 900 });
+    await page.goto(APP + "/");
+    await page.evaluate(async (passphrase) => fetch("/auth/dev-login", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ passphrase, user: "alice" }) }), s.passphrase());
+    const callout = await (async () => { await openForm(page); return page.$eval(".callout", (e) => e.textContent); })();
+    assert.match(callout, /lasts as long as you choose \(the workspace's plan may set a maximum\) and can be replaced or revoked at any time/);
+    for (const [w, name] of [[1280, "desktop"], [390, "mobile"]]) {
+      await page.setViewport({ width: w, height: 900 });
+      await openForm(page);
+      await page.waitForFunction(() => { const e = document.querySelector(".life-hint"); return e && !e.hidden; }, { timeout: 10000 });
+      assert.equal(await page.$eval(".life-hint", (e) => e.textContent), "This workspace's plan allows keys up to 90 days.");
+      assert.deepEqual(await page.$$eval("select[aria-label=Lifetime] option", (os) => os.map((o) => o.textContent)), ["1 day", "7 days", "30 days", "90 days"]);
+      assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1), `no horizontal scroll at ${w}`);
+      await (await page.$("details .card")).screenshot({ path: `tmp/test-evidence/limits-key-lifetime-cap-${name}.png` });
+    }
+    // No maximum: no hint, and a "Never expires" key's note says so (not "expires 1/1/9999").
+    sql(`UPDATE workspaces SET plan = 'pro' WHERE id = '${personal}'`);
+    await page.setViewport({ width: 1280, height: 900 });
+    await openForm(page);
+    await page.waitForFunction(() => [...document.querySelectorAll("select[aria-label=Lifetime] option")].some((o) => o.value === "never"), { timeout: 10000 });
+    assert.equal(await page.$eval(".life-hint", (e) => e.hidden), true);
+    await page.type("input[aria-label='Key label']", "Forever key");
+    await page.select("select[aria-label=Lifetime]", "never");
+    await page.waitForSelector("details .scope select[aria-label^='Access to ']");
+    await page.select("details .scope select[aria-label^='Access to ']", "read");
+    await (await page.waitForSelector("xpath/.//button[normalize-space()='Create key']")).click();
+    await page.waitForFunction(() => /API key for Forever key/.test(document.body.innerText), { timeout: 10000 });
+    const note = await page.evaluate(() => document.body.innerText);
+    assert.match(note, /· never expires\./);
+    assert.doesNotMatch(note, /9999/);
+    await page.evaluate(() => window.scrollTo(0, 0));
+    await page.screenshot({ path: "tmp/test-evidence/limits-key-never-expires.png" });
+    const k = ok(await alice.req("GET", "/api/api-keys")).keys.find((x) => x.label === "Forever key");
+    ok(await alice.req("POST", `/api/api-keys/${k.id}/revoke`, {}));
+  } finally { await browser.close(); sql(`UPDATE workspaces SET plan = 'free' WHERE id = '${personal}'`); }
 });

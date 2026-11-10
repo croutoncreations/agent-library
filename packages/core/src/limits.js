@@ -128,7 +128,7 @@ const FIX = {
   storage_bytes: "Delete documents or files you no longer need (deleted items stop counting once they're removed from the trash, and deleted projects once they're deleted permanently under Recently deleted), or ask the workspace owner about a bigger plan.",
   projects: "Delete a project you no longer need (Project settings), or ask the workspace owner about a bigger plan.",
   members: "Remove a member you no longer work with, or ask the workspace owner about a bigger plan.",
-  pending_invites: "Cancel a pending invitation you no longer need (Members), or ask the workspace owner about a bigger plan.",
+  pending_invites: "Cancel a pending invitation you no longer need (Pending invitations), or ask the workspace owner about a bigger plan.",
   items_per_project: "Delete or empty the trash of documents you no longer need in this project, or ask the workspace owner about a bigger plan.",
   agents: "Disconnect an app or revoke an API key you no longer use (Connections), or ask the workspace owner about a bigger plan.",
   owned_workspaces: "Delete a shared workspace you no longer need."

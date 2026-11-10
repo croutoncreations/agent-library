@@ -10,6 +10,8 @@ const isUnique = (e) => /UNIQUE|constraint/i.test(String(e?.message ?? e));
 const handleTaken = () => new HttpError(409, "handle_taken", "That address is already taken; choose another");
 
 export const INVITE_DAYS = 14;
+/** List caps (the UI's "Showing the first N" notes use the same numbers). */
+export const WORKSPACES_LIST_MAX = 200, MEMBERS_LIST_MAX = 500, INVITES_LIST_MAX = 200;
 export const multiUser = multiUserInstall;
 const EMAIL = /^[^\s@<>"',;]{1,64}@[A-Za-z0-9.-]{1,190}\.[A-Za-z]{2,24}$/;
 
@@ -35,11 +37,11 @@ export async function listWorkspaces(ctx) {
     `SELECT w.id, w.name, w.handle, w.personal, w.status, w.plan, w.created_at, m.role,
        (SELECT COUNT(*) FROM workspace_members x WHERE x.workspace_id = w.id) AS member_count
      FROM workspaces w JOIN workspace_members m ON m.workspace_id = w.id AND m.principal_id = ?
-     WHERE w.status <> 'deleting' ORDER BY w.personal DESC, w.created_at LIMIT 201`
+     WHERE w.status <> 'deleting' ORDER BY w.personal DESC, w.created_at LIMIT ${WORKSPACES_LIST_MAX + 1}`
   ).bind(ctx.principal.id).all();
   const out = [];
-  for (const w of r.results.slice(0, 200)) out.push({ ...w, personal: !!w.personal, handle: await ensureHandle(ctx.env, w) });
-  return { workspaces: out, truncated: cutLists({ workspaces: r.results.length > 200 }) };
+  for (const w of r.results.slice(0, WORKSPACES_LIST_MAX)) out.push({ ...w, personal: !!w.personal, handle: await ensureHandle(ctx.env, w) });
+  return { workspaces: out, truncated: cutLists({ workspaces: r.results.length > WORKSPACES_LIST_MAX }) };
 }
 
 export async function createWorkspace(ctx, input) {
@@ -108,19 +110,19 @@ export async function listMembers(ctx, id) {
   const ws = await requireWorkspaceRole(ctx, id, "viewer");
   const m = await ctx.env.DB.prepare(
     `SELECT m.principal_id, m.role, m.created_at, p.label, p.email FROM workspace_members m JOIN principals p ON p.id = m.principal_id
-     WHERE m.workspace_id = ? ORDER BY CASE m.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 WHEN 'member' THEN 2 ELSE 3 END, m.created_at LIMIT 501`
+     WHERE m.workspace_id = ? ORDER BY CASE m.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 WHEN 'member' THEN 2 ELSE 3 END, m.created_at LIMIT ${MEMBERS_LIST_MAX + 1}`
   ).bind(id).all();
   const admin = ROLE_RANK[ws.role] >= ROLE_RANK.admin;
   const inv = admin ? await ctx.env.DB.prepare(
     `SELECT id, email, role, created_at, expires_at FROM workspace_invites WHERE workspace_id = ? AND accepted_at IS NULL AND revoked_at IS NULL AND expires_at > ?
-     ORDER BY created_at DESC LIMIT 201`
+     ORDER BY created_at DESC LIMIT ${INVITES_LIST_MAX + 1}`
   ).bind(id, nowMs()).all() : { results: [] };
   return {
     workspace: { id: ws.id, name: ws.name, handle: await ensureHandle(ctx.env, ws), personal: !!ws.personal, role: ws.role, status: ws.status },
     // Emails are shown to admins only; everyone sees names and roles.
-    members: m.results.slice(0, 500).map((x) => ({ principal_id: x.principal_id, label: x.label, email: admin ? x.email : null, role: x.role, created_at: x.created_at, me: x.principal_id === ctx.principal.id })),
-    invites: inv.results.slice(0, 200).map((i) => ({ ...i, expires_at: new Date(i.expires_at).toISOString() })),
-    truncated: cutLists({ members: m.results.length > 500, invites: inv.results.length > 200 })
+    members: m.results.slice(0, MEMBERS_LIST_MAX).map((x) => ({ principal_id: x.principal_id, label: x.label, email: admin ? x.email : null, role: x.role, created_at: x.created_at, me: x.principal_id === ctx.principal.id })),
+    invites: inv.results.slice(0, INVITES_LIST_MAX).map((i) => ({ ...i, expires_at: new Date(i.expires_at).toISOString() })),
+    truncated: cutLists({ members: m.results.length > MEMBERS_LIST_MAX, invites: inv.results.length > INVITES_LIST_MAX })
   };
 }
 
@@ -274,7 +276,7 @@ export async function acceptInvite(ctx, input) {
     if (still && lg.limits.members !== undefined) {
       const used = await usageOf(ctx.env, "members", inv.workspace_id);
       if (used + 1 > lg.limits.members) throw new HttpError(402, "limit_reached",
-        `This workspace is full: its plan allows ${lg.limits.members} members. Ask the person who invited you to make room or move to a bigger plan, then open this invitation again.`,
+        `This workspace is full: its plan allows ${lg.limits.members} member${lg.limits.members === 1 ? "" : "s"}. Ask the person who invited you to free up a spot or upgrade the plan, then open this invitation again.`,
         { limit: "members", used, allowed: lg.limits.members });
     }
     throw new HttpError(410, "invite_used", "This invitation was already used, revoked or has expired");

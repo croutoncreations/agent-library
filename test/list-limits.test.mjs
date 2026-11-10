@@ -76,6 +76,8 @@ test("comments: newest 200 (oldest first), next_cursor pages back in created_at,
 test("folders: 1,000 per project on create (409 too_many_folders, also /v1 and the consent page); lists show all 1,000", async () => {
   const F = ok(await owner.req("POST", "/api/projects", { title: "Folders" }), 201).id;
   ok(await owner.req("POST", `/api/projects/${F}/folders`, { name: "First" }), 201);
+  // Folders in another project that sort before F's: the consent picker's cap is per project, so F still shows all of its own.
+  await sql(`${series(5)} INSERT INTO folders (id, project_id, name, name_key, created_at, created_by) SELECT printf('fld_lla%04d', i), '${P}', printf('Aaa %04d', i), printf('aaa %04d', i), '2026-01-01T00:00:00.000Z', '${me}' FROM s`);
   await sql(`${series(999)} INSERT INTO folders (id, project_id, name, name_key, created_at, created_by) SELECT printf('fld_ll%04d', i), '${F}', printf('Folder %04d', i), printf('folder %04d', i), '2026-01-01T00:00:00.000Z', '${me}' FROM s`);
   const full = await owner.req("POST", `/api/projects/${F}/folders`, { name: "One too many" });
   assert.equal(full.status, 409, JSON.stringify(full.body));
@@ -93,13 +95,17 @@ test("folders: 1,000 per project on create (409 too_many_folders, also /v1 and t
   assert.equal(a.error, 400);
   assert.match(a.html, /already has 1,000 folders, the most a project can have/);
   assert.equal(await sql(`SELECT COUNT(*) AS n FROM folders WHERE project_id = '${F}'`).then((r) => r[0].n), 1000, "nothing created");
-  assert.equal((a.consentHtml.match(/value="folder:fld_/g) ?? []).length, 1000, "the consent picker lists all 1,000 folders");
+  const group = (pid) => a.consentHtml.match(new RegExp(`<optgroup label="Folders in ${pid === F ? "Folders" : "Limits"}"[^>]*>(.*?)</optgroup>`))?.[1] ?? "";
+  assert.equal((group(F).match(/value="folder:fld_/g) ?? []).length, 1000, "the consent picker lists all 1,000 of the capped project's folders");
+  assert.equal((group(P).match(/value="folder:fld_lla/g) ?? []).length, 5, "and the other project's folders");
   const pub = await h.connectPublisher(app, { project_id: F, destination: "folder:fld_ll0001" });
   assert.ok(pub.publisher_id);
   if (haveChrome) {
     const browser = await createRequire(import.meta.url)(PUP).launch({ executablePath: CHROME, headless: true, args: ["--no-first-run"] });
     try {
       const page = await browser.newPage();
+      // Reduced motion: the consent card's fade-in is off, so the screenshot shows the settled page.
+      await page.emulateMediaFeatures([{ name: "prefers-reduced-motion", value: "reduce" }]);
       for (const [w, name] of [[1280, "desktop"], [390, "mobile"]]) {
         await page.setViewport({ width: w, height: 900 });
         await page.setContent(a.html.replace(/<meta http-equiv="refresh"[^>]*>/, ""));
@@ -159,10 +165,16 @@ test("capped lists say truncated: [names]; complete lists say []", async () => {
   assert.deepEqual([ws.workspaces.length, ws.truncated], [200, ["workspaces"]]);
   const au = ok(await owner.req("GET", `/api/projects/${P}/audit`));
   assert.deepEqual([au.audits.length, au.truncated], [200, ["audits"]]);
+  // The consent pages list the first 500 projects and say so (agent grant page and publishing page).
+  const pubApp = await h.registerApp({ display_name: "Many Projects App", redirect_uris: ["http://127.0.0.1:5994/cb"], origins: [] });
+  const consent = await h.authorize(pubApp, {}, { stopAtConsent: true });
+  assert.match(consent.consentHtml, /Showing the first 500 projects\./);
+  assert.equal((consent.consentHtml.match(/<option value="prj_/g) ?? []).length, 500);
   if (!haveChrome) return;
   const browser = await createRequire(import.meta.url)(PUP).launch({ executablePath: CHROME, headless: true, args: ["--no-first-run"] });
   try {
     const page = await browser.newPage();
+    await page.emulateMediaFeatures([{ name: "prefers-reduced-motion", value: "reduce" }]);
     await page.goto(h.appUi + "/");
     await page.evaluate(async (passphrase) => fetch("/auth/dev-login", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ passphrase }) }), h.passphrase());
     const note = (sel) => page.evaluate((s) => [...document.querySelectorAll(".truncated-note")].map((e) => e.textContent).filter((t) => t.includes(s)), sel);
@@ -171,7 +183,7 @@ test("capped lists say truncated: [names]; complete lists say []", async () => {
       await page.goto(`${h.appUi}/#/workspaces/${W}`); await page.reload();
       await page.waitForFunction(() => document.querySelectorAll(".truncated-note").length >= 4, { timeout: 30_000 });
       assert.deepEqual(await note("members"), ["Showing the first 500 members."]);
-      assert.deepEqual(await note("invitations"), ["Showing the first 200 pending invitations."]);
+      assert.deepEqual(await note("invitations"), ["Showing the 200 most recent pending invitations."]);
       assert.deepEqual(await note("deleted"), ["Showing the first 200 deleted projects."]);
       assert.deepEqual(await note("open"), ["Showing the first 1,000 projects you can open."]);
       assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1), `no horizontal scroll at ${w}`);
@@ -193,6 +205,7 @@ test("UI: \"Show older comments\" loads the earlier pages above the newest (desk
   const browser = await createRequire(import.meta.url)(PUP).launch({ executablePath: CHROME, headless: true, args: ["--no-first-run"] });
   try {
     const page = await browser.newPage();
+    await page.emulateMediaFeatures([{ name: "prefers-reduced-motion", value: "reduce" }]);
     await page.goto(h.appUi + "/");
     await page.evaluate(async (passphrase) => fetch("/auth/dev-login", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ passphrase }) }), h.passphrase());
     for (const [w, name] of [[1280, "desktop"], [390, "mobile"]]) {
@@ -201,15 +214,21 @@ test("UI: \"Show older comments\" loads the earlier pages above the newest (desk
       await page.waitForFunction(() => [...document.querySelectorAll("[role=tab]")].some((t) => t.textContent.trim() === "Comments"), { timeout: 30_000 });
       await page.evaluate(() => [...document.querySelectorAll("[role=tab]")].find((t) => t.textContent.trim() === "Comments").click());
       const older = await page.waitForSelector("button.com-older:not([hidden])");
-      const rows = () => page.evaluate(() => document.querySelector("button.com-older").nextElementSibling.children.length);
+      const rows = () => page.evaluate(() => document.querySelector("button.com-older + .msg + ul").children.length);
       assert.equal(await rows(), 200);
       const panel = await page.evaluateHandle(() => document.querySelector("button.com-older").closest("[role=tabpanel]"));
       await older.evaluate((b) => b.scrollIntoView({ block: "center" }));
       await page.screenshot({ path: `tmp/test-evidence/limits-comments-load-more-${name}.png` });
       await older.evaluate((b) => b.click());
-      await page.waitForFunction(() => document.querySelector("button.com-older").nextElementSibling.children.length === 400);
+      const list = "button.com-older + .msg + ul";
+      await page.waitForFunction((l) => document.querySelector(l).children.length === 400, {}, list);
+      // Focus is on the first (oldest) loaded comment; the status next to the button says how many loaded.
+      assert.equal(await page.evaluate((l) => document.activeElement === document.querySelector(l).firstElementChild, list), true);
+      assert.equal(await page.$eval("button.com-older + .msg", (e) => [e.textContent, e.getAttribute("aria-live")].join("|")), "Loaded 200 older comments|polite");
+      assert.equal(await page.$eval(list, (e) => e.hasAttribute("aria-busy")), false);
+      assert.match(await page.$eval(`${list} li .muted`, (e) => e.textContent), /^.* · rev 1 · /);
       await older.evaluate((b) => b.click());
-      await page.waitForFunction(() => document.querySelector("button.com-older").nextElementSibling.children.length === 450);
+      await page.waitForFunction((l) => document.querySelector(l).children.length === 450, {}, list);
       assert.equal(await page.$eval("button.com-older", (b) => b.hidden), true, "no more pages");
       const texts = await panel.evaluate((p) => [...p.querySelectorAll(".raw-text")].map((e) => e.textContent));
       assert.equal(texts.at(-1), "newest synthetic comment");

@@ -153,15 +153,22 @@ function logRegistration(outcome, m) {
     software_version: s(m.software_version, 40)
   }));
 }
-// Projects a person can connect an agent to: every visible project, with whether they may grant edit access.
+// Projects a person can connect an agent to: every visible project (the first CONSENT_PROJECTS_MAX; list.truncated
+// says more exist), with whether they may grant edit access.
+const CONSENT_PROJECTS_MAX = 500;
+const consentProjectsNote = (projects) => projects.truncated ? `<p class="fine">Showing the first ${CONSENT_PROJECTS_MAX} projects.</p>` : "";
+// The projects a publisher may write to, keeping the list's truncated flag.
+const writableConsentProjects = (list) => Object.assign(list.filter((p) => p.can_write), { truncated: list.truncated });
 async function consentProjects(env, principalId) {
-  const list = (await visibleProjects(env, principalId)).slice(0, 500).map((p) => ({ id: p.id, title: p.title, workspace_id: p.workspace_id,
+  const visible = await visibleProjects(env, principalId);
+  const list = visible.slice(0, CONSENT_PROJECTS_MAX).map((p) => ({ id: p.id, title: p.title, workspace_id: p.workspace_id,
     workspace_name: p.personal ? null : p.workspace_name, can_write: ROLE_RANK[p.role] >= ROLE_RANK.member && p.workspace_status === "active" }));
   // Active workspaces where the signer may create projects (admin+), including ones with no projects yet.
   const admin = (await env.DB.prepare(`SELECT w.id, w.name, w.personal FROM workspace_members m JOIN workspaces w ON w.id = m.workspace_id
     WHERE m.principal_id = ? AND w.status = 'active' AND m.role IN ('owner','admin') ORDER BY w.personal DESC, w.created_at LIMIT 51`).bind(principalId).all()).results;
   list.adminWorkspaces = admin.slice(0, 50).map((w) => ({ id: w.id, name: w.personal ? null : w.name }));
   list.adminWorkspaces.truncated = admin.length > 50;
+  list.truncated = visible.length > CONSENT_PROJECTS_MAX || visible.truncated;
   return list;
 }
 async function liveConnection(env, id) {
@@ -288,7 +295,7 @@ function cxGrantPage(d, email, projects, prev, consent, values = null, error = "
   const named = groups.length > 1 || groups.some((g) => g.name);
   const rows = projects.length ? (named
     ? groups.map((g, i) => `<div class="wsg" role="group" aria-labelledby="wsh-${i}"><h3 class="wsh" id="wsh-${i}">${esc(g.name ?? "Personal")}</h3><ul class="list">${g.items.map(row).join("")}</ul></div>`).join("")
-    : `<ul class="list">${projects.map(row).join("")}</ul>`) : "";
+    : `<ul class="list">${projects.map(row).join("")}</ul>`) + consentProjectsNote(projects) : "";
   // New projects: by default they go in the workspace of the picked projects (else Personal); any other active
   // workspace where the signer is an admin can be chosen, including ones without projects yet.
   const admin = projects.adminWorkspaces ?? [];
@@ -614,7 +621,7 @@ async function callback(req, env, as, origin) {
   const pubApp = await appClientFor(env, resumed.request.clientId);
   if (pubApp && resumed.request.resource === `${origin}/v1`) {
     if (pubApp.owner_principal_id !== principalId) return errorPage("This app is registered to a different owner.", 403);
-    return publishConsentPage(env, oauth, resumed, pubApp, principalId, ident.email, projects.results.filter((p) => p.can_write));
+    return publishConsentPage(env, oauth, resumed, pubApp, principalId, ident.email, writableConsentProjects(projects.results));
   }
   const details = await oauth.describeConsent(resumed.request);
   const consent = await oauth.beginConsent(resumed.request);
@@ -673,7 +680,10 @@ async function cxPublishPage(env, app, principalId, email, projects, consent, va
   const chosenProject = pick("project_id", (cxSuggestedProject(projects, suggest?.project) ?? projects[0]).id);
   const dupe = cxDupes(projects);
   const projOpts = projects.map((p) => `<option value="${esc(p.id)}"${p.id === chosenProject ? " selected" : ""}>${esc(p.title)}${dupe(p) ? ` (${esc(p.id)})` : ""}</option>`).join("");
-  const folders = await env.DB.prepare(`SELECT f.id, f.name, f.project_id FROM folders f JOIN projects p ON p.id = f.project_id WHERE ${memberRoleSql("p.id", "member")} ORDER BY f.name_key LIMIT ?`).bind(principalId, FOLDERS_PER_PROJECT).all();
+  // Up to FOLDERS_PER_PROJECT folders for each project (a project at its cap shows all of its folders).
+  const folders = await env.DB.prepare(`SELECT id, name, project_id FROM (SELECT f.id, f.name, f.project_id, f.name_key,
+      ROW_NUMBER() OVER (PARTITION BY f.project_id ORDER BY f.name_key) AS n
+    FROM folders f JOIN projects p ON p.id = f.project_id WHERE ${memberRoleSql("p.id", "member")}) WHERE n <= ? ORDER BY name_key`).bind(principalId, FOLDERS_PER_PROJECT).all();
   const byProject = /* @__PURE__ */ new Map();
   for (const f of folders.results) byProject.set(f.project_id, [...byProject.get(f.project_id) ?? [], f]);
   // One folder field for all projects (a hidden control still submits, and /authorize caps bodies at 16 KiB), with
@@ -705,7 +715,7 @@ async function cxPublishPage(env, app, principalId, email, projects, consent, va
 ${active.length ? `<section class="sec"><h2>Destination</h2>${cards}<label class="choice"><input type="radio" name="resume" value="new"${resume === "new" ? " checked" : ""}><span><strong>Somewhere new</strong><small>Start a separate set of files.</small></span></label>
 <p class="fine">Continuing an earlier destination keeps its files and signs out the app's older session.</p></section>` : '<input type="hidden" name="resume" value="new">'}
 <section class="sec fresh">${active.length ? "<h2>New destination</h2>" : ""}<style>${projectCss}</style>
-<label class="field"><span>Project</span><select name="project_id" aria-label="Project">${projOpts}</select></label>
+<label class="field"><span>Project</span><select name="project_id" aria-label="Project">${projOpts}</select></label>${consentProjectsNote(projects)}
 <label class="field"><span>Folder</span>${folderSelect}</label>
 <label class="field newname"><span>Folder name</span><input type="text" name="new_folder_name" maxlength="80" value="${esc(pick("new_folder_name", defaultFolder))}" aria-label="New folder name"></label>
 <details class="more"><summary>${cxIcon("chev")}Who else can read this project</summary><div class="inner"><p class="fine">They will be able to read this app's files, <strong>including future exports</strong>, and <strong>cannot edit them</strong>. Nothing new is granted to them.</p>${audienceHtml}</div></details>
@@ -721,7 +731,7 @@ async function publishConsentPost(req, env, oauth, form, handle, origin) {
   const retry = async (msg) => {
     if (!sess.email) return errorPage(msg);
     const owned = { results: await consentProjects(env, sess.principal_id) };
-    return cxPublishPage(env, app, sess.principal_id, sess.email, owned.results.filter((p) => p.can_write), { handle, headers: new Headers() }, form, msg, 400, sess.suggest ?? null);
+    return cxPublishPage(env, app, sess.principal_id, sess.email, writableConsentProjects(owned.results), { handle, headers: new Headers() }, form, msg, 400, sess.suggest ?? null);
   };
   const resume = String(form.get("resume") ?? "new");
   const at = nowIso(), rid = randomId("req", 9);
@@ -760,7 +770,7 @@ async function publishConsentPost(req, env, oauth, form, handle, origin) {
       }
       const ex = await env.DB.prepare("SELECT id FROM folders WHERE project_id = ? AND name_key = ?").bind(projectId, nm.key).first("id");
       if (ex) return retry(`A folder named \u201C${nm.name}\u201D already exists in this project. Pick it from the folder list, or choose another name.`);
-      const FULL = "This project already has 1,000 folders, the most a project can have. Pick one of its folders, or publish to the project root.";
+      const FULL = `This project already has ${FOLDERS_PER_PROJECT.toLocaleString("en-US")} folders, the most a project can have. Pick one of its folders, or publish to the project root.`;
       if (await env.DB.prepare("SELECT COUNT(*) AS n FROM folders WHERE project_id = ?").bind(projectId).first("n") >= FOLDERS_PER_PROJECT) return retry(FULL);
       folderId = randomId("fld");
       // Checked again inside the INSERT (concurrent creates). A refused folder refuses the principal insert below too,
@@ -788,7 +798,7 @@ async function publishConsentPost(req, env, oauth, form, handle, origin) {
     res = await env.DB.batch(stmts);
   } catch (e) {
     if (/FOREIGN KEY/i.test(String(e?.message)) && newFolder && await env.DB.prepare("SELECT COUNT(*) AS n FROM folders WHERE project_id = ?").bind(form.get("project_id")).first("n") >= FOLDERS_PER_PROJECT)
-      return errorPage("This project reached 1,000 folders, the most a project can have, while you were deciding. Start connecting again from the app and pick an existing folder or the project root.", 409);
+      return errorPage(`This project reached ${FOLDERS_PER_PROJECT.toLocaleString("en-US")} folders, the most a project can have, while you were deciding. Start connecting again from the app and pick an existing folder or the project root.`, 409);
     if (/FOREIGN KEY/i.test(String(e?.message))) return errorPage("Your access to that project, or its workspace's plan limits, changed. Start connecting again from the app.", 403);
     if (/UNIQUE/i.test(String(e?.message))) return errorPage("A folder with that name was just created in this project. Start connecting again from the app and choose it as an existing folder, or pick another name.");
     throw e;
