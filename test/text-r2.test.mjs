@@ -148,6 +148,22 @@ test("chunked R2 reads recheck trash and version after the object await", async 
   await assert.rejects(lib.readTextChunk(ctx, "proj-s", id), e => e.status === 404);
 });
 
+test("chunked R2 reads recheck expiration against the time after the object await", async () => {
+  const { lib, sql, ctx, env } = await harness();
+  const c = await lib.createMarkdown(ctx, "proj-s", { title: "Expiration", body: "private text" }, "expire-create");
+  const realNow = Date.now;
+  let clock = realNow();
+  const at = new Date(clock).toISOString();
+  sql.prepare("INSERT INTO principals (id, kind, issuer, subject, label, created_at) VALUES ('ag','agent','synthetic','ag','Agent',?)").run(at);
+  sql.prepare("INSERT INTO grants (id, project_id, principal_id, token_hash, can_write, expires_at, created_by, created_at) VALUES ('g','proj-s','ag','synthetic-hash',0,?,'hum_s',?)").run(clock + 1000, at);
+  const agent = { ...ctx, principal: { id: "ag", kind: "agent" }, grant: { id: "g", project_id: "proj-s", can_write: 0 } };
+  const get = env.BLOBS.get;
+  env.BLOBS.get = async (...args) => { const object = await get(...args); clock += 2000; return object; };
+  Date.now = () => clock;
+  try { await assert.rejects(lib.readTextChunk(agent, "proj-s", c.body.artifact_id), e => e.status === 404); }
+  finally { Date.now = realNow; }
+});
+
 test("expired or swept intents cannot publish, even after a successful put", async () => {
   for (const mode of ["expired", "swept"]) {
     const { lib, sql, ctx, env, objects } = await harness();

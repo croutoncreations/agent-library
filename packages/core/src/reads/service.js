@@ -101,12 +101,12 @@ async function readTextChunk(ctx, projectId, artifactId, opts = {}) {
   const offset = pin ? pin.o : 0;
   const az = rtReadAuthzSql(ctx, projectId);
   // One statement pins current access, trash state and the immutable version before fetching its bytes.
-  const select = `SELECT a.kind, a.head_rev, a.trashed_at, r.rev_no, r.sha256, r.mime, r.blob_key,
+  const select = (access) => `SELECT a.kind, a.head_rev, a.trashed_at, r.rev_no, r.sha256, r.mime, r.blob_key,
        r.body, r.body_key, CASE WHEN r.body_key IS NOT NULL THEN r.size ELSE length(CAST(r.body AS BLOB)) END AS nbytes,
-       (${az.sql}) AS allowed
+       (${access.sql}) AS allowed
      FROM artifacts a LEFT JOIN revisions r ON r.artifact_id = a.id AND r.project_id = a.project_id AND r.rev_no = COALESCE(?, a.head_rev)
      WHERE a.id = ? AND a.project_id = ?`;
-  const row = await db(ctx).prepare(select).bind(...az.params, rev, artifactId, projectId).first();
+  const row = await db(ctx).prepare(select(az)).bind(...az.params, rev, artifactId, projectId).first();
   // Access ended between authentication and this chunk (revoked, expired or project removed): same answer as a
   // project the caller cannot see, whether or not the document exists. The next request fails authentication.
   if (!row || !row.allowed) throw new HttpError(404, "not_found", "Artifact not found");
@@ -119,7 +119,8 @@ async function readTextChunk(ctx, projectId, artifactId, opts = {}) {
   const nbytes = row.nbytes;
   const bytes = await getTextRange(ctx.env, row, offset, Math.min(maxBytes, Math.max(0, nbytes - offset)));
   // An R2 await must not let a revoked grant, trashed artifact or changed version escape the SQL access fence.
-  const checked = await db(ctx).prepare(select).bind(...az.params, row.rev_no, artifactId, projectId).first();
+  const checkedAccess = rtReadAuthzSql(ctx, projectId);
+  const checked = await db(ctx).prepare(select(checkedAccess)).bind(...checkedAccess.params, row.rev_no, artifactId, projectId).first();
   if (!checked?.allowed || checked.trashed_at || !checked.head_rev) throw new HttpError(404, "not_found", "Artifact not found");
   if (checked.rev_no !== row.rev_no || checked.sha256 !== row.sha256 || checked.body_key !== row.body_key) throw new HttpError(409, "revision_changed", "The version this cursor reads has changed; start again without cursor");
   row.head_rev = checked.head_rev;
