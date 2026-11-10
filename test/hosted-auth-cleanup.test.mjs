@@ -128,24 +128,26 @@ async function r2Has(k) {
 }
 const d1 = (sql) => JSON.parse(execFileSync("wrangler", ["d1", "--config", LOCAL_CONFIG, "execute", "DB", "--local", "--persist-to", s.dir, "--json", "--command", sql], { cwd: ROOT, stdio: ["ignore", "pipe", "ignore"] }).toString())[0].results;
 
-test("expired upload with staged bytes: counted until deleted, then R2 object removed by reconciliation", async () => {
+test("expired upload with received bytes: counted until deleted, then R2 object removed by reconciliation", async () => {
   const A = agent(tokA);
   const b = pngOf(40 * 1024);
   const begin = await A("POST", `/api/projects/${P}/uploads`, { title: "abandoned", mime: "image/png", size: b.length, sha256: sha256(b) });
   assert.equal(begin.status, 201);
-  assert.equal((await A("PUT", begin.body.put_url, undefined, { raw: b })).status, 200); // bytes staged, never finished
-  const sk = d1(`SELECT staging_key FROM uploads WHERE id = '${begin.body.upload_id}'`)[0].staging_key;
-  assert.ok(await r2Has(sk), "staging object exists after PUT");
+  assert.equal((await A("PUT", begin.body.put_url, undefined, { raw: b })).status, 200); // bytes received, never finished
+  // Single pass: the PUT writes the upload's final_key; nothing is ever at staging_key.
+  const { final_key: sk, staging_key: unused } = d1(`SELECT final_key, staging_key FROM uploads WHERE id = '${begin.body.upload_id}'`)[0];
+  assert.ok(await r2Has(sk), "uploaded object exists after PUT");
+  assert.equal(await r2Has(unused), false, "nothing at staging_key");
   await sleep(2500); // past expiry
   // While the abandoned object still exists, its bytes count: a 40 KiB reservation must not fit in 64 KiB.
   // (Expiry processing for this project happens inside begin; it deletes the object, after which space frees.)
   const owner2 = await owner("POST", `/api/projects/${P}/maintenance/reconcile-uploads`);
   assert.equal(owner2.status, 200);
-  assert.ok(owner2.body.expired >= 1 && owner2.body.purged_staging >= 1, JSON.stringify(owner2.body));
-  assert.equal(await r2Has(sk), false, "staging object deleted");
-  const row = d1(`SELECT state, staging_purged_at FROM uploads WHERE id = '${begin.body.upload_id}'`)[0];
+  assert.ok(owner2.body.expired >= 1 && owner2.body.purged_final >= 1, JSON.stringify(owner2.body));
+  assert.equal(await r2Has(sk), false, "uploaded object deleted");
+  const row = d1(`SELECT state, final_purged_at FROM uploads WHERE id = '${begin.body.upload_id}'`)[0];
   assert.equal(row.state, "failed");
-  assert.ok(row.staging_purged_at > 0);
+  assert.ok(row.final_purged_at > 0);
   // Space is released only now; a fresh 40 KiB upload fits again.
   const again = await A("POST", `/api/projects/${P}/uploads`, { title: "after", mime: "image/png", size: b.length, sha256: sha256(b) });
   assert.equal(again.status, 201, JSON.stringify(again.body));
@@ -153,20 +155,22 @@ test("expired upload with staged bytes: counted until deleted, then R2 object re
   await sleep(2500);
   const r2 = await owner("POST", `/api/projects/${P}/maintenance/reconcile-uploads`);
   const r3 = await owner("POST", `/api/projects/${P}/maintenance/reconcile-uploads`);
-  assert.equal(r3.body.purged_staging, 0, JSON.stringify([r2.body, r3.body]));
+  assert.deepEqual([r3.body.purged_staging, r3.body.purged_final], [0, 0], JSON.stringify([r2.body, r3.body]));
 });
 
-test("integrity failure at finish deletes the staged object immediately", async () => {
+test("integrity failure at PUT stores nothing", async () => {
   const A = agent(tokA);
   const b = pngOf(1000);
   const begin = await A("POST", `/api/projects/${P}/uploads`, { title: "bad", mime: "image/png", size: b.length, sha256: "0".repeat(64) });
   assert.equal(begin.status, 201, JSON.stringify(begin.body));
-  assert.equal((await A("PUT", begin.body.put_url, undefined, { raw: b })).status, 200);
-  const fin = await A("POST", `/api/projects/${P}/uploads/${begin.body.upload_id}/finish`, {});
-  assert.equal(fin.status, 422);
-  const row = d1(`SELECT staging_key, staging_purged_at FROM uploads WHERE id = '${begin.body.upload_id}'`)[0];
-  assert.ok(row.staging_purged_at > 0);
+  const put = await A("PUT", begin.body.put_url, undefined, { raw: b });
+  assert.equal(put.status, 422, JSON.stringify(put.body));
+  assert.equal(put.body.error.code, "integrity_mismatch");
+  const row = d1(`SELECT state, final_writes, final_key, staging_key FROM uploads WHERE id = '${begin.body.upload_id}'`)[0];
+  assert.deepEqual([row.state, row.final_writes], ["pending", 0]);
+  assert.equal(await r2Has(row.final_key), false);
   assert.equal(await r2Has(row.staging_key), false);
+  await sleep(2500); // let the reservation expire so this identity can begin again below
 });
 
 test("failed-but-undeleted bytes are quota-charged; space is freed only by a real R2 delete", async () => {
@@ -178,9 +182,10 @@ test("failed-but-undeleted bytes are quota-charged; space is freed only by a rea
   assert.equal(begin.status, 201, JSON.stringify(begin.body));
   assert.equal((await A("PUT", begin.body.put_url, undefined, { raw: b })).status, 200);
   d1(`UPDATE uploads SET state = 'failed', expires_at = 0 WHERE id = '${begin.body.upload_id}'`); // failed, delete pending
-  const used = d1(`SELECT COALESCE(SUM(expected_size),0) AS n FROM uploads WHERE project_id='${P}' AND staging_purged_at IS NULL AND state IN ('failed','conflict')`)[0].n;
+  const used = d1(`SELECT COALESCE(SUM(expected_size),0) AS n FROM uploads WHERE project_id='${P}' AND final_key IS NOT NULL AND final_purged_at IS NULL AND state IN ('failed','conflict')`)[0].n;
   assert.ok(used >= b.length, "failed-but-undeleted bytes are charged");
-  const heldKey = d1(`SELECT staging_key FROM uploads WHERE id = '${begin.body.upload_id}'`)[0].staging_key;
+  const heldKey = d1(`SELECT final_key FROM uploads WHERE id = '${begin.body.upload_id}'`)[0].final_key;
+  assert.ok(await r2Has(heldKey), "the held object exists");
   const B2 = agentHttp(s.base, (await owner("POST", `/api/projects/${P}/grants`, { label: "C", can_write: true })).body.token);
   // Charged: 30 KiB held + published 0; a 40 KiB request must fail while 30 KiB object exists (64 KiB cap)...
   const big = pngOf(40 * 1024);
@@ -191,7 +196,7 @@ test("failed-but-undeleted bytes are quota-charged; space is freed only by a rea
   assert.equal(r.status, 201, JSON.stringify(r.body));
   // The R2 object is really gone. The upload row is either marked purged or, because this upload's placeholder file
   // never published and its expiry is long past, removed with that placeholder (cleanup.js deleteOrphanPlaceholders).
-  const row = d1(`SELECT staging_purged_at FROM uploads WHERE id = '${begin.body.upload_id}'`)[0];
-  if (row) assert.ok(row.staging_purged_at > 0);
+  const row = d1(`SELECT final_purged_at FROM uploads WHERE id = '${begin.body.upload_id}'`)[0];
+  if (row) assert.ok(row.final_purged_at > 0);
   assert.equal(await r2Has(heldKey), false);
 });
