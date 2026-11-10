@@ -24,7 +24,7 @@ remove. A string that's too long is `413 too_large`; a number out of range is `4
 
 | Limit | Default | Scope | Configure | When you hit it |
 |---|---|---|---|---|
-| Text document size (Markdown, HTML, JSON, CSV) | 1 MiB (UTF-8 bytes) | document version | fixed; _ceiling_: text is stored in a D1 row (2 MB max) until text moves to file storage (D23) | `413 too_large` "Markdown exceeds 1 MiB" |
+| Text document size (Markdown, HTML, JSON, CSV) | 1 MiB (UTF-8 bytes) | document version | fixed; text versions are stored in R2; the 1 MiB limit is unchanged in this release | `413 too_large` "Markdown exceeds 1 MiB" |
 | File size (images, PDF, video, other uploads) | 25 MiB | file version | `FILE_MAX_BYTES`; plan `file_bytes`. Never above 90 MiB (_ceiling_: Cloudflare refuses requests over 100 MB, and a file is sent in one PUT). Measured on Cloudflare (Workers Paid, 2026-11-10): 25 MiB works; 50 and 80 MiB uploads fail with 1102 (resource limits), so keep `file_bytes` at 25 MiB or less until uploads stop passing the file through the Worker twice | `413 too_large` "Files can be up to 25 MB on this plan", `{ limit: "file_bytes", allowed }` |
 | Storage | unlimited | workspace | plan `storage_bytes` | `402 limit_reached` |
 | JSON nesting | 64 levels | document | fixed | `422 invalid_content` |

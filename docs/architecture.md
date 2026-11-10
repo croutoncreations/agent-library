@@ -18,8 +18,8 @@ Storage:
 
 | Binding | Holds |
 |---|---|
-| D1 `DB` | projects, folders, artifacts, revisions (Markdown text inline), comments, principals, grants, API credentials, OAuth connections, publishers, uploads, idempotency records, audit log |
-| R2 `BLOBS` (private) | immutable binary versions (keys derived from project/artifact/version IDs; never a mutable "latest" key) |
+| D1 `DB` | projects, folders, artifacts, revisions (object keys for new text versions; older text may remain inline), comments, principals, grants, API credentials, OAuth connections, publishers, uploads, idempotency records, audit log |
+| R2 `BLOBS` (private) | immutable text and binary versions (keys derived from project/artifact/version IDs; never a mutable "latest" key) |
 | KV `OAUTH_KV` | OAuth provider state (clients, grants, tokens), consent context |
 
 A `*/15` cron cleans up expired uploads and their staging objects (bounded and idempotent).
