@@ -89,7 +89,7 @@ remove. A string that's too long is `413 too_large`; a number out of range is `4
 |---|---|---|---|---|
 | Upload reservation | 15 minutes, at most 24 hours | upload | `UPLOAD_TTL_SECONDS` (larger values are capped at 86400) | `410 upload_expired` |
 | Uploads at once | 1 | agent or person | fixed | `429 upload_in_progress` |
-| Upload body | exactly the declared size | upload | fixed | `413 too_large` (longer); `400 incomplete_body` (shorter) |
+| Upload body | exactly the declared size and SHA-256, checked at the PUT (a `Content-Length` other than the declared size is refused before anything is stored) | upload | fixed | `413 too_large` (longer); `400 incomplete_body` (shorter); `422 integrity_mismatch` (other bytes). The upload stays writable: PUT the whole file again |
 | MCP `upload_file` (inline base64) | 2 MiB decoded | call | fixed | `413 too_large`: use `upload_begin` + PUT |
 | MCP inline image in `read_file` | 1 MiB | call | fixed | only a download link |
 | MCP download links | 10 minutes | link | fixed | link expires |

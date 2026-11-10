@@ -598,7 +598,7 @@ function ftToolsFor(env, conn) {
     upload_finish: {
       name: "upload_finish",
       title: "Finish upload",
-      description: "Finish an upload after the PUT: verifies size, SHA-256 and file type, then publishes exactly one new version (shown in History with your change_note). Safe to retry; returns artifact_id, revision and web_url (for the user's browser).",
+      description: "Finish an upload after the PUT (the PUT itself refuses bytes whose size or SHA-256 differ from upload_begin: 422 integrity_mismatch, 400 incomplete_body or 413; PUT the whole file again): checks the file type, then publishes exactly one new version (shown in History with your change_note). Safe to retry; returns artifact_id, revision and web_url (for the user's browser).",
       inputSchema: S({ project_id: P, upload_id: { type: "string", maxLength: 64 }, idempotency_key: K }, ["upload_id", "idempotency_key"]),
       annotations: RW,
       write: true,

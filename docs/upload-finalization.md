@@ -2,14 +2,40 @@
 
 Upload finalization lives in `packages/core/src/uploads.js` (`uploadFinish`) with the cron reconciler in `packages/core/src/cleanup.js`.
 
-Files reach 90 MiB (`FILE_BYTES_CEILING`) and a Worker has 128 MB, so no step holds a whole file in memory. The PUT streams the body to the staging object (through `FixedLengthStream`, counting and hashing each chunk; a body longer than declared is `413`, a chunked body that ends early is `400 incomplete_body` and the upload stays writable). Finish hashes the staged object as a stream, checks the type signature on its first 16 bytes and copies it to the final key as a stream, with R2 checking the SHA-256 again on write.
+Files reach 90 MiB (`FILE_BYTES_CEILING`) and a Worker has 128 MB, so no step holds a whole file in memory, and a
+file passes through the Worker once:
+
+- `uploadBegin` fixes the upload's `final_key` (`blobs/{project}/{artifact}/rev_…`) in the reservation insert.
+  `staging_key` is still filled in but nothing is ever written there.
+- `uploadPut` refuses a `Content-Length` other than the declared size before writing (`413` longer, `400
+  incomplete_body` shorter). It claims the upload (`pending → receiving`) and registers the write
+  (`final_writes + 1`) in one statement, then pipes the body through `FixedLengthStream(expected_size)` into
+  `R2.put(final_key, { sha256: expected_sha256 })`. R2 stores nothing if the length or the SHA-256 is wrong: `422
+  integrity_mismatch`, `400 incomplete_body` or `413`, and the upload goes back to `pending` so the whole file can be
+  PUT again. `final_writes - 1` runs when the put settles. On success it records R2's `size` and `checksums.sha256`.
+- `uploadFinish` writes nothing. Under its lease it checks `head(final_key)` (size equals the declaration and the
+  recorded SHA-256 equals the declared one; no recorded checksum fails closed with `500 publish_failed`) and the type
+  signature on the first 16 bytes, then publishes that object with the fenced revision insert.
+
+Why this is safe:
+
+- PUT writes only from `pending`, and finish only from `sealed` (via `received`), so a write and a finish never
+  overlap.
+- A PUT that dies leaves `final_writes > 0`: the object stays tracked and charged, never orphaned (see below).
+- A retried PUT overwrites the same key, but only before any revision references it (still `pending`).
+- Published is terminal, so no write can follow it.
+- A failed, conflicting or expired upload's `final_key` is purged by the existing cleanup rule (terminal,
+  `final_writes = 0`, unreferenced by any revision); finish also removes it at once when that holds.
+- Rollback: the previous Worker's cleanup deletes `staging_key` for published uploads. Live bytes are never at
+  `staging_key`, so that deletes nothing referenced.
 
 Migration `0011_upload_finalize_lease.sql` must precede the new Worker. It adds:
 
 - `finalize_token` and `finalize_until`: exclusive, expiring finalization ownership.
-- `final_writes`: final-object writes registered before R2 PUT and released when PUT settles.
+- `final_writes`: final-object writes (the upload PUT's) registered before the R2 put and released when it settles.
 
-The first finalizer fixes one final R2 key per upload. Publication checks its ownership
+The final R2 key is fixed at upload begin (an upload begun by an older Worker gets it at its PUT or first lease).
+Publication checks its ownership
 inside the revision-insertion statement. Cleanup cannot fail an upload with a live
 lease, and terminal final objects are purged only when no registered write remains.
 
