@@ -90,10 +90,25 @@ nowMs = () => Date.now();
  * cap is refused before reading, and the stream is counted as it arrives (a missing or understated length can't pass).
  * Returns null when the body is too large (the caller answers in its own error format).
  */
+// An over-cap body is still read (and discarded, never buffered) up to DRAIN_BYTES before the 413 is sent: a client
+// that writes the whole body before reading the response would otherwise see a reset connection instead of the 413.
+var DRAIN_BYTES = 16 * 1024 * 1024;
+async function drainOrCancel(reader, seen) {
+  let n = seen;
+  for (;;) {
+    const { done, value } = await reader.read().catch(() => ({ done: true }));
+    if (done) return;
+    n += value.byteLength;
+    if (n > DRAIN_BYTES) { await reader.cancel().catch(() => {}); return; }
+  }
+}
 async function readTextCapped(req, maxBytes) {
   const declared = req.headers.get("content-length");
-  if (declared !== null && !(Number(declared) <= maxBytes)) return null;
   const reader = req.body?.getReader();
+  if (declared !== null && !(Number(declared) <= maxBytes)) {
+    if (reader) await drainOrCancel(reader, 0);
+    return null;
+  }
   if (!reader) return "";
   const parts = [];
   let n = 0;
@@ -102,7 +117,7 @@ async function readTextCapped(req, maxBytes) {
     if (done) break;
     n += value.byteLength;
     if (n > maxBytes) {
-      await reader.cancel().catch(() => {});
+      await drainOrCancel(reader, n);
       return null;
     }
     parts.push(value);
