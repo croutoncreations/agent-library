@@ -13,6 +13,8 @@ file passes through the Worker once:
   `R2.put(final_key, { sha256: expected_sha256 })`. R2 stores nothing if the length or the SHA-256 is wrong: `422
   integrity_mismatch`, `400 incomplete_body` or `413`, and the upload goes back to `pending` so the whole file can be
   PUT again. `final_writes - 1` runs when the put settles. On success it records R2's `size` and `checksums.sha256`.
+  Each PUT has a deadline: the body is aborted at the upload's `expires_at`, and the put is abandoned at `expires_at +
+  PUT_MARGIN_MS` (60 s; `410 upload_expired`), so no put commits later than that.
 - `uploadFinish` writes nothing. Under its lease it checks `head(final_key)` (size equals the declaration and the
   recorded SHA-256 equals the declared one; no recorded checksum fails closed with `500 publish_failed`) and the type
   signature on the first 16 bytes, then publishes that object with the fenced revision insert.
@@ -21,7 +23,8 @@ Why this is safe:
 
 - PUT writes only from `pending`, and finish only from `sealed` (via `received`), so a write and a finish never
   overlap.
-- A PUT that dies leaves `final_writes > 0`: the object stays tracked and charged, never orphaned (see below).
+- A PUT that dies leaves `final_writes > 0`: the object stays tracked and charged, never orphaned, until the count
+  is stale (see below).
 - A retried PUT overwrites the same key, but only before any revision references it (still `pending`).
 - Published is terminal, so no write can follow it.
 - A failed, conflicting or expired upload's `final_key` is purged by the existing cleanup rule (terminal,
@@ -41,13 +44,19 @@ lease, and terminal final objects are purged only when no registered write remai
 
 ## Interrupted writes
 
-A terminated Worker or failed counter decrement can leave `final_writes > 0` on a
-failed/conflicting upload. Its final object remains tracked and charged to project
-quota rather than risking a late write escaping cleanup. There is deliberately no
-automatic timeout that declares such a write complete.
+A terminated Worker (whose `finally` never runs) or a failed counter decrement can leave
+`final_writes > 0` on a failed/conflicting upload. Its final object remains tracked and
+charged to project quota while a late write could still land.
 
-Cleanup emits `upload_final_writes_retained` for failed, conflicting, or published
-uploads with outstanding write accounting, with an aggregate count and
+Because every PUT ends by `expires_at + PUT_MARGIN_MS` (above), a count is **stale** once
+`now > expires_at + UPLOAD_CLEANUP_GRACE_SECONDS + PUT_MARGIN_MS`. On a terminal row,
+cleanup (`reconcileUploads`), orphan-placeholder deletion and the project purge's waits
+(`purgeDueProjects`) treat a stale count as `final_writes = 0`: cleanup deletes `final_key`
+(absent is harmless) and sets `final_writes = 0, final_purged_at = now`, which releases the
+quota. Live (not stale) counts behave as before.
+
+Cleanup emits `upload_final_writes_retained` for failed or conflicting uploads with live
+(not stale) write accounting, and for published ones, with an aggregate count and
 `oldest_expiry_age_ms` (age since the oldest affected upload expired, not proof that
 its writer has stopped). A failed write-counter decrement emits
 `upload_final_write_release_failed` without masking the original PUT error. Wire
@@ -56,15 +65,10 @@ credentials, or artifact contents. A retained count is a recovery signal, not
 permission to release accounting automatically. A failed decrement after a successful
 PUT can leave accounting on a published upload too. Published bytes remain charged
 through their revision (not double-charged through the counter), and cleanup never
-deletes referenced bytes. Include published rows when diagnosing outstanding counters;
-these may also represent a legitimately finishing older writer, not a stuck process.
+deletes referenced bytes (a stale count on a published row is left alone).
 
 Diagnose with a read-only query against uploads whose state is `failed` or `conflict`
-and `final_writes > 0`. Do not blindly reset counters: a write may still be pending.
-Recovery requires a planned maintenance window that prevents finalization,
-establishes outstanding writers have ended, and confirms the final key is not referenced
-by any revision before resetting accounting and allowing normal cleanup. Preserve a
-database export and recovery record. Never delete a referenced key.
+and `final_writes > 0`. Don't reset counters by hand: cleanup releases them once stale.
 
 ## Rollback
 

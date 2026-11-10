@@ -4,9 +4,16 @@ import { nowMs } from "./util.js";
 
 var EXPIRED = JSON.stringify({ status: 410, code: "upload_expired", message: "Upload expired" });
 var CRASHED = JSON.stringify({ status: 500, code: "finish_abandoned", message: "Upload finish did not complete" });
+// uploadPut aborts its body at the upload's expires_at, so no put commits after expires_at + PUT_MARGIN_MS. A write
+// count (uploads.final_writes) on an upload that expired before staleWritesBefore() is stale: its PUT died without
+// releasing it (an isolate that dies never runs its finally). Cleanup, orphan placeholders and project purge then
+// treat it as final_writes = 0, so a leaked count can't hold quota, an object or a purge forever.
+var PUT_MARGIN_MS = 6e4;
+var staleWritesBefore = (env, now) => now - limitsFor(env).cleanupGraceMs - PUT_MARGIN_MS;
 async function reconcileUploads(env, opts = {}) {
   const now = nowMs();
   const grace = limitsFor(env).cleanupGraceMs;
+  const stale = staleWritesBefore(env, now);
   const limit = opts.limit ?? 50;
   const pf = opts.projectId ? " AND project_id = ?" : "";
   const pp = opts.projectId ? [opts.projectId] : [];
@@ -15,7 +22,9 @@ async function reconcileUploads(env, opts = {}) {
   const e2 = await DB.prepare(`UPDATE uploads SET state = 'failed', result = ? WHERE state = 'receiving' AND expires_at <= ?${pf}`).bind(EXPIRED, now - grace, ...pp).run();
   const e3 = await DB.prepare(`UPDATE uploads SET state = 'failed', result = ?, finalize_token = NULL, finalize_until = NULL WHERE state = 'sealed' AND expires_at <= ? AND (finalize_until IS NULL OR finalize_until <= ?)${pf}
       AND NOT EXISTS (SELECT 1 FROM revisions r WHERE r.id = uploads.final_revision_id)`).bind(CRASHED, now - grace, now, ...pp).run();
-  const retained = await DB.prepare(`SELECT COUNT(*) AS count, MIN(expires_at) AS oldest_expiry FROM uploads WHERE state IN ('failed','conflict','published') AND final_writes > 0 AND final_key IS NOT NULL AND final_purged_at IS NULL${pf}`).bind(...pp).first();
+  // Stale counts on failed or conflicting uploads are released below, so they are not reported as retained.
+  const retained = await DB.prepare(`SELECT COUNT(*) AS count, MIN(expires_at) AS oldest_expiry FROM uploads WHERE state IN ('failed','conflict','published') AND final_writes > 0 AND final_key IS NOT NULL AND final_purged_at IS NULL
+      AND (state = 'published' OR expires_at > ?)${pf}`).bind(stale, ...pp).first();
   if (retained?.count > 0) console.warn(JSON.stringify({ event: "upload_final_writes_retained", count: retained.count, oldest_expiry_age_ms: Math.max(0, now - retained.oldest_expiry) }));
   let purgedStaging = 0, purgedFinal = 0;
   const st = await DB.prepare(`SELECT id, staging_key FROM uploads WHERE staging_purged_at IS NULL AND state IN ('failed','conflict','published')${pf} LIMIT ?`).bind(...pp, limit).all();
@@ -24,15 +33,15 @@ async function reconcileUploads(env, opts = {}) {
     const r = await DB.prepare("UPDATE uploads SET staging_purged_at = ? WHERE id = ? AND staging_purged_at IS NULL AND state IN ('failed','conflict','published')").bind(now, u.id).run();
     purgedStaging += r.meta.changes ? 1 : 0;
   }
-  const fi = await DB.prepare(`SELECT id, final_key FROM uploads u WHERE final_key IS NOT NULL AND final_purged_at IS NULL AND state IN ('failed','conflict') AND final_writes = 0
-      AND NOT EXISTS (SELECT 1 FROM revisions r WHERE r.blob_key = u.final_key)${pf.replace("project_id", "u.project_id")} LIMIT ?`).bind(...pp, limit).all();
+  const fi = await DB.prepare(`SELECT id, final_key FROM uploads u WHERE final_key IS NOT NULL AND final_purged_at IS NULL AND state IN ('failed','conflict') AND (final_writes = 0 OR expires_at <= ?)
+      AND NOT EXISTS (SELECT 1 FROM revisions r WHERE r.blob_key = u.final_key)${pf.replace("project_id", "u.project_id")} LIMIT ?`).bind(stale, ...pp, limit).all();
   for (const u of fi.results) {
     await deleteBlob(env, u.final_key);
-    const r = await DB.prepare("UPDATE uploads SET final_purged_at = ? WHERE id = ? AND final_purged_at IS NULL").bind(now, u.id).run();
+    const r = await DB.prepare("UPDATE uploads SET final_purged_at = ?, final_writes = 0 WHERE id = ? AND final_purged_at IS NULL").bind(now, u.id).run();
     purgedFinal += r.meta.changes ? 1 : 0;
   }
   // Best effort: a failure here must not stop the rest of cleanup or the upload begin that called it.
-  const placeholders = await deleteOrphanPlaceholders(env, now, opts.projectId, limit).catch(() => {
+  const placeholders = await deleteOrphanPlaceholders(env, now, stale, opts.projectId, limit).catch(() => {
     console.error(JSON.stringify({ event: "placeholder_cleanup_failed" }));
     return 0;
   });
@@ -52,7 +61,7 @@ async function reconcileUploads(env, opts = {}) {
 // from every list but counts toward items_per_project, so the cron deletes it, with its upload rows (they reference
 // it), once every upload for it is finished with: terminal, expired more than PLACEHOLDER_GRACE_MS ago (finish keeps
 // answering 410 upload_expired until then) and with its R2 objects purged. Nothing can start a new upload for it
-// (loadArtifact hides binary artifacts at head_rev 0). Bounded per run.
+// (loadArtifact hides binary artifacts at head_rev 0). A stale write count (PUT_MARGIN_MS) does not keep it. Bounded per run.
 var PLACEHOLDER_GRACE_MS = 864e5;
 // Only a placeholder nothing else refers to: a comment, details version or revision on it (all foreign keys to
 // artifacts) leaves it alone, so the delete can never fail a foreign key and roll the cleanup batch back.
@@ -61,18 +70,18 @@ var ORPHAN_PLACEHOLDER_SQL = `a.head_rev = 0 AND a.kind = 'binary' AND a.publish
   AND NOT EXISTS (SELECT 1 FROM comments c WHERE c.artifact_id = a.id)
   AND NOT EXISTS (SELECT 1 FROM revisions r WHERE r.artifact_id = a.id)
   AND NOT EXISTS (SELECT 1 FROM uploads u WHERE u.artifact_id = a.id AND (u.state NOT IN ('failed','conflict') OR u.expires_at > ?
-    OR u.staging_purged_at IS NULL OR u.final_writes > 0 OR (u.final_key IS NOT NULL AND u.final_purged_at IS NULL)))`;
-async function deleteOrphanPlaceholders(env, now, projectId, limit) {
+    OR u.staging_purged_at IS NULL OR (u.final_writes > 0 AND u.expires_at > ?) OR (u.final_key IS NOT NULL AND u.final_purged_at IS NULL)))`;
+async function deleteOrphanPlaceholders(env, now, stale, projectId, limit) {
   const cutoff = now - PLACEHOLDER_GRACE_MS;
   const pf = projectId ? " AND a.project_id = ?" : "";
-  const rows = (await env.DB.prepare(`SELECT a.id FROM artifacts a WHERE ${ORPHAN_PLACEHOLDER_SQL}${pf} LIMIT ?`).bind(cutoff, ...projectId ? [projectId] : [], limit).all()).results;
+  const rows = (await env.DB.prepare(`SELECT a.id FROM artifacts a WHERE ${ORPHAN_PLACEHOLDER_SQL}${pf} LIMIT ?`).bind(cutoff, stale, ...projectId ? [projectId] : [], limit).all()).results;
   if (!rows.length) return 0;
   const stmts = [];
   for (const { id } of rows) {
     // Re-checked in each statement, so a row that changed since the SELECT is left alone.
     const still = `EXISTS (SELECT 1 FROM artifacts a WHERE a.id = ? AND ${ORPHAN_PLACEHOLDER_SQL})`;
-    stmts.push(env.DB.prepare(`DELETE FROM uploads WHERE artifact_id = ? AND ${still}`).bind(id, id, cutoff),
-      env.DB.prepare(`DELETE FROM artifacts AS a WHERE a.id = ? AND ${ORPHAN_PLACEHOLDER_SQL}`).bind(id, cutoff));
+    stmts.push(env.DB.prepare(`DELETE FROM uploads WHERE artifact_id = ? AND ${still}`).bind(id, id, cutoff, stale),
+      env.DB.prepare(`DELETE FROM artifacts AS a WHERE a.id = ? AND ${ORPHAN_PLACEHOLDER_SQL}`).bind(id, cutoff, stale));
   }
   const res = await env.DB.batch(stmts);
   return res.filter((_, i) => i % 2 === 1).reduce((n, r) => n + (r.meta.changes ? 1 : 0), 0);
@@ -110,4 +119,4 @@ async function pruneExpiredRows(env, { batch = PRUNE_BATCH } = {}) {
   return out;
 }
 
-export { pruneExpiredRows, reconcileUploads };
+export { PUT_MARGIN_MS, pruneExpiredRows, reconcileUploads, staleWritesBefore };

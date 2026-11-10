@@ -1,6 +1,6 @@
 import { blobSha256Hex, deleteBlob, getBlob, getBlobHead, headBlob, putBlobStream, readText } from "./content-store.js";
 import { authenticate, authorizeProject, authzSql, enforceRate, limitsFor, requireCsrf } from "./auth.js";
-import { reconcileUploads } from "./cleanup.js";
+import { PUT_MARGIN_MS, reconcileUploads } from "./cleanup.js";
 import { CONTENT_TYPE, spreadsheetSafeCsv } from "./formats.js";
 import { __name } from "./runtime.js";
 import { explainLimit, fileTooLarge, guardSql, projectLimitGuard } from "./limits.js";
@@ -130,19 +130,38 @@ async function uploadPut(req, env, requestId, uploadId, linkCtx) {
   try {
     // One pass, constant memory (files reach FILE_BYTES_CEILING, Workers have 128 MB): the body streams straight to
     // final_key. R2 checks the length (FixedLengthStream) and the declared SHA-256, and stores nothing if either is wrong.
-    let stored;
+    // Deadline (cleanup.js PUT_MARGIN_MS): the body is aborted at expires_at (a chunk after it, or a timer, errors the
+    // stream), and the put is abandoned at expires_at + PUT_MARGIN_MS, so cleanup can treat older write counts as stale.
+    const deadline = u.expires_at;
+    const expired = () => new HttpError(410, "upload_expired", "Upload expired during transfer");
+    let stored, bodyCtl, abortTimer, marginTimer, timedOut = false, abandoned = false;
+    const body = req.body.pipeThrough(new TransformStream({
+      start(c) { bodyCtl = c; },
+      transform(chunk, out) {
+        if (nowMs() > deadline) { timedOut = true; throw expired(); }
+        out.enqueue(chunk);
+      }
+    }));
     try {
-      stored = await putBlobStream(env, finalKey, req.body, u.expected_size, { sha256: u.expected_sha256, httpMetadata: { contentType: u.mime } });
+      abortTimer = setTimeout(() => { timedOut = true; bodyCtl.error(expired()); }, Math.max(0, deadline - nowMs()));
+      const margin = new Promise((_, reject) => {
+        marginTimer = setTimeout(() => { timedOut = abandoned = true; bodyCtl.error(expired()); reject(expired()); }, Math.max(0, deadline + PUT_MARGIN_MS - nowMs()));
+      });
+      stored = await Promise.race([putBlobStream(env, finalKey, body, u.expected_size, { sha256: u.expected_sha256, httpMetadata: { contentType: u.mime } }), margin]);
     } catch (e) {
+      if (timedOut) throw expired();
       const m = String(e?.message ?? e);
       if (/SHA-256 checksum you specified did not match|10037/.test(m)) throw new HttpError(422, "integrity_mismatch", "The body's SHA-256 does not match the declared sha256; PUT the whole file again");
       if (/too many bytes/i.test(m)) throw new HttpError(413, "too_large", "Body exceeds declared size");
       if (/did not see all expected bytes/i.test(m)) throw new HttpError(400, "incomplete_body", "Body ended before the declared size; PUT the whole file again");
       throw e;
     } finally {
+      clearTimeout(abortTimer);
+      clearTimeout(marginTimer);
       // A release failure leaves accounting raised (fail closed): the object stays tracked and charged. Log it without
-      // replacing the PUT's own error. Never log blob keys or errors.
-      await env.DB.prepare("UPDATE uploads SET final_writes = final_writes - 1 WHERE id = ? AND final_writes > 0").bind(uploadId).run().catch(() => {
+      // replacing the PUT's own error. Never log blob keys or errors. An abandoned put might still commit, so its count
+      // is left for cleanup to treat as stale.
+      if (!abandoned) await env.DB.prepare("UPDATE uploads SET final_writes = final_writes - 1 WHERE id = ? AND final_writes > 0").bind(uploadId).run().catch(() => {
         console.warn(JSON.stringify({ event: "upload_final_write_release_failed" }));
       });
     }
@@ -173,7 +192,7 @@ async function uploadPut(req, env, requestId, uploadId, linkCtx) {
 //  - Every final-object write is counted in uploads.final_writes (taken in the PUT's claim, released when the put
 //    settles). Cleanup purges a failed upload's final object only once no write is in flight; a failed upload can
 //    start no new write, so nothing re-creates the object afterwards. A Worker that dies mid-put leaves the count
-//    raised: the object then stays tracked and counted against quota instead of escaping both.
+//    raised: the object stays tracked and counted against quota until the count is stale (cleanup.js PUT_MARGIN_MS).
 //  - A finisher that lost its lease never deletes or publishes; it replays the upload's recorded outcome, or answers
 //    409 finish_in_progress while another finisher still holds the lease.
 var FINALIZE_LEASE_MS = 60 * 1e3;

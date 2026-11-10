@@ -2,9 +2,13 @@
 // the production uploadPut/uploadFinish/reconcileUploads in the in-memory world of upload-world.mjs, so each
 // interleaving is scheduled exactly, not hoped for. Since single-pass uploads the only R2 write is the PUT's (to
 // final_key); finish reads R2's recorded checksum and the first bytes, then publishes. Synthetic data only.
-import { test } from "node:test";
+import { test, mock } from "node:test";
 import assert from "node:assert/strict";
 import { P, PNG, lib, world } from "./upload-world.mjs";
+
+// Defaults (cleanup.js / auth.js): UPLOAD_CLEANUP_GRACE_SECONDS 600 and PUT_MARGIN_MS 60 s. A write count on an upload
+// that expired longer ago than both is stale: no PUT can still commit (uploadPut's deadline).
+const GRACE = 600000, PUT_MARGIN = 60000;
 
 test("finding 1: cleanup racing an expired sealed retry can no longer leave a revision without bytes", async () => {
   const w = world();
@@ -104,12 +108,13 @@ test("conflict at publication removes the unpublished object and records the con
 test("a PUT still in flight when cleanup expires the upload: the object is purged only after the write settles", async () => {
   const w = world();
   const { id, art } = w.upload({ state: "pending" });
-  // The PUT's R2 write is in flight; meanwhile the upload expires past the grace and cleanup fails it. Cleanup must not
+  // The PUT's R2 write is in flight; meanwhile the upload expires past the grace (not yet past the PUT deadline, so the
+  // count is live) and cleanup fails it. Cleanup must not
   // purge (and stop tracking) the key while the write can still commit.
   w.r2.beforeCommit = async (k) => {
     if (!k.startsWith("blobs/")) return;
     w.r2.beforeCommit = null;
-    w.sql.prepare("UPDATE uploads SET expires_at = ? WHERE id = ?").run(Date.now() - 3600000, id);
+    w.sql.prepare("UPDATE uploads SET expires_at = ? WHERE id = ?").run(Date.now() - GRACE - 30000, id);
     await lib.reconcileUploads(w.env);
     assert.equal(w.row(id).state, "failed");
     assert.equal(w.row(id).final_writes, 1);
@@ -128,9 +133,9 @@ test("a PUT still in flight when cleanup expires the upload: the object is purge
   assert.deepEqual(w.revisions(art), []);
 });
 
-test("a Worker that dies mid-write leaves the object tracked and counted, never orphaned", async () => {
+test("a Worker that dies mid-write leaves the object tracked and counted until the count is stale, never orphaned", async () => {
   const w = world();
-  const { id } = w.upload({ state: "sealed", expiresAt: Date.now() - 3600000 });
+  const { id } = w.upload({ state: "sealed", expiresAt: Date.now() - GRACE - 30000 });
   // Simulate termination: a write registered but never settled, object present, lease lapsed.
   const key = "blobs/" + P + "/" + w.row(id).artifact_id + "/rev_synthetic_dead";
   w.sql.prepare("UPDATE uploads SET final_key = ?, final_writes = 1, finalize_token = 'fin_dead', finalize_until = ? WHERE id = ?").run(key, Date.now() - 1, id);
@@ -140,6 +145,73 @@ test("a Worker that dies mid-write leaves the object tracked and counted, never 
   assert.ok(w.blobs.has(key));
   assert.equal(w.row(id).final_purged_at, null, "still tracked by cleanup");
   assert.equal(w.quota(), PNG.length, "still counted against quota");
+});
+
+// F1: the PUT owns final_writes; a request that dies never runs its finally. Past the PUT deadline (expires_at +
+// PUT_MARGIN_MS) no put can commit, so after the cleanup grace as well the count is stale and the row is purged.
+test("a PUT that never settles: past the deadline and grace, reconcile purges the key, releases quota and deletes the placeholder", async (t) => {
+  const w = world();
+  const { id, art } = w.upload({ state: "pending" });
+  // The put stores the object, then hangs forever: the request died and its finally never runs. (Mocked timers, so
+  // the PUT's deadline timer never fires either.)
+  mock.timers.enable({ apis: ["setTimeout"] });
+  t.after(() => mock.timers.reset());
+  w.r2.onPut = () => new Promise(() => {});
+  void w.put(id, PNG).catch(() => {});
+  for (let i = 0; i < 100 && !w.blobs.has(w.row(id).final_key); i++) await new Promise(setImmediate);
+  const key = w.row(id).final_key;
+  assert.ok(w.blobs.has(key), "the object was stored");
+  assert.deepEqual([w.row(id).state, w.row(id).final_writes], ["receiving", 1]);
+  // Inside the deadline plus grace: the count is live, so the object stays tracked and charged.
+  w.sql.prepare("UPDATE uploads SET expires_at = ? WHERE id = ?").run(Date.now() - GRACE - PUT_MARGIN + 30000, id);
+  await lib.reconcileUploads(w.env);
+  assert.deepEqual([w.row(id).state, w.row(id).final_writes, w.row(id).final_purged_at], ["failed", 1, null]);
+  assert.ok(w.blobs.has(key));
+  assert.equal(w.quota(), PNG.length);
+  // Past expires_at + grace + PUT_MARGIN_MS: stale, handled as if no write were in flight.
+  w.sql.prepare("UPDATE uploads SET expires_at = ? WHERE id = ?").run(Date.now() - GRACE - PUT_MARGIN - 1000, id);
+  await lib.reconcileUploads(w.env);
+  assert.equal(w.blobs.has(key), false, "final_key purged");
+  assert.deepEqual([w.row(id).final_writes, w.row(id).final_purged_at > 0], [0, true]);
+  assert.equal(w.quota(), 0, "quota released");
+  // The placeholder goes once the upload expired over a day ago.
+  w.sql.prepare("UPDATE uploads SET expires_at = ? WHERE id = ?").run(Date.now() - 2 * 864e5, id);
+  await lib.reconcileUploads(w.env);
+  assert.equal(w.sql.prepare("SELECT COUNT(*) AS n FROM artifacts WHERE id = ?").get(art).n, 0, "placeholder deleted");
+  assert.equal(w.row(id), undefined);
+});
+
+test("a stale write count does not keep an old placeholder alive (purged in the same run)", async () => {
+  const w = world();
+  const { id, art, finalKey } = w.upload({ state: "failed", expiresAt: Date.now() - 2 * 864e5 });
+  w.sql.prepare("UPDATE uploads SET final_writes = 2, staging_purged_at = ? WHERE id = ?").run(Date.now(), id);
+  await lib.reconcileUploads(w.env);
+  assert.equal(w.blobs.has(finalKey), false);
+  assert.equal(w.sql.prepare("SELECT COUNT(*) AS n FROM artifacts WHERE id = ?").get(art).n, 0);
+});
+
+test("uploadPut aborts a body still streaming at the deadline: nothing is stored and the write is released", async () => {
+  const w = world();
+  const { id } = w.upload({ state: "pending" });
+  // Ten bytes, then the client stalls. Mocked clock and timers: advance past expires_at + PUT_MARGIN_MS.
+  mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
+  try {
+    const body = new ReadableStream({ start(c) { c.enqueue(new Uint8Array(PNG.subarray(0, 10))); } });
+    const req = new Request("https://example.test/api/transfers/" + id, { method: "PUT", body, duplex: "half" });
+    const p = lib.uploadPut(req, w.env, w.ctx.requestId, id, w.ctx);
+    let outcome = null;
+    p.then(() => (outcome = "ok"), (e) => (outcome = e));
+    for (let i = 0; i < 100 && w.row(id).state !== "receiving"; i++) await new Promise(setImmediate);
+    assert.equal(w.row(id).state, "receiving");
+    mock.timers.tick(w.row(id).expires_at - Date.now() - 1000);
+    for (let i = 0; i < 20; i++) await new Promise(setImmediate);
+    assert.equal(outcome, null, "still streaming before the deadline");
+    mock.timers.tick(2000);
+    for (let i = 0; i < 100 && outcome === null; i++) await new Promise(setImmediate);
+    assert.ok(outcome instanceof Error && outcome.status === 410 && outcome.code === "upload_expired", String(outcome?.message ?? outcome));
+  } finally { mock.timers.reset(); }
+  assert.deepEqual(w.finals(), [], "nothing stored");
+  assert.equal(w.row(id).final_writes, 0, "write released");
 });
 
 test("cleanup never deletes a final object a revision references", async () => {
@@ -166,15 +238,15 @@ test("decrement failures preserve the PUT error and retained accounting is visib
     await assert.rejects(w.put(id, PNG), /synthetic original PUT failure/);
     assert.equal(w.row(id).final_writes, 1, "failure leaves accounting raised");
     assert.equal(w.row(id).state, "pending");
-    w.sql.prepare("UPDATE uploads SET expires_at = ? WHERE id = ?").run(Date.now() - 3600000, id);
+    w.sql.prepare("UPDATE uploads SET expires_at = ? WHERE id = ?").run(Date.now() - GRACE - 30000, id);
     await lib.reconcileUploads(w.env);
     assert.equal(w.row(id).state, "failed");
     assert.deepEqual(warnings[0], { event: "upload_final_write_release_failed" });
     assert.equal(warnings[1].event, "upload_final_writes_retained");
     assert.equal(warnings[1].count, 1);
-    assert.ok(warnings[1].oldest_expiry_age_ms >= 3600000);
+    assert.ok(warnings[1].oldest_expiry_age_ms >= GRACE);
     assert.equal(JSON.stringify(warnings).includes(id), false, "warnings contain no upload identifier");
-    assert.equal(w.row(id).final_purged_at, null, "still retained for operator recovery");
+    assert.equal(w.row(id).final_purged_at, null, "still retained until the count is stale");
   } finally { console.warn = warn; }
 });
 
