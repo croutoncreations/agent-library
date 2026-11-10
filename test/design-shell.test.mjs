@@ -119,9 +119,12 @@ test("project list: whole-row link without nested controls; distinct empty, no-m
   await Promise.all([page.waitForFunction(() => location.hash === "#/p/alpha"), page.evaluate(() => { const li = [...document.querySelectorAll(".list li.link")].find((l) => l.innerText.includes("Alpha notes")); const r = li.getBoundingClientRect(); document.elementFromPoint(r.right - 40, r.top + r.height / 2).click(); })]);
   await page.goto(ORIGIN + "/#/p/empty-one"); await page.waitForFunction(() => document.body.innerText.includes("This project is empty"));
   await page.goto(ORIGIN + "/#/p/alpha"); await page.waitForFunction(() => document.body.innerText.includes("First doc"));
+  assert.equal(await page.$eval("input[type=search]", (e) => e.placeholder), "Filter titles");
   await page.type("input[type=search]", "no-such-text-zz");
   await page.waitForFunction(() => document.body.innerText.includes("No matches for"));
-  await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.textContent === "Clear search").click());
+  assert.equal(await page.$eval(".state p", (e) => e.textContent), "The filter matches titles in this project. Try a different word or clear the filter.");
+  assert.equal(await page.$eval(".state button", (b) => b.textContent), "Clear filter");
+  await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.textContent === "Clear filter").click());
   await page.waitForFunction(() => document.body.innerText.includes("First doc"));
   // Server error keeps the session and offers a retry; nothing is replaced optimistically.
   await page.setRequestInterception(true);

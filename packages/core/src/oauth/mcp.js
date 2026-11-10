@@ -26,7 +26,7 @@ function toolsFor(env) {
   if (!appConnectEnabled(env)) return TOOLS;
   return [...TOOLS.map((t) => t.name === "list_artifacts" ? {
     ...t,
-    description: "List or search documents and data files (Markdown, JSON, CSV) in a connected project. Paginated.",
+    description: "List documents and data files (Markdown, JSON, CSV) in a connected project; optional query filters by title. Paginated. To search document text, use search_artifacts if it is listed.",
     inputSchema: { ...t.inputSchema, properties: { ...t.inputSchema.properties, ...AC_LIST_PROPS } }
   } : t), READ_RECORDS];
 }
@@ -202,7 +202,7 @@ TOOLS = [
   {
     name: "list_artifacts",
     title: "List documents",
-    description: "List or search documents (Markdown and HTML) in a connected project (title and text). Paginated.",
+    description: "List documents (Markdown and HTML) in a connected project; optional query filters by title. Paginated. To search document text, use search_artifacts if it is listed.",
     inputSchema: S({ project_id: P, query: { type: "string", maxLength: 200 }, cursor: { type: "string", maxLength: 12 } }, []),
     annotations: RO,
     write: false,
@@ -611,7 +611,7 @@ function ftToolsFor(env, conn) {
       out2.push({
         ...t,
         title: "List documents and files",
-        description: 'List or search documents (Markdown, HTML, JSON, CSV) and files (images, PDFs, video: kind "binary") in a connected project. Each item has kind, mime, size and revision. Paginated (50 per page; pass next_cursor).',
+        description: 'List documents (Markdown, HTML, JSON, CSV) and files (images, PDFs, video: kind "binary") in a connected project; optional query filters by title. Each item has kind, mime, size and revision. Paginated (50 per page; pass next_cursor). To search document text, use search_artifacts if it is listed.',
         inputSchema: S({
           project_id: P,
           query: { type: "string", maxLength: 200 },

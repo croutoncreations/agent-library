@@ -1726,8 +1726,8 @@ async function viewList(pid, trash) {
     return li;
   }
   function emptyFor(term) {
-    if (term) return stateBox("", "search", "No matches for \u201C" + term + "\u201D", trash ? "Nothing in trash matches. Try a different word." : "Search looks at titles and document text in this project. Try a different word or clear the search.",
-      h("button", { type: "button", class: "secondary", onclick: function () { q.value = ""; load(true); q.focus(); } }, "Clear search"));
+    if (term) return stateBox("", "search", "No matches for \u201C" + term + "\u201D", trash ? "Nothing in trash matches. Try a different word." : "The filter matches titles in this project. Try a different word or clear the filter.",
+      h("button", { type: "button", class: "secondary", onclick: function () { q.value = ""; load(true); q.focus(); } }, "Clear filter"));
     if (trash) return stateBox("", "trash", "Trash is empty", "Items you move to trash stay here with their history until you restore them.");
     if (!canWrite(pid)) return stateBox("", "doc", "This project is empty", "Nothing has been added yet. You have view-only access.");
     return stateBox("", "doc", "This project is empty", "Write a document or upload an image, video or PDF. Connected apps you allow can also add items here.",

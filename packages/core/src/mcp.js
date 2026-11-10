@@ -20,7 +20,7 @@ var TOOLS2 = [
   { name: "list_projects", description: "List projects this identity may access.", inputSchema: S2({}, []), run: (c) => listProjects(c) },
   {
     name: "list_artifacts",
-    description: "List/search artifacts (title and Markdown body). Paginated (50).",
+    description: "List artifacts; optional query filters by title. Paginated (50). To search document text, use search_artifacts if it is listed.",
     inputSchema: S2({ project_id: P2, query: { type: "string" }, cursor: { type: "string" } }, ["project_id"]),
     run: (c, a) => listArtifacts(c, a.project_id, { query: a.query, cursor: a.cursor })
   },
