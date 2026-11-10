@@ -1,4 +1,4 @@
-import { commitTextWrites, getText, isTextWriteFenceError, readText, stageTextWrite, storeText, textWriteComplete } from "./content-store.js";
+import { commitTextWrites, getText, isTextWriteFenceError, mapContent, stageTextWrite, textWriteComplete } from "./content-store.js";
 import { authorizeProject, authzSql, contentWriteSql, credentialGate, protectSql, requireHuman } from "./auth.js";
 import { chQuery, cleanupChanges, listChanges } from "./changes/service.js";
 import { MEASUREMENTS, MIME, checkFile, isCalendarDate } from "./formats.js";
@@ -620,12 +620,14 @@ async function addComment(ctx, projectId, artifactId, input, key) {
   const az = { sql: `${az0.sql} AND ${pr.sql}`, params: [...az0.params, ...pr.params] };
   const gate = "EXISTS (SELECT 1 FROM comments WHERE id = ?)";
   const body2 = { comment_id: id, revision: rev };
-  const out2 = await runBatch(ctx, [
-    db(ctx).prepare(`INSERT INTO comments (id, project_id, artifact_id, rev_no, author_id, body, created_at)
-      SELECT ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM revisions WHERE artifact_id = ? AND project_id = ? AND rev_no = ?) AND ${az.sql}`).bind(id, projectId, artifactId, rev, ctx.principal.id, storeText(text), nowIso(), artifactId, projectId, rev, ...az.params),
+  const bodyKey = await stageTextWrite(ctx.env, projectId, artifactId, id, text);
+  const out2 = await commitTextWrites(ctx.env, [bodyKey], (guarded) => runBatch(ctx, guarded([
+    db(ctx).prepare(`INSERT INTO comments (id, project_id, artifact_id, rev_no, author_id, body, body_key, created_at)
+      SELECT ?, ?, ?, ?, ?, '', ?, ? WHERE EXISTS (SELECT 1 FROM revisions WHERE artifact_id = ? AND project_id = ? AND rev_no = ?) AND ${az.sql}`).bind(id, projectId, artifactId, rev, ctx.principal.id, bodyKey, nowIso(), artifactId, projectId, rev, ...az.params),
     idemInsert(ctx, i, 201, body2, gate, [id]),
-    audit(ctx, projectId, "comment.add", artifactId, rev, "ok", gate, [id])
-  ], i);
+    audit(ctx, projectId, "comment.add", artifactId, rev, "ok", gate, [id]),
+    textWriteComplete(ctx.env, bodyKey)
+  ]), i));
   if (!Array.isArray(out2)) return out2;
   if (!out2[0].meta.changes) throw new HttpError(404, "not_found", "Revision not found");
   return { status: 201, body: body2 };
@@ -653,13 +655,13 @@ async function listComments(ctx, projectId, artifactId, cursor) {
   await loadArtifact(ctx, projectId, artifactId);
   const before = cursor === void 0 || cursor === null || cursor === "" ? null : parseCommentCursor(cursor);
   const r = await db(ctx).prepare(
-    `SELECT c.id, c.rev_no AS revision, c.body, c.created_at, p.label AS author FROM comments c JOIN principals p ON p.id = c.author_id
+    `SELECT c.id, c.rev_no AS revision, c.body, c.body_key, c.created_at, p.label AS author FROM comments c JOIN principals p ON p.id = c.author_id
      WHERE c.artifact_id = ? AND c.project_id = ?${before ? " AND (c.created_at, c.id) < (?, ?)" : ""}
      ORDER BY c.created_at DESC, c.id DESC LIMIT ?`
   ).bind(artifactId, projectId, ...before ? [before.at, before.id] : [], COMMENTS_PAGE + 1).all();
   const page = r.results.slice(0, COMMENTS_PAGE).reverse();
   return {
-    comments: page.map((c) => ({ ...c, body: readText(c.body) })),
+    comments: await mapContent(page, async ({ body_key, ...c }) => ({ ...c, body: await getText(ctx.env, { ...c, body_key }) })),
     next_cursor: r.results.length > COMMENTS_PAGE ? commentCursor(page[0]) : null
   };
 }

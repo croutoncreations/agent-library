@@ -10,7 +10,7 @@ import { SERVER_PORTS } from "./ports.mjs";
 import { commitTextWrites, isTextWriteFenceError } from "../packages/core/src/content-store.js";
 
 async function harness() {
-  const lib = await loadWorker({ "service.js": ["createMarkdown", "saveMarkdown", "getArtifact", "restoreRevision", "updateMetadata", "listArtifacts"], "reads/service.js": ["readTextChunk"], "uploads.js": ["serveContent"], "history/service.js": ["diffRevisions"], "backup.js": ["exportBackup", "restoreBackup", "importBackup"], "cleanup.js": ["reconcileUploads"], "content-store.js": ["stageTextWrites", "commitTextWrites"], "adapters.js": ["withAdapters", "defaultAdapters"] });
+  const lib = await loadWorker({ "service.js": ["createMarkdown", "saveMarkdown", "getArtifact", "restoreRevision", "updateMetadata", "listArtifacts", "addComment", "listComments"], "reads/service.js": ["readTextChunk"], "uploads.js": ["serveContent"], "history/service.js": ["diffRevisions"], "backup.js": ["exportBackup", "restoreBackup", "importBackup"], "cleanup.js": ["reconcileUploads"], "content-store.js": ["stageTextWrites", "commitTextWrites"], "adapters.js": ["withAdapters", "defaultAdapters"] });
   const sql = new DatabaseSync(":memory:");
   for (const f of readdirSync(join(ROOT, "migrations")).filter(f => f.endsWith(".sql")).sort()) sql.exec(readFileSync(join(ROOT, "migrations", f), "utf8"));
   const stmt = (q, p = []) => ({ q, p, bind: (...p) => stmt(q, p), async first(c) { const r = sql.prepare(q).get(...p); return c ? r?.[c] ?? null : r ?? null; }, async all() { return { results: sql.prepare(q).all(...p) }; }, async run() { return { meta: { changes: sql.prepare(q).run(...p).changes } }; } });
@@ -24,6 +24,74 @@ async function harness() {
   const ctx = { env, requestId: "req_s", principal: { id: "hum_s", kind: "human", label: "Owner" } };
   return { lib, sql, ctx, env, objects };
 }
+
+test("comments publish immutable UTF-8 objects, replay without another put, and retain the length limit", async () => {
+  const { lib, ctx, sql, objects, env } = await harness();
+  const created = await lib.createMarkdown(ctx, "proj-s", { title: "Comments", body: "document" }, "comments-create");
+  const aid = created.body.artifact_id, input = { revision: 1, body: "café 🙂 漢字" };
+  const counts = spyBindings(env);
+  const result = await lib.addComment(ctx, "proj-s", aid, input, "comment-one");
+  const row = sql.prepare("SELECT * FROM comments").get();
+  assert.equal(row.body, "");
+  assert.equal(row.body_key, textKey("proj-s", aid, result.body.comment_id));
+  assert.equal(new TextDecoder().decode(objects.get(row.body_key)), input.body);
+  assert.equal(sql.prepare("SELECT COUNT(*) AS n FROM content_writes").get().n, 0);
+  const replay = await lib.addComment(ctx, "proj-s", aid, input, "comment-one");
+  assert.deepEqual(replay.body, { ...result.body, idempotent_replay: true });
+  assert.equal(counts.puts, 1);
+  assert.equal(objects.size, 2);
+  await assert.rejects(lib.addComment(ctx, "proj-s", aid, { revision: 1, body: "x".repeat(10001) }, "too-long"), e => e.status === 413);
+});
+
+test("comment pages preserve mixed legacy and R2 bodies, order and cursors with bounded reads", async () => {
+  const { lib, ctx, sql, objects, env } = await harness();
+  const created = await lib.createMarkdown(ctx, "proj-s", { title: "Pages", body: "document" }, "pages-create");
+  const aid = created.body.artifact_id, expected = [];
+  for (let i = 0; i < 405; i++) {
+    const id = `cmt_${String(i).padStart(4, "0")}`, body = `comment ${i} café🙂`;
+    const key = i % 2 ? textKey("proj-s", aid, id) : null;
+    if (key) objects.set(key, new TextEncoder().encode(body));
+    sql.prepare("INSERT INTO comments (id, project_id, artifact_id, rev_no, author_id, body, body_key, created_at) VALUES (?, 'proj-s', ?, 1, 'hum_s', ?, ?, '2026-01-01')").run(id, aid, key ? "" : body, key);
+    expected.push({ id, revision: 1, body, created_at: "2026-01-01", author: "Owner" });
+  }
+  const counts = spyBindings(env);
+  let cursor, end = expected.length;
+  do {
+    const page = await lib.listComments(ctx, "proj-s", aid, cursor);
+    const start = Math.max(0, end - 200);
+    assert.deepEqual(page.comments, expected.slice(start, end));
+    const wantedCursor = start ? Buffer.from(JSON.stringify(["2026-01-01", expected[start].id])).toString("base64url") : null;
+    assert.equal(page.next_cursor, wantedCursor);
+    cursor = page.next_cursor; end = start;
+  } while (cursor);
+  assert.equal(counts.gets, 202);
+  assert.ok(counts.maxInFlight > 1 && counts.maxInFlight <= 6);
+});
+
+test("refused or expired comment publication leaves no objects or intents; sweep keeps referenced comments", async () => {
+  for (const mode of ["missing-revision", "lost-access", "expired"]) {
+    const { lib, ctx, sql, env, objects } = await harness();
+    const c = await lib.createMarkdown(ctx, "proj-s", { title: "Refusal", body: "document" }, "refusal-create");
+    const put = env.BLOBS.put;
+    env.BLOBS.put = async (...args) => {
+      await put(...args);
+      if (mode === "lost-access") sql.exec("DELETE FROM workspace_members WHERE principal_id = 'hum_s'");
+      if (mode === "expired") sql.exec("UPDATE content_writes SET created_at = 0");
+    };
+    await assert.rejects(lib.addComment(ctx, "proj-s", c.body.artifact_id, { revision: mode === "missing-revision" ? 99 : 1, body: "refused" }, "refused-comment"), e => e.status === (mode === "expired" ? 503 : 404));
+    assert.equal(sql.prepare("SELECT COUNT(*) AS n FROM comments").get().n, 0);
+    assert.equal(sql.prepare("SELECT COUNT(*) AS n FROM content_writes").get().n, 0);
+    assert.equal(objects.size, 1);
+  }
+  const { lib, ctx, sql, objects, env } = await harness();
+  const c = await lib.createMarkdown(ctx, "proj-s", { title: "Sweep", body: "document" }, "sweep-create");
+  await lib.addComment(ctx, "proj-s", c.body.artifact_id, { revision: 1, body: "keep comment" }, "sweep-comment");
+  const key = sql.prepare("SELECT body_key FROM comments").get().body_key;
+  sql.prepare("INSERT INTO content_writes (key, project_id, created_at) VALUES (?, 'proj-s', 0)").run(key);
+  await lib.reconcileUploads(env);
+  assert.equal(new TextDecoder().decode(objects.get(key)), "keep comment");
+  assert.equal(sql.prepare("SELECT COUNT(*) AS n FROM content_writes").get().n, 0);
+});
 
 test("R2 chunked reads match legacy UTF-8 bytes; legacy rows still diff, restore and export", async () => {
   const { lib, sql, ctx, env } = await harness();

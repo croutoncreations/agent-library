@@ -146,7 +146,7 @@ export async function stageTextWrites(env, writes) {
 
 /** Include in the same transaction that references the immutable key. */
 export function textWriteComplete(env, key) {
-  return env.DB.prepare("DELETE FROM content_writes WHERE key = ? AND EXISTS (SELECT 1 FROM revisions WHERE body_key = ?)").bind(key, key);
+  return env.DB.prepare("DELETE FROM content_writes WHERE key = ? AND (EXISTS (SELECT 1 FROM revisions WHERE body_key = ?) OR EXISTS (SELECT 1 FROM comments WHERE body_key = ?))").bind(key, key, key);
 }
 
 // The sweep age must stay well above the publish deadline: an intent eligible for deletion can never publish.

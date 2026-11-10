@@ -58,7 +58,12 @@ test("revision INSERTs bind NULL bodies except allow-listed generation copies; c
         const bodyIndex = m[2].split(",").map(c => c.trim()).indexOf("body");
         const values = sql.slice(sql.indexOf(")") + 1).match(/(?:SELECT|VALUES\s*\()\s*([\s\S]*?)(?:\bWHERE\b|\)\s*`)/i)?.[1].split(",").map(v => v.trim());
         if (/\bbody_key\b/.test(m[2]) && values?.[bodyIndex] === "NULL") continue;
-      } else if (/storeText\(/.test(bind)) continue;
+      } else {
+        // Backup writers stay inline until their conversion in the next commit.
+        if (f.endsWith("/backup.js") && /storeText\(/.test(bind)) continue;
+        const sql = after.slice(0, after.indexOf(".bind("));
+        if (/\bbody_key\b/.test(m[2]) && /SELECT \?, \?, \?, \?, \?, '',/.test(sql)) continue;
+      }
       bad.push(`${f.slice(ROOT.length + 1)}:${text.slice(0, m.index).split("\n").length}`);
     }
   }
@@ -88,7 +93,8 @@ test("main JS write and read paths of text bodies go through storeText/readText 
   await lib.restoreRevision(ctx, "proj-s", aid, { from_revision: 1, expected_revision: 2 }, "idem-restore-1");
   assert.deepEqual(sql.prepare("SELECT body FROM revisions ORDER BY rev_no").all().map((r) => r.body), [null, null, null]);
   assert.deepEqual(sql.prepare("SELECT body_key FROM revisions ORDER BY rev_no").all().map(r => new TextDecoder().decode(objects.get(r.body_key))), ["ENC:first body", "ENC:second body", "ENC:first body"]);
-  assert.equal(sql.prepare("SELECT body FROM comments").get().body, "ENC:a comment");
+  assert.equal(sql.prepare("SELECT body FROM comments").get().body, "");
+  assert.equal(new TextDecoder().decode(objects.get(sql.prepare("SELECT body_key FROM comments").get().body_key)), "ENC:a comment");
   assert.equal((await lib.getArtifact(ctx, "proj-s", aid, 2)).body, "second body");
   assert.deepEqual((await lib.listComments(ctx, "proj-s", aid)).comments.map((x) => x.body), ["a comment"]);
   const d = await lib.diffRevisions(ctx, "proj-s", aid, 1, 2);

@@ -1,5 +1,5 @@
 import { personalWorkspaceId } from "./tenancy.js";
-import { commitTextWrites, deleteBlob, getBlob, putBlob, getText, mapContent, readText, stageTextWrites, storeText, textKey, textWriteComplete } from "./content-store.js";
+import { commitTextWrites, deleteBlob, getBlob, putBlob, getText, mapContent, stageTextWrites, storeText, textKey, textWriteComplete } from "./content-store.js";
 import { textSearchBridge } from "./search/service.js";
 import { limitsFor, requireHuman } from "./auth.js";
 import { BINARY_TYPES, LIMITS, tplDate } from "./service.js";
@@ -34,7 +34,7 @@ async function exportBackup(ctx, projectId) {
   const [arts, revs, comments] = await DB.batch([
     DB.prepare("SELECT id, kind, title, folder, tags, head_rev, head_revision_id, meta_version, trashed_at, created_at, updated_at, is_template, template_description, source_artifact_id, source_revision, source_role, template_date FROM artifacts WHERE project_id = ? AND head_rev > 0").bind(projectId),
     DB.prepare("SELECT id, artifact_id, rev_no, author_id, body, body_key, blob_key, size, sha256, mime, restored_from, created_at, via_kind, via_id, via_label, client_info, change_note FROM revisions WHERE project_id = ?").bind(projectId),
-    DB.prepare("SELECT id, artifact_id, rev_no, author_id, body, created_at FROM comments WHERE project_id = ?").bind(projectId),
+    DB.prepare("SELECT id, artifact_id, rev_no, author_id, body, body_key, created_at FROM comments WHERE project_id = ?").bind(projectId),
     DB.prepare("SELECT id, artifact_id, version, title, folder, tags, trashed, author_id, via_kind, via_id, via_label, client_info, change_note, restored_from, created_at, template_description FROM meta_versions WHERE project_id = ?").bind(projectId)
   ]).then(([a, r, c, mv]) => (metaVersionsExport = mv.results, [a, r, c]));
   const blobs = {};
@@ -55,7 +55,7 @@ async function exportBackup(ctx, projectId) {
     project: { id: p.id, title: p.title, created_at: p.created_at },
     artifacts: arts.results,
     revisions: await mapContent(revs.results, async ({ body_key, ...r }) => ({ ...r, body: r.blob_key ? null : await getText(ctx.env, { ...r, body_key }) })),
-    comments: comments.results.map((c) => ({ ...c, body: readText(c.body) })),
+    comments: await mapContent(comments.results, async ({ body_key, ...c }) => ({ ...c, body: await getText(ctx.env, { ...c, body_key }) })),
     meta_versions: metaVersionsExport,
     blobs
   };

@@ -73,6 +73,19 @@ test("comments: newest 200 (oldest first), next_cursor pages back in created_at,
   } finally { await m.close(); }
 });
 
+test("MCP add_comment then list_comments round-trips UTF-8 through the real SDK", async () => {
+  const g = ok(await owner.req("POST", `/api/projects/${P}/grants`, { label: "comments writer", can_write: true }), 201);
+  const m = await mcpClient(h.appUi, g.token, "comments-writer");
+  const aid = ok(await owner.req("POST", `/api/projects/${P}/artifacts`, { title: "MCP comments", body: "synthetic" }), 201).artifact_id;
+  try {
+    const body = "MCP café 🙂 漢字";
+    const added = await m.call("add_comment", { project_id: P, artifact_id: aid, revision: 1, body, idempotency_key: key("comment") });
+    assert.ok(added.data.comment_id);
+    const listed = await m.call("list_comments", { project_id: P, artifact_id: aid });
+    assert.equal(listed.data.comments.find(c => c.id === added.data.comment_id)?.body, body);
+  } finally { await m.close(); }
+});
+
 test("folders: 1,000 per project on create (409 too_many_folders, also /v1 and the consent page); lists show all 1,000", async () => {
   const F = ok(await owner.req("POST", "/api/projects", { title: "Folders" }), 201).id;
   ok(await owner.req("POST", `/api/projects/${F}/folders`, { name: "First" }), 201);
