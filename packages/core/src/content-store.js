@@ -71,3 +71,29 @@ export function storeText(text) {
 export function readText(stored) {
   return stored;
 }
+
+/** Write one immutable text version; scope is reserved for the workspace codec. */
+export async function putText(env, scope, key, text) {
+  const bytes = new TextEncoder().encode(text);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  const sha256 = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+  await putBlob(env, key, bytes, { sha256: digest });
+  return { size: bytes.length, sha256 };
+}
+
+/** Byte ranges must not decode partial UTF-8 characters before the caller chooses a character boundary. */
+export async function getTextRange(env, row, offset, length) {
+  if (!row.body_key) return new TextEncoder().encode(readText(row.body)).slice(offset, offset + length);
+  if (length === 0) return new Uint8Array();
+  const object = await getBlob(env, row.body_key, { offset, length });
+  if (!object) throw new Error("Missing text object");
+  return new Uint8Array(await object.arrayBuffer());
+}
+
+/** Legacy inline rows remain readable while new versions store only a key in D1. */
+export async function getText(env, row) {
+  if (!row.body_key) return readText(row.body);
+  const bytes = await getBlobBytes(env, row.body_key);
+  if (!bytes) throw new Error("Missing text object");
+  return new TextDecoder().decode(bytes);
+}

@@ -4,6 +4,13 @@ import assert from "node:assert/strict";
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { ROOT } from "./helpers.mjs";
+import { getText, getTextRange } from "../packages/core/src/content-store.js";
+
+test("legacy text reads retain byte-exact UTF-8 ranges", async () => {
+  const body = "aé🙂z";
+  assert.equal(await getText({}, { body }), body);
+  assert.deepEqual(await getTextRange({}, { body }, 2, 3), new TextEncoder().encode(body).slice(2, 5));
+});
 
 function jsFiles(dir) {
   return readdirSync(dir).flatMap((n) => {
