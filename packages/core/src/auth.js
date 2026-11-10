@@ -35,7 +35,7 @@ async function agentRate(env, workspaceId, write) {
 async function enforceRate(ctx, write) {
   const l = limitsFor(ctx.env);
   const limit = ctx.principal.kind === "human" ? (write ? l.writesPerMin : l.readsPerMin) * 3
-    : await agentRate(ctx.env, ctx.grant?.project_id ? await projectWorkspaceId(ctx.env, ctx.grant.project_id) : null, write);
+    : await agentRate(ctx.env, ctx.grant?.workspace_id ?? (ctx.grant?.project_id ? await projectWorkspaceId(ctx.env, ctx.grant.project_id) : null), write);
   await rateLimit(ctx.env, `${write ? "w" : "r"}:${ctx.principal.id}`, limit);
 }
 function cookie(req, name) {
@@ -67,7 +67,8 @@ async function authenticateInner(req, env, requestId) {
     const row = await env.DB.prepare(
       `SELECT g.id, g.project_id, g.can_write, g.expires_at, g.revoked_at, g.client_info, p.id AS pid, p.kind, p.label,
               ${memberRoleSql("g.project_id", "viewer", "g.created_by")} AS creator_ok,
-              (SELECT deleted_at IS NOT NULL FROM projects WHERE id = g.project_id) AS project_deleted
+              (SELECT deleted_at IS NOT NULL FROM projects WHERE id = g.project_id) AS project_deleted,
+              (SELECT COALESCE(workspace_id, 'wsp_' || owner_id) FROM projects WHERE id = g.project_id) AS workspace_id
        FROM grants g JOIN principals p ON p.id = g.principal_id WHERE g.token_hash = ?`
     ).bind(await sha256Hex(m[1])).first();
     if (!row || row.kind !== "agent") throw new HttpError(401, "unauthenticated", "Unknown token");
@@ -80,7 +81,7 @@ async function authenticateInner(req, env, requestId) {
       env,
       requestId,
       principal: { id: row.pid, kind: "agent", label: row.label },
-      grant: { id: row.id, project_id: row.project_id, can_write: row.can_write },
+      grant: { id: row.id, project_id: row.project_id, can_write: row.can_write, workspace_id: row.workspace_id },
       grantClientInfo: row.client_info ?? null
     };
   }

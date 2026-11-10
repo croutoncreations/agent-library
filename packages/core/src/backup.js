@@ -137,11 +137,13 @@ async function restoreBackup(ctx, backup) {
 const IMPORT_KINDS = new Set(["markdown", "html", "json", "csv", "binary"]);
 // The via_kind values the code writes (history/service.js viaFields); null for versions from before 0010.
 const VIA_KINDS = new Set(["browser", "oauth", "api_key", "grant", "publisher"]);
-// One import is one D1 batch: at most this many versions, comments or details versions each.
+// One import is one D1 batch: at most this many documents and files, versions, comments or details versions each
+// (documents and files are also capped by the plan's items_per_project).
 var IMPORT_MAX_ROWS = 2000;
 function checkImportRows(env, backup, decoded, limits) {
   const bad = (m) => { throw new HttpError(400, "bad_backup", m); };
   if (backup.artifacts.length > limits.items_per_project) bad(`A project holds at most ${limits.items_per_project} documents and files on this plan`);
+  if (backup.artifacts.length > IMPORT_MAX_ROWS) bad(`One import can bring in at most ${IMPORT_MAX_ROWS.toLocaleString("en-US")} documents and files`);
   if (backup.revisions.length > IMPORT_MAX_ROWS || backup.comments.length > IMPORT_MAX_ROWS || (backup.meta_versions ?? []).length > IMPORT_MAX_ROWS) bad("Too many versions or comments to import at once");
   const ids = new Set(), revKeys = new Set(), revIds = new Set();
   for (const a of backup.artifacts) {
@@ -279,5 +281,5 @@ async function importBackup(ctx, workspaceId, input, idemKeyValue, digest = "") 
   return result;
 }
 
-export { exportBackup, importBackup, restoreBackup };
+export { IMPORT_MAX_ROWS, checkImportRows, exportBackup, importBackup, restoreBackup };
 

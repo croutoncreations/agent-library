@@ -313,3 +313,29 @@ test("a conflicting takeover never deletes the object while another finisher's w
   assert.deepEqual(w.finals(), [], "cleanup purged it once idle");
   assert.equal(w.quota(), 0);
 });
+
+test("orphan placeholders: a new file whose upload failed and expired over a day ago is deleted (it counted toward items_per_project)", async () => {
+  const w = world();
+  const items = () => w.sql.prepare("SELECT COUNT(*) AS n FROM artifacts WHERE project_id = ? AND publisher_id IS NULL").get(P).n;
+  // One active upload per identity: each pending one belongs to its own synthetic uploader.
+  const by = (u, who) => { w.sql.prepare("INSERT INTO principals (id, kind, issuer, subject, label, created_at) VALUES (?, 'agent', 'synthetic', ?, 'Uploader', ?)").run(who, who, new Date().toISOString());
+    w.sql.prepare("UPDATE uploads SET principal_id = ? WHERE id = ?").run(who, u.id); return u; };
+  const old = by(w.upload({ state: "failed", expiresAt: Date.now() - 2 * 864e5 }), "agt_old");
+  w.sql.prepare("UPDATE uploads SET state = 'pending' WHERE id = ?").run(old.id);
+  const recent = by(w.upload({ state: "failed", expiresAt: Date.now() - 3600000 }), "agt_recent");
+  w.sql.prepare("UPDATE uploads SET state = 'pending' WHERE id = ?").run(recent.id);
+  const live = w.upload({ state: "received" });
+  // A published file whose later version upload failed long ago: it has a revision, so it stays.
+  const kept = w.upload({ state: "failed", expiresAt: Date.now() - 2 * 864e5 });
+  w.sql.prepare("UPDATE artifacts SET head_rev = 1 WHERE id = ?").run(kept.art);
+  assert.equal(items(), 4);
+  // First run: the old upload is failed and its staging object purged; the placeholder goes in the same run.
+  const r = await lib.reconcileUploads(w.env);
+  assert.equal(r.deleted_placeholders, 1, JSON.stringify(r));
+  assert.equal(w.sql.prepare("SELECT COUNT(*) AS n FROM artifacts WHERE id = ?").get(old.art).n, 0);
+  assert.equal(w.row(old.id), undefined, "its upload rows go with it");
+  // Expired within the last day (finish still answers 410), still uploading, or published: kept.
+  for (const u of [recent, live, kept]) assert.equal(w.sql.prepare("SELECT COUNT(*) AS n FROM artifacts WHERE id = ?").get(u.art).n, 1);
+  assert.equal(items(), 3);
+  assert.equal((await lib.reconcileUploads(w.env)).deleted_placeholders, 0, "idempotent");
+});

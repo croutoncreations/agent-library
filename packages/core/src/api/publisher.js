@@ -854,7 +854,7 @@ async function route(req, env, p, requestId) {
   const path = url.pathname.replace(/\/$/, "");
   const m = req.method;
   const write = m !== "GET" && m !== "HEAD";
-  await rateLimit(env, `${write ? "w" : "r"}:${p.principal_id}`, await agentRate(env, await projectWorkspaceId(env, p.project_id), write));
+  await rateLimit(env, `${write ? "w" : "r"}:${p.principal_id}`, await agentRate(env, p.workspace_id ?? await projectWorkspaceId(env, p.project_id), write));
   const only = (method) => {
     if (m !== method && !(method === "GET" && m === "HEAD")) throw new HttpError(405, "method_not_allowed", "Method not allowed");
   };

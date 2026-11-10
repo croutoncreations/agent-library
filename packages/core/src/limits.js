@@ -37,6 +37,16 @@ export const defaultLimits = (env) => ({
  * limits(env, { workspaceId }); the default (and self-host) has none.
  */
 export async function workspaceLimits(env, workspaceId) {
+  // Within one request (withRequestMemo) each workspace's limits are read once; never cached across requests.
+  const memo = env?.[LIMITS_MEMO];
+  if (!memo) return readWorkspaceLimits(env, workspaceId);
+  if (!memo.has(workspaceId)) memo.set(workspaceId, readWorkspaceLimits(env, workspaceId).catch((e) => { memo.delete(workspaceId); throw e; }));
+  return memo.get(workspaceId);
+}
+const LIMITS_MEMO = Symbol("agent-library.limits-memo");
+/** A request's env with its own workspace-limits memo (createWorker attaches one per fetch). */
+export const withRequestMemo = (env) => ({ ...env, [LIMITS_MEMO]: new Map() });
+async function readWorkspaceLimits(env, workspaceId) {
   const f = adapters(env).entitlements.limits;
   const l = (typeof f === "function" ? await f(env, { workspaceId }) : null) ?? {};
   const out = Object.fromEntries(LIMIT_KEYS.filter((k) => Number.isSafeInteger(l[k]) && l[k] >= (k === "rate_multiplier" ? 1 : 0)).map((k) => [k, l[k]]));
@@ -192,7 +202,9 @@ export const planEntitlements = {
     if (!plans || typeof plans !== "object") return {};
     if (principalId && !workspaceId) {
       const own = await env.DB.prepare("SELECT plan FROM workspaces WHERE id = ?").bind(`wsp_${principalId}`).first("plan");
-      return { owned_workspaces: plans[own ?? "free"]?.owned_workspaces ?? plans.free?.owned_workspaces };
+      // A listed plan without owned_workspaces is unlimited, as for every other limit; no or an unlisted plan uses free's.
+      const plan = own ?? "free";
+      return { owned_workspaces: plans[plan] ? plans[plan].owned_workspaces : plans.free?.owned_workspaces };
     }
     const plan = await env.DB.prepare("SELECT plan FROM workspaces WHERE id = ?").bind(workspaceId).first("plan");
     return plans[plan ?? "free"] ?? {};

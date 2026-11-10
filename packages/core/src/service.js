@@ -648,9 +648,9 @@ async function listComments(ctx, projectId, artifactId, cursor) {
   const before = cursor === void 0 || cursor === null || cursor === "" ? null : parseCommentCursor(cursor);
   const r = await db(ctx).prepare(
     `SELECT c.id, c.rev_no AS revision, c.body, c.created_at, p.label AS author FROM comments c JOIN principals p ON p.id = c.author_id
-     WHERE c.artifact_id = ? AND c.project_id = ?${before ? " AND (c.created_at < ? OR (c.created_at = ? AND c.id < ?))" : ""}
+     WHERE c.artifact_id = ? AND c.project_id = ?${before ? " AND (c.created_at, c.id) < (?, ?)" : ""}
      ORDER BY c.created_at DESC, c.id DESC LIMIT ?`
-  ).bind(artifactId, projectId, ...before ? [before.at, before.at, before.id] : [], COMMENTS_PAGE + 1).all();
+  ).bind(artifactId, projectId, ...before ? [before.at, before.id] : [], COMMENTS_PAGE + 1).all();
   const page = r.results.slice(0, COMMENTS_PAGE).reverse();
   return {
     comments: page.map((c) => ({ ...c, body: readText(c.body) })),
