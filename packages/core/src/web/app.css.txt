@@ -114,7 +114,16 @@ button.on{color:var(--ok);border-color:var(--ok-line)}
 .icons{display:inline-flex;align-items:center;gap:2px;flex-wrap:wrap}
 .titlebar{display:flex;align-items:flex-start;gap:8px;flex-wrap:wrap}.titlebar h1{flex:1 1 14rem;min-width:0}
 .titlebar .icons{margin-top:-2px}
-select{min-height:40px;padding:6px 10px}
+/* Dropdowns draw their own chevron, inset like the text (the native arrow sat flush right). Two gradient strokes, no
+   image (the app CSP has no data: images); the muted colour follows the theme. */
+select{min-height:40px;padding:6px 38px 6px 12px;appearance:none;-webkit-appearance:none;background-image:linear-gradient(45deg,transparent 50%,var(--muted) 50%),linear-gradient(135deg,var(--muted) 50%,transparent 50%);background-position:calc(100% - 19px) 50%,calc(100% - 14px) 50%;background-size:5px 5px,5px 5px;background-repeat:no-repeat}
+select:disabled{opacity:.6}
+/* Windows high contrast drops background images: use the native arrow there. */
+@media(forced-colors:active){select{appearance:auto;-webkit-appearance:auto;background-image:none;padding-right:12px}}
+/* Text fields and dropdowns side by side share one height. */
+input:not([type=checkbox]):not([type=radio]),select{min-height:42px}
+/* Fields show focus with the accent border and soft ring; no second outline on top. */
+input:focus-visible,textarea:focus-visible,select:focus-visible{outline:none}
 /* ---------- menu ---------- */
 .menu{position:absolute;right:0;top:calc(100% + 6px);min-width:16rem;background:var(--card);border:1px solid var(--line2);border-radius:var(--r3);padding:6px;box-shadow:var(--pop);z-index:20}
 .menu a,.menu button{display:flex;width:100%;justify-content:flex-start;gap:10px;align-items:center;padding:8px 10px;border-radius:var(--r2);border:0;background:transparent;color:var(--fg);font-weight:500;min-height:40px;font-size:14.5px}
@@ -181,7 +190,7 @@ select{min-height:40px;padding:6px 10px}
 small.warn,.warn{color:var(--warn)}
 .tabs{display:flex;gap:4px;overflow-x:auto;margin:0;padding:3px;background:var(--sunk);border-radius:var(--r2);width:fit-content;max-width:100%;scrollbar-width:none}
 .tabs::-webkit-scrollbar{display:none}
-.tabs button,.tabs a{display:inline-flex;align-items:center;text-decoration:none;background:transparent;color:var(--muted);border:0;border-radius:6px;min-height:34px;padding:4px 14px;font-weight:500;font-size:14px}
+.tabs button,.tabs a{white-space:nowrap;display:inline-flex;align-items:center;text-decoration:none;background:transparent;color:var(--muted);border:0;border-radius:6px;min-height:34px;padding:4px 14px;font-weight:500;font-size:14px}
 .tabs button:hover,.tabs a:hover{color:var(--fg);filter:none}
 .tabs button[aria-selected=true],.tabs button[aria-pressed=true],.tabs a[aria-current=page]{background:var(--card);color:var(--fg);box-shadow:0 1px 2px rgba(0,0,0,.08);font-weight:600}
 .status{display:inline-flex;align-items:center;gap:6px;font-size:13.5px;color:var(--muted)}
@@ -216,6 +225,21 @@ pre.raw{white-space:pre-wrap;overflow-wrap:anywhere;background:var(--card);borde
 .filecard .ficon{width:44px;height:44px;border-radius:var(--r2);background:var(--accent-soft);color:var(--accent);display:flex;align-items:center;justify-content:center;flex:none}
 .filecard .ficon svg{width:22px;height:22px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
 .token{font-family:ui-monospace,Menlo,monospace;width:100%}
+/* Copy/Done under a shown-once secret (API key, invitation link) get breathing room from the field. */
+.token + .row{margin-top:12px}
+/* Same for a form's buttons under its text box. */
+form > textarea + .row,form > input + .row{margin-top:12px}
+/* Comments: the box on top, newest first, "Show older comments" under the list. */
+textarea.com-text{min-height:5.5rem;font-family:inherit;font-size:15px}
+.com-list{margin-top:16px}
+.com-more{margin-top:12px}
+.com-more .msg{margin:0}
+/* A list row's "Connection ID" details: its own full-width line under the row's text and buttons, so every row's
+   buttons line up; flush with the text, no divider of its own (the row has one). */
+.list li > details.connection-summary{flex:1 0 100%;margin:4px 0 0;padding-top:0;border-top:0}
+.list li > details.connection-summary summary{min-height:32px;font-size:13.5px}
+/* Narrow screens: the text takes its own line, so the status badge and buttons always sit on the next line, the same on every row. */
+@media(max-width:540px){.list li:has(> details.connection-summary) > .grow{flex-basis:100%}}
 details{border-top:1px solid var(--line);margin-top:16px;padding-top:6px}
 details summary{cursor:pointer;font-weight:500;color:var(--muted);min-height:40px;display:flex;align-items:center;gap:6px;list-style:none;border-radius:var(--r2)}
 details summary::-webkit-details-marker{display:none}

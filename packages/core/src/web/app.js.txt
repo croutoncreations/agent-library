@@ -2776,17 +2776,18 @@ async function viewArtifact(pid, aid, initialTab) {
     }
   }
   // comments
-  var comMsg = h("p", { class: "msg", role: "status" }), comList = h("ul", { class: "list" }), comText = h("textarea", { class: "half", maxLength: 4000, placeholder: "Comment on the current revision" });
+  var comMsg = h("p", { class: "msg", role: "status" }), comList = h("ul", { class: "list com-list", "aria-label": "Comments, newest first" }), comText = h("textarea", { class: "half com-text", maxLength: 4000, rows: 3, "aria-label": "New comment", placeholder: "Comment on the current revision" });
   var comPending = null, comCursor = null;
-  // The newest page first (oldest first within it); "Show older comments" prepends the page before it.
-  // Its status line (comOlderMsg, next to it) announces what loaded or why it failed; focus moves to the first loaded comment.
+  // Newest first, under the comment box. Each API page is oldest first, so it's reversed; "Show older comments" (under
+  // the list, like "show more") appends the page before it. Its status line (next to it) announces what loaded or why
+  // it failed, and focus moves to the first comment it loaded.
   var comOlderMsg = sectionMsg();
   var comOlder = h("button", { type: "button", class: "secondary com-older", hidden: true, onclick: async function () {
     comOlder.disabled = true; comOlder.textContent = "Loading…"; comList.setAttribute("aria-busy", "true"); showMsg(comOlderMsg, "", true);
     try {
       var r = await api("GET", base + "/comments?cursor=" + enc(comCursor));
-      var first = comList.firstChild, added = null;
-      r.comments.forEach(function (c) { var row = commentRow(c); if (!added) added = row; comList.insertBefore(row, first); });
+      var added = null;
+      r.comments.slice().reverse().forEach(function (c) { var row = commentRow(c); if (!added) added = row; comList.append(row); });
       comCursor = r.next_cursor; comOlder.hidden = !comCursor;
       var n = r.comments.length;
       showMsg(comOlderMsg, "Loaded " + n + " older comment" + (n === 1 ? "" : "s"), true); comOlderMsg.setAttribute("aria-live", "polite");
@@ -2802,7 +2803,7 @@ async function viewArtifact(pid, aid, initialTab) {
       var r = await api("GET", base + "/comments");
       comList.replaceChildren();
       if (!r.comments.length) comList.append(h("li", { class: "empty", text: "No comments yet." }));
-      r.comments.forEach(function (c) { comList.append(commentRow(c)); });
+      r.comments.slice().reverse().forEach(function (c) { comList.append(commentRow(c)); });
       comCursor = r.next_cursor || null; comOlder.hidden = !comCursor;
     } catch (err) { showErr(comMsg, err); }
   }
@@ -2822,7 +2823,7 @@ async function viewArtifact(pid, aid, initialTab) {
   addTab("history", "History", VH.load);
   panels.history.append(VH.root);
   addTab("comments", "Comments", loadComments);
-  panels.comments.append(comOlder, comOlderMsg, comList, comForm, comMsg);
+  panels.comments.append(comForm, comMsg, comList, h("div", { class: "row com-more" }, comOlder, comOlderMsg));
   for (var k in panels) app.append(panels[k]);
   app.append(below);
   // Documents open on the rendered view; Edit is one tap away (and /edit deep links open the editor).

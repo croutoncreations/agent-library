@@ -1017,6 +1017,10 @@ form{margin:0}
 .newp:has(input[type=text]:placeholder-shown)~.newp:has(input[type=text]:placeholder-shown){display:none}
 .newp:has(input[type=text]:placeholder-shown) .seg{opacity:.45}
 input[type=text],select{font:inherit;font-size:16px;width:100%;min-width:0;min-height:42px;padding:8px 12px;border:1px solid var(--line2);border-radius:var(--r2);background:var(--field);color:var(--fg);outline:none}
+/* Dropdowns draw their own chevron, inset like the text (the native arrow sat flush right); no image (CSP). The native
+   arrow comes back in Windows high contrast, which drops background images. */
+@media(forced-colors:active){select{appearance:auto!important;-webkit-appearance:auto!important;background-image:none!important;padding-right:12px!important}}
+select{appearance:none;-webkit-appearance:none;padding-right:38px;background-image:linear-gradient(45deg,transparent 50%,var(--muted) 50%),linear-gradient(135deg,var(--muted) 50%,transparent 50%);background-position:calc(100% - 19px) 50%,calc(100% - 14px) 50%;background-size:5px 5px,5px 5px;background-repeat:no-repeat}
 input::placeholder{color:var(--faint);opacity:1}
 input[type=text]:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
 .newp input[type=text]{flex:1}

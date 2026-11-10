@@ -199,7 +199,7 @@ test("capped lists say truncated: [names]; complete lists say []", async () => {
   } finally { await browser.close(); }
 });
 
-test("UI: \"Show older comments\" loads the earlier pages above the newest (desktop and mobile)", async (t) => {
+test("UI: comments are newest first under the comment box; \"Show older comments\" below the list appends earlier pages (desktop and mobile)", async (t) => {
   if (!haveChrome) return t.skip("Chrome/puppeteer not installed");
   mkdirSync("tmp/test-evidence", { recursive: true });
   const browser = await createRequire(import.meta.url)(PUP).launch({ executablePath: CHROME, headless: true, args: ["--no-first-run"] });
@@ -214,16 +214,21 @@ test("UI: \"Show older comments\" loads the earlier pages above the newest (desk
       await page.waitForFunction(() => [...document.querySelectorAll("[role=tab]")].some((t) => t.textContent.trim() === "Comments"), { timeout: 30_000 });
       await page.evaluate(() => [...document.querySelectorAll("[role=tab]")].find((t) => t.textContent.trim() === "Comments").click());
       const older = await page.waitForSelector("button.com-older:not([hidden])");
-      const rows = () => page.evaluate(() => document.querySelector("button.com-older + .msg + ul").children.length);
+      const LIST = "ul.com-list";
+      const rows = () => page.evaluate((l) => document.querySelector(l).children.length, LIST);
       assert.equal(await rows(), 200);
       const panel = await page.evaluateHandle(() => document.querySelector("button.com-older").closest("[role=tabpanel]"));
+      // Layout: comment box, then the list (newest first), then the button.
+      assert.equal(await panel.evaluate((p) => { const f = p.querySelector("form"), l = p.querySelector("ul.com-list"), b = p.querySelector("button.com-older");
+        return !!(f.compareDocumentPosition(l) & Node.DOCUMENT_POSITION_FOLLOWING) && !!(l.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING); }), true);
+      assert.equal(await page.$eval(`${LIST} li:first-child .raw-text`, (e) => e.textContent), "newest synthetic comment");
       await older.evaluate((b) => b.scrollIntoView({ block: "center" }));
       await page.screenshot({ path: `tmp/test-evidence/limits-comments-load-more-${name}.png` });
       await older.evaluate((b) => b.click());
-      const list = "button.com-older + .msg + ul";
+      const list = LIST;
       await page.waitForFunction((l) => document.querySelector(l).children.length === 400, {}, list);
-      // Focus is on the first (oldest) loaded comment; the status next to the button says how many loaded.
-      assert.equal(await page.evaluate((l) => document.activeElement === document.querySelector(l).firstElementChild, list), true);
+      // Focus is on the first comment of the loaded page (the 201st row); the status next to the button says how many loaded.
+      assert.equal(await page.evaluate((l) => document.activeElement === document.querySelector(l).children[200], list), true);
       assert.equal(await page.$eval("button.com-older + .msg", (e) => [e.textContent, e.getAttribute("aria-live")].join("|")), "Loaded 200 older comments|polite");
       assert.equal(await page.$eval(list, (e) => e.hasAttribute("aria-busy")), false);
       assert.match(await page.$eval(`${list} li .muted`, (e) => e.textContent), /^.* · rev 1 · /);
@@ -231,7 +236,9 @@ test("UI: \"Show older comments\" loads the earlier pages above the newest (desk
       await page.waitForFunction((l) => document.querySelector(l).children.length === 450, {}, list);
       assert.equal(await page.$eval("button.com-older", (b) => b.hidden), true, "no more pages");
       const texts = await panel.evaluate((p) => [...p.querySelectorAll(".raw-text")].map((e) => e.textContent));
-      assert.equal(texts.at(-1), "newest synthetic comment");
+      assert.equal(texts[0], "newest synthetic comment");
+      // Newest to oldest, all the way down: comments 450..1 after the newest (seeded oldest = 1).
+      assert.equal(texts[1], "synthetic comment 449"); assert.equal(texts.at(-1), "synthetic comment 1");
       assert.equal(new Set(texts).size, 450);
       assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1), `no horizontal scroll at ${w}`);
     }
