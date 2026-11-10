@@ -107,8 +107,10 @@ async function restoreBackup(ctx, backup) {
   const existing = await DB.prepare("SELECT COUNT(*) AS n FROM projects").first("n");
   if (existing) throw new HttpError(409, "store_not_empty", "Restore targets an empty isolated store only");
   const { pid, decoded } = await validateBackup(backup);
-  // Restore preserves legacy IDs; validate every resulting key before writing any bytes or intents.
-  for (const r of backup.revisions) if (r.blob_key === null) textKey(pid, r.artifact_id, r.id);
+  // IDs stay stable, but each attempt owns fresh immutable objects, even after a lost acknowledgement.
+  const attempt = randomId("restore");
+  // Validate every resulting key, including the attempt segment, before writing any bytes or intents.
+  for (const r of backup.revisions) if (r.blob_key === null) textKey(pid, r.artifact_id, r.id, attempt);
   for (const [k, bytes] of decoded) await putBlob(ctx.env, k, bytes);
   const authors = new Set([...backup.revisions, ...backup.comments, ...backup.meta_versions ?? []].map((x) => x.author_id));
   const stmts = [];
@@ -121,7 +123,7 @@ async function restoreBackup(ctx, backup) {
   const textKeys = [];
   const bridges = [];
   for (const r of backup.revisions) {
-    const bodyKey = r.blob_key ? null : await stageTextWrite(ctx.env, pid, r.artifact_id, r.id, r.body);
+    const bodyKey = r.blob_key ? null : await stageTextWrite(ctx.env, pid, r.artifact_id, r.id, r.body, attempt);
     if (bodyKey) { textKeys.push(bodyKey); bridges.push(textSearchBridge(ctx.env, r.artifact_id, r.id, r.body), textWriteComplete(ctx.env, bodyKey)); }
     stmts.push(DB.prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, body_key, blob_key, size, sha256, mime, restored_from, created_at, via_kind, via_id, via_label, client_info, change_note)
       VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(r.id, r.artifact_id, pid, r.rev_no, r.author_id, bodyKey, r.blob_key, r.size, r.sha256, r.mime, r.restored_from, r.created_at, r.via_kind ?? null, r.via_id ?? null, r.via_label ?? null, r.client_info ?? null, r.change_note ?? null));
@@ -132,7 +134,12 @@ async function restoreBackup(ctx, backup) {
   for (const c of backup.comments)
     stmts.push(DB.prepare("INSERT INTO comments (id, project_id, artifact_id, rev_no, author_id, body, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(c.id, pid, c.artifact_id, c.rev_no, c.author_id, storeText(c.body), c.created_at));
   stmts.push(DB.prepare("INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id) VALUES (?, ?, ?, 'backup.restore', ?, 'ok', ?)").bind(nowIso(), ctx.principal.id, pid, pid, ctx.requestId));
-  await commitTextWrites(ctx.env, textKeys, (guarded) => DB.batch(guarded([...stmts, ...bridges])));
+  try {
+    await commitTextWrites(ctx.env, textKeys, (guarded) => DB.batch(guarded([...stmts, ...bridges])));
+  } catch (error) {
+    if (await DB.prepare("SELECT COUNT(*) AS n FROM projects").first("n")) throw new HttpError(409, "store_not_empty", "Restore targets an empty isolated store only");
+    throw error;
+  }
   return { restored_project: pid, artifacts: backup.artifacts.length, revisions: backup.revisions.length, blobs: decoded.size, grants: 0 };
 }
 

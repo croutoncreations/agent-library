@@ -248,7 +248,14 @@ test("restore preserves unusual legacy IDs without aliasing text keys and refuse
   target.sql.exec("DELETE FROM projects");
   await target.lib.restoreBackup(target.ctx, backup);
   assert.equal(target.objects.size, 2);
-  assert.deepEqual([...target.objects.keys()].sort(), ["text/proj-s/a%2Fb/c", "text/proj-s/a/b%2Fc"].sort());
+  const keys = [...target.objects.keys()].sort();
+  assert.match(keys[0], /^text\/proj-s\/a%2Fb\/c\/[^/]+$/);
+  assert.match(keys[1], /^text\/proj-s\/a\/b%2Fc\/[^/]+$/);
+  assert.equal(keys[0].split("/").at(-1), keys[1].split("/").at(-1));
+  const roundTrip = await harness();
+  roundTrip.sql.exec("DELETE FROM projects");
+  await roundTrip.lib.restoreBackup(roundTrip.ctx, await target.lib.exportBackup(target.ctx, "proj-s"));
+  assert.deepEqual((await roundTrip.lib.exportBackup(roundTrip.ctx, "proj-s")).revisions, backup.revisions);
   for (const revision of backup.revisions) assert.equal((await target.lib.getArtifact(target.ctx, "proj-s", revision.artifact_id)).body, revision.body);
   const tooLong = structuredClone(backup);
   tooLong.revisions[1].id = "x".repeat(1025);
@@ -257,4 +264,45 @@ test("restore preserves unusual legacy IDs without aliasing text keys and refuse
   await assert.rejects(empty.lib.restoreBackup(empty.ctx, tooLong), e => e.status === 400 && e.code === "bad_backup");
   assert.equal(empty.objects.size, 0);
   assert.equal(empty.sql.prepare("SELECT COUNT(*) AS n FROM content_writes").get().n, 0);
+});
+
+async function twoVersionBackup() {
+  const source = await harness();
+  const created = await source.lib.createMarkdown(source.ctx, "proj-s", { title: "Retry", body: "first café" }, "retry-create");
+  await source.lib.saveMarkdown(source.ctx, "proj-s", created.body.artifact_id, { expected_revision: 1, body: "second 🙂" }, "retry-save");
+  return source.lib.exportBackup(source.ctx, "proj-s");
+}
+
+test("failed restore retries immediately with distinct immutable keys and every version intact", async () => {
+  const backup = await twoVersionBackup();
+  const target = await harness();
+  target.sql.exec("DELETE FROM projects");
+  const put = target.env.BLOBS.put;
+  let calls = 0;
+  target.env.BLOBS.put = async (...args) => { if (++calls === 2) throw new Error("synthetic midway outage"); return put(...args); };
+  await assert.rejects(target.lib.restoreBackup(target.ctx, backup), /midway outage/);
+  const abandoned = [...target.objects.keys()];
+  target.env.BLOBS.put = put;
+  await target.lib.restoreBackup(target.ctx, backup);
+  assert.deepEqual((await target.lib.exportBackup(target.ctx, "proj-s")).revisions, backup.revisions);
+  for (const r of target.sql.prepare("SELECT body_key FROM revisions").all()) assert.ok(!abandoned.includes(r.body_key));
+});
+
+test("concurrent restores publish once and refuse the loser cleanly without overwriting bytes", async () => {
+  const backup = await twoVersionBackup();
+  const target = await harness();
+  target.sql.exec("DELETE FROM projects");
+  const put = target.env.BLOBS.put;
+  target.env.BLOBS.put = async (...args) => { await new Promise(resolve => setImmediate(resolve)); return put(...args); };
+  const outcomes = await Promise.allSettled([target.lib.restoreBackup(target.ctx, backup), target.lib.restoreBackup(target.ctx, backup)]);
+  assert.equal(outcomes.filter(r => r.status === "fulfilled").length, 1);
+  const loser = outcomes.find(r => r.status === "rejected");
+  assert.equal(loser.reason.status, 409);
+  assert.equal(loser.reason.code, "store_not_empty");
+  assert.equal(target.sql.prepare("SELECT COUNT(*) AS n FROM projects").get().n, 1);
+  for (const r of target.sql.prepare("SELECT body_key, sha256 FROM revisions").all()) {
+    const hash = Buffer.from(await crypto.subtle.digest("SHA-256", target.objects.get(r.body_key))).toString("hex");
+    assert.equal(hash, r.sha256);
+  }
+  assert.deepEqual((await target.lib.exportBackup(target.ctx, "proj-s")).revisions, backup.revisions);
 });

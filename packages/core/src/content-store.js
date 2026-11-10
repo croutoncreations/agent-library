@@ -97,16 +97,16 @@ export async function getText(env, row) {
   return new TextDecoder().decode(bytes);
 }
 
-/** Encode each ID independently so unusual legacy backup IDs cannot alias another version's object. */
-export function textKey(projectId, artifactId, revisionId) {
-  const key = `text/${encodeURIComponent(projectId)}/${encodeURIComponent(artifactId)}/${encodeURIComponent(revisionId)}`;
+/** Encode each ID independently; restore's optional attempt segment prevents retries overwriting prior bytes. */
+export function textKey(projectId, artifactId, revisionId, attempt) {
+  const key = `text/${encodeURIComponent(projectId)}/${encodeURIComponent(artifactId)}/${encodeURIComponent(revisionId)}${attempt ? `/${encodeURIComponent(attempt)}` : ""}`;
   if (new TextEncoder().encode(key).length > 1024) throw new HttpError(400, "bad_backup", "Text revision object key exceeds R2's 1024-byte limit");
   return key;
 }
 
 /** Persist intent before bytes: a dead request remains sweepable even if put succeeds after it dies. */
-export async function stageTextWrite(env, projectId, artifactId, revisionId, text) {
-  const key = textKey(projectId, artifactId, revisionId);
+export async function stageTextWrite(env, projectId, artifactId, revisionId, text, attempt) {
+  const key = textKey(projectId, artifactId, revisionId, attempt);
   await env.DB.prepare("INSERT INTO content_writes (key, project_id, created_at) VALUES (?, ?, ?)").bind(key, projectId, Date.now()).run();
   await putText(env, { projectId }, key, text);
   return key;

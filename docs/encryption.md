@@ -28,7 +28,9 @@ D1 keeps `revisions.body = NULL` and `body_key` names the object. All JavaScript
 `getTextRange`, which fall back to legacy inline bodies. Ranges return raw bytes, including partial UTF-8 sequences;
 chunked readers choose character boundaries only after fetching the bytes. Text writes record a `content_writes`
 intent before `putText`; the revision batch clears it. No encryption codec is enabled yet, and the text limit remains
-1 MiB.
+1 MiB. Restore preserves revision IDs but adds a random attempt segment to each text key
+(`text/{project}/{artifact}/{revision}/{attempt}`), so retries never overwrite another attempt's objects or
+collide with its intents. Failed attempts remain unreferenced and are reclaimed by the normal sweep.
 
 ### Text write deadline and orphan safety
 
