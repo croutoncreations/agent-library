@@ -159,11 +159,16 @@ async function uploadPut(req, env, requestId, uploadId, linkCtx) {
       const margin = new Promise((_, reject) => {
         marginTimer = setTimeout(() => { timedOut = abandoned = true; bodyCtl.error(expired()); reject(expired()); }, Math.max(0, deadline + PUT_MARGIN_MS - nowMs()));
       });
-      stored = await Promise.race([putBlobStream(env, finalKey, body, u.expected_size, { sha256: u.expected_sha256, httpMetadata: { contentType: u.mime } }), margin]);
+      const put = putBlobStream(env, finalKey, body, u.expected_size, { sha256: u.expected_sha256, httpMetadata: { contentType: u.mime } });
+      // An abandoned put may still reject later; never let that surface as an unhandled rejection (it carries R2's message).
+      put.catch(() => {
+      });
+      stored = await Promise.race([put, margin]);
     } catch (e) {
-      if (timedOut) throw expired();
       const m = String(e?.message ?? e);
-      if (/SHA-256 checksum you specified did not match|10037/.test(m)) throw new HttpError(422, "integrity_mismatch", "The body's SHA-256 does not match the declared sha256; this upload has ended, start a new one with upload_begin");
+      // A digest rejection is a real answer even if a timer fired meanwhile: report it (and end the upload) as 422.
+      if (!abandoned && /SHA-256 checksum you specified did not match|10037/.test(m)) throw new HttpError(422, "integrity_mismatch", "The body's SHA-256 does not match the declared sha256; this upload has ended, start a new one with upload_begin");
+      if (timedOut) throw expired();
       if (/too many bytes/i.test(m)) throw new HttpError(413, "too_large", "Body exceeds declared size");
       if (/did not see all expected bytes/i.test(m)) throw new HttpError(400, "incomplete_body", "Body ended before the declared size; PUT the whole file again");
       throw e;

@@ -9,7 +9,11 @@ var CRASHED = JSON.stringify({ status: 500, code: "finish_abandoned", message: "
 // releasing it (an isolate that dies never runs its finally). Cleanup, orphan placeholders and project purge then
 // treat it as final_writes = 0, so a leaked count can't hold quota, an object or a purge forever.
 var PUT_MARGIN_MS = 6e4;
-var staleWritesBefore = (env, now) => now - limitsFor(env).cleanupGraceMs - PUT_MARGIN_MS;
+// At least 10 minutes past the margin even when UPLOAD_CLEANUP_GRACE_SECONDS is 0: the handler stops waiting at the
+// margin, but R2 can't be told to abort a put whose body has already fully arrived, so give a slow commit room to land
+// before the object is treated as never written.
+var STALE_WRITE_MIN_GRACE_MS = 6e5;
+var staleWritesBefore = (env, now) => now - Math.max(limitsFor(env).cleanupGraceMs, STALE_WRITE_MIN_GRACE_MS) - PUT_MARGIN_MS;
 async function reconcileUploads(env, opts = {}) {
   const now = nowMs();
   const grace = limitsFor(env).cleanupGraceMs;

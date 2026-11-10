@@ -55,7 +55,10 @@ A terminated Worker (whose `finally` never runs) or a failed counter decrement c
 charged to project quota while a late write could still land.
 
 Because every PUT ends by `expires_at + PUT_MARGIN_MS` (above), a count is **stale** once
-`now > expires_at + UPLOAD_CLEANUP_GRACE_SECONDS + PUT_MARGIN_MS`. On a terminal row,
+`now > expires_at + max(UPLOAD_CLEANUP_GRACE_SECONDS, 10 min) + PUT_MARGIN_MS`. The handler stops
+waiting at the margin, but R2 has no way to abort a put whose body has fully arrived, so the
+minimum 10 minutes lets a slow commit land first. Assumption: R2 commits or fails a put within
+that window; a later commit would leave an untracked object until the project is purged. On a terminal row,
 cleanup (`reconcileUploads`), orphan-placeholder deletion and the project purge's waits
 (`purgeDueProjects`) treat a stale count as `final_writes = 0`: cleanup deletes `final_key`
 (absent is harmless) and sets `final_writes = 0, final_purged_at = now`, which releases the
