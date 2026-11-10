@@ -16,6 +16,7 @@ async function sha256Hex(data) {
   return hex(await crypto.subtle.digest("SHA-256", bytes));
 }
 /** SHA-256 (hex) of a byte stream, consumed chunk by chunk without buffering it (workerd DigestStream). */
+// Unused since single-pass uploads (R2 checks the PUT's sha256); kept for slice 3 (encryption), which hashes plaintext.
 async function sha256HexStream(stream) {
   const d = new crypto.DigestStream("SHA-256");
   await stream.pipeTo(d);

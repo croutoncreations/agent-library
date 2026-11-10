@@ -110,6 +110,28 @@ test("quota: one failed upload is charged exactly once (staging and final_key bo
   assert.equal(await quotaUsed(w), 0);
 });
 
+test("a malformed Content-Length is refused 400 invalid_input before the claim", async () => {
+  const w = world();
+  const calls = spy(w);
+  const id = await beginAs(w, PNG);
+  // A Request normalises its own headers, so the handler sees exactly these values through a plain request-like object.
+  for (const cl of ["abc", "-1", "1.5", "1e2", "", " ", "0x44"]) {
+    const req = { headers: new Headers([["content-length", cl]]), body: new Blob([PNG]).stream() };
+    await assert.rejects(lib.uploadPut(req, w.env, w.ctx.requestId, id, w.ctx), (e) => e.status === 400 && e.code === "invalid_input", JSON.stringify(cl));
+  }
+  assert.deepEqual([w.row(id).state, w.row(id).final_writes, calls.put.length], ["pending", 0, 0], "never claimed, nothing written");
+  assert.equal((await w.put(id, PNG)).status, 200);
+});
+
+test("the PUT re-checks the grant when it records the bytes: revoked mid-transfer gives 403 and the upload is not received", async () => {
+  const w = world();
+  const id = await beginAs(w, PNG);
+  // Revoke write access (here: the owner leaves the project's workspace) while the R2 write is in flight.
+  w.r2.beforeCommit = async () => { w.r2.beforeCommit = null; w.sql.prepare("UPDATE projects SET deleted_at = 1 WHERE id = ?").run(P); };
+  await assert.rejects(w.put(id, PNG), (e) => e.status === 403);
+  assert.notEqual(w.row(id).state, "received");
+});
+
 test("finish fails closed (500 publish_failed) when R2 recorded no SHA-256, and leaves final_key purgeable", async () => {
   const w = world();
   const id = await beginAs(w, PNG);

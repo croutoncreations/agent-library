@@ -127,6 +127,7 @@ async function uploadPut(req, env, requestId, uploadId, linkCtx) {
   if (u.expires_at <= nowMs()) throw new HttpError(410, "upload_expired", "Upload expired");
   // R2 checks the stored length against the declared size anyway: refuse any other Content-Length before writing.
   const cl = req.headers.get("content-length");
+  if (cl !== null && !/^\d+$/.test(cl)) throw new HttpError(400, "invalid_input", "Content-Length must be a non-negative integer");
   const declared = cl === null ? NaN : Number(cl);
   if (Number.isFinite(declared) && declared > u.expected_size) throw new HttpError(413, "too_large", "Body exceeds declared size");
   if (Number.isFinite(declared) && declared < u.expected_size) throw new HttpError(400, "incomplete_body", "Content-Length is smaller than the declared size; PUT the whole file");
@@ -178,8 +179,11 @@ async function uploadPut(req, env, requestId, uploadId, linkCtx) {
     }
     const n = stored?.size ?? null;
     const sha2 = blobSha256Hex(stored);
-    const rec = await env.DB.prepare("UPDATE uploads SET state = 'received', received_size = ?, received_sha256 = ? WHERE id = ? AND state = 'receiving'").bind(n, sha2, uploadId).run();
+    // Re-checks the grant (same as the claim): access revoked mid-transfer leaves the upload unreceived.
+    const rec = await env.DB.prepare(`UPDATE uploads SET state = 'received', received_size = ?, received_sha256 = ? WHERE id = ? AND state = 'receiving' AND ${az.sql}`).bind(n, sha2, uploadId, ...az.params).run();
     if (!rec.meta.changes) {
+      if (await env.DB.prepare("SELECT 1 AS x FROM uploads WHERE id = ? AND state = 'receiving'").bind(uploadId).first("x"))
+        throw new HttpError(403, "forbidden", "Grant no longer valid");
       // Cleanup ended the upload, or a project purge removed its row, mid-transfer: remove the object just stored, best
       // effort (cleanup or the purge's prefix sweep catch a failure). A fresh rev_ key is never referenced before
       // publish; dropUnpublished re-checks that and that no write is in flight.
@@ -211,8 +215,8 @@ async function uploadPut(req, env, requestId, uploadId, linkCtx) {
     throw e;
   }
 }
-// Exclusive upload finalization (security review 2026-10-23, findings 1 and 3). Spliced over the hash-pinned
-// uploadFinish of // src/uploads.ts by build-upload-fixes.mjs; needs migration 0011_upload_finalize_lease.sql.
+// Exclusive upload finalization (security review 2026-10-23, findings 1 and 3); needs migration
+// 0011_upload_finalize_lease.sql.
 //  - One finisher at a time holds an expiring lease (uploads.finalize_token/finalize_until). Cleanup never fails a
 //    sealed upload while its lease is live, and the revision insert is fenced on "still sealed and still my token",
 //    so cleanup can never delete bytes under a publication that then succeeds.
