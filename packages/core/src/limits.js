@@ -60,7 +60,8 @@ export async function projectWorkspaceId(env, projectId) {
 /** The plan's agent rate-limit multiplier for a workspace (1 when unknown). */
 export async function rateMultiplier(env, workspaceId) {
   if (!workspaceId) return 1;
-  return (await workspaceLimits(env, workspaceId)).rate_multiplier;
+  try { return (await workspaceLimits(env, workspaceId)).rate_multiplier ?? 1; }
+  catch { console.error(JSON.stringify({ event: "rate_multiplier_unavailable" })); return 1; }
 }
 export async function personLimits(env, principalId) {
   const f = adapters(env).entitlements.limits;

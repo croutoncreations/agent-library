@@ -174,6 +174,26 @@ test("import: a backup with more documents than the plan's items_per_project is 
   assert.match(r.body.error.message, /at most 6 documents and files on this plan/);
 });
 
+test("import: a file larger than the plan's file_bytes is refused", async () => {
+  // A real, correctly hashed 3,001-byte PNG in a backup of W.p's file; the free plan allows 3,000-byte files.
+  const bk = ok(await alice.req("GET", `/api/projects/${W.p}/backup`));
+  const file = bk.revisions.find((r) => r.blob_key !== null);
+  assert.ok(file, "W.p holds a file");
+  const big = Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), Buffer.alloc(3001 - 8)]);
+  const rev = { ...file, size: big.length, sha256: createHash("sha256").update(big).digest("hex") };
+  const art = { ...bk.artifacts.find((a) => a.id === file.artifact_id), head_rev: file.rev_no, head_revision_id: file.id };
+  const one = { ...bk, artifacts: [art], revisions: [rev], comments: [], meta_versions: (bk.meta_versions ?? []).filter((m) => m.artifact_id === art.id),
+    blobs: { [file.blob_key]: { sha256: rev.sha256, data: big.toString("base64") } } };
+  sql(`UPDATE workspaces SET plan = 'pro' WHERE id = '${W.team}'`);
+  const fits = await alice.req("POST", `/api/workspaces/${W.team}/import`, { backup: one, title: "Big file ok" });
+  assert.equal(fits.status, 201, "the same backup imports on a plan that allows the file: " + JSON.stringify(fits.body));
+  sql(`UPDATE workspaces SET plan = 'free' WHERE id = '${W.team}'`);
+  const r = await alice.req("POST", `/api/workspaces/${W.team}/import`, { backup: one, title: "Big file" });
+  assert.equal(r.status, 400, JSON.stringify(r.body));
+  assert.match(r.body.error.message, /A file is larger than this plan allows \(2\.9 KB\)/);
+  ok(await alice.req("DELETE", `/api/projects/${fits.body.project_id ?? fits.body.id}`, { confirm_title: "Big file ok" }));
+});
+
 test("members: only accepted members count; pending invitations have their own limit; accepting needs a free member slot", async () => {
   ok(await alice.req("POST", `/api/workspaces/${W.team}/invites`, { email: "bob@example.test", role: "member" }), 201);
   ok(await alice.req("POST", `/api/workspaces/${W.team}/invites`, { email: "carol@example.test", role: "viewer" }), 201);
@@ -274,6 +294,17 @@ test("API key lifetimes: the plan's max_key_lifetime_days refuses longer keys (4
   assert.equal(ok(await alice.req("GET", "/api/api-keys")).keys.find((x) => x.id === k.id).status, "active");
   assert.equal((await fetch(`${API}/v1/projects`, { headers: { authorization: `Bearer ${k.secret}` } })).status, 200);
   ok(await alice.req("POST", `/api/api-keys/${k.id}/revoke`, {}));
+  // A plan lowered after a key was made: the key lasts at most max_key_lifetime_days from its creation.
+  const old = ok(await mk("never"), 201);
+  sql(`UPDATE api_credentials SET created_at = '${new Date(Date.now() - 91 * 864e5).toISOString()}' WHERE id = '${old.id}'`);
+  assert.equal((await fetch(`${API}/v1/projects`, { headers: { authorization: `Bearer ${old.secret}` } })).status, 200, "pro: no maximum");
+  sql(`UPDATE workspaces SET plan = 'free' WHERE id = '${W.team}'`);
+  const exp = await fetch(`${API}/v1/projects`, { headers: { authorization: `Bearer ${old.secret}` } });
+  assert.equal(exp.status, 401);
+  assert.equal((await exp.json()).error.code, "credential_expired");
+  sql(`UPDATE workspaces SET plan = 'pro' WHERE id = '${W.team}'`);
+  assert.equal((await fetch(`${API}/v1/projects`, { headers: { authorization: `Bearer ${old.secret}` } })).status, 200, "back on pro, it works again");
+  ok(await alice.req("POST", `/api/api-keys/${old.id}/revoke`, {}));
   // file_bytes above core's ceiling is capped at 90 MiB.
   assert.deepEqual(ok(await alice.req("GET", `/api/workspaces/${W.team}/usage`)).file_bytes, { limit: 90 * 1024 * 1024 });
   sql(`UPDATE workspaces SET plan = 'legacy-unlisted' WHERE id = '${W.team}'`);

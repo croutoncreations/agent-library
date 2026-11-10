@@ -81,9 +81,13 @@ async function deleteOrphanPlaceholders(env, now, projectId, limit) {
 //   the project audit list shows the newest 200, and project purge only adds one.
 var PRUNE_BATCH = 5e3;
 var IDEMPOTENCY_RETENTION_DAYS = 30;
+// Audits are incident history: a configured retention below this is raised to it.
+var AUDIT_RETENTION_MIN_DAYS = 30;
 function auditRetentionDays(env) {
   const v = env.AUDIT_RETENTION_DAYS;
-  return v !== void 0 && /^\d{1,6}$/.test(v) ? Number(v) : 365;
+  if (v === void 0 || !/^\d{1,6}$/.test(v)) return 365;
+  const n = Number(v);
+  return n === 0 ? 0 : Math.max(n, AUDIT_RETENTION_MIN_DAYS);
 }
 async function pruneExpiredRows(env, { batch = PRUNE_BATCH } = {}) {
   const now = nowMs(), day = 864e5, DB = env.DB;

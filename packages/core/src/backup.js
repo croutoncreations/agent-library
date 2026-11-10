@@ -4,7 +4,7 @@ import { limitsFor, requireHuman } from "./auth.js";
 import { BINARY_TYPES, LIMITS, tplDate } from "./service.js";
 import { requireProjectRole, requireWorkspaceRole, workspaceRoleSql } from "./tenancy.js";
 import { HttpError, int, nowIso, randomId, sha256Hex, str } from "./util.js";
-import { explainLimit, limitGuard, workspaceLimits } from "./limits.js";
+import { explainLimit, fmtBytes, limitGuard, workspaceLimits } from "./limits.js";
 
 
 var SCHEMA = "agent-library-backup/1";
@@ -174,6 +174,7 @@ function checkImportRows(env, backup, decoded, limits) {
       const sniff = BINARY_TYPES[r.mime];
       if (!sniff && r.mime !== "application/octet-stream") bad("Unsupported file type");
       if (sniff && !sniff(decoded.get(r.blob_key))) bad("A file's contents don't match its type");
+      if (limits?.file_bytes !== undefined && r.size > limits.file_bytes) bad(`A file is larger than this plan allows (${fmtBytes(limits.file_bytes)})`);
       binBytes += r.size;
     }
   }

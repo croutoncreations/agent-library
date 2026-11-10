@@ -180,6 +180,11 @@ async function verifyApiKey(env, authz) {
   if (!row) throw new HttpError(401, "unauthenticated", "Malformed or unknown credential", { reason: "unknown_key" });
   if (row.revoked_at !== null) throw new HttpError(401, "credential_revoked", "Credential revoked", { reason: "revoked", key_id: row.id });
   if (row.expires_at <= nowMs()) throw new HttpError(401, "credential_expired", "Credential expired", { reason: "expired", key_id: row.id });
+  // The workspace's plan may have lowered max_key_lifetime_days since the key was made: it then lasts that long from
+  // its creation, at most (the stored expiry is left alone, so moving back to a bigger plan restores it).
+  const maxDays = (await workspaceLimits(env, row.workspace_id ?? `wsp_${row.owner_principal_id}`)).max_key_lifetime_days;
+  if (maxDays !== undefined && Date.parse(row.created_at) + maxDays * 864e5 <= nowMs())
+    throw new HttpError(401, "credential_expired", "Credential expired (the workspace's plan allows keys up to " + maxDays + " days)", { reason: "plan_lifetime", key_id: row.id });
   const ps = await env.DB.prepare(
     `SELECT p.id, p.title, acp.can_write AND ${memberRoleSql("p.id", "member")} AS can_write,
        acp.can_write AND ${memberRoleSql("p.id", "member", "?", true)} AND NOT ${memberRoleSql("p.id", "member")} AS read_only

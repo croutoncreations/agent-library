@@ -66,6 +66,14 @@ test("retention: AUDIT_RETENTION_DAYS sets the audit window; \"0\" keeps audits 
   assert.equal((await lib.pruneExpiredRows({ DB: w.DB, AUDIT_RETENTION_DAYS: "100" })).audits, 4);
 });
 
+test("retention: AUDIT_RETENTION_DAYS below 30 is raised to 30 (audits are incident history)", async () => {
+  const w = world();
+  const a = w.db.prepare("INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id) VALUES (?, 'hum_r', NULL, 'synthetic', NULL, 'ok', 'req')");
+  a.run(iso(Date.now() - 10 * DAY)); a.run(iso(Date.now() - 31 * DAY));
+  assert.equal((await lib.pruneExpiredRows({ DB: w.DB, AUDIT_RETENTION_DAYS: "1" })).audits, 1, "only the 31-day-old audit goes");
+  assert.equal(w.count("audits"), 1);
+});
+
 test("retention deletes use their indexes (migration 0026), not full scans", () => {
   const w = world();
   for (const [t, c] of [["sessions", "expires_at"], ["idempotency", "created_at"], ["audits", "at"]]) {

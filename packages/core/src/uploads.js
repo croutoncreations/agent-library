@@ -1,4 +1,4 @@
-import { deleteBlob, getBlob, getBlobHead, headBlob, putBlobStream, readText } from "./content-store.js";
+import { deleteBlob, getBlob, headBlob, putBlobStream, readText } from "./content-store.js";
 import { authenticate, authorizeProject, authzSql, enforceRate, limitsFor, requireCsrf } from "./auth.js";
 import { reconcileUploads } from "./cleanup.js";
 import { CONTENT_TYPE, spreadsheetSafeCsv } from "./formats.js";
@@ -266,12 +266,22 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
     const staged = await getBlob(ctx.env, u.staging_key);
     if (!staged) return fail(409, "missing_bytes", "Staged bytes missing", "failed");
     const size = staged.size;
-    const sha2 = await sha256HexStream(staged.body);
+    // The type signature is checked on the first bytes of the same stream that is hashed (no second read).
+    const head = new Uint8Array(Math.min(16, size));
+    let got = 0;
+    const sha2 = await sha256HexStream(staged.body.pipeThrough(new TransformStream({
+      transform(chunk, ctl) {
+        if (got < head.length) { const take = chunk.subarray(0, head.length - got); head.set(take, got); got += take.length; }
+        ctl.enqueue(chunk);
+      }
+    })));
     if (size !== u.expected_size || sha2 !== u.expected_sha256)
       return fail(422, "integrity_mismatch", "Byte length or SHA-256 does not match declaration", "failed", { received_size: size, received_sha256: sha2 });
-    const head = await getBlobHead(ctx.env, u.staging_key, Math.min(16, size));
-    if (!head) return fail(409, "missing_bytes", "Staged bytes missing", "failed");
     if (!BINARY_TYPES[u.mime](head)) return fail(415, "signature_mismatch", `Bytes are not a valid ${u.mime}`, "failed");
+    // Hashing a large file can take a while: renew the lease (still fenced on this finisher's token) before the copy,
+    // so a slow R2 read doesn't hand the upload to a second finisher mid-copy.
+    const held2 = await db2(ctx).prepare("UPDATE uploads SET finalize_until = ? WHERE id = ? AND state = 'sealed' AND finalize_token = ?").bind(nowMs() + FINALIZE_LEASE_MS, uploadId, token).run();
+    if (!held2.meta.changes) return lost();
     // Register the write before it starts, only while still the finisher of a sealed upload.
     const begin = await db2(ctx).prepare("UPDATE uploads SET final_writes = final_writes + 1 WHERE id = ? AND state = 'sealed' AND finalize_token = ?").bind(uploadId, token).run();
     if (!begin.meta.changes) return lost();
@@ -288,7 +298,8 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
       });
     }
     const check = await headBlob(ctx.env, finalKey);
-    if (!check || check.size !== size) return fail(500, "publish_failed", "Final object verification failed", "failed");
+    const storedSha = check?.checksums?.sha256 ? hex(check.checksums.sha256) : null;
+    if (!check || check.size !== size || (storedSha !== null && storedSha !== sha2)) return fail(500, "publish_failed", "Final object verification failed", "failed");
     // Still the finisher after the write? Renew the lease for the publication.
     const renew = await db2(ctx).prepare("UPDATE uploads SET finalize_until = ? WHERE id = ? AND state = 'sealed' AND finalize_token = ?").bind(nowMs() + FINALIZE_LEASE_MS, uploadId, token).run();
     if (!renew.meta.changes) return lostAfterWrite();

@@ -180,6 +180,7 @@ test("failed-but-undeleted bytes are quota-charged; space is freed only by a rea
   d1(`UPDATE uploads SET state = 'failed', expires_at = 0 WHERE id = '${begin.body.upload_id}'`); // failed, delete pending
   const used = d1(`SELECT COALESCE(SUM(expected_size),0) AS n FROM uploads WHERE project_id='${P}' AND staging_purged_at IS NULL AND state IN ('failed','conflict')`)[0].n;
   assert.ok(used >= b.length, "failed-but-undeleted bytes are charged");
+  const heldKey = d1(`SELECT staging_key FROM uploads WHERE id = '${begin.body.upload_id}'`)[0].staging_key;
   const B2 = agentHttp(s.base, (await owner("POST", `/api/projects/${P}/grants`, { label: "C", can_write: true })).body.token);
   // Charged: 30 KiB held + published 0; a 40 KiB request must fail while 30 KiB object exists (64 KiB cap)...
   const big = pngOf(40 * 1024);
@@ -188,7 +189,9 @@ test("failed-but-undeleted bytes are quota-charged; space is freed only by a rea
   const r = await B2("POST", `/api/projects/${P}/uploads`, { title: "big", mime: "image/png", size: big.length, sha256: sha256(big) },
     { headers: { "cf-access-jwt-assertion": SERVICE() } });
   assert.equal(r.status, 201, JSON.stringify(r.body));
-  const row = d1(`SELECT staging_key, staging_purged_at FROM uploads WHERE id = '${begin.body.upload_id}'`)[0];
-  assert.ok(row.staging_purged_at > 0);
-  assert.equal(await r2Has(row.staging_key), false);
+  // The R2 object is really gone. The upload row is either marked purged or, because this upload's placeholder file
+  // never published and its expiry is long past, removed with that placeholder (cleanup.js deleteOrphanPlaceholders).
+  const row = d1(`SELECT staging_purged_at FROM uploads WHERE id = '${begin.body.upload_id}'`)[0];
+  if (row) assert.ok(row.staging_purged_at > 0);
+  assert.equal(await r2Has(heldKey), false);
 });
