@@ -29,6 +29,10 @@ Why this is safe:
   is stale (see below).
 - A retried PUT overwrites the same key, but only before any revision references it (still `pending`).
 - Published is terminal, so no write can follow it.
+- A project purge (`purgeDueProjects`, and the immediate run of "delete permanently") waits while any of the project's
+  uploads holds a live finish lease, is `receiving`, or has a live (not stale) write count. A PUT whose row was ended
+  or removed mid-transfer deletes the object it just stored (best effort; a fresh `rev_` key is never referenced
+  before publish), and the purge's prefix sweep catches anything left.
 - A failed, conflicting or expired upload's `final_key` is purged by the existing cleanup rule (terminal,
   `final_writes = 0`, unreferenced by any revision); finish also removes it at once when that holds.
 - Rollback: the previous Worker's cleanup deletes `staging_key` for published uploads. Live bytes are never at

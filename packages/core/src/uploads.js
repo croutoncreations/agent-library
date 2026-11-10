@@ -178,9 +178,17 @@ async function uploadPut(req, env, requestId, uploadId, linkCtx) {
     }
     const n = stored?.size ?? null;
     const sha2 = blobSha256Hex(stored);
-    // If cleanup ended the upload mid-transfer, cleanup purges the object at final_key (terminal, no write in flight).
     const rec = await env.DB.prepare("UPDATE uploads SET state = 'received', received_size = ?, received_sha256 = ? WHERE id = ? AND state = 'receiving'").bind(n, sha2, uploadId).run();
-    if (!rec.meta.changes) throw new HttpError(410, "upload_expired", "Upload expired during transfer");
+    if (!rec.meta.changes) {
+      // Cleanup ended the upload, or a project purge removed its row, mid-transfer: remove the object just stored, best
+      // effort (cleanup or the purge's prefix sweep catch a failure). A fresh rev_ key is never referenced before
+      // publish; dropUnpublished re-checks that and that no write is in flight.
+      await (async () => {
+        if (await env.DB.prepare("SELECT 1 AS x FROM uploads WHERE id = ?").bind(uploadId).first("x")) return dropUnpublished(env, uploadId, finalKey);
+        if (!await env.DB.prepare("SELECT 1 AS x FROM revisions WHERE blob_key = ?").bind(finalKey).first("x")) await deleteBlob(env, finalKey);
+      })().catch(() => {});
+      throw new HttpError(410, "upload_expired", "Upload expired during transfer");
+    }
     await audit(ctx, u.project_id, "upload.put", u.artifact_id, null, "ok").run();
     return new Response(JSON.stringify({ upload_id: uploadId, received_bytes: n, sha256: sha2, matches_declared: n === u.expected_size && sha2 === u.expected_sha256 }), {
       status: 200,

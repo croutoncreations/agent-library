@@ -1,5 +1,5 @@
 // In-memory world for driving the production uploadPut/uploadFinish/reconcileUploads (packages/core/src/, bundled by
-// load-worker.mjs) over every migration applied to node:sqlite and a controlled R2 double, so each interleaving is
+// load-worker.mjs), and purgeDueProjects, over every migration applied to node:sqlite and a controlled R2 double, so each interleaving is
 // scheduled exactly. The R2 double behaves like R2 for what uploads rely on: put consumes a stream, refuses (storing
 // nothing) bytes that don't match options.sha256, and put/head return size and checksums.sha256. Synthetic data only.
 import { readFileSync, readdirSync } from "node:fs";
@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { ROOT } from "./helpers.mjs";
 import { loadWorker } from "./load-worker.mjs";
 
-export const lib = await loadWorker({ "uploads.js": ["quotaUsedSql", "uploadBegin", "uploadFinish", "uploadPut"], "cleanup.js": ["reconcileUploads"], "adapters.js": ["withAdapters", "defaultAdapters"] });
+export const lib = await loadWorker({ "uploads.js": ["quotaUsedSql", "uploadBegin", "uploadFinish", "uploadPut"], "cleanup.js": ["reconcileUploads"], "project-deletion.js": ["purgeDueProjects"], "adapters.js": ["withAdapters", "defaultAdapters"] });
 // The workerd stream class uploadPut uses, a minimal Node stand-in with workerd's messages: FixedLengthStream (errors
 // unless exactly n bytes).
 globalThis.FixedLengthStream ??= class extends TransformStream {
@@ -66,6 +66,7 @@ export function world() {
     },
     async head(k) { if (r2.failHead) throw new Error("synthetic R2 head failure"); return blobs.has(k) ? { size: blobs.get(k).length, checksums: { sha256: digest(blobs.get(k)) } } : null; },
     async delete(k) { blobs.delete(k); },
+    async list({ prefix, limit }) { return { objects: [...blobs.keys()].filter((k) => k.startsWith(prefix)).slice(0, limit).map((key) => ({ key })) }; },
   };
   const at = new Date().toISOString();
   sql.prepare("INSERT INTO principals (id, kind, issuer, subject, label, created_at) VALUES ('hum_synthetic','human','synthetic','owner','Synthetic owner',?)").run(at);

@@ -121,15 +121,14 @@ test("a PUT still in flight when cleanup expires the upload: the object is purge
     assert.equal(w.row(id).final_purged_at, null, "not purged while a write is in flight");
   };
   await assert.rejects(w.put(id, PNG), (e) => e.status === 410 && e.code === "upload_expired");
-  const key = w.row(id).final_key;
   assert.equal(w.row(id).final_writes, 0, "write settled");
   assert.equal(w.row(id).state, "failed");
-  assert.deepEqual(w.finals(), [key], "the late write committed");
-  assert.equal(w.quota(), PNG.length, "still tracked and counted against quota");
-  await lib.reconcileUploads(w.env);
-  assert.deepEqual(w.finals(), [], "purged once no write was in flight");
+  // The late write committed; once it settled the PUT itself removed the now-unreferenced object (F5).
+  assert.deepEqual(w.finals(), [], "removed once no write was in flight");
   assert.ok(w.row(id).final_purged_at);
   assert.equal(w.quota(), 0);
+  await lib.reconcileUploads(w.env);
+  assert.deepEqual(w.finals(), []);
   assert.deepEqual(w.revisions(art), []);
 });
 
@@ -212,6 +211,49 @@ test("uploadPut aborts a body still streaming at the deadline: nothing is stored
   } finally { mock.timers.reset(); }
   assert.deepEqual(w.finals(), [], "nothing stored");
   assert.equal(w.row(id).final_writes, 0, "write released");
+});
+
+// F5: a project purge must not delete an upload's rows while its PUT can still write final_key.
+const deleteProject = (w) => w.sql.prepare("UPDATE projects SET deleted_at = 1, purge_at = 1 WHERE id = ?").run(P);
+const purged = (w) => w.sql.prepare("SELECT purged_at FROM projects WHERE id = ?").get(P).purged_at;
+
+test("a purge during a slow PUT waits for it, then removes its object: nothing untracked is left", async () => {
+  const w = world();
+  const { id } = w.upload({ state: "pending" });
+  w.r2.beforeCommit = async (k) => {
+    if (!k.startsWith("blobs/")) return;
+    w.r2.beforeCommit = null;
+    deleteProject(w);
+    await lib.purgeDueProjects(w.env);
+    assert.equal(purged(w), null, "the purge waits while the PUT is receiving");
+    assert.ok(w.row(id), "upload row kept");
+  };
+  await w.put(id, PNG).catch(() => {});
+  assert.equal(w.row(id).final_writes, 0);
+  await lib.purgeDueProjects(w.env);
+  assert.ok(purged(w) > 0, "purged once the PUT settled");
+  assert.deepEqual([...w.blobs.keys()], [], "no object left");
+});
+
+test("a PUT whose upload row was removed mid-write deletes the object it stored", async () => {
+  const w = world();
+  const { id } = w.upload({ state: "pending" });
+  w.r2.beforeCommit = async (k) => { if (k.startsWith("blobs/")) { w.r2.beforeCommit = null; w.sql.prepare("DELETE FROM uploads WHERE id = ?").run(id); } };
+  await assert.rejects(w.put(id, PNG), (e) => e.status === 410 && e.code === "upload_expired");
+  assert.deepEqual([...w.blobs.keys()], [], "the unreferenced object was removed");
+});
+
+test("purge waits for a live write count, but not for a stale one", async () => {
+  const w = world();
+  const { id } = w.upload({ state: "failed", expiresAt: Date.now() - GRACE - 30000 });
+  w.sql.prepare("UPDATE uploads SET final_writes = 1 WHERE id = ?").run(id);
+  deleteProject(w);
+  await lib.purgeDueProjects(w.env);
+  assert.equal(purged(w), null, "a live count holds the purge");
+  w.sql.prepare("UPDATE uploads SET expires_at = ? WHERE id = ?").run(Date.now() - GRACE - PUT_MARGIN - 1000, id);
+  await lib.purgeDueProjects(w.env);
+  assert.ok(purged(w) > 0, "a stale count does not");
+  assert.deepEqual([...w.blobs.keys()], []);
 });
 
 test("cleanup never deletes a final object a revision references", async () => {

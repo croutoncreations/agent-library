@@ -9,6 +9,7 @@
 //             (title "Deleted project", no address) because API keys, connections and audits reference it.
 // Nothing here runs for agents, and nothing is removed outside purgeDueProjects.
 import { requireHuman } from "./auth.js";
+import { staleWritesBefore } from "./cleanup.js";
 import { deleteBlob, listBlobKeys } from "./content-store.js";
 import { explainLimit, limitGuard } from "./limits.js";
 import { ensureSlug } from "./paths.js";
@@ -124,12 +125,17 @@ export async function purgeProjectNow(ctx, projectId, input) {
     audit(ctx, projectId, "project.purge_requested", "ok", "changes() = 1", [])
   ]);
   if (!u.meta.changes) throw new HttpError(409, "conflict", "The project changed meanwhile. Reload and try again.");
-  // Start right away (bounded) unless an upload could still be finishing (its lease is 60 s); the cron finishes the rest.
-  const leased = await ctx.env.DB.prepare("SELECT 1 FROM uploads WHERE project_id = ? AND finalize_until > ? LIMIT 1").bind(projectId, now).first();
+  // Start right away (bounded) unless an upload could still be finishing (its lease is 60 s) or writing; the cron
+  // finishes the rest.
+  const leased = await ctx.env.DB.prepare(`SELECT 1 FROM uploads u WHERE u.project_id = ?1 AND ${UPLOAD_BUSY} LIMIT 1`).bind(projectId, now, staleWritesBefore(ctx.env, now)).first();
   if (!leased) await purgeDueProjects(ctx.env, { projectId, rowBudget: 2000, blobBudget: 200 });
   return { ok: true, id: projectId };
 }
 
+// An upload whose finish lease is live, or whose PUT may still write final_key (receiving, or a write counted), unless
+// that count is stale (cleanup.js staleWritesBefore: no PUT commits that late), so a leaked count can't block a purge
+// forever. ?2 = now, ?3 = staleWritesBefore.
+const UPLOAD_BUSY = "(u.finalize_until > ?2 OR ((u.state = 'receiving' OR u.final_writes > 0) AND u.expires_at > ?3))";
 const STILL_DUE = "EXISTS (SELECT 1 FROM projects d WHERE d.id = ?1 AND d.deleted_at IS NOT NULL AND d.purged_at IS NULL AND d.purge_at <= ?3)";
 // Purge order: children before parents (composite foreign keys), and R2 files before the rows that name them so a
 // crash never leaves a file nobody can find. Each step deletes at most `n` rows.
@@ -161,10 +167,11 @@ const STEPS = [
  */
 export async function purgeDueProjects(env, { projectId, rowBudget = 5000, blobBudget = 500 } = {}) {
   const now = nowMs();
-  // A project with an upload still inside its finish lease waits for the next run, so no file lands after its rows go.
-  const due = (await env.DB.prepare(`SELECT id FROM projects WHERE purge_at IS NOT NULL AND purge_at <= ?1 AND purged_at IS NULL AND deleted_at IS NOT NULL${projectId ? " AND id = ?2" : ""}
-      AND NOT EXISTS (SELECT 1 FROM uploads u WHERE u.project_id = projects.id AND u.finalize_until > ?1) ORDER BY purge_at LIMIT 5`)
-    .bind(now, ...projectId ? [projectId] : []).all()).results;
+  // A project with an upload still inside its finish lease or still writing waits for the next run, so no file lands
+  // after its rows go.
+  const due = (await env.DB.prepare(`SELECT id FROM projects WHERE purge_at IS NOT NULL AND purge_at <= ?2 AND purged_at IS NULL AND deleted_at IS NOT NULL${projectId ? " AND id = ?4" : ""}
+      AND NOT EXISTS (SELECT 1 FROM uploads u WHERE u.project_id = projects.id AND ${UPLOAD_BUSY}) ORDER BY purge_at LIMIT 5`)
+    .bind(null, now, staleWritesBefore(env, now), ...projectId ? [projectId] : []).all()).results;
   const out = { projects: 0, rows: 0, files: 0, finished: [] };
   for (const { id } of due) {
     const stillDue = async () => !!await env.DB.prepare(`SELECT 1 AS ok WHERE ${STILL_DUE}`).bind(id, null, now).first("ok");
@@ -202,7 +209,8 @@ export async function purgeDueProjects(env, { projectId, rowBudget = 5000, blobB
       }
     }
     // Then sweep both prefixes for anything no row names (a write that landed after its row went, or an earlier
-    // crash). The run waits while an upload is inside its finish lease (see `due`), so nothing new arrives after this.
+    // crash). The run waits while an upload is inside its finish lease or writing (see `due`), so nothing new arrives
+    // after this.
     for (const prefix of [`blobs/${id}/`, `staging/${id}/`]) {
       for (;;) {
         if (blobBudget <= 0) return out;
