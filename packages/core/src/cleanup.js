@@ -44,6 +44,13 @@ async function reconcileUploads(env, opts = {}) {
     const r = await DB.prepare("UPDATE uploads SET final_purged_at = ?, final_writes = 0 WHERE id = ? AND final_purged_at IS NULL").bind(now, u.id).run();
     purgedFinal += r.meta.changes ? 1 : 0;
   }
+  // Second delete of ended uploads' final keys, 1 to 3 hours after the first: R2 can't abort a put whose body fully
+  // arrived, so an abandoned put that commits after the first purge is removed here (deletes of absent keys are free).
+  const late = await DB.prepare(`SELECT final_key FROM uploads u WHERE final_key IS NOT NULL AND state IN ('failed','conflict')
+      AND final_purged_at BETWEEN ? AND ? AND NOT EXISTS (SELECT 1 FROM revisions r WHERE r.blob_key = u.final_key)${pf.replace("project_id", "u.project_id")} LIMIT ?`)
+    .bind(now - 3 * 36e5, now - 36e5, ...pp, limit).all().catch(() => ({ results: [] }));
+  for (const u of late.results) await deleteBlob(env, u.final_key).catch(() => {
+  });
   // Best effort: a failure here must not stop the rest of cleanup or the upload begin that called it.
   const placeholders = await deleteOrphanPlaceholders(env, now, stale, opts.projectId, limit).catch(() => {
     console.error(JSON.stringify({ event: "placeholder_cleanup_failed" }));

@@ -148,6 +148,25 @@ test("a Worker that dies mid-write leaves the object tracked and counted until t
 
 // F1: the PUT owns final_writes; a request that dies never runs its finally. Past the PUT deadline (expires_at +
 // PUT_MARGIN_MS) no put can commit, so after the cleanup grace as well the count is stale and the row is purged.
+// Round-2 review: R2 can't abort a put whose body fully arrived, so it may commit after the stale purge. Cleanup
+// deletes the ended upload's final_key a second time 1 to 3 hours later.
+test("a put that commits after the stale purge is removed by the second delete, never a referenced key", async () => {
+  const w = world();
+  const { id } = w.upload({ state: "sealed", expiresAt: Date.now() - GRACE - PUT_MARGIN - 1000 });
+  const key = "blobs/" + P + "/" + w.row(id).artifact_id + "/rev_synthetic_late";
+  w.sql.prepare("UPDATE uploads SET final_key = ?, final_writes = 1, finalize_until = ? WHERE id = ?").run(key, Date.now() - 1, id);
+  await lib.reconcileUploads(w.env);
+  assert.deepEqual([w.row(id).state, w.row(id).final_writes, w.row(id).final_purged_at > 0], ["failed", 0, true]);
+  // The abandoned put lands after that first purge.
+  w.blobs.set(key, PNG);
+  await lib.reconcileUploads(w.env);
+  assert.ok(w.blobs.has(key), "not yet: the second delete waits an hour");
+  w.sql.prepare("UPDATE uploads SET final_purged_at = ? WHERE id = ?").run(Date.now() - 2 * 36e5, id);
+  await lib.reconcileUploads(w.env);
+  assert.equal(w.blobs.has(key), false, "late object removed");
+  assert.equal(w.quota(), 0);
+});
+
 test("a PUT that never settles: past the deadline and grace, reconcile purges the key, releases quota and deletes the placeholder", async (t) => {
   const w = world();
   const { id, art } = w.upload({ state: "pending" });
