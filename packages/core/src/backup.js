@@ -1,5 +1,5 @@
 import { personalWorkspaceId } from "./tenancy.js";
-import { commitTextWrites, deleteBlob, getBlob, putBlob, getText, readText, stageTextWrite, storeText, textWriteComplete } from "./content-store.js";
+import { commitTextWrites, deleteBlob, getBlob, putBlob, getText, readText, stageTextWrite, storeText, textKey, textWriteComplete } from "./content-store.js";
 import { textSearchBridge } from "./search/service.js";
 import { limitsFor, requireHuman } from "./auth.js";
 import { BINARY_TYPES, LIMITS, tplDate } from "./service.js";
@@ -107,6 +107,8 @@ async function restoreBackup(ctx, backup) {
   const existing = await DB.prepare("SELECT COUNT(*) AS n FROM projects").first("n");
   if (existing) throw new HttpError(409, "store_not_empty", "Restore targets an empty isolated store only");
   const { pid, decoded } = await validateBackup(backup);
+  // Restore preserves legacy IDs; validate every resulting key before writing any bytes or intents.
+  for (const r of backup.revisions) if (r.blob_key === null) textKey(pid, r.artifact_id, r.id);
   for (const [k, bytes] of decoded) await putBlob(ctx.env, k, bytes);
   const authors = new Set([...backup.revisions, ...backup.comments, ...backup.meta_versions ?? []].map((x) => x.author_id));
   const stmts = [];

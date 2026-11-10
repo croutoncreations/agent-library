@@ -4,7 +4,13 @@ import assert from "node:assert/strict";
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { ROOT } from "./helpers.mjs";
-import { getText, getTextRange } from "../packages/core/src/content-store.js";
+import { getText, getTextRange, textKey } from "../packages/core/src/content-store.js";
+
+test("text keys preserve normal IDs and escape legacy separators without aliasing", () => {
+  assert.equal(textKey("proj-s", "art_123", "rev_123"), "text/proj-s/art_123/rev_123");
+  assert.equal(textKey("proj-s", "a%2Fb", "c"), "text/proj-s/a%252Fb/c");
+  assert.notEqual(textKey("proj-s", "a/b", "c"), textKey("proj-s", "a", "b/c"));
+});
 
 test("legacy text reads retain byte-exact UTF-8 ranges", async () => {
   const body = "aé🙂z";

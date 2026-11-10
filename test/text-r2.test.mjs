@@ -220,3 +220,30 @@ test("publication fence matches real local D1 constraint text and rolls back a m
     assert.equal(await DB.prepare("SELECT COUNT(*) AS n FROM content_writes WHERE key = 'should-rollback'").first("n"), 0);
   } finally { await mf.dispose(); }
 });
+
+test("restore preserves unusual legacy IDs without aliasing text keys and refuses oversized keys before writing", async () => {
+  const source = await harness();
+  await source.lib.createMarkdown(source.ctx, "proj-s", { title: "First", body: "first distinct body" }, "key-first");
+  await source.lib.createMarkdown(source.ctx, "proj-s", { title: "Second", body: "second distinct body" }, "key-second");
+  const backup = await source.lib.exportBackup(source.ctx, "proj-s");
+  const pairs = [["a/b", "c"], ["a", "b/c"]];
+  for (let i = 0; i < pairs.length; i++) {
+    const artifact = backup.artifacts[i], oldId = artifact.id;
+    const revision = backup.revisions.find(r => r.artifact_id === oldId);
+    [artifact.id, artifact.head_revision_id] = pairs[i];
+    [revision.artifact_id, revision.id] = pairs[i];
+  }
+  const target = await harness();
+  target.sql.exec("DELETE FROM projects");
+  await target.lib.restoreBackup(target.ctx, backup);
+  assert.equal(target.objects.size, 2);
+  assert.deepEqual([...target.objects.keys()].sort(), ["text/proj-s/a%2Fb/c", "text/proj-s/a/b%2Fc"].sort());
+  for (const revision of backup.revisions) assert.equal((await target.lib.getArtifact(target.ctx, "proj-s", revision.artifact_id)).body, revision.body);
+  const tooLong = structuredClone(backup);
+  tooLong.revisions[1].id = "x".repeat(1025);
+  const empty = await harness();
+  empty.sql.exec("DELETE FROM projects");
+  await assert.rejects(empty.lib.restoreBackup(empty.ctx, tooLong), e => e.status === 400 && e.code === "bad_backup");
+  assert.equal(empty.objects.size, 0);
+  assert.equal(empty.sql.prepare("SELECT COUNT(*) AS n FROM content_writes").get().n, 0);
+});
