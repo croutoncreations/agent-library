@@ -1710,7 +1710,7 @@ async function viewList(pid, trash) {
   var msg = h("p", { class: "msg", role: "status", "aria-live": "polite" });
   var list = h("ul", { class: "list", "aria-label": trash ? "Trashed items" : "Documents and files" }), empty = h("div", { hidden: true });
   var more = h("button", { type: "button", class: "secondary", hidden: true }, "Load more");
-  var q = h("input", { type: "search", placeholder: trash ? "Search trash" : "Search titles and text", "aria-label": trash ? "Search trash" : "Search this project" });
+  var q = h("input", { type: "search", placeholder: trash ? "Filter trash by title" : "Filter titles", "aria-label": trash ? "Filter trash by title" : "Filter this project by title" });
   var cursor = null, seq = 0, qTimer = null;
 
   function row(a) {

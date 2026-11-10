@@ -180,12 +180,13 @@ test("new saves store only R2 keys, conflicts leave no orphan, search and backup
   assert.deepEqual((await other.lib.exportBackup(other.ctx, "proj-s")).revisions, backup.revisions);
 });
 
-test("owner filter retains legacy body matching and is title-only for R2 text", async () => {
+test("owner filter is title-only for legacy inline and R2 text", async () => {
   const { lib, sql, ctx } = await harness();
   const legacy = await lib.createMarkdown(ctx, "proj-s", { title: "Legacy", body: "legacybodyword" }, "legacy-filter");
   sql.prepare("UPDATE revisions SET body = 'legacybodyword', body_key = NULL WHERE artifact_id = ?").run(legacy.body.artifact_id);
   await lib.createMarkdown(ctx, "proj-s", { title: "Titleneedle", body: "r2bodyword" }, "r2-filter");
-  assert.equal((await lib.listArtifacts(ctx, "proj-s", { query: "legacybodyword" })).artifacts.length, 1);
+  assert.equal((await lib.listArtifacts(ctx, "proj-s", { query: "legacybodyword" })).artifacts.length, 0);
+  assert.equal((await lib.listArtifacts(ctx, "proj-s", { query: "Legacy" })).artifacts.length, 1);
   assert.equal((await lib.listArtifacts(ctx, "proj-s", { query: "r2bodyword" })).artifacts.length, 0);
   assert.equal((await lib.listArtifacts(ctx, "proj-s", { query: "Titleneedle" })).artifacts.length, 1);
 });

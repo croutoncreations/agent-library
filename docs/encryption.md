@@ -27,7 +27,7 @@ New Markdown, HTML, JSON and CSV versions live in immutable R2 objects at `text/
 D1 keeps `revisions.body = NULL` and `body_key` names the object. All JavaScript version reads use `getText` or
 `getTextRange`, which fall back to legacy inline bodies. Ranges return raw bytes, including partial UTF-8 sequences;
 chunked readers choose character boundaries only after fetching the bytes. Text writes record a `content_writes`
-intent before `putText`; the revision batch clears it. No encryption codec is enabled yet, and the text limit remains
+intent before `putText`; the publication batch clears it. No encryption codec is enabled yet, and the text limit remains
 1 MiB. Restore preserves revision IDs but adds a random attempt segment to each text key
 (`text/{project}/{artifact}/{revision}/{attempt}`), so retries never overwrite another attempt's objects or
 collide with its intents. Failed attempts remain unreferenced and are reclaimed by the normal sweep.
@@ -50,8 +50,13 @@ An operation taking over ten minutes can still expire its early intents and roll
 publishing partial data. Settled-batch cleanup queries all unreferenced keys together, deletes objects in R2
 batches of at most 1,000, then removes their intents in one statement; failed deletes leave intents for cron.
 
-Comments remain inline through `storeText`/`readText`. Publisher generation commits also remain inline until a later
-slice. `test/content-store.test.mjs` checks NULL revision inserts (with explicit generation exceptions), restricts R2
+New comments use the same staged R2 writes and fence at `text/{project}/{artifact}/{comment}`; D1 keeps
+`comments.body = ''` and `body_key` names the object. Lists and exports use `getText` with legacy inline fallback
+and at most six reads in flight. Restore adds the same per-attempt segment as versions, and imports use fresh IDs.
+Both reference checks and project purge include comment keys. The comment limit remains 10,000 characters.
+
+Publisher generation commits remain inline until a later slice. `test/content-store.test.mjs` checks NULL revision
+and empty comment inserts (with explicit generation exceptions), disallows body matching in SQL, restricts R2
 binding access to the seam, and exercises main body paths with a marker codec. `test/text-r2.test.mjs` covers R2 and
 legacy reads, byte ranges, conflicts, orphan cleanup, search and backup round trips.
 
@@ -61,9 +66,11 @@ when text encryption is built:
 | Where | What reads the body in SQL |
 |---|---|
 | `migrations/0014_ranked_search.sql` triggers, `packages/core/src/search/service.js` | FTS5 index of title and body; temporary plaintext R2 bridge refreshed after version and metadata writes |
-| `packages/core/src/service.js` (`listArtifacts`) | owner `LIKE` filter over the legacy head body (R2 versions match titles only until blind search) |
 | `packages/core/src/api/publisher.js` | generation commit copies staged part bodies into revisions with `INSERT … SELECT` (marked `content-store: sql-side`) and refreshes the search index from them; `json_extract` over staged parts |
 | `publisher_generation_parts.body` | staged App Connect parts are plaintext in D1 from upload until commit (then cleared) |
+
+The owner document-list filter matches titles only, for both legacy and R2-backed rows; body matching returns
+through the blind index in slice 4b. Ranked search still uses the temporary FTS bridge above.
 
 Plan when per-workspace encryption is built: add a nullable `key_version` to `revisions` and `comments` (NULL =
 plaintext, read both), encrypt in the Worker before insert, and replace the SQL-side uses above. Search is the hard

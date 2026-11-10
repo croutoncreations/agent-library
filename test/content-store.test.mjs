@@ -34,14 +34,25 @@ test("only packages/core/src/content-store.js touches the R2 binding", () => {
   assert.deepEqual(offenders, []);
 });
 
-// Text bodies in D1 (revisions.body, comments.body). Two checks:
-// 1. Static: every statement in packages/core/src/ that inserts into revisions or comments either binds storeText(...) or is an
-//    SQL-side copy marked "content-store: sql-side" (listed in docs/encryption.md).
-// 2. Behavioural: the build is made with storeText/readText replaced by a reversible marker codec and the main write
-//    and read paths (documents, comments, history, restore, templates, JSON files and records, backup export and
-//    restore) run against the migrated schema in node:sqlite. A covered path that skips the seam leaves the marker
-//    out of the stored row or leaks it into a response. Paths not exercised here are covered only by check 1 (writes).
-test("revision INSERTs bind NULL bodies except allow-listed generation copies; comments bind storeText", () => {
+// Legacy fallback SELECTs still fetch inline bodies, but SQL must not match against them. The temporary FTS
+// bridge and publisher generation copies remain plaintext until later slices (docs/encryption.md).
+test("SQL never matches revision or comment body columns", () => {
+  const bad = [];
+  for (const f of jsFiles(join(ROOT, "packages", "core", "src"))) {
+    const text = readFileSync(f, "utf8");
+    for (const m of text.matchAll(/\bprepare\(\s*(["'`])([\s\S]*?)\1/g)) {
+      if (/\b(?:revisions|comments)\b/.test(m[2]) && /\b(?:\w+\.)?body\s+(?:LIKE|GLOB|MATCH|REGEXP)\b/i.test(m[2])) {
+        bad.push(`${f.slice(ROOT.length + 1)}:${text.slice(0, m.index).split("\n").length}`);
+      }
+    }
+  }
+  assert.deepEqual(bad, [], "inline bodies are compatibility reads, not SQL search inputs");
+});
+
+// Every new body is staged through the content store. Only publisher generation commits may still write inline:
+// staged-part SQL copies and the manifest's storeText call. The marker-codec test exercises actual reads/writes,
+// including inline compatibility, and fails if encoded bytes are missing or leak into a response.
+test("body INSERTs use NULL revisions or empty comments, except allow-listed publisher generation copies", () => {
   const bad = [];
   for (const f of jsFiles(join(ROOT, "packages", "core", "src"))) {
     const text = readFileSync(f, "utf8");
@@ -55,19 +66,17 @@ test("revision INSERTs bind NULL bodies except allow-listed generation copies; c
         const generationCommit = f.endsWith("/api/publisher.js") && text.lastIndexOf("async function commit(", m.index) > text.lastIndexOf("async function commitSnapshot(", m.index);
         if (generationCommit && /content-store: sql-side/.test(before) && /t\.body, t\.bytes, t\.sha256/.test(sql)) continue;
         if (generationCommit && /storeText\(manifestText\)/.test(bind)) continue;
-        const bodyIndex = m[2].split(",").map(c => c.trim()).indexOf("body");
-        const values = sql.slice(sql.indexOf(")") + 1).match(/(?:SELECT|VALUES\s*\()\s*([\s\S]*?)(?:\bWHERE\b|\)\s*`)/i)?.[1].split(",").map(v => v.trim());
-        if (/\bbody_key\b/.test(m[2]) && values?.[bodyIndex] === "NULL") continue;
-      } else {
-        const sql = after.slice(0, after.indexOf(".bind("));
-        if (/\bbody_key\b/.test(m[2]) && /(?:SELECT\s+|VALUES\s*\(\s*)\?, \?, \?, \?, \?, '',/.test(sql)) continue;
       }
+      const sql = after.slice(0, after.indexOf(".bind("));
+      const bodyIndex = m[2].split(",").map(c => c.trim()).indexOf("body");
+      const values = sql.slice(sql.indexOf(")") + 1).match(/(?:SELECT|VALUES\s*\()\s*([\s\S]*?)(?:\bWHERE\b|\)\s*[`"])/i)?.[1].split(",").map(v => v.trim());
+      if (/\bbody_key\b/.test(m[2]) && values?.[bodyIndex] === (m[1] === "revisions" ? "NULL" : "''")) continue;
       bad.push(`${f.slice(ROOT.length + 1)}:${text.slice(0, m.index).split("\n").length}`);
     }
   }
   assert.deepEqual(bad, [], "text-body INSERT outside the explicit inline generation allow-list");
 });
-test("main JS write and read paths of text bodies go through storeText/readText (marker codec)", async () => {
+test("main JS text and comment paths go through the content store (marker codec)", async () => {
   const { loadWorker } = await import("./load-worker.mjs");
   const lib = await loadWorker({ "service.js": ["createMarkdown", "createFile", "saveFile", "readRecords", "saveMarkdown", "getArtifact", "addComment", "listComments", "restoreRevision"], "templates/service.js": ["saveAsTemplate", "createFromTemplate"], "backup.js": ["exportBackup", "restoreBackup"], "history/service.js": ["diffRevisions"], "adapters.js": ["withAdapters", "defaultAdapters"] },
     { "content-store.js": "export * from \"./packages/core/src/content-store.js\"; import { getText as actualGetText, stageTextWrite as actualStage, stageTextWrites as actualStageMany } from \"./packages/core/src/content-store.js\"; export async function stageTextWrite(env, p, a, r, t, attempt) { return actualStage(env, p, a, r, storeText(t), attempt); } export async function stageTextWrites(env, writes) { return actualStageMany(env, writes.map(w => ({ ...w, text: storeText(w.text) }))); } export async function getText(env, row) { return readText(await actualGetText(env, row)); } export function storeText(t) { return \"ENC:\" + t; } export function readText(s) { if (!String(s).startsWith(\"ENC:\")) throw new Error(\"unencoded body read: \" + String(s).slice(0, 20)); return String(s).slice(4); }" });

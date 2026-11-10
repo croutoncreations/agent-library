@@ -35,7 +35,7 @@ One Cloudflare Worker serves two hostnames:
 | `APP_HOST`, e.g. `library.example.com` | You, in a browser (desktop or phone) | The library UI, behind Cloudflare Access |
 | `MCP_HOST`, e.g. `library-mcp.example.com` | Agents and apps | OAuth, the MCP server at `/mcp`, the HTTP API at `/v1` |
 
-D1 stores projects, folders, Markdown, versions, grants and audit records. A private R2 bucket holds immutable binary versions (images, PDFs, video). KV holds OAuth state. A cron job cleans up abandoned uploads.
+D1 stores projects, folders, version and comment metadata, grants and audit records; older text may remain inline. A private R2 bucket holds new text versions, comment bodies and immutable binary versions (images, PDFs, video). KV holds OAuth state. A cron job cleans up abandoned uploads.
 
 It is a single-owner library with many agents, not a multi-tenant service. Uploaded HTML and SVG are never executed on the app's origin. Every save is checked against the expected revision, so a conflicting edit preserves your draft instead of overwriting it.
 

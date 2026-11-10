@@ -5,8 +5,8 @@ import { HttpError } from "./util.js";
 // Today content is encrypted at rest by the storage provider (Cloudflare D1/R2), so these are pass-throughs.
 // Per-workspace envelope encryption (hosted plan, "Encryption at rest") plugs in here: a KeyProvider wraps
 // per-workspace data keys and R2 objects become chunked AES-GCM so Range reads keep working.
-// test/content-store.test.mjs fails if any other module touches env.BLOBS. Text versions use putText/getText;
-// comments and legacy inline bodies still pass through storeText/readText.
+// test/content-store.test.mjs fails if any other module touches env.BLOBS. Text versions and comments use
+// staged immutable writes and getText; legacy inline bodies still pass through readText.
 
 /** Read a stored object, optionally a byte range ({ offset, length }). Returns an R2ObjectBody or null. */
 export async function getBlob(env, key, range) {
@@ -67,7 +67,7 @@ export async function listBlobKeys(env, prefix, limit = 100) {
 }
 
 
-// Inline compatibility codec: comments and publisher generation copies still write inline; legacy text versions
+// Inline compatibility codec: publisher generation copies still write inline; legacy versions and comments
 // are decoded here by getText/getTextRange. SQL-side plaintext uses are listed in docs/encryption.md.
 export function storeText(text) {
   return text;

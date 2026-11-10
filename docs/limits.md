@@ -32,7 +32,7 @@ remove. A string that's too long is `413 too_large`; a number out of range is `4
 | Title | 1–200 characters | document, file, project, template | fixed | `413 too_large` |
 | Tags | 20 per document, each 1–50 characters | document | fixed | `400 invalid_input` / `413 too_large` |
 | Change note | 280 characters | version | fixed | `413 too_large` |
-| Comment | 1–10,000 characters | comment | fixed | `413 too_large` |
+| Comment | 1–10,000 characters | comment | fixed; new bodies are stored in R2, legacy inline D1 bodies remain readable | `413 too_large` |
 | Versions kept | all, forever | document | fixed (only `storage_bytes` bounds them) | — |
 
 ## Projects & folders
@@ -70,6 +70,9 @@ remove. A string that's too long is `413 too_large`; a number out of range is `4
 | Publishing app snapshots | 32 files, 256 MiB per app | app | fixed | `413 quota_exceeded` |
 
 ## Search & lists
+
+The owner's document-list filter matches titles only, for both legacy inline and R2-backed documents. Body matching
+will return through the blind index in slice 4b. The separate ranked search still searches titles and stored text.
 
 | Limit | Default | Scope | Configure | When you hit it |
 |---|---|---|---|---|
@@ -116,11 +119,12 @@ the error instead of a reset connection.
 | Imported file bytes | `PROJECT_BINARY_BYTES` (`"0"` = no cap) | import | `PROJECT_BINARY_BYTES` | `400 bad_backup` |
 | Workspace limits on import | `projects`, `storage_bytes` | workspace | plan | `402 limit_reached` |
 
-Text versions cost one R2 call per version on import, restore and export. Import and restore also use about
-one D1 call per 100 text versions for staging, plus the publication batch and fixed validation/cleanup calls.
+Text versions and comments cost one R2 call per body on import, restore and export (export of legacy inline bodies
+needs no R2 read). Import and restore also use about one D1 call per 100 bodies for staging, plus the publication
+batch and fixed validation/cleanup calls. All object operations run with at most six in flight.
 Cloudflare's [subrequest limits](https://developers.cloudflare.com/workers/platform/limits/#subrequests) mean
-the 2,000-version import cap fits Workers Paid (10,000 subrequests). On Workers Free (1,000 calls to Cloudflare
-services), an import, restore or export with more than roughly 900 text versions fails. This is a platform ceiling,
+the combined 2,000-version and 2,000-comment import caps fit Workers Paid (10,000 subrequests). On Workers Free
+(1,000 calls to Cloudflare services), an import, restore or export with more than roughly 900 R2 text/comment bodies fails. This is a platform ceiling,
 not a plan check; file versions and other request work also consume calls.
 
 ## Sign-in & sessions
