@@ -10,3 +10,6 @@ CREATE INDEX IF NOT EXISTS audits_at ON audits(at);
 CREATE INDEX IF NOT EXISTS comments_artifact ON comments(artifact_id, project_id, created_at, id);
 CREATE INDEX IF NOT EXISTS audits_project ON audits(project_id, seq);
 CREATE INDEX IF NOT EXISTS workspaces_created_by ON workspaces(created_by) WHERE personal = 0;
+-- The cron's unfinished-upload placeholder cleanup (cleanup.js deleteOrphanPlaceholders).
+CREATE INDEX IF NOT EXISTS artifacts_placeholders ON artifacts(project_id) WHERE head_rev = 0 AND kind = 'binary';
+CREATE INDEX IF NOT EXISTS uploads_artifact ON uploads(artifact_id);

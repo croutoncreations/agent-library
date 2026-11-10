@@ -31,7 +31,11 @@ async function reconcileUploads(env, opts = {}) {
     const r = await DB.prepare("UPDATE uploads SET final_purged_at = ? WHERE id = ? AND final_purged_at IS NULL").bind(now, u.id).run();
     purgedFinal += r.meta.changes ? 1 : 0;
   }
-  const placeholders = await deleteOrphanPlaceholders(env, now, opts.projectId, limit);
+  // Best effort: a failure here must not stop the rest of cleanup or the upload begin that called it.
+  const placeholders = await deleteOrphanPlaceholders(env, now, opts.projectId, limit).catch(() => {
+    console.error(JSON.stringify({ event: "placeholder_cleanup_failed" }));
+    return 0;
+  });
   // rate_counters.win is a minute number. Only past windows are deleted: longer counters (hosted daily email caps) use
   // the minute their period ends, so keep this "older than" and never delete future windows.
   await DB.prepare("DELETE FROM rate_counters WHERE win < ?").bind(Math.floor(now / 6e4) - 2).run();
@@ -50,7 +54,12 @@ async function reconcileUploads(env, opts = {}) {
 // answering 410 upload_expired until then) and with its R2 objects purged. Nothing can start a new upload for it
 // (loadArtifact hides binary artifacts at head_rev 0). Bounded per run.
 var PLACEHOLDER_GRACE_MS = 864e5;
+// Only a placeholder nothing else refers to: a comment, details version or revision on it (all foreign keys to
+// artifacts) leaves it alone, so the delete can never fail a foreign key and roll the cleanup batch back.
 var ORPHAN_PLACEHOLDER_SQL = `a.head_rev = 0 AND a.kind = 'binary' AND a.publisher_id IS NULL
+  AND NOT EXISTS (SELECT 1 FROM meta_versions m WHERE m.artifact_id = a.id)
+  AND NOT EXISTS (SELECT 1 FROM comments c WHERE c.artifact_id = a.id)
+  AND NOT EXISTS (SELECT 1 FROM revisions r WHERE r.artifact_id = a.id)
   AND NOT EXISTS (SELECT 1 FROM uploads u WHERE u.artifact_id = a.id AND (u.state NOT IN ('failed','conflict') OR u.expires_at > ?
     OR u.staging_purged_at IS NULL OR u.final_writes > 0 OR (u.final_key IS NOT NULL AND u.final_purged_at IS NULL)))`;
 async function deleteOrphanPlaceholders(env, now, projectId, limit) {

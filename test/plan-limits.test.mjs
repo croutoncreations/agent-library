@@ -413,7 +413,9 @@ test("browser: the API key form explains the plan's lifetime maximum; a never-ex
     await page.select("select[aria-label=Lifetime]", "never");
     await page.waitForSelector("details .scope select[aria-label^='Access to ']");
     await page.select("details .scope select[aria-label^='Access to ']", "read");
-    await (await page.waitForSelector("xpath/.//button[normalize-space()='Create key']")).click();
+    // Submit the open create form (a click can land while the settings page re-renders after the plan change).
+    await page.waitForSelector("xpath/.//button[normalize-space()='Create key']", { visible: true });
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.textContent.trim() === "Create key" && b.offsetParent).form.requestSubmit());
     await page.waitForFunction(() => /API key for Forever key/.test(document.body.innerText), { timeout: 10000 });
     const note = await page.evaluate(() => document.body.innerText);
     assert.match(note, /· never expires\./);

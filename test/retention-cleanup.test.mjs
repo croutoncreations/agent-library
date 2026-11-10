@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { ROOT } from "./helpers.mjs";
 import { loadWorker } from "./load-worker.mjs";
 
-const lib = await loadWorker({ "cleanup.js": ["pruneExpiredRows"], "identity/browser.js": ["limitSigninStart"], "util.js": ["readTextCapped"] });
+const lib = await loadWorker({ "cleanup.js": ["pruneExpiredRows", "reconcileUploads"], "identity/browser.js": ["limitSigninStart"], "util.js": ["readTextCapped"] });
 const DAY = 864e5;
 
 function world() {
@@ -72,6 +72,51 @@ test("retention: AUDIT_RETENTION_DAYS below 30 is raised to 30 (audits are incid
   a.run(iso(Date.now() - 10 * DAY)); a.run(iso(Date.now() - 31 * DAY));
   assert.equal((await lib.pruneExpiredRows({ DB: w.DB, AUDIT_RETENTION_DAYS: "1" })).audits, 1, "only the 31-day-old audit goes");
   assert.equal(w.count("audits"), 1);
+});
+
+// D1 enforces foreign keys and runs a batch as one transaction: so does this wrapper.
+function fkWorld() {
+  const w = world();
+  w.db.exec("PRAGMA foreign_keys = ON");
+  w.DB.batch = async (stmts) => {
+    w.db.exec("BEGIN");
+    try { const out = []; for (const s of stmts) out.push(await s.run()); w.db.exec("COMMIT"); return out; }
+    catch (e) { w.db.exec("ROLLBACK"); throw e; }
+  };
+  const now = Date.now(), old = now - 3 * DAY, at = iso(old);
+  w.db.prepare("INSERT INTO projects (id, owner_id, title, created_at) VALUES ('prj_c', 'hum_r', 'C', ?)").run(at);
+  const ph = w.db.prepare("INSERT INTO artifacts (id, project_id, kind, title, head_rev, created_at, updated_at) VALUES (?, 'prj_c', 'binary', ?, 0, ?, ?)");
+  const up = w.db.prepare(`INSERT INTO uploads (id, project_id, artifact_id, principal_id, base_rev, expected_size, expected_sha256, mime, state, staging_key,
+    expires_at, created_at, staging_purged_at) VALUES (?, 'prj_c', ?, 'hum_r', 0, 1, 'x', 'image/png', 'failed', ?, ?, ?, ?)`);
+  for (const id of ["art_plain", "art_renamed"]) { ph.run(id, id, at, at); up.run("upl_" + id, id, "stage/" + id, old, at, old); }
+  // The uploader renamed this placeholder before the upload expired: it has details versions (foreign keys).
+  w.db.prepare(`INSERT INTO meta_versions (id, artifact_id, project_id, version, title, folder, tags, trashed, author_id, created_at)
+    VALUES ('mv_1', 'art_renamed', 'prj_c', 1, 'renamed', '', '[]', 0, 'hum_r', ?)`).run(at);
+  return w;
+}
+
+test("cleanup removes an unfinished upload's placeholder, but never one something refers to (foreign keys on)", async () => {
+  const w = fkWorld();
+  const env = { DB: w.DB, BLOBS: { delete: async () => {} } };
+  const r = await lib.reconcileUploads(env, { projectId: "prj_c" });
+  assert.equal(r.deleted_placeholders, 1);
+  assert.deepEqual(w.db.prepare("SELECT id FROM artifacts ORDER BY id").all().map((x) => x.id), ["art_renamed"]);
+  assert.deepEqual(w.db.prepare("SELECT id FROM uploads ORDER BY id").all().map((x) => x.id), ["upl_art_renamed"]);
+  assert.equal((await lib.reconcileUploads(env, {})).deleted_placeholders, 0, "the cron run leaves the referenced one alone too");
+});
+
+test("a failing placeholder cleanup doesn't stop the rest of cleanup", async () => {
+  const w = fkWorld();
+  w.DB.batch = async () => { throw new Error("synthetic D1 failure"); };
+  w.db.prepare("INSERT INTO rate_counters (k, win, n) VALUES ('old', 1, 1)").run();
+  const errs = [], orig = console.error;
+  console.error = (m) => errs.push(m);
+  try {
+    const r = await lib.reconcileUploads({ DB: w.DB, BLOBS: { delete: async () => {} } }, {});
+    assert.equal(r.deleted_placeholders, 0);
+  } finally { console.error = orig; }
+  assert.ok(errs.some((m) => /placeholder_cleanup_failed/.test(m)));
+  assert.equal(w.count("rate_counters"), 0, "later cleanup steps still ran");
 });
 
 test("retention deletes use their indexes (migration 0026), not full scans", () => {

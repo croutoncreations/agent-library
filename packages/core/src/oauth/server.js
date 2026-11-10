@@ -680,10 +680,10 @@ async function cxPublishPage(env, app, principalId, email, projects, consent, va
   const chosenProject = pick("project_id", (cxSuggestedProject(projects, suggest?.project) ?? projects[0]).id);
   const dupe = cxDupes(projects);
   const projOpts = projects.map((p) => `<option value="${esc(p.id)}"${p.id === chosenProject ? " selected" : ""}>${esc(p.title)}${dupe(p) ? ` (${esc(p.id)})` : ""}</option>`).join("");
-  // Up to FOLDERS_PER_PROJECT folders for each project (a project at its cap shows all of its folders).
+  // Up to FOLDERS_PER_PROJECT folders for each listed project (a project at its cap shows all of its folders).
   const folders = await env.DB.prepare(`SELECT id, name, project_id FROM (SELECT f.id, f.name, f.project_id, f.name_key,
       ROW_NUMBER() OVER (PARTITION BY f.project_id ORDER BY f.name_key) AS n
-    FROM folders f JOIN projects p ON p.id = f.project_id WHERE ${memberRoleSql("p.id", "member")}) WHERE n <= ? ORDER BY name_key`).bind(principalId, FOLDERS_PER_PROJECT).all();
+    FROM folders f JOIN projects p ON p.id = f.project_id WHERE p.id IN (SELECT value FROM json_each(?)) AND ${memberRoleSql("p.id", "member")}) WHERE n <= ? ORDER BY name_key`).bind(JSON.stringify(projects.map((p) => p.id)), principalId, FOLDERS_PER_PROJECT).all();
   const byProject = /* @__PURE__ */ new Map();
   for (const f of folders.results) byProject.set(f.project_id, [...byProject.get(f.project_id) ?? [], f]);
   // One folder field for all projects (a hidden control still submits, and /authorize caps bodies at 16 KiB), with
