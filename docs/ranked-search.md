@@ -45,7 +45,7 @@ The service budgets the full 64 KiB JSON-RPC envelope, including the duplicated 
 
 **Between PR2 slices 2a and 4b:** this SQL-only backfill (including restore-then-backfill) rebuilds bodies only for
 legacy inline rows. R2 text remains searchable by title, but not body, until saved again; the temporary live-write
-bridge does not repair a SQL backfill. Readiness still reports ready because it compares revision id, hash and title,
+bridge does not repair a SQL backfill. The write/refresh bridge indexes only the first 1 MiB (1,048,576 UTF-8 bytes, cut at a character boundary) of each document. Larger documents match their title and words in that prefix, not words only in the suffix, until the blind-index search slice. Readiness still reports ready because it compares revision id, hash and title,
 not the body. Slice 4b replaces this with the token backfill.
 
 The previous Worker remains compatible. Its ordinary writes maintain the index, but generation insert triggers are deliberately excluded to preserve exact D1 commit-count checks. The new Worker indexes generations in the publication transaction. If a rollback's old Worker publishes a generation, the completeness probe suppresses search after re-upgrade until backfill repairs it. Worker rollback leaves the derived index in place.

@@ -4,12 +4,16 @@ import { appConnectEnabled, db, rtReadAuthzSql } from "../service.js";
 import { HttpError, nowMs, sha256Hex } from "../util.js";
 import { addressLinks, resolveProjectRef } from "../paths.js";
 
-/** Temporary plaintext FTS bridge for R2 text heads, until the blind index replaces it. */
+/** Temporary plaintext FTS bridge: only the first 1 MiB, safely below D1's 2,000,000-byte value ceiling. */
 export function textSearchBridge(env, artifactId, revisionId, text) {
+  const bytes = new TextEncoder().encode(text.slice(0, 1048576));
+  let end = Math.min(bytes.length, 1048576);
+  while (end < bytes.length && (bytes[end] & 0xc0) === 0x80) end--;
+  const prefix = new TextDecoder().decode(bytes.subarray(0, end));
   return env.DB.prepare(`UPDATE artifact_search SET body = ? WHERE rowid =
     (SELECT search_id FROM artifact_search_keys WHERE artifact_id = ?) AND revision_id = ?
     AND EXISTS (SELECT 1 FROM artifacts WHERE id = ? AND head_revision_id = ?)`)
-    .bind(text, artifactId, revisionId, artifactId, revisionId);
+    .bind(prefix, artifactId, revisionId, artifactId, revisionId);
 }
 
 /** Metadata triggers rebuild FTS from the legacy column; restore its R2 body without overwriting a newer head. */

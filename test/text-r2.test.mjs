@@ -25,6 +25,41 @@ async function harness() {
   return { lib, sql, ctx, env, objects };
 }
 
+test("search bridge caps UTF-8 at 1 MiB on real local D1 (known suffix search gap)", async () => {
+  const { Miniflare, convertV4MiniflareOptions } = await import("miniflare");
+  const mf = new Miniflare(convertV4MiniflareOptions({ port: SERVER_PORTS["text-r2"], name: "bridge-bound", modules: true, script: "export default { fetch() { return new Response('test'); } }", compatibilityDate: "2026-10-24", d1Databases: { DB: "bridge-bound" } }));
+  try {
+    const DB = await mf.getD1Database("DB");
+    await DB.batch([
+      DB.prepare("CREATE TABLE artifact_search (rowid INTEGER PRIMARY KEY, body TEXT, revision_id TEXT)"),
+      DB.prepare("CREATE TABLE artifact_search_keys (artifact_id TEXT, search_id INTEGER)"),
+      DB.prepare("CREATE TABLE artifacts (id TEXT, head_revision_id TEXT)"),
+      DB.prepare("INSERT INTO artifact_search (rowid, body, revision_id) VALUES (1, '', 'r')"),
+      DB.prepare("INSERT INTO artifact_search_keys (artifact_id, search_id) VALUES ('a', 1)"),
+      DB.prepare("INSERT INTO artifacts (id, head_revision_id) VALUES ('a', 'r')")
+    ]);
+    const lib = await loadWorker({ "search/service.js": ["textSearchBridge"] });
+    const prefix = "firstneedle " + "a".repeat(1048576 - 14);
+    await lib.textSearchBridge({ DB }, "a", "r", prefix + "🙂 suffixneedle " + "z".repeat(3 * 1048576)).run();
+    const stored = await DB.prepare("SELECT body FROM artifact_search").first("body");
+    assert.equal(stored, prefix);
+    assert.ok(Buffer.byteLength(stored) <= 1048576);
+    assert.ok(!stored.includes("\ufffd"));
+  } finally { await mf.dispose(); }
+});
+
+test("backup text export refuses over 32 MiB before any object read and allows the boundary", async () => {
+  const h = await harness();
+  await h.lib.createMarkdown(h.ctx, "proj-s", { title: "Export cap", body: "synthetic" }, "export-cap");
+  const counts = spyBindings(h.env);
+  h.sql.prepare("UPDATE revisions SET size = ?").run(32 * 1048576 + 1);
+  await assert.rejects(h.lib.exportBackup(h.ctx, "proj-s"), e => e.status === 413 && e.code === "backup_too_large" && /32 MiB/.test(e.message));
+  assert.equal(counts.gets, 0);
+  h.sql.prepare("UPDATE revisions SET size = ?").run(32 * 1048576);
+  assert.equal((await h.lib.exportBackup(h.ctx, "proj-s")).revisions[0].body, "synthetic");
+  assert.equal(counts.gets, 1);
+});
+
 test("comments publish immutable UTF-8 objects, replay without another put, and retain the length limit", async () => {
   const { lib, ctx, sql, objects, env } = await harness();
   const created = await lib.createMarkdown(ctx, "proj-s", { title: "Comments", body: "document" }, "comments-create");

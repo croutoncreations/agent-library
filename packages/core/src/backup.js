@@ -11,6 +11,7 @@ import { explainLimit, fmtBytes, limitGuard, workspaceLimits } from "./limits.js
 var SCHEMA = "agent-library-backup/1";
 /** Largest total of distinct file bytes a project export holds (exports above it refuse with 413 backup_too_large). */
 var BACKUP_EXPORT_FILE_BYTES = 16 * 1024 * 1024;
+var BACKUP_EXPORT_TEXT_BYTES = 32 * 1024 * 1024;
 var b64 = (b) => {
   let s = "";
   for (let i = 0; i < b.length; i += 32768) s += String.fromCharCode(...b.subarray(i, i + 32768));
@@ -31,6 +32,8 @@ async function exportBackup(ctx, projectId) {
   // before any file is read. Streamed backups are a follow-up.
   const fileBytes = await DB.prepare("SELECT COALESCE(SUM(size),0) AS n FROM (SELECT DISTINCT blob_key, size FROM revisions WHERE project_id = ? AND blob_key IS NOT NULL)").bind(projectId).first("n");
   if (fileBytes > BACKUP_EXPORT_FILE_BYTES) throw new HttpError(413, "backup_too_large", "This project's files are too large for a single backup file (over 16 MB). Download large files individually.");
+  const textBytes = await DB.prepare("SELECT COALESCE(SUM(size),0) AS n FROM revisions WHERE project_id = ? AND blob_key IS NULL").bind(projectId).first("n");
+  if (textBytes > BACKUP_EXPORT_TEXT_BYTES) throw new HttpError(413, "backup_too_large", "This project's text versions exceed 32 MiB for a single backup. Download documents individually or export a smaller project.");
   const [arts, revs, comments] = await DB.batch([
     DB.prepare("SELECT id, kind, title, folder, tags, head_rev, head_revision_id, meta_version, trashed_at, created_at, updated_at, is_template, template_description, source_artifact_id, source_revision, source_role, template_date FROM artifacts WHERE project_id = ? AND head_rev > 0").bind(projectId),
     DB.prepare("SELECT id, artifact_id, rev_no, author_id, body, body_key, blob_key, size, sha256, mime, restored_from, created_at, via_kind, via_id, via_label, client_info, change_note FROM revisions WHERE project_id = ?").bind(projectId),
