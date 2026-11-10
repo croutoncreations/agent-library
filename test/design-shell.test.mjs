@@ -120,6 +120,8 @@ test("project list: whole-row link without nested controls; distinct empty, no-m
   await page.goto(ORIGIN + "/#/p/empty-one"); await page.waitForFunction(() => document.body.innerText.includes("This project is empty"));
   await page.goto(ORIGIN + "/#/p/alpha"); await page.waitForFunction(() => document.body.innerText.includes("First doc"));
   assert.equal(await page.$eval("input[type=search]", (e) => e.placeholder), "Filter titles");
+  // The accessible name starts with the visible placeholder, so voice control can match it (WCAG 2.5.3).
+  assert.equal(await page.$eval("input[type=search]", (e) => e.getAttribute("aria-label")), "Filter titles in this project");
   await page.type("input[type=search]", "no-such-text-zz");
   await page.waitForFunction(() => document.body.innerText.includes("No matches for"));
   assert.equal(await page.$eval(".state p", (e) => e.textContent), "The filter matches titles in this project. Try a different word or clear the filter.");
