@@ -68,23 +68,28 @@ test("A7 PUT after finish -> 409 and published bytes unchanged", async () => {
   assert.equal(sha256(c.body), sha256(pub.bytes));
 });
 
-test("A7 wrong declared hash -> finish 422 and no visible version", async () => {
-  const bytes = readFileSync(fx.png);
-  const b = await begin("bad hash", "image/png", bytes, "a".repeat(64));
-  assert.equal(b.isError, false);
-  const p = await put(b.data.put_url, bytes);
-  assert.equal(p.status, 200);
-  assert.equal(p.body.matches_declared, false);
-  const f = await mA.call("upload_finish", { project_id: P, upload_id: b.data.upload_id, idempotency_key: key("uf") });
-  assert.equal(f.isError, true);
-  assert.equal(f.data.error.status, 422);
-  assert.equal((await A("GET", `/api/projects/${P}/artifacts/${b.data.artifact_id}`)).status, 404);
-  assert.equal((await A("GET", `/api/projects/${P}/artifacts/${b.data.artifact_id}/content`)).status, 404);
-  const list = await A("GET", `/api/projects/${P}/artifacts?q=bad%20hash`);
-  assert.equal(list.body.artifacts.length, 0);
-  // repeat finish returns the same recorded failure
-  const f2 = await mA.call("upload_finish", { project_id: P, upload_id: b.data.upload_id, idempotency_key: key("uf") });
-  assert.equal(f2.data.error.status, 422);
+test("A7 wrong declared hash -> PUT 422 (R2 verifies the sha256), upload stays pending, no visible version", async () => {
+  // Its own identity: the refused upload stays pending (retryable) until it expires, holding that identity's one slot.
+  const g = await grant(h, P, "bad-hash uploader");
+  const B = agentHttp(s.base, g.token);
+  const mB = await mcpClient(s.base, g.token, "bad-hash uploader");
+  try {
+    const bytes = readFileSync(fx.png);
+    const b = await mB.call("upload_begin", { project_id: P, title: "bad hash", mime: "image/png", size: bytes.length, sha256: "a".repeat(64), idempotency_key: key("ub") });
+    assert.equal(b.isError, false);
+    const p = await B("PUT", b.data.put_url, undefined, { raw: bytes, headers: { "content-type": "application/octet-stream" } });
+    assert.equal(p.status, 422);
+    assert.equal(p.body.error.code, "integrity_mismatch");
+    const f = await mB.call("upload_finish", { project_id: P, upload_id: b.data.upload_id, idempotency_key: key("uf") });
+    assert.equal(f.isError, true);
+    assert.equal(f.data.error.status, 409, "nothing was received, so there is nothing to finish");
+    assert.equal((await A("GET", `/api/projects/${P}/artifacts/${b.data.artifact_id}`)).status, 404);
+    assert.equal((await A("GET", `/api/projects/${P}/artifacts/${b.data.artifact_id}/content`)).status, 404);
+    const list = await A("GET", `/api/projects/${P}/artifacts?q=bad%20hash`);
+    assert.equal(list.body.artifacts.length, 0);
+    // A repeated PUT of the same bytes is refused the same way.
+    assert.equal((await B("PUT", b.data.put_url, undefined, { raw: bytes, headers: { "content-type": "application/octet-stream" } })).status, 422);
+  } finally { await mB.close(); }
 });
 
 test("A7 oversize declaration -> 413; body larger than declared -> 413 then correct retry succeeds", async () => {

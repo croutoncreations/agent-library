@@ -1,0 +1,95 @@
+// In-memory world for driving the production uploadPut/uploadFinish/reconcileUploads (packages/core/src/, bundled by
+// load-worker.mjs) over every migration applied to node:sqlite and a controlled R2 double, so each interleaving is
+// scheduled exactly. The R2 double behaves like R2 for what uploads rely on: put consumes a stream, refuses (storing
+// nothing) bytes that don't match options.sha256, and put/head return size and checksums.sha256. Synthetic data only.
+import { readFileSync, readdirSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
+import { createHash } from "node:crypto";
+import { join } from "node:path";
+import { ROOT } from "./helpers.mjs";
+import { loadWorker } from "./load-worker.mjs";
+
+export const lib = await loadWorker({ "uploads.js": ["uploadBegin", "uploadFinish", "uploadPut"], "cleanup.js": ["reconcileUploads"], "adapters.js": ["withAdapters", "defaultAdapters"] });
+// The workerd stream class uploadPut uses, a minimal Node stand-in with workerd's messages: FixedLengthStream (errors
+// unless exactly n bytes).
+globalThis.FixedLengthStream ??= class extends TransformStream {
+  constructor(n) {
+    let seen = 0;
+    super({ transform(c, out) { seen += c.byteLength; if (seen > n) throw new RangeError("Attempt to write too many bytes through a FixedLengthStream."); out.enqueue(c); }, flush() { if (seen !== n) throw new RangeError("FixedLengthStream did not see all expected bytes before close()."); } });
+  }
+};
+
+export const PNG = Buffer.from("89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000b49444154789c636000020000050001a5f645400000000049454e44ae426082", "hex");
+export const SHA = createHash("sha256").update(PNG).digest("hex");
+export const P = "prj_synthetic";
+
+export function world() {
+  const sql = new DatabaseSync(":memory:");
+  for (const f of readdirSync(join(ROOT, "migrations")).filter((f) => f.endsWith(".sql")).sort()) sql.exec(readFileSync(join(ROOT, "migrations", f), "utf8"));
+  const hooks = { beforeBatch: null, beforeRun: null };
+  const stmt = (q, p) => ({
+    async first(c) { const r = sql.prepare(q).get(...p); return c ? r?.[c] ?? null : r ?? null; },
+    async all() { return { results: sql.prepare(q).all(...p) }; },
+    runSync() { const r = sql.prepare(q).run(...p); return { meta: { changes: Number(r.changes) } }; },
+    async run() { if (hooks.beforeRun) await hooks.beforeRun(q); return this.runSync(); },
+  });
+  const DB = {
+    withSession() { return DB; },
+    prepare(q) { return { bind: (...p) => stmt(q, p), ...stmt(q, []) }; },
+    async batch(ss) {
+      if (hooks.beforeBatch) { const h = hooks.beforeBatch; hooks.beforeBatch = null; await h(); }
+      sql.exec("BEGIN");
+      try { const r = ss.map((s) => s.runSync()); sql.exec("COMMIT"); return r; } catch (e) { sql.exec("ROLLBACK"); throw e; }
+    },
+  };
+  const blobs = new Map();
+  const r2 = { onPut: null, beforeCommit: null, onGet: null, failHead: false, gets: [] };
+  const digest = (b) => new Uint8Array(createHash("sha256").update(b).digest()).buffer;
+  const BLOBS = {
+    // R2ObjectBody-like: size, a byte stream and arrayBuffer, optionally of a range; put consumes a stream and, like
+    // R2, refuses (storing nothing) when the bytes do not match options.sha256.
+    async get(k, opts) {
+      r2.gets.push(opts?.range ?? null);
+      if (r2.onGet) await r2.onGet(k);
+      const whole = blobs.get(k);
+      if (!whole) return null;
+      const b = opts?.range ? whole.subarray(opts.range.offset, opts.range.offset + opts.range.length) : whole;
+      return { size: whole.length, body: new Blob([b]).stream(), async arrayBuffer() { return b; } };
+    },
+    async put(k, b, opts) {
+      const bytes = b instanceof ReadableStream ? Buffer.from(await new Response(b).arrayBuffer()) : b;
+      if (opts?.sha256 && createHash("sha256").update(bytes).digest("hex") !== opts.sha256) throw new Error("put: The SHA-256 checksum you specified did not match what we received. (10037)");
+      if (r2.beforeCommit) await r2.beforeCommit(k);
+      blobs.set(k, bytes);
+      if (r2.onPut) await r2.onPut(k);
+      return { size: bytes.length, checksums: { sha256: digest(bytes) } };
+    },
+    async head(k) { if (r2.failHead) throw new Error("synthetic R2 head failure"); return blobs.has(k) ? { size: blobs.get(k).length, checksums: { sha256: digest(blobs.get(k)) } } : null; },
+    async delete(k) { blobs.delete(k); },
+  };
+  const at = new Date().toISOString();
+  sql.prepare("INSERT INTO principals (id, kind, issuer, subject, label, created_at) VALUES ('hum_synthetic','human','synthetic','owner','Synthetic owner',?)").run(at);
+  sql.prepare("INSERT INTO projects (id, owner_id, title, created_at) VALUES (?,'hum_synthetic','Synthetic project',?)").run(P, at);
+  const env = { DB, BLOBS };
+  const ctx = { env, principal: { id: "hum_synthetic", kind: "human", label: "Synthetic owner" }, requestId: "req_synthetic" };
+  let n = 0;
+  const upload = ({ state = "received", expiresAt = Date.now() + 900000 } = {}) => {
+    const id = "upl_s" + ++n, art = "art_s" + n;
+    // As uploadBegin writes it: final_key fixed at reservation, staging_key filled in but never written. Past
+    // 'pending', the PUT has stored the bytes at final_key.
+    const finalKey = `blobs/${P}/${art}/rev_s${n}`;
+    sql.prepare("INSERT INTO artifacts(id,project_id,kind,title,created_at,updated_at) VALUES (?,?, 'binary','Synthetic image',?,?)").run(art, P, at, at);
+    sql.prepare("INSERT INTO uploads(id,project_id,artifact_id,principal_id,base_rev,expected_size,expected_sha256,mime,state,staging_key,final_key,expires_at,created_at) VALUES (?,?,?,'hum_synthetic',0,?,?,'image/png',?,?,?,?,?)")
+      .run(id, P, art, PNG.length, SHA, state, "staging/" + id, finalKey, expiresAt, at);
+    if (state !== "pending") blobs.set(finalKey, PNG);
+    return { id, art, finalKey };
+  };
+  const finals = () => [...blobs.keys()].filter((k) => k.startsWith("blobs/"));
+  const revisions = (art) => sql.prepare("SELECT id, blob_key FROM revisions WHERE artifact_id = ?").all(art);
+  const row = (id) => sql.prepare("SELECT * FROM uploads WHERE id = ?").get(id);
+  const quota = () => sql.prepare("SELECT COALESCE(SUM(expected_size),0) AS n FROM uploads WHERE project_id = ? AND final_key IS NOT NULL AND final_purged_at IS NULL AND state IN ('failed','conflict')").get(P).n;
+  // uploadPut over the transfer link path (linkCtx: no cookie, so no CSRF).
+  const put = (id, body, length = body.length) => lib.uploadPut(new Request("https://example.test/api/transfers/" + id, { method: "PUT", body, headers: { "content-length": String(length) } }), env, ctx.requestId, id, ctx);
+  return { sql, env, ctx, hooks, r2, blobs, upload, put, finals, revisions, row, quota };
+}
+

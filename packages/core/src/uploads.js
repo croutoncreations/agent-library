@@ -1,11 +1,11 @@
-import { deleteBlob, getBlob, headBlob, putBlobStream, readText } from "./content-store.js";
+import { blobSha256Hex, deleteBlob, getBlob, getBlobHead, headBlob, putBlobStream, readText } from "./content-store.js";
 import { authenticate, authorizeProject, authzSql, enforceRate, limitsFor, requireCsrf } from "./auth.js";
 import { reconcileUploads } from "./cleanup.js";
 import { CONTENT_TYPE, spreadsheetSafeCsv } from "./formats.js";
 import { __name } from "./runtime.js";
 import { explainLimit, fileTooLarge, guardSql, projectLimitGuard } from "./limits.js";
 import { BINARY_TYPES, IMAGE_TYPES, VIDEO_TYPES, assertWritable, audit, idemLookup, loadArtifact, publishRevision } from "./service.js";
-import { HttpError, hex, int, nowIso, nowMs, randomId, sha256Hex, sha256HexStream, str } from "./util.js";
+import { HttpError, int, nowIso, nowMs, randomId, sha256Hex, str } from "./util.js";
 
 var db2 = /* @__PURE__ */ __name((ctx) => ctx.env.DB, "db");
 var quotaUsedSql = (now) => `(SELECT COALESCE(SUM(size),0) FROM revisions WHERE project_id = ?1 AND blob_key IS NOT NULL)
@@ -22,6 +22,8 @@ async function purgeStaging(env, u) {
   } catch {
   }
 }
+// The immutable R2 key of an upload's bytes, which the revision publishing them references.
+var finalKeyFor = (projectId, artifactId) => `blobs/${projectId}/${artifactId}/${randomId("rev")}`;
 async function uploadBegin(ctx, projectId, input, key) {
   await authorizeProject(ctx, projectId, true);
   const mime = str(input.mime, "mime", 100);
@@ -74,10 +76,12 @@ async function uploadBegin(ctx, projectId, input, key) {
   stmts.push(
     // Reservation: inserted only if the project quota still has room, evaluated in the same statement.
     // The partial unique index uploads_one_active rejects a second concurrent active upload outright.
-    db2(ctx).prepare(`INSERT INTO uploads (id, project_id, artifact_id, principal_id, base_rev, expected_size, expected_sha256, mime, state, staging_key, expires_at, created_at)
-      SELECT ?2, ?1, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', ?9, ?10, ?11
+    // final_key, the one object this upload ever writes (by its PUT), is fixed here. staging_key is still filled in
+    // because the previous Worker's cleanup deletes it for published uploads, but nothing is ever written there.
+    db2(ctx).prepare(`INSERT INTO uploads (id, project_id, artifact_id, principal_id, base_rev, expected_size, expected_sha256, mime, state, staging_key, final_key, expires_at, created_at)
+      SELECT ?2, ?1, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', ?9, ?13, ?10, ?11
       WHERE (?12 = 0 OR ${quotaUsedSql(nowMs())} + ?6 <= ?12) AND EXISTS (SELECT 1 FROM artifacts WHERE id = ?3 AND project_id = ?1)
-        AND ${az.sql} AND ${sg.sql}`).bind(projectId, uploadId, artifactId, ctx.principal.id, baseRev, size, sha2, mime, `staging/${projectId}/${uploadId}`, expires, nowIso(), limits.projectBinaryBytes, ...az.params, ...sg.params),
+        AND ${az.sql} AND ${sg.sql}`).bind(projectId, uploadId, artifactId, ctx.principal.id, baseRev, size, sha2, mime, `staging/${projectId}/${uploadId}`, expires, nowIso(), limits.projectBinaryBytes, finalKeyFor(projectId, artifactId), ...az.params, ...sg.params),
     db2(ctx).prepare(`INSERT INTO idempotency (principal_id, project_id, op, key, digest, status, response, created_at)
       SELECT ?, ?, ?, ?, ?, 201, ?, ? WHERE ${gate}`).bind(ctx.principal.id, projectId, i.op, i.key, i.digest, JSON.stringify(body2), nowIso(), uploadId),
     audit(ctx, projectId, "upload.begin", artifactId, baseRev, "ok", gate, [uploadId])
@@ -110,44 +114,43 @@ async function uploadPut(req, env, requestId, uploadId, linkCtx) {
   if (!u || u.principal_id !== ctx.principal.id) throw new HttpError(404, "not_found", "Upload not found");
   await authorizeProject(ctx, u.project_id, true);
   if (u.expires_at <= nowMs()) throw new HttpError(410, "upload_expired", "Upload expired");
+  // R2 checks the stored length against the declared size anyway: refuse any other Content-Length before writing.
+  const cl = req.headers.get("content-length");
+  const declared = cl === null ? NaN : Number(cl);
+  if (Number.isFinite(declared) && declared > u.expected_size) throw new HttpError(413, "too_large", "Body exceeds declared size");
+  if (Number.isFinite(declared) && declared < u.expected_size) throw new HttpError(400, "incomplete_body", "Content-Length is smaller than the declared size; PUT the whole file");
+  if (!req.body) throw new HttpError(400, "invalid_input", "Missing body");
   const az = authzSql(ctx, u.project_id);
-  const claim = await env.DB.prepare(`UPDATE uploads SET state = 'receiving' WHERE id = ? AND state = 'pending' AND expires_at > ? AND ${az.sql}`).bind(uploadId, nowMs(), ...az.params).run();
+  // Claim the upload and register the write in one statement: cleanup purges final_key only once final_writes is 0.
+  // An upload begun by the previous Worker has no final_key yet; it is fixed here (nothing else writes it while pending).
+  const finalKey = u.final_key ?? finalKeyFor(u.project_id, u.artifact_id);
+  const claim = await env.DB.prepare(`UPDATE uploads SET state = 'receiving', final_writes = final_writes + 1, final_key = COALESCE(final_key, ?)
+    WHERE id = ? AND state = 'pending' AND expires_at > ? AND ${az.sql}`).bind(finalKey, uploadId, nowMs(), ...az.params).run();
   if (!claim.meta.changes) throw new HttpError(409, "upload_not_writable", "Upload is not accepting bytes (in progress, sealed or published)");
   try {
-    const declared = Number(req.headers.get("content-length") ?? "NaN");
-    if (Number.isFinite(declared) && declared > u.expected_size) throw new HttpError(413, "too_large", "Body exceeds declared size");
-    if (!req.body) throw new HttpError(400, "invalid_input", "Missing body");
-    // Streamed to R2 in constant memory (files reach FILE_BYTES_CEILING, Workers have 128 MB): each chunk is counted,
-    // hashed and passed on in turn, so backpressure reaches the client. R2 needs the length up front: Content-Length
-    // when sent (a shorter body is stored and reported as not matching, as before), else the declared size.
-    const length = Number.isFinite(declared) ? declared : u.expected_size;
-    const digest = new crypto.DigestStream("SHA-256");
-    const hashing = digest.getWriter();
-    let n = 0;
-    const counted = req.body.pipeThrough(new TransformStream({
-      async transform(chunk, out) {
-        n += chunk.byteLength;
-        if (n > length) throw new HttpError(413, "too_large", "Body exceeds declared size");
-        await hashing.write(chunk);
-        out.enqueue(chunk);
-      }
-    }));
+    // One pass, constant memory (files reach FILE_BYTES_CEILING, Workers have 128 MB): the body streams straight to
+    // final_key. R2 checks the length (FixedLengthStream) and the declared SHA-256, and stores nothing if either is wrong.
+    let stored;
     try {
-      await putBlobStream(env, u.staging_key, counted, length, { httpMetadata: { contentType: "application/octet-stream" } });
+      stored = await putBlobStream(env, finalKey, req.body, u.expected_size, { sha256: u.expected_sha256, httpMetadata: { contentType: u.mime } });
     } catch (e) {
-      hashing.abort().catch(() => {
-      });
-      if (n > length) throw new HttpError(413, "too_large", "Body exceeds declared size");
-      if (n < length) throw new HttpError(400, "incomplete_body", "Body ended before the declared size; PUT the whole file again");
+      const m = String(e?.message ?? e);
+      if (/SHA-256 checksum you specified did not match|10037/.test(m)) throw new HttpError(422, "integrity_mismatch", "The body's SHA-256 does not match the declared sha256; PUT the whole file again");
+      if (/too many bytes/i.test(m)) throw new HttpError(413, "too_large", "Body exceeds declared size");
+      if (/did not see all expected bytes/i.test(m)) throw new HttpError(400, "incomplete_body", "Body ended before the declared size; PUT the whole file again");
       throw e;
+    } finally {
+      // A release failure leaves accounting raised (fail closed): the object stays tracked and charged. Log it without
+      // replacing the PUT's own error. Never log blob keys or errors.
+      await env.DB.prepare("UPDATE uploads SET final_writes = final_writes - 1 WHERE id = ? AND final_writes > 0").bind(uploadId).run().catch(() => {
+        console.warn(JSON.stringify({ event: "upload_final_write_release_failed" }));
+      });
     }
-    await hashing.close();
-    const sha2 = hex(await digest.digest);
+    const n = stored?.size ?? null;
+    const sha2 = blobSha256Hex(stored);
+    // If cleanup ended the upload mid-transfer, cleanup purges the object at final_key (terminal, no write in flight).
     const rec = await env.DB.prepare("UPDATE uploads SET state = 'received', received_size = ?, received_sha256 = ? WHERE id = ? AND state = 'receiving'").bind(n, sha2, uploadId).run();
-    if (!rec.meta.changes) {
-      await purgeStaging(env, u);
-      throw new HttpError(410, "upload_expired", "Upload expired during transfer");
-    }
+    if (!rec.meta.changes) throw new HttpError(410, "upload_expired", "Upload expired during transfer");
     await audit(ctx, u.project_id, "upload.put", u.artifact_id, null, "ok").run();
     return new Response(JSON.stringify({ upload_id: uploadId, received_bytes: n, sha256: sha2, matches_declared: n === u.expected_size && sha2 === u.expected_sha256 }), {
       status: 200,
@@ -163,12 +166,14 @@ async function uploadPut(req, env, requestId, uploadId, linkCtx) {
 //  - One finisher at a time holds an expiring lease (uploads.finalize_token/finalize_until). Cleanup never fails a
 //    sealed upload while its lease is live, and the revision insert is fenced on "still sealed and still my token",
 //    so cleanup can never delete bytes under a publication that then succeeds.
-//  - The final R2 key is fixed per upload at the first lease (uploads.final_key, kept by COALESCE): every attempt
-//    writes the same object with the same verified bytes, so a retry or takeover can never leave an untracked object.
-//  - Every final-object write is counted in uploads.final_writes (taken only while holding the lease of a sealed upload,
-//    released when the put settles). Cleanup purges a failed upload's final object only once no write is in flight;
-//    a failed upload can start no new write, so nothing re-creates the object afterwards. A Worker that dies mid-put
-//    leaves the count raised: the object then stays tracked and counted against quota instead of escaping both.
+//  - Single pass (docs/upload-finalization.md): the final R2 key is fixed at upload begin (uploads.final_key; the lease
+//    COALESCE only covers rows begun by an older Worker) and only uploadPut writes it, from 'pending', with R2
+//    verifying length and SHA-256. Finish writes nothing: it checks R2's recorded size and checksum and the first
+//    bytes' type signature, then publishes that object. Every attempt and takeover publishes the same object.
+//  - Every final-object write is counted in uploads.final_writes (taken in the PUT's claim, released when the put
+//    settles). Cleanup purges a failed upload's final object only once no write is in flight; a failed upload can
+//    start no new write, so nothing re-creates the object afterwards. A Worker that dies mid-put leaves the count
+//    raised: the object then stays tracked and counted against quota instead of escaping both.
 //  - A finisher that lost its lease never deletes or publishes; it replays the upload's recorded outcome, or answers
 //    409 finish_in_progress while another finisher still holds the lease.
 var FINALIZE_LEASE_MS = 60 * 1e3;
@@ -214,7 +219,7 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
   // Take the lease (re-checking the grant in the same statement); while another finisher holds it, wait briefly.
   for (let deadline = nowMs() + FINALIZE_WAIT_MS, free = 0; ; await pause()) {
     const lease = await db2(ctx).prepare(`UPDATE uploads SET finalize_token = ?, finalize_until = ?, final_key = COALESCE(final_key, ?)
-      WHERE id = ? AND state = 'sealed' AND (finalize_until IS NULL OR finalize_until <= ?) AND ${az.sql}`).bind(token, nowMs() + FINALIZE_LEASE_MS, `blobs/${projectId}/${u.artifact_id}/${randomId("rev")}`, uploadId, nowMs(), ...az.params).run();
+      WHERE id = ? AND state = 'sealed' AND (finalize_until IS NULL OR finalize_until <= ?) AND ${az.sql}`).bind(token, nowMs() + FINALIZE_LEASE_MS, finalKeyFor(projectId, u.artifact_id), uploadId, nowMs(), ...az.params).run();
     if (lease.meta.changes) break;
     const row = await current();
     const r = recorded(row);
@@ -242,6 +247,7 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
     };
     const fail = async (status, code, message, state, extra) => {
       if (!await end(status, code, message, state, extra)) return lost();
+      await dropUnpublished();
       await purgeStaging(ctx.env, u);
       throw new HttpError(status, code, message, extra);
     };
@@ -254,53 +260,27 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
       await deleteBlob(ctx.env, finalKey);
       await db2(ctx).prepare("UPDATE uploads SET final_purged_at = ? WHERE id = ? AND final_purged_at IS NULL").bind(nowMs(), uploadId).run();
     };
-    // Lost the lease after writing the final object: if cleanup ended the upload, its delete may have run before this
-    // write re-created the object, so remove it again. A takeover finisher (upload still sealed) reuses the object.
+    // Lost the lease before publishing: if cleanup ended the upload, remove the unreferenced object now (cleanup would
+    // too). A takeover finisher (upload still sealed) publishes the same object.
     const lostAfterWrite = async () => {
       const row = await current();
       if (row && (row.state === "failed" || row.state === "conflict")) await dropUnpublished();
       return lost();
     };
-    // No whole-object reads (files reach FILE_BYTES_CEILING): the staged object is hashed as a stream, the type
-    // signature needs only its first bytes (BINARY_TYPES checks need at most 13), and the copy below streams it.
-    const staged = await getBlob(ctx.env, u.staging_key);
-    if (!staged) return fail(409, "missing_bytes", "Staged bytes missing", "failed");
-    const size = staged.size;
-    // The type signature is checked on the first bytes of the same stream that is hashed (no second read).
-    const head = new Uint8Array(Math.min(16, size));
-    let got = 0;
-    const sha2 = await sha256HexStream(staged.body.pipeThrough(new TransformStream({
-      transform(chunk, ctl) {
-        if (got < head.length) { const take = chunk.subarray(0, head.length - got); head.set(take, got); got += take.length; }
-        ctl.enqueue(chunk);
-      }
-    })));
+    // No write and no whole-object read: the upload's PUT already stored the bytes at final_key, and R2 checked their
+    // length and the declared SHA-256 on the way in. Confirm what R2 recorded (fail closed without a checksum), then
+    // check the type signature on the first bytes (BINARY_TYPES checks need at most 13).
+    const stored = await headBlob(ctx.env, finalKey);
+    if (!stored) return fail(409, "missing_bytes", "Uploaded bytes missing", "failed");
+    const size = stored.size;
+    const sha2 = blobSha256Hex(stored);
+    if (sha2 === null) return fail(500, "publish_failed", "Stored object has no SHA-256 checksum", "failed");
     if (size !== u.expected_size || sha2 !== u.expected_sha256)
       return fail(422, "integrity_mismatch", "Byte length or SHA-256 does not match declaration", "failed", { received_size: size, received_sha256: sha2 });
+    const head = await getBlobHead(ctx.env, finalKey, 16);
+    if (!head) return fail(409, "missing_bytes", "Uploaded bytes missing", "failed");
     if (!BINARY_TYPES[u.mime](head)) return fail(415, "signature_mismatch", `Bytes are not a valid ${u.mime}`, "failed");
-    // Hashing a large file can take a while: renew the lease (still fenced on this finisher's token) before the copy,
-    // so a slow R2 read doesn't hand the upload to a second finisher mid-copy.
-    const held2 = await db2(ctx).prepare("UPDATE uploads SET finalize_until = ? WHERE id = ? AND state = 'sealed' AND finalize_token = ?").bind(nowMs() + FINALIZE_LEASE_MS, uploadId, token).run();
-    if (!held2.meta.changes) return lost();
-    // Register the write before it starts, only while still the finisher of a sealed upload.
-    const begin = await db2(ctx).prepare("UPDATE uploads SET final_writes = final_writes + 1 WHERE id = ? AND state = 'sealed' AND finalize_token = ?").bind(uploadId, token).run();
-    if (!begin.meta.changes) return lost();
-    try {
-      // R2 re-checks the SHA-256 of what it stores against the verified hash.
-      const source = await getBlob(ctx.env, u.staging_key);
-      if (!source) throw new HttpError(500, "publish_failed", "Staged bytes missing during copy");
-      await putBlobStream(ctx.env, finalKey, source.body, size, { httpMetadata: { contentType: u.mime }, sha256: sha2 });
-    } finally {
-      // A release failure leaves accounting raised (fail closed). Log it without replacing the PUT's own error;
-      // reconciliation also reports retained terminal uploads for operator recovery. Never log blob keys or errors.
-      await db2(ctx).prepare("UPDATE uploads SET final_writes = final_writes - 1 WHERE id = ? AND final_writes > 0").bind(uploadId).run().catch(() => {
-        console.warn(JSON.stringify({ event: "upload_final_write_release_failed" }));
-      });
-    }
-    const check = await headBlob(ctx.env, finalKey);
-    const storedSha = check?.checksums?.sha256 ? hex(check.checksums.sha256) : null;
-    if (!check || check.size !== size || (storedSha !== null && storedSha !== sha2)) return fail(500, "publish_failed", "Final object verification failed", "failed");
-    // Still the finisher after the write? Renew the lease for the publication.
+    // Still the finisher? Renew the lease for the publication.
     const renew = await db2(ctx).prepare("UPDATE uploads SET finalize_until = ? WHERE id = ? AND state = 'sealed' AND finalize_token = ?").bind(nowMs() + FINALIZE_LEASE_MS, uploadId, token).run();
     if (!renew.meta.changes) return lostAfterWrite();
     const ok2 = { artifact_id: u.artifact_id, revision: u.base_rev + 1, revision_id: revId, sha256: sha2, size };

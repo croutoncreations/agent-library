@@ -1,99 +1,10 @@
-// Upload finalization races (build-upload-fixes.mjs; security review 2026-10-23, findings 1 and 3). Drives the
-// production uploadFinish/reconcileUploads from the deploy bundle (packages/core/src/index.js) over every migration applied to an
-// in-memory SQLite (node:sqlite) and a controlled R2 double, so each interleaving is scheduled exactly, not hoped for.
-// The bundle's cloudflare:workers import is replaced by an inert class only so Node can load it. Synthetic data only.
-import { test, after } from "node:test";
+// Upload finalization races (security review 2026-10-23, findings 1 and 3; single-pass uploads, PR2 slice 1). Drives
+// the production uploadPut/uploadFinish/reconcileUploads in the in-memory world of upload-world.mjs, so each
+// interleaving is scheduled exactly, not hoped for. Since single-pass uploads the only R2 write is the PUT's (to
+// final_key); finish reads R2's recorded checksum and the first bytes, then publishes. Synthetic data only.
+import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, readdirSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
-import { DatabaseSync } from "node:sqlite";
-import { createHash } from "node:crypto";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { ROOT } from "./helpers.mjs";
-import { loadWorker } from "./load-worker.mjs";
-
-const dir = mkdtempSync(join(tmpdir(), "al-upload-races-"));
-after(() => rmSync(dir, { recursive: true, force: true }));
-const lib = await loadWorker({ "uploads.js": ["uploadFinish"], "cleanup.js": ["reconcileUploads"] });
-// workerd stream classes uploadFinish uses, minimal Node stand-ins: FixedLengthStream (errors unless exactly n bytes)
-// and crypto.DigestStream (a WritableStream whose .digest resolves to the hash).
-globalThis.FixedLengthStream ??= class extends TransformStream {
-  constructor(n) {
-    let seen = 0;
-    super({ transform(c, out) { seen += c.byteLength; if (seen > n) throw new Error("FixedLengthStream: too long"); out.enqueue(c); }, flush() { if (seen !== n) throw new Error("FixedLengthStream: too short"); } });
-  }
-};
-crypto.DigestStream ??= class extends WritableStream {
-  constructor() {
-    const h = createHash("sha256");
-    let done;
-    const digest = new Promise((r) => (done = r));
-    super({ write(c) { h.update(c); }, close() { done(new Uint8Array(h.digest()).buffer); } });
-    this.digest = digest;
-  }
-};
-
-const PNG = Buffer.from("89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000b49444154789c636000020000050001a5f645400000000049454e44ae426082", "hex");
-const SHA = createHash("sha256").update(PNG).digest("hex");
-const P = "prj_synthetic";
-
-function world() {
-  const sql = new DatabaseSync(":memory:");
-  for (const f of readdirSync(join(ROOT, "migrations")).filter((f) => f.endsWith(".sql")).sort()) sql.exec(readFileSync(join(ROOT, "migrations", f), "utf8"));
-  const hooks = { beforeBatch: null, beforeRun: null };
-  const stmt = (q, p) => ({
-    async first(c) { const r = sql.prepare(q).get(...p); return c ? r?.[c] ?? null : r ?? null; },
-    async all() { return { results: sql.prepare(q).all(...p) }; },
-    runSync() { const r = sql.prepare(q).run(...p); return { meta: { changes: Number(r.changes) } }; },
-    async run() { if (hooks.beforeRun) await hooks.beforeRun(q); return this.runSync(); },
-  });
-  const DB = {
-    withSession() { return DB; },
-    prepare(q) { return { bind: (...p) => stmt(q, p), ...stmt(q, []) }; },
-    async batch(ss) {
-      if (hooks.beforeBatch) { const h = hooks.beforeBatch; hooks.beforeBatch = null; await h(); }
-      sql.exec("BEGIN");
-      try { const r = ss.map((s) => s.runSync()); sql.exec("COMMIT"); return r; } catch (e) { sql.exec("ROLLBACK"); throw e; }
-    },
-  };
-  const blobs = new Map();
-  const r2 = { onPut: null, beforeCommit: null, failHead: false };
-  const BLOBS = {
-    // R2ObjectBody-like: size, a byte stream and arrayBuffer, optionally of a range; put consumes a stream.
-    async get(k, opts) {
-      const whole = blobs.get(k);
-      if (!whole) return null;
-      const b = opts?.range ? whole.subarray(opts.range.offset, opts.range.offset + opts.range.length) : whole;
-      return { size: whole.length, body: new Blob([b]).stream(), async arrayBuffer() { return b; } };
-    },
-    async put(k, b) {
-      if (r2.beforeCommit) await r2.beforeCommit(k);
-      blobs.set(k, b instanceof ReadableStream ? Buffer.from(await new Response(b).arrayBuffer()) : b);
-      if (r2.onPut) await r2.onPut(k);
-    },
-    async head(k) { if (r2.failHead) throw new Error("synthetic R2 head failure"); return blobs.has(k) ? { size: blobs.get(k).length } : null; },
-    async delete(k) { blobs.delete(k); },
-  };
-  const at = new Date().toISOString();
-  sql.prepare("INSERT INTO principals (id, kind, issuer, subject, label, created_at) VALUES ('hum_synthetic','human','synthetic','owner','Synthetic owner',?)").run(at);
-  sql.prepare("INSERT INTO projects (id, owner_id, title, created_at) VALUES (?,'hum_synthetic','Synthetic project',?)").run(P, at);
-  const env = { DB, BLOBS };
-  const ctx = { env, principal: { id: "hum_synthetic", kind: "human", label: "Synthetic owner" }, requestId: "req_synthetic" };
-  let n = 0;
-  const upload = ({ state = "received", expiresAt = Date.now() + 900000 } = {}) => {
-    const id = "upl_s" + ++n, art = "art_s" + n;
-    sql.prepare("INSERT INTO artifacts(id,project_id,kind,title,created_at,updated_at) VALUES (?,?, 'binary','Synthetic image',?,?)").run(art, P, at, at);
-    sql.prepare("INSERT INTO uploads(id,project_id,artifact_id,principal_id,base_rev,expected_size,expected_sha256,mime,state,staging_key,expires_at,created_at) VALUES (?,?,?,'hum_synthetic',0,?,?,'image/png',?,?,?,?)")
-      .run(id, P, art, PNG.length, SHA, state, "staging/" + id, expiresAt, at);
-    blobs.set("staging/" + id, PNG);
-    return { id, art };
-  };
-  const finals = () => [...blobs.keys()].filter((k) => k.startsWith("blobs/"));
-  const revisions = (art) => sql.prepare("SELECT id, blob_key FROM revisions WHERE artifact_id = ?").all(art);
-  const row = (id) => sql.prepare("SELECT * FROM uploads WHERE id = ?").get(id);
-  const quota = () => sql.prepare("SELECT COALESCE(SUM(expected_size),0) AS n FROM uploads WHERE project_id = ? AND final_key IS NOT NULL AND final_purged_at IS NULL AND state IN ('failed','conflict')").get(P).n;
-  return { sql, env, ctx, hooks, r2, blobs, upload, finals, revisions, row, quota };
-}
+import { P, PNG, lib, world } from "./upload-world.mjs";
 
 test("finding 1: cleanup racing an expired sealed retry can no longer leave a revision without bytes", async () => {
   const w = world();
@@ -112,16 +23,16 @@ test("finding 1: cleanup racing an expired sealed retry can no longer leave a re
 test("finding 1: cleanup that wins first (lease expired) fails the upload and the late finisher never publishes", async () => {
   const w = world();
   const { id, art } = w.upload({ state: "sealed", expiresAt: Date.now() - 3600000 });
-  // Between the final write and the publication, the finisher's lease lapses and cleanup ends the upload.
-  w.r2.onPut = async (k) => {
+  // Between finish's checks (its read of the first bytes) and the publication, its lease lapses and cleanup ends the upload.
+  w.r2.onGet = async (k) => {
     if (!k.startsWith("blobs/")) return;
-    w.r2.onPut = null;
+    w.r2.onGet = null;
     w.sql.prepare("UPDATE uploads SET finalize_until = ? WHERE id = ?").run(Date.now() - 1, id);
     await lib.reconcileUploads(w.env);
   };
   await assert.rejects(lib.uploadFinish(w.ctx, P, id, "late-key-1"), (e) => e.status === 500 && e.code === "finish_abandoned");
   assert.deepEqual(w.revisions(art), [], "no revision");
-  assert.deepEqual(w.finals(), [], "no orphaned final object (the finisher removes what it wrote)");
+  assert.deepEqual(w.finals(), [], "no orphaned final object (the finisher removes the unreferenced object)");
   assert.equal(w.row(id).state, "failed");
 });
 
@@ -140,9 +51,9 @@ test("finding 1: a live lease protects a sealed upload from cleanup", async () =
 test("finding 3: concurrent same-key finishes publish once and leave exactly one final object", async () => {
   const w = world();
   const { id, art } = w.upload();
-  // Hold the first finisher inside its R2 write until the second has started.
+  // Hold the first finisher inside its R2 read until the second has started.
   let release; const gate = new Promise((r) => (release = r));
-  w.r2.onPut = async (k) => { if (k.startsWith("blobs/")) { w.r2.onPut = null; await gate; } };
+  w.r2.onGet = async (k) => { if (k.startsWith("blobs/")) { w.r2.onGet = null; await gate; } };
   const a = lib.uploadFinish(w.ctx, P, id, "same-key-123");
   await new Promise((r) => setTimeout(r, 20));
   const b = lib.uploadFinish(w.ctx, P, id, "same-key-123");
@@ -162,7 +73,7 @@ test("finding 3: a finisher stuck past its lease is taken over without a second 
   const w = world();
   const { id, art } = w.upload();
   let release; const gate = new Promise((r) => (release = r));
-  w.r2.onPut = async (k) => { if (k.startsWith("blobs/")) { w.r2.onPut = null; await gate; } };
+  w.r2.onGet = async (k) => { if (k.startsWith("blobs/")) { w.r2.onGet = null; await gate; } };
   const slow = lib.uploadFinish(w.ctx, P, id, "slow-key-1");
   await new Promise((r) => setTimeout(r, 20));
   const key = w.row(id).final_key;
@@ -175,7 +86,7 @@ test("finding 3: a finisher stuck past its lease is taken over without a second 
   assert.equal(late.body.revision_id, fresh.body.revision_id, "the stale finisher replays the takeover's result");
   const revs = w.revisions(art);
   assert.equal(revs.length, 1);
-  assert.equal(revs[0].blob_key, key, "the final key was fixed at the first lease");
+  assert.equal(revs[0].blob_key, key, "the final key was fixed at upload begin");
   assert.deepEqual(w.finals(), [key]);
 });
 
@@ -190,26 +101,24 @@ test("conflict at publication removes the unpublished object and records the con
   await assert.rejects(lib.uploadFinish(w.ctx, P, id, "conflict-key-1"), (e) => e.status === 409 && e.code === "revision_conflict");
 });
 
-test("a final write still in flight when cleanup fails the upload is purged only after it settles (even if HEAD then fails)", async () => {
+test("a PUT still in flight when cleanup expires the upload: the object is purged only after the write settles", async () => {
   const w = world();
-  const { id, art } = w.upload({ state: "sealed", expiresAt: Date.now() - 3600000 });
-  // The finisher's put is in flight; meanwhile its lease lapses and cleanup fails the upload. Cleanup must not purge
-  // (and stop tracking) the key while the write can still commit. The put then commits and HEAD throws, so the
-  // finisher never reaches its own clean-up path.
+  const { id, art } = w.upload({ state: "pending" });
+  // The PUT's R2 write is in flight; meanwhile the upload expires past the grace and cleanup fails it. Cleanup must not
+  // purge (and stop tracking) the key while the write can still commit.
   w.r2.beforeCommit = async (k) => {
     if (!k.startsWith("blobs/")) return;
     w.r2.beforeCommit = null;
-    w.sql.prepare("UPDATE uploads SET finalize_until = ? WHERE id = ?").run(Date.now() - 1, id);
+    w.sql.prepare("UPDATE uploads SET expires_at = ? WHERE id = ?").run(Date.now() - 3600000, id);
     await lib.reconcileUploads(w.env);
     assert.equal(w.row(id).state, "failed");
     assert.equal(w.row(id).final_writes, 1);
     assert.equal(w.row(id).final_purged_at, null, "not purged while a write is in flight");
-    w.r2.failHead = true;
   };
-  await assert.rejects(lib.uploadFinish(w.ctx, P, id, "late-commit-1"), /synthetic R2 head failure/);
-  w.r2.failHead = false;
+  await assert.rejects(w.put(id, PNG), (e) => e.status === 410 && e.code === "upload_expired");
   const key = w.row(id).final_key;
   assert.equal(w.row(id).final_writes, 0, "write settled");
+  assert.equal(w.row(id).state, "failed");
   assert.deepEqual(w.finals(), [key], "the late write committed");
   assert.equal(w.quota(), PNG.length, "still tracked and counted against quota");
   await lib.reconcileUploads(w.env);
@@ -247,15 +156,17 @@ test("cleanup never deletes a final object a revision references", async () => {
 
 test("decrement failures preserve the PUT error and retained accounting is visible without private identifiers", async () => {
   const w = world();
-  const { id } = w.upload({ state: "sealed", expiresAt: Date.now() - 3600000 });
+  const { id } = w.upload({ state: "pending" });
   w.hooks.beforeRun = (q) => { if (q.includes("final_writes = final_writes - 1")) throw new Error("synthetic decrement failure"); };
   w.r2.beforeCommit = () => { throw new Error("synthetic original PUT failure"); };
   const warnings = [];
   const warn = console.warn;
   console.warn = (s) => warnings.push(JSON.parse(s));
   try {
-    await assert.rejects(lib.uploadFinish(w.ctx, P, id, "release-failure"), /synthetic original PUT failure/);
+    await assert.rejects(w.put(id, PNG), /synthetic original PUT failure/);
     assert.equal(w.row(id).final_writes, 1, "failure leaves accounting raised");
+    assert.equal(w.row(id).state, "pending");
+    w.sql.prepare("UPDATE uploads SET expires_at = ? WHERE id = ?").run(Date.now() - 3600000, id);
     await lib.reconcileUploads(w.env);
     assert.equal(w.row(id).state, "failed");
     assert.deepEqual(warnings[0], { event: "upload_final_write_release_failed" });
@@ -269,12 +180,13 @@ test("decrement failures preserve the PUT error and retained accounting is visib
 
 test("a successful PUT with a failed decrement publishes safely and remains visible to reconciliation", async () => {
   const w = world();
-  const { id, art } = w.upload();
+  const { id, art } = w.upload({ state: "pending" });
   w.hooks.beforeRun = (q) => { if (q.includes("final_writes = final_writes - 1")) throw new Error("synthetic decrement failure"); };
   const warnings = [];
   const warn = console.warn;
   console.warn = (s) => warnings.push(JSON.parse(s));
   try {
+    assert.equal((await w.put(id, PNG)).status, 200);
     assert.equal((await lib.uploadFinish(w.ctx, P, id, "published-release-failure")).status, 200);
     assert.equal(w.row(id).state, "published");
     assert.equal(w.row(id).final_writes, 1);
@@ -288,30 +200,30 @@ test("a successful PUT with a failed decrement publishes safely and remains visi
   } finally { console.warn = warn; }
 });
 
-test("a conflicting takeover never deletes the object while another finisher's write is in flight", async () => {
+test("a conflicting takeover replays the conflict to the stalled finisher and never deletes while a write is counted", async () => {
   const w = world();
   const { id, art } = w.upload();
   w.sql.prepare("UPDATE artifacts SET head_rev = 3 WHERE id = ?").run(art); // publication will conflict
-  // A's put is held before commit; its lease lapses and B takes over, writes, and hits the conflict.
+  // A PUT whose release failed left final_writes raised (the PUT itself settled; see the decrement tests).
+  w.sql.prepare("UPDATE uploads SET final_writes = 1 WHERE id = ?").run(id);
+  // A is held in its R2 read; its lease lapses and B takes over and hits the conflict.
   let releaseA; const holdA = new Promise((r) => (releaseA = r));
-  let first = true;
-  w.r2.beforeCommit = async (k) => { if (k.startsWith("blobs/") && first) { first = false; await holdA; } };
+  w.r2.onGet = async (k) => { if (k.startsWith("blobs/")) { w.r2.onGet = null; await holdA; } };
   const a = lib.uploadFinish(w.ctx, P, id, "takeover-a");
   await new Promise((r) => setTimeout(r, 20));
   w.sql.prepare("UPDATE uploads SET finalize_until = ? WHERE id = ?").run(Date.now() - 1, id);
   await assert.rejects(lib.uploadFinish(w.ctx, P, id, "takeover-b"), (e) => e.code === "revision_conflict");
   assert.equal(w.row(id).state, "conflict");
-  assert.equal(w.row(id).final_purged_at, null, "B left the purge to cleanup: A's write is in flight");
-  // A's put now commits, then its HEAD fails.
-  w.r2.failHead = true; releaseA();
-  await assert.rejects(a);
-  w.r2.failHead = false;
-  assert.equal(w.row(id).final_writes, 0);
-  assert.equal(w.finals().length, 1, "A re-created the object");
+  assert.equal(w.row(id).final_purged_at, null, "B left the purge to cleanup: a write is still counted");
+  releaseA();
+  await assert.rejects(a, (e) => e.code === "revision_conflict", "A replays B's recorded outcome");
+  assert.equal(w.finals().length, 1, "kept while counted");
   assert.equal(w.quota(), PNG.length, "still counted");
+  w.sql.prepare("UPDATE uploads SET final_writes = 0 WHERE id = ?").run(id);
   await lib.reconcileUploads(w.env);
   assert.deepEqual(w.finals(), [], "cleanup purged it once idle");
   assert.equal(w.quota(), 0);
+  assert.deepEqual(w.revisions(art), []);
 });
 
 test("orphan placeholders: a new file whose upload failed and expired over a day ago is deleted (it counted toward items_per_project)", async () => {
