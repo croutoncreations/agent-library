@@ -87,7 +87,7 @@ remove. A string that's too long is `413 too_large`; a number out of range is `4
 
 | Limit | Default | Scope | Configure | When you hit it |
 |---|---|---|---|---|
-| Upload reservation | 15 minutes | upload | `UPLOAD_TTL_SECONDS` | `410 upload_expired` |
+| Upload reservation | 15 minutes, at most 24 hours | upload | `UPLOAD_TTL_SECONDS` (larger values are capped at 86400) | `410 upload_expired` |
 | Uploads at once | 1 | agent or person | fixed | `429 upload_in_progress` |
 | Upload body | exactly the declared size | upload | fixed | `413 too_large` (longer); `400 incomplete_body` (shorter) |
 | MCP `upload_file` (inline base64) | 2 MiB decoded | call | fixed | `413 too_large`: use `upload_begin` + PUT |
@@ -111,7 +111,7 @@ the error instead of a reset connection.
 | Backup export | 16 MiB of files (distinct file versions) | project | fixed | `413 backup_too_large`; download large files individually |
 | Export of a project with App Connect files | refused | project | fixed | `409 backup_unsupported` |
 | Backup import request | 2 MiB | request | fixed | `413 backup_too_large` |
-| Imported documents and files | `items_per_project` (10,000 by default) | import | `PROJECT_ITEMS_MAX`; plan `items_per_project` | `400 bad_backup` |
+| Imported documents and files | `items_per_project` (10,000 by default), and at most 2,000 per import (one D1 batch) | import | `PROJECT_ITEMS_MAX`; plan `items_per_project` | `400 bad_backup` |
 | Imported versions, comments, details versions | 2,000 each | import | fixed | `400 bad_backup` |
 | Imported file bytes | `PROJECT_BINARY_BYTES` (`"0"` = no cap) | import | `PROJECT_BINARY_BYTES` | `400 bad_backup` |
 | Workspace limits on import | `projects`, `storage_bytes` | workspace | plan | `402 limit_reached` |
@@ -155,8 +155,10 @@ The cron job runs every 15 minutes. Each step is bounded per run and later runs 
 | Change feed | 30 days, up to 10,000 rows per run | project | fixed | `410 cursor_expired` for older cursors |
 | Deleted projects | purged after 30 days | project | fixed | large projects take several runs |
 | Abandoned uploads | removed after their reservation plus a 10-minute grace | upload | `UPLOAD_CLEANUP_GRACE_SECONDS` | — |
+| A new file whose upload never finished | its hidden placeholder is removed a day after the upload expired, up to 100 per run | project | fixed | until then it counts toward `items_per_project` |
 
-A full batch logs a warning (`retention_cleanup_batch_full`, `project_changes_cleanup_batch_full`).
+A full batch logs a warning (`retention_cleanup_batch_full`, `project_changes_cleanup_batch_full`); a failed
+retention run logs `retention_failed` and the next run tries again.
 
 ## Plan limits (entitlements)
 
@@ -208,6 +210,16 @@ keeps everything and stays readable; it just can't grow until it's under the lim
 Deleting a project (Project settings) frees its projects slot at once; its storage is freed when it's removed for good
 (after 30 days, or with Delete permanently). A failed payment is different: the workspace becomes read-only (D11 B /
 D13 A).
+
+### Rolling back the Worker
+
+Migration 0026 only adds indexes, so an earlier Worker runs on the new schema and no data is corrupted. Worker
+rollback doesn't undo data written under these limits, and the earlier Worker treats it differently:
+
+- It caps a project at 100 documents and files, so projects that grew past 100 can't take new items.
+- Its backup export has no 16 MiB cap, so exporting a large project can run the Worker out of memory.
+- It counts pending invitations as members, so it may refuse invitations this version allowed.
+- API keys created with "Never expires" (stored with `expires_at` 9999-01-01) stay valid.
 
 ### Configuration (hosted)
 

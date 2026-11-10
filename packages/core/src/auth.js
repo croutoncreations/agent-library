@@ -3,6 +3,7 @@ import { projectWorkspaceId, rateMultiplier } from "./limits.js";
 import { humanGate, memberRoleSql, requireProjectRole, readOnlyError } from "./tenancy.js";
 import { HttpError, nowMs, sha256Hex } from "./util.js";
 
+var UPLOAD_TTL_MAX_SECONDS = 24 * 60 * 60;
 function limitsFor(env) {
   const n = (v, d) => v && /^\d{1,12}$/.test(v) ? Number(v) : d;
   return {
@@ -10,7 +11,8 @@ function limitsFor(env) {
     readsPerMin: n(env.RATE_READS_PER_MIN, 240),
     writesPerMin: n(env.RATE_WRITES_PER_MIN, 60),
     authFailPerMin: n(env.RATE_AUTHFAIL_PER_MIN, 30),
-    uploadTtlMs: n(env.UPLOAD_TTL_SECONDS, 15 * 60) * 1e3,
+    // At most 24 hours: idempotency replays for upload begin are kept 30 days (cleanup.js), far longer than any upload.
+    uploadTtlMs: Math.min(n(env.UPLOAD_TTL_SECONDS, 15 * 60), UPLOAD_TTL_MAX_SECONDS) * 1e3,
     // Files per project (bytes); "0" = no per-project cap (workspace storage still applies).
     projectBinaryBytes: n(env.PROJECT_BINARY_BYTES, 100 * 1024 * 1024),
     cleanupGraceMs: n(env.UPLOAD_CLEANUP_GRACE_SECONDS, 10 * 60) * 1e3

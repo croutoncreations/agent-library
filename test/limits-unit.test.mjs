@@ -80,3 +80,26 @@ test("migration 0026: the comments cursor, a project's audit list and the owned-
   const owned = plan("SELECT COUNT(*) FROM workspaces w WHERE w.created_by = ? AND w.personal = 0 AND w.status <> 'deleting'", "hum_o");
   assert.match(owned, /INDEX workspaces_created_by/, owned);
 });
+
+test("UPLOAD_TTL_SECONDS: at most 24 hours (idempotency replays for upload begin are kept 30 days)", async () => {
+  const w = await loadWorker({ "auth.js": ["limitsFor"] });
+  assert.equal(w.limitsFor({}).uploadTtlMs, 15 * 60 * 1e3);
+  assert.equal(w.limitsFor({ UPLOAD_TTL_SECONDS: "3600" }).uploadTtlMs, 3600 * 1e3);
+  assert.equal(w.limitsFor({ UPLOAD_TTL_SECONDS: String(40 * 86400) }).uploadTtlMs, 86400 * 1e3);
+});
+
+test("cron: a failed retention run logs retention_failed instead of an unhandled rejection", async () => {
+  const w = await loadWorker({ "adapters.js": ["defaultAdapters"] });
+  const errors = [], waits = [];
+  const orig = console.error; console.error = (...a) => errors.push(a.join(" "));
+  try {
+    // A DB whose every statement fails: each cron step rejects; retention must catch and log its own.
+    const fail = () => { throw new Error("synthetic D1 failure"); };
+    const DB = { prepare: () => ({ bind: () => ({ run: fail, all: fail, first: fail }), run: fail, all: fail, first: fail }), batch: fail };
+    await w.default.scheduled({}, { DB }, { waitUntil: (p) => waits.push(p) });
+    const settled = await Promise.allSettled(waits);
+    assert.ok(errors.some((e) => /"event":"retention_failed"/.test(e) && /synthetic D1 failure/.test(e)), errors.join("\n"));
+    // The third waitUntil is retention (index.js scheduled); it settles fulfilled because its failure is handled.
+    assert.equal(settled[2].status, "fulfilled");
+  } finally { console.error = orig; }
+});

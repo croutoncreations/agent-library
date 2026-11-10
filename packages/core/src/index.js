@@ -63,6 +63,8 @@ function withSec(res) {
 }
 // App JSON request bodies: at most 2 MiB of UTF-8 bytes.
 var APP_BODY_BYTES = 2 * 1024 * 1024;
+// Backup import request bodies: also 2 MiB of UTF-8 bytes (refused with backup_too_large).
+var BACKUP_IMPORT_BYTES = 2 * 1024 * 1024;
 async function body(req) {
   const t = await readTextCapped(req, APP_BODY_BYTES);
   if (t === null) throw new HttpError(413, "too_large", "Request body too large");
@@ -188,10 +190,10 @@ async function route3(req, env, url, requestId, seen = {}) {
     if (seg[2] === "members" && seg.length === 4 && m === "DELETE") return json(await removeMember(ctx, wid, str(seg[3], "member", 80)));
     if (seg[2] === "import" && seg.length === 3 && m === "POST") {
       // Backups embed files as base64; the request cap is 2 MiB (about 1.5 MB of files). Larger projects need a
-      // streamed import (later); say so clearly instead of a generic 413. The body is read before refusing (measured in
-      // bytes) so HTTP/1 clients receive the error rather than a reset; Cloudflare's own request limit bounds the read.
-      const raw = await req.text();
-      if (new TextEncoder().encode(raw).length > 2 * 1024 * 1024) throw new HttpError(413, "backup_too_large", "This backup is larger than 2 MB, the import limit for now. Split the project or remove large files first.");
+      // streamed import (later); say so clearly instead of a generic 413. readTextCapped counts bytes and never buffers
+      // past the cap; it drains the rest (bounded) so HTTP/1 clients receive the error rather than a reset.
+      const raw = await readTextCapped(req, BACKUP_IMPORT_BYTES);
+      if (raw === null) throw new HttpError(413, "backup_too_large", "This backup is larger than 2 MB, the import limit for now. Split the project or remove large files first.");
       let parsed; try { parsed = raw ? JSON.parse(raw) : {}; } catch { throw new HttpError(400, "invalid_json", "Malformed JSON"); }
       const k = req.headers.get("idempotency-key");
       return json(await importBackup(ctx, wid, parsed, k ? idemKey(k) : null, k ? await sha256Hex(raw) : ""), 201);
@@ -373,7 +375,8 @@ var coreWorker = {
     ctx.waitUntil(cleanupChanges(env));
     ctx.waitUntil(reconcileUploads(env, { limit: 100 }).then((r) => console.log("reconcile", JSON.stringify(r))));
     // Expired sessions, idempotency records past 30 days, audits past AUDIT_RETENTION_DAYS (bounded per run).
-    ctx.waitUntil(pruneExpiredRows(env).then((r) => { if (r.sessions || r.idempotency || r.audits) console.log("retention", JSON.stringify(r)); }));
+    ctx.waitUntil(pruneExpiredRows(env).then((r) => { if (r.sessions || r.idempotency || r.audits) console.log("retention", JSON.stringify(r)); },
+      (e) => console.error(JSON.stringify({ event: "retention_failed", message: String(e?.message ?? e).slice(0, 200) }))));
     // Deleted projects past their 30 days (D21): bounded per run, finished by later runs.
     ctx.waitUntil(purgeDueProjects(env).then((r) => { if (r.projects || r.rows || r.files) console.log("project_purge", JSON.stringify({ projects: r.projects, rows: r.rows, files: r.files })); }));
   },

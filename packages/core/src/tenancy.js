@@ -128,9 +128,10 @@ export async function visibleProjects(env, principalId) {
   const r = await env.DB.prepare(
     `SELECT * FROM (SELECT ${cols} ${from("t_p.workspace_id = t_w.id")}
      UNION ALL SELECT ${cols} ${from("t_p.workspace_id IS NULL AND t_w.personal = 1 AND t_p.owner_id = substr(t_w.id, 5)")})
-     ORDER BY personal DESC, ws_created, created_at LIMIT ${VISIBLE_PROJECTS_MAX + 1}`
+     WHERE role IS NOT NULL ORDER BY personal DESC, ws_created, created_at LIMIT ${VISIBLE_PROJECTS_MAX + 1}`
   ).bind(principalId, principalId).all();
-  const out = r.results.slice(0, VISIBLE_PROJECTS_MAX).filter((p) => p.role);
+  // Rows without access (role NULL) are dropped in the query, so they don't use up the VISIBLE_PROJECTS_MAX slots.
+  const out = r.results.slice(0, VISIBLE_PROJECTS_MAX);
   // True when the person can see more than VISIBLE_PROJECTS_MAX projects (only the first ones are listed).
   out.truncated = r.results.length > VISIBLE_PROJECTS_MAX;
   return out;

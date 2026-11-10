@@ -134,7 +134,7 @@ Anything else, such as `DROP`, `DELETE`, `UPDATE`, `REPLACE`, renames, `PRAGMA` 
 | Out-of-band deploy (dashboard edit or manual deploy) | The preflight refuses. Bring that source into `main`; if it should become the new baseline, update `baseline` in the deploy repo's `deploy/production.json`. |
 
 Worker rollback restores code and config only, not D1, R2 or KV. Rolling back to a version before project deletion
-(migration 0024) reopens deleted, not-yet-purged projects ([workspaces.md](workspaces.md#deleting-a-project)). After a database restore or import, restart the [bounded search backfill](ranked-search.md#required-infrastructure--rollout) from `--after 0`. Search readiness checks suppress results if any published current heads are missing from the restored index. The FTS key map uses explicit integer primary keys, so ordinary VACUUM does not invalidate it.
+(migration 0024) reopens deleted, not-yet-purged projects ([workspaces.md](workspaces.md#deleting-a-project)). Rolling back past the D22 limits release changes how existing data is limited ([limits.md](limits.md#rolling-back-the-worker)). After a database restore or import, restart the [bounded search backfill](ranked-search.md#required-infrastructure--rollout) from `--after 0`. Search readiness checks suppress results if any published current heads are missing from the restored index. The FTS key map uses explicit integer primary keys, so ordinary VACUUM does not invalidate it.
 
 ### Search rollout readiness
 
