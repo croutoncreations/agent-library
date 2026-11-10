@@ -1,4 +1,4 @@
-import { readText, storeText } from "../content-store.js";
+import { getText, storeText } from "../content-store.js";
 import { authorizeProject, authzSql, requireHuman } from "../auth.js";
 import { provenance } from "../history/service.js";
 import { appOrigin, artifactWebUrl, previewWebUrl } from "../links.js";
@@ -49,12 +49,12 @@ async function listTemplates(ctx, projectId, q = {}) {
 async function tplSource(ctx, pid, id, revision, definition) {
   const az = rtReadAuthzSql(ctx, pid);
   // Read access, availability, project and pinned content are checked in the same statement.
-  const r = await db(ctx).prepare(`SELECT r.body FROM revisions r JOIN artifacts a ON a.id = r.artifact_id AND a.project_id = r.project_id
+  const r = await db(ctx).prepare(`SELECT r.body, r.body_key FROM revisions r JOIN artifacts a ON a.id = r.artifact_id AND a.project_id = r.project_id
     WHERE a.id = ? AND a.project_id = ? AND r.rev_no = ? AND a.kind = 'markdown' AND a.publisher_id IS NULL
     AND a.trashed_at IS NULL ${definition ? "AND a.is_template = 1" : ""} AND ${az.sql}`)
     .bind(id, pid, revision, ...az.params).first();
   if (!r) throw new HttpError(404, "not_found", "Source is not available");
-  return { body: readText(r.body) };
+  return { body: await getText(ctx.env, r) };
 }
 async function tplCopy(ctx, projectId, input, key, definition = false) {
   tplDenyPublisher(ctx);

@@ -1,4 +1,4 @@
-import { readText, storeText } from "./content-store.js";
+import { getText, readText, storeText } from "./content-store.js";
 import { authorizeProject, authzSql, contentWriteSql, credentialGate, protectSql, requireHuman } from "./auth.js";
 import { chQuery, cleanupChanges, listChanges } from "./changes/service.js";
 import { MEASUREMENTS, MIME, checkFile, isCalendarDate } from "./formats.js";
@@ -248,7 +248,7 @@ async function getArtifact(ctx, projectId, artifactId, revNo) {
     artifact: { ...artifactView(a, appConnectEnabled(ctx.env)), ...await tplProvenance(ctx, projectId, a) },
     revision: { rev: rev.rev_no, id: rev.id, size: rev.size, sha256: rev.sha256, mime: rev.mime, created_at: rev.created_at, author_id: rev.author_id },
     ...access ? { access: { role: access.role, can_write: ROLE_RANK[access.role] >= ROLE_RANK.member && access.status === "active", ...access.status !== "active" ? { read_only_reason: "workspace_suspended" } : {} } } : {},
-    ...a.kind === "markdown" || a.kind === "html" ? { body: readText(rev.body) } : a.kind === "json" || a.kind === "csv" ? { content: readText(rev.body), content_url: `/api/projects/${projectId}/artifacts/${artifactId}/content?rev=${rev.rev_no}` } : { content_url: `/api/projects/${projectId}/artifacts/${artifactId}/content?rev=${rev.rev_no}` }
+    ...a.kind === "markdown" || a.kind === "html" ? { body: await getText(ctx.env, rev) } : a.kind === "json" || a.kind === "csv" ? { content: await getText(ctx.env, rev), content_url: `/api/projects/${projectId}/artifacts/${artifactId}/content?rev=${rev.rev_no}` } : { content_url: `/api/projects/${projectId}/artifacts/${artifactId}/content?rev=${rev.rev_no}` }
   };
 }
 async function history(ctx, projectId, artifactId, opts = {}) {
@@ -443,7 +443,7 @@ async function restoreRevision(ctx, projectId, artifactId, input, key) {
     artifactId,
     expected,
     i,
-    { body: old.body === null || old.body === void 0 ? void 0 : readText(old.body), blobKey: old.blob_key ?? void 0, size: old.size, sha256: old.sha256, mime: old.mime, restoredFrom: from, change_note: input.change_note ?? "Restored version " + from },
+    { body: old.blob_key ? void 0 : await getText(ctx.env, old), blobKey: old.blob_key ?? void 0, size: old.size, sha256: old.sha256, mime: old.mime, restoredFrom: from, change_note: input.change_note ?? "Restored version " + from },
     [],
     "artifact.restore_revision"
   );
@@ -567,7 +567,7 @@ async function readRecords(ctx, projectId, artifactId, q) {
   const a = await loadArtifact(ctx, projectId, artifactId);
   if (a.kind !== "json" || a.schema_id !== MEASUREMENTS)
     throw new HttpError(422, "schema_not_queryable", "Records can be queried only on JSON files with schema agentlib.measurements/1");
-  const rev = await db(ctx).prepare("SELECT rev_no, body FROM revisions WHERE id = ?").bind(a.head_revision_id).first();
+  const rev = await db(ctx).prepare("SELECT rev_no, body, body_key FROM revisions WHERE id = ?").bind(a.head_revision_id).first();
   const from = q.from ?? null, to = q.to ?? null;
   if (from !== null && !isCalendarDate(from)) throw new HttpError(400, "invalid_input", "from must be a real calendar date YYYY-MM-DD");
   if (to !== null && !isCalendarDate(to)) throw new HttpError(400, "invalid_input", "to must be a real calendar date YYYY-MM-DD");
@@ -575,7 +575,7 @@ async function readRecords(ctx, projectId, artifactId, q) {
   const metric = q.metric ?? null;
   const limit = q.limit === void 0 || q.limit === null || q.limit === "" ? 100 : int(Number(q.limit), "limit", 1, 500);
   const offset = q.cursor ? int(Number(q.cursor), "cursor", 0, 1e7) : 0;
-  const all = JSON.parse(readText(rev.body)).records;
+  const all = JSON.parse(await getText(ctx.env, rev)).records;
   let undated = 0;
   const ranged = from !== null || to !== null;
   const hits = [];

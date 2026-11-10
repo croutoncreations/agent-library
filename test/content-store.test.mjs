@@ -53,7 +53,7 @@ test("every INSERT of a text body binds storeText or is a marked SQL-side copy",
 test("main JS write and read paths of text bodies go through storeText/readText (marker codec)", async () => {
   const { loadWorker } = await import("./load-worker.mjs");
   const lib = await loadWorker({ "service.js": ["createMarkdown", "createFile", "saveFile", "readRecords", "saveMarkdown", "getArtifact", "addComment", "listComments", "restoreRevision"], "templates/service.js": ["saveAsTemplate", "createFromTemplate"], "backup.js": ["exportBackup", "restoreBackup"], "history/service.js": ["diffRevisions"], "adapters.js": ["withAdapters", "defaultAdapters"] },
-    { "content-store.js": "export * from \"./packages/core/src/content-store.js\"; export function storeText(t) { return \"ENC:\" + t; } export function readText(s) { if (!String(s).startsWith(\"ENC:\")) throw new Error(\"unencoded body read: \" + String(s).slice(0, 20)); return String(s).slice(4); }" });
+    { "content-store.js": "export * from \"./packages/core/src/content-store.js\"; import { getText as actualGetText } from \"./packages/core/src/content-store.js\"; export async function getText(env, row) { return row.body_key ? actualGetText(env, row) : readText(row.body); } export function storeText(t) { return \"ENC:\" + t; } export function readText(s) { if (!String(s).startsWith(\"ENC:\")) throw new Error(\"unencoded body read: \" + String(s).slice(0, 20)); return String(s).slice(4); }" });
   const { DatabaseSync } = await import("node:sqlite");
   const sql = new DatabaseSync(":memory:");
   for (const f of readdirSync(join(ROOT, "migrations")).filter((f) => f.endsWith(".sql")).sort()) sql.exec(readFileSync(join(ROOT, "migrations", f), "utf8"));

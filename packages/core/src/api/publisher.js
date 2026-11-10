@@ -1,4 +1,4 @@
-import { readText, storeText } from "../content-store.js";
+import { getText, storeText } from "../content-store.js";
 import { agentRate, authzSql, rateLimit } from "../auth.js";
 import { CONTENT_TYPE, MIME, byteLength, checkFile } from "../formats.js";
 import { appOrigin, artifactWebUrl, previewWebUrl } from "../links.js";
@@ -898,9 +898,9 @@ async function route(req, env, p, requestId) {
     const a = await ownFile(env, p, g[1]);
     const revQ = url.searchParams.get("revision");
     const revNo = revQ !== null ? int(Number(revQ), "revision", 1) : a.head_rev;
-    const r = await env.DB.prepare("SELECT body, mime, sha256 FROM revisions WHERE artifact_id = ? AND rev_no = ?").bind(a.id, revNo).first();
+    const r = await env.DB.prepare("SELECT body, body_key, mime, sha256 FROM revisions WHERE artifact_id = ? AND rev_no = ?").bind(a.id, revNo).first();
     if (!r) throw new HttpError(404, "not_found", "File not found");
-    const bytes = new TextEncoder().encode(readText(r.body));
+    const bytes = new TextEncoder().encode(await getText(env, r));
     return new Response(m === "HEAD" ? null : bytes, { status: 200, headers: {
       "content-type": CONTENT_TYPE[r.mime] ?? r.mime,
       "content-length": String(bytes.length),

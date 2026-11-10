@@ -1,4 +1,4 @@
-import { readText } from "../content-store.js";
+import { getText } from "../content-store.js";
 import { authorizeProject } from "../auth.js";
 import { db, loadArtifact, updateMetadata } from "../service.js";
 import { CHANGE_NOTE_MAX, HttpError, int, nowIso, randomId } from "../util.js";
@@ -157,14 +157,14 @@ async function diffRevisions(ctx, projectId, artifactId, fromQ, toQ) {
   const a = await loadArtifact(ctx, projectId, artifactId, { allowTrashed: ctx.principal.kind === "human" });
   const to = toQ === null || toQ === void 0 || toQ === "" ? a.head_rev : int(Number(toQ), "to", 1);
   const from = fromQ === null || fromQ === void 0 || fromQ === "" ? Math.max(1, to - 1) : int(Number(fromQ), "from", 1);
-  const rs = await db(ctx).prepare("SELECT rev_no, body, blob_key, size, sha256, mime FROM revisions WHERE artifact_id = ? AND project_id = ? AND rev_no IN (?, ?)").bind(artifactId, projectId, from, to).all();
+  const rs = await db(ctx).prepare("SELECT rev_no, body, body_key, blob_key, size, sha256, mime FROM revisions WHERE artifact_id = ? AND project_id = ? AND rev_no IN (?, ?)").bind(artifactId, projectId, from, to).all();
   const A = rs.results.find((r) => r.rev_no === from), B = rs.results.find((r) => r.rev_no === to);
   if (!A || !B) throw new HttpError(404, "not_found", "Revision not found");
   const side = (r) => ({ rev: r.rev_no, size: r.size, sha256: r.sha256, mime: r.mime });
-  if (A.blob_key || B.blob_key || typeof A.body !== "string" || typeof B.body !== "string")
+  if (A.blob_key || B.blob_key || (!A.body_key && typeof A.body !== "string") || (!B.body_key && typeof B.body !== "string"))
     return { from: side(A), to: side(B), binary: true, identical: A.sha256 === B.sha256 };
   if (A.sha256 === B.sha256) return { from: side(A), to: side(B), binary: false, identical: true, added: 0, removed: 0, hunks: [], truncated: false };
-  return { from: side(A), to: side(B), binary: false, identical: false, ...lineDiff(readText(A.body), readText(B.body)) };
+  return { from: side(A), to: side(B), binary: false, identical: false, ...lineDiff(await getText(ctx.env, A), await getText(ctx.env, B)) };
 }
 // ---------- metadata versions ----------
 // The first metadata change after 0010 records the prior state as a baseline row (author: whoever created the

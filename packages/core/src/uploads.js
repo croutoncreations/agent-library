@@ -1,4 +1,4 @@
-import { blobSha256Hex, deleteBlob, getBlob, getBlobHead, headBlob, putBlobStream, readText } from "./content-store.js";
+import { blobSha256Hex, deleteBlob, getBlob, getBlobHead, headBlob, putBlobStream, getText, getTextRange } from "./content-store.js";
 import { authenticate, authorizeProject, authzSql, enforceRate, limitsFor, requireCsrf } from "./auth.js";
 import { PUT_MARGIN_MS, reconcileUploads } from "./cleanup.js";
 import { CONTENT_TYPE, spreadsheetSafeCsv } from "./formats.js";
@@ -394,7 +394,7 @@ async function serveContent(ctx, req, projectId, artifactId, revParam) {
   const sp = new URL(req.url).searchParams;
   if (sp.get("format") === "spreadsheet" && ctx.env.APP_CONNECT_ENABLED === "1") {
     if (r.mime !== "text/csv") throw new HttpError(400, "invalid_input", "format=spreadsheet applies to CSV files only");
-    const safe = new TextEncoder().encode(spreadsheetSafeCsv(readText(r.body)));
+    const safe = new TextEncoder().encode(spreadsheetSafeCsv(await getText(ctx.env, r)));
     const nm = (a.title.replace(/[^A-Za-z0-9._ -]/g, "_").slice(0, 100) || "download").replace(/\.csv$/i, "") + ".spreadsheet.csv";
     return new Response(req.method === "HEAD" ? null : safe, { status: 200, headers: {
       "content-type": CONTENT_TYPE["text/csv"],
@@ -456,7 +456,7 @@ async function serveContent(ctx, req, projectId, artifactId, revParam) {
   const status = partial ? 206 : 200;
   if (req.method === "HEAD") return new Response(null, { status, headers });
   if (r.blob_key === null) {
-    const b = new TextEncoder().encode(readText(r.body)).slice(start, end + 1);
+    const b = await getTextRange(ctx.env, r, start, end - start + 1);
     return new Response(b, { status, headers });
   }
   const obj2 = await getBlob(ctx.env, r.blob_key, partial ? { offset: start, length: end - start + 1 } : void 0);

@@ -1,3 +1,4 @@
+import { getTextRange } from "../content-store.js";
 import { authorizeProject, credentialGate } from "../auth.js";
 import { db } from "../service.js";
 import { HttpError, int, nowMs } from "../util.js";
@@ -6,7 +7,7 @@ import { HttpError, int, nowMs } from "../util.js";
 // One shared implementation for every transport (OAuth MCP, legacy /mcp, /v1, browser API). A read returns at most
 // one bounded chunk of one immutable version: the cursor pins the version (rev_no + sha256) and the byte offset, so
 // chunks never mix versions even while the document is being edited. Every chunk re-checks, in the same statement
-// that reads its bytes, the caller's current read access, the trash and the pinned version.
+// that pins its version, the caller's current read access and trash state (again after reading R2).
 const RT_KINDS_ALL = ["markdown", "html", "json", "csv"];
 const RT_KINDS_DOCS = ["markdown", "html"];
 const RT_DEFAULT_MAX = 64 * 1024, RT_MIN_MAX = 4096, RT_MAX_MAX = 512 * 1024;
@@ -104,14 +105,13 @@ async function readTextChunk(ctx, projectId, artifactId, opts = {}) {
   }
   const offset = pin ? pin.o : 0;
   const az = rtReadAuthzSql(ctx, projectId);
-  // One statement: current access, trash state, the pinned version and at most maxBytes of its UTF-8 bytes.
-  // (Text bodies are inline in D1, at most 1 MiB; hex keeps the fetched slice <= 1 MiB of row data.)
-  const row = await db(ctx).prepare(
-    `SELECT a.kind, a.head_rev, a.trashed_at, r.rev_no, r.sha256, r.mime, r.blob_key,
-       length(CAST(r.body AS BLOB)) AS nbytes, hex(substr(CAST(r.body AS BLOB), ?, ?)) AS hx, (${az.sql}) AS allowed
+  // One statement pins current access, trash state and the immutable version before fetching its bytes.
+  const select = `SELECT a.kind, a.head_rev, a.trashed_at, r.rev_no, r.sha256, r.mime, r.blob_key,
+       r.body, r.body_key, CASE WHEN r.body_key IS NOT NULL THEN r.size ELSE length(CAST(r.body AS BLOB)) END AS nbytes,
+       (${az.sql}) AS allowed
      FROM artifacts a LEFT JOIN revisions r ON r.artifact_id = a.id AND r.project_id = a.project_id AND r.rev_no = COALESCE(?, a.head_rev)
-     WHERE a.id = ? AND a.project_id = ?`
-  ).bind(offset + 1, maxBytes, ...az.params, rev, artifactId, projectId).first();
+     WHERE a.id = ? AND a.project_id = ?`;
+  const row = await db(ctx).prepare(select).bind(...az.params, rev, artifactId, projectId).first();
   // Access ended between authentication and this chunk (revoked, expired or project removed): same answer as a
   // project the caller cannot see, whether or not the document exists. The next request fails authentication.
   if (!row || !row.allowed) throw new HttpError(404, "not_found", "Artifact not found");
@@ -121,7 +121,13 @@ async function readTextChunk(ctx, projectId, artifactId, opts = {}) {
   if (row.rev_no === null || row.rev_no === void 0) throw new HttpError(404, "not_found", "Revision not found");
   if (row.blob_key !== null || row.nbytes === null) throw new HttpError(415, "unsupported_kind", "This version has no text body; use the content download");
   if (pin && row.sha256 !== pin.h) throw new HttpError(409, "revision_changed", "The version this cursor reads has changed; start again without cursor");
-  const nbytes = row.nbytes, bytes = rtHexBytes(row.hx ?? "");
+  const nbytes = row.nbytes;
+  const bytes = await getTextRange(ctx.env, row, offset, Math.min(maxBytes, Math.max(0, nbytes - offset)));
+  // An R2 await must not let a revoked grant, trashed artifact or changed version escape the SQL access fence.
+  const checked = await db(ctx).prepare(select).bind(...az.params, row.rev_no, artifactId, projectId).first();
+  if (!checked?.allowed || checked.trashed_at || !checked.head_rev) throw new HttpError(404, "not_found", "Artifact not found");
+  if (checked.rev_no !== row.rev_no || checked.sha256 !== row.sha256 || checked.body_key !== row.body_key) throw new HttpError(409, "revision_changed", "The version this cursor reads has changed; start again without cursor");
+  row.head_rev = checked.head_rev;
   if (offset > nbytes || offset > 0 && offset < nbytes && (bytes[0] & 192) === 128) throw new HttpError(400, "invalid_cursor", "cursor is not a read cursor for this document; start again without cursor");
   const out = {
     artifact_id: artifactId, kind: row.kind, revision: row.rev_no, sha256: row.sha256, mime: row.mime, size: nbytes,

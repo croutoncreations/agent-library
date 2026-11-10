@@ -1,5 +1,5 @@
 import { personalWorkspaceId } from "./tenancy.js";
-import { deleteBlob, getBlob, putBlob, readText, storeText } from "./content-store.js";
+import { deleteBlob, getBlob, putBlob, getText, readText, storeText } from "./content-store.js";
 import { limitsFor, requireHuman } from "./auth.js";
 import { BINARY_TYPES, LIMITS, tplDate } from "./service.js";
 import { requireProjectRole, requireWorkspaceRole, workspaceRoleSql } from "./tenancy.js";
@@ -32,7 +32,7 @@ async function exportBackup(ctx, projectId) {
   if (fileBytes > BACKUP_EXPORT_FILE_BYTES) throw new HttpError(413, "backup_too_large", "This project's files are too large for a single backup file (over 16 MB). Download large files individually.");
   const [arts, revs, comments] = await DB.batch([
     DB.prepare("SELECT id, kind, title, folder, tags, head_rev, head_revision_id, meta_version, trashed_at, created_at, updated_at, is_template, template_description, source_artifact_id, source_revision, source_role, template_date FROM artifacts WHERE project_id = ? AND head_rev > 0").bind(projectId),
-    DB.prepare("SELECT id, artifact_id, rev_no, author_id, body, blob_key, size, sha256, mime, restored_from, created_at, via_kind, via_id, via_label, client_info, change_note FROM revisions WHERE project_id = ?").bind(projectId),
+    DB.prepare("SELECT id, artifact_id, rev_no, author_id, body, body_key, blob_key, size, sha256, mime, restored_from, created_at, via_kind, via_id, via_label, client_info, change_note FROM revisions WHERE project_id = ?").bind(projectId),
     DB.prepare("SELECT id, artifact_id, rev_no, author_id, body, created_at FROM comments WHERE project_id = ?").bind(projectId),
     DB.prepare("SELECT id, artifact_id, version, title, folder, tags, trashed, author_id, via_kind, via_id, via_label, client_info, change_note, restored_from, created_at, template_description FROM meta_versions WHERE project_id = ?").bind(projectId)
   ]).then(([a, r, c, mv]) => (metaVersionsExport = mv.results, [a, r, c]));
@@ -53,7 +53,7 @@ async function exportBackup(ctx, projectId) {
     exported_at: nowIso(),
     project: { id: p.id, title: p.title, created_at: p.created_at },
     artifacts: arts.results,
-    revisions: revs.results.map((r) => ({ ...r, body: r.body === null ? null : readText(r.body) })),
+    revisions: await Promise.all(revs.results.map(async ({ body_key, ...r }) => ({ ...r, body: r.blob_key ? null : await getText(ctx.env, { ...r, body_key }) }))),
     comments: comments.results.map((c) => ({ ...c, body: readText(c.body) })),
     meta_versions: metaVersionsExport,
     blobs
