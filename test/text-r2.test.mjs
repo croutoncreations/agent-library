@@ -206,6 +206,17 @@ test("publication fence matches real local D1 constraint text and rolls back a m
     const DB = await mf.getD1Database("DB");
     await DB.prepare("CREATE TABLE content_writes (key TEXT PRIMARY KEY, project_id TEXT NOT NULL, created_at INTEGER NOT NULL)").run();
     await DB.prepare("CREATE TABLE revisions (body_key TEXT)").run();
+    await DB.prepare("CREATE TABLE comments (body TEXT)").run();
+    // Apply the actual migration's index statements through local D1, not a simulated planner.
+    const migration = readFileSync(join(ROOT, "migrations/0027_text_in_r2.sql"), "utf8");
+    for (const table of ["revisions", "comments"]) {
+      if (table === "comments") await DB.prepare("ALTER TABLE comments ADD COLUMN body_key TEXT").run();
+      const index = migration.split(";").find(s => s.includes(`CREATE INDEX IF NOT EXISTS ${table}_body_key`));
+      assert.ok(index, `${table} body_key index is in migration 0027`);
+      await DB.prepare(index).run();
+      const plan = await DB.prepare(`EXPLAIN QUERY PLAN SELECT 1 FROM ${table} WHERE body_key = ? LIMIT 1`).bind("text/p/a/r").all();
+      assert.match(plan.results.map(r => r.detail).join("\n"), new RegExp(`USING (?:COVERING )?INDEX ${table}_body_key`));
+    }
     let raw;
     try { await DB.prepare("INSERT INTO content_writes (key, project_id, created_at) VALUES (NULL, NULL, NULL)").run(); } catch (error) { raw = error; }
     assert.match(raw.message, /NOT NULL constraint failed: content_writes\.project_id/);
