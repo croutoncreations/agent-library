@@ -122,6 +122,26 @@ test("finish fails closed (500 publish_failed) when R2 recorded no SHA-256, and 
   assert.deepEqual(w.finals(), []);
 });
 
+// F4: an upload the previous Worker already PUT has its bytes at staging_key and no final_key.
+for (const state of ["received", "sealed"]) {
+  test(`deploy: an old-Worker upload (${state}, bytes at staging_key, final_key NULL) fails 409 reupload_required and its staging object is purged`, async () => {
+    const w = world();
+    const { id, art } = w.upload({ state });
+    const u = w.row(id);
+    w.blobs.delete(u.final_key);
+    w.blobs.set(u.staging_key, PNG);
+    w.sql.prepare("UPDATE uploads SET final_key = NULL WHERE id = ?").run(id);
+    await assert.rejects(lib.uploadFinish(w.ctx, P, id, "finish-old-" + state), (e) => e.status === 409 && e.code === "reupload_required" && /upload_begin/.test(e.message));
+    assert.deepEqual([w.row(id).state, w.row(id).final_key, JSON.parse(w.row(id).result).code], ["failed", null, "reupload_required"]);
+    await assert.rejects(lib.uploadFinish(w.ctx, P, id, "finish-old-again"), (e) => e.code === "reupload_required", "replayed");
+    await lib.reconcileUploads(w.env);
+    assert.equal(w.blobs.has(u.staging_key), false, "staging object purged");
+    assert.ok(w.row(id).staging_purged_at > 0);
+    assert.deepEqual(w.finals(), []);
+    assert.deepEqual(w.revisions(art), []);
+  });
+}
+
 test("rollback: the previous Worker's staging cleanup on a published row touches nothing referenced", async () => {
   const w = world();
   const id = await beginAs(w, PNG);

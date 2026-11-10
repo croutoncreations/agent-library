@@ -72,7 +72,13 @@ deletes referenced bytes (a stale count on a published row is left alone).
 Diagnose with a read-only query against uploads whose state is `failed` or `conflict`
 and `final_writes > 0`. Don't reset counters by hand: cleanup releases them once stale.
 
-## Rollback
+## Rollback and deploy
+
+- Uploads in flight across a deploy must restart. An upload the previous Worker already PUT has its bytes at
+  `staging_key` and no `final_key`; this Worker's finish ends it `failed` with `409 reupload_required` ("start it again
+  with upload_begin"), and cleanup deletes its `staging_key`.
+- After a rollback, uploads this Worker received (bytes at `final_key`) fail at the previous Worker's finish with
+  `409 missing_bytes` (it reads `staging_key`). Nothing leaks: the row is terminal and cleanup purges its `final_key`.
 
 The migration is additive, so the old Worker accepts the schema, but it ignores leases
 and write accounting and restores the original concurrency bugs. Drain in-flight

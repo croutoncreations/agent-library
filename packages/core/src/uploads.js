@@ -239,6 +239,21 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
   if (prior) return prior;
   if (u.expires_at <= nowMs() && u.state !== "sealed") throw new HttpError(410, "upload_expired", "Upload expired");
   const az = authzSql(ctx, projectId);
+  // Received or sealed with no final_key: the previous Worker took this PUT, so its bytes are at staging_key, which
+  // this Worker never publishes from. End it (unless an older finisher holds the lease) and purge staging_key.
+  if (u.final_key === null && (u.state === "received" || u.state === "sealed")) {
+    const msg = "This upload started before an update; start it again with upload_begin";
+    const ended = await db2(ctx).prepare(`UPDATE uploads SET state = 'failed', result = ? WHERE id = ? AND state IN ('received','sealed') AND final_key IS NULL
+      AND (finalize_until IS NULL OR finalize_until <= ?) AND ${az.sql}`).bind(JSON.stringify({ status: 409, code: "reupload_required", message: msg }), uploadId, nowMs(), ...az.params).run();
+    if (ended.meta.changes) {
+      await audit(ctx, projectId, "upload.finish", u.artifact_id, null, "failed:reupload_required").run();
+      await purgeStaging(ctx.env, u);
+      throw new HttpError(409, "reupload_required", msg);
+    }
+    const r = recorded(await db2(ctx).prepare("SELECT state, result FROM uploads WHERE id = ?").bind(uploadId).first());
+    if (r) return r;
+    throw new HttpError(409, "finish_in_progress", "Another finish of this upload is in progress; retry shortly", { retry_after_seconds: 1 });
+  }
   const seal = await db2(ctx).prepare(`UPDATE uploads SET state = 'sealed' WHERE id = ? AND state = 'received' AND ${az.sql}`).bind(uploadId, ...az.params).run();
   if (!seal.meta.changes) {
     const cur = await db2(ctx).prepare("SELECT state FROM uploads WHERE id = ?").bind(uploadId).first("state");
