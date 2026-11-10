@@ -61,6 +61,33 @@ test("JSON structure and schema", () => {
   assert.equal(F.checkFile("json", json([rec({ extra_field: { nested: true } })]), M).record_count, 1, "extra record keys preserved");
 });
 
+test("parseCsv exact characterisation before large-cell allocation optimisation", () => {
+  const cases = [
+    ["a,b\n1,2\n", { header: ["a", "b"], rows: [{ line: 2, cells: ["1", "2"] }] }],
+    ["a,b\r\n1,2", { header: ["a", "b"], rows: [{ line: 2, cells: ["1", "2"] }] }],
+    ['a,b\n"x,y","line1\nline2"\n', { header: ["a", "b"], rows: [{ line: 2, cells: ["x,y", "line1\nline2"] }] }],
+    ['a\n"he said ""hi"""', { header: ["a"], rows: [{ line: 2, cells: ['he said "hi"'] }] }],
+    ['a,b\n"",\n', { header: ["a", "b"], rows: [{ line: 2, cells: ["", ""] }] }],
+    ["a\n\n", { header: ["a"], rows: [{ line: 2, cells: [""] }] }],
+    ["a\n", { header: ["a"], rows: [] }],
+    ["a", { header: ["a"], rows: [] }],
+    ['a\n"x\ry"', { header: ["a"], rows: [{ line: 2, cells: ["x\ry"] }] }],
+    ['a\n"x\r\ny"\nz', { header: ["a"], rows: [{ line: 2, cells: ["x\r\ny"] }, { line: 4, cells: ["z"] }] }],
+    ['a,b\né🙂,"漢🙂"', { header: ["a", "b"], rows: [{ line: 2, cells: ["é🙂", "漢🙂"] }] }]
+  ];
+  for (const [text, expected] of cases) assert.deepEqual(F.parseCsv(text), expected, JSON.stringify(text));
+  for (const [text, line, detail] of [
+    ["a\rb", 1, "bare CR line ending"],
+    ["\ufeffa\n1", undefined, "byte order mark not allowed"],
+    ['a\nx"y', 2, "quote inside unquoted field"],
+    ['a\n"x', 2, "unterminated quoted field"],
+    ['a\n"x"y', 2, "unexpected character after closing quote"],
+    ["", 1, "header row required"],
+    ["a,a", 1, 'duplicate header "a"'],
+    ["a,b\n1", 2, "expected 2 columns, found 1"]
+  ]) assert.throws(() => F.parseCsv(text), e => e.code === "invalid_content" && e.extra.line === line && e.extra.detail === detail, JSON.stringify(text));
+});
+
 test("spreadsheet-safe export only prefixes risky cells; canonical text untouched", () => {
   const src = "a,b\n=1+1,ok\n@x,\"-2\"\n";
   assert.equal(F.spreadsheetSafeCsv(src), "a,b\r\n'=1+1,ok\r\n'@x,'-2\r\n");

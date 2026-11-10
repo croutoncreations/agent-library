@@ -59,12 +59,12 @@ All restores need the current `expected_revision` / `expected_meta_version` and 
 
 **Agents and the trash.** The trash takes a document away from agents. For them, diff, details history and details restore of a trashed document return 404, as `read_artifact` and `artifact_history` already did; the owner can still see everything. When an agent restores details, it gets back the title, folder and tags; the trash state stays as it is. Only the owner's restore (browser) restores the trash state too. That way `restore_metadata` doesn't give OAuth connections a new trash/untrash ability (`trash_artifact` exists only on the legacy endpoint).
 
-**Diff limits (free plan, 10 ms CPU).** Diffs use Myers with three hard caps:
+**Diff limits.** Non-identical inputs larger than 1 MiB are summarised (`added`/`removed`: null, no hunks, `truncated: true`) before reading their objects. This bounds long-line comparisons and response size for 10 MiB revisions. Identical hashes still return the identical result. Smaller inputs use Myers with three hard caps:
 - **Edit distance:** at most 500 changed lines.
 - **Work:** at most 200k steps.
 - **Size:** inputs of at most 20,000 lines.
 
-Measured worst case is about 8 ms CPU for a 1 MiB rewrite; a typical edit takes about 0.4 ms. Past the edit-distance or work cap, the changed middle is reported as one replacement (`truncated: true`). Over the line cap, the response is `too_many_lines: true` with no hunks, and the UI points to "Show full text". Memory stays capped by `TRACE_INTS` / `MAX_OUT`.
+The earlier 1 MiB benchmark measured about 8 ms CPU for a rewrite and about 0.4 ms for a typical edit; it is not a production CPU guarantee for large documents. Past the edit-distance or work cap, the changed middle is reported as one replacement (`truncated: true`). Over the line cap, the response is `too_many_lines: true` with no hunks, and the UI points to "Show full text". Memory stays capped by `TRACE_INTS` / `MAX_OUT`.
 
 ## Browser UI (History tab)
 

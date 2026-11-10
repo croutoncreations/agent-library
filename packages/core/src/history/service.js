@@ -65,15 +65,22 @@ async function historyPage(ctx, projectId, artifactId, opts) {
   }
   return out2;
 }
-// Line diff (Myers) with hard caps so memory stays far below the Worker's 128 MiB on any pair of 1 MiB inputs:
+// Revisions can be 10 MiB. Summarise inputs over 1 MiB before reading objects: line count alone cannot bound
+// long-line comparisons or output bytes (2,000 changed lines could contain the entire 20 MiB pair).
+// Keep the prior algorithm budget for smaller inputs: 20k lines, 500 edit distance, 200k steps, <=4M trace ints
+// (~16 MiB), and 2k output lines. No 10 MiB split/trace/output allocation is needed.
+const DIFF_MAX_BYTES = 1048576;
+const diffSummary = () => ({ added: null, removed: null, hunks: [], truncated: true });
+// Line diff (Myers) with hard caps:
 //   - the shared prefix/suffix is never materialised as ops (only the hunks' context lines are built);
 //   - the Myers trace (sum of 2d+3 ints per step) is capped at TRACE_INTS; beyond it the changed middle is reported
 //     as a full replacement (truncated: true);
 //   - at most MAX_OUT changed lines are returned in hunks (counts stay exact; truncated: true).
 function lineDiff(a, b) {
+  if (a.length > DIFF_MAX_BYTES || b.length > DIFF_MAX_BYTES) return diffSummary();
   // STEPS bounds CPU for the free plan's 10 ms/request: every diagonal visited and every line compared counts
   // (~2-4 ms at the cap). Typical edits finish far below it; big rewrites come back as a replacement (truncated).
-  // Pathological line counts (e.g. a 1 MiB file of empty lines) are summarised instead of diffed line by line.
+  // Pathological line counts (even within 1 MiB) are summarised instead of diffed line by line.
   const MAX_LINES = 20000;
   const count = (s) => { let k = 1; for (let i = s.indexOf("\n"); i >= 0 && k <= MAX_LINES; i = s.indexOf("\n", i + 1)) k++; return k; };
   if (count(a) > MAX_LINES || count(b) > MAX_LINES) return { added: null, removed: null, hunks: [], truncated: true, too_many_lines: true };
@@ -164,6 +171,8 @@ async function diffRevisions(ctx, projectId, artifactId, fromQ, toQ) {
   if (A.blob_key || B.blob_key || (!A.body_key && typeof A.body !== "string") || (!B.body_key && typeof B.body !== "string"))
     return { from: side(A), to: side(B), binary: true, identical: A.sha256 === B.sha256 };
   if (A.sha256 === B.sha256) return { from: side(A), to: side(B), binary: false, identical: true, added: 0, removed: 0, hunks: [], truncated: false };
+  if (A.size > DIFF_MAX_BYTES || B.size > DIFF_MAX_BYTES)
+    return { from: side(A), to: side(B), binary: false, identical: false, ...diffSummary() };
   return { from: side(A), to: side(B), binary: false, identical: false, ...lineDiff(await getText(ctx.env, A), await getText(ctx.env, B)) };
 }
 // ---------- metadata versions ----------

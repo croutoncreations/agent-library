@@ -57,28 +57,34 @@ function parseCsv(text, file) {
       let cell = "";
       if (text[i] === '"') {
         i++;
+        let start = i;
+        const pieces = [];
         for (; ; ) {
           if (i >= n) throw invalid({ format: "csv", file, line: startLine, detail: "unterminated quoted field" });
           const c = text[i];
           if (c === '"') {
             if (text[i + 1] === '"') {
-              cell += '"';
+              pieces.push(text.slice(start, i + 1));
               i += 2;
+              start = i;
               continue;
             }
+            cell = text.slice(start, i);
+            if (pieces.length) { pieces.push(cell); cell = pieces.join(""); }
             i++;
             break;
           }
           if (c === "\n") line++;
-          cell += c;
           i++;
         }
         if (i < n && text[i] !== "," && text[i] !== "\n" && text[i] !== "\r") throw invalid({ format: "csv", file, line, detail: "unexpected character after closing quote" });
       } else {
+        const start = i;
         while (i < n && text[i] !== "," && text[i] !== "\n" && text[i] !== "\r") {
           if (text[i] === '"') throw invalid({ format: "csv", file, line, detail: "quote inside unquoted field" });
-          cell += text[i++];
+          i++;
         }
+        cell = text.slice(start, i);
       }
       cells.push(cell);
       if (i >= n) break;

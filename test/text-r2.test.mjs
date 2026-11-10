@@ -50,14 +50,18 @@ test("search bridge caps UTF-8 at 1 MiB on real local D1 (known suffix search ga
 
 test("backup text export refuses over 32 MiB before any object read and allows the boundary", async () => {
   const h = await harness();
-  await h.lib.createMarkdown(h.ctx, "proj-s", { title: "Export cap", body: "synthetic" }, "export-cap");
+  const body = "synthetic ".repeat(Math.ceil(8 * 1048576 / 10)).slice(0, 8 * 1048576);
+  const made = await h.lib.createMarkdown(h.ctx, "proj-s", { title: "Export cap", body }, "export-cap");
+  const id = made.body.artifact_id;
+  for (let rev = 1; rev < 4; rev++) await h.lib.saveMarkdown(h.ctx, "proj-s", id, { expected_revision: rev, body }, `export-cap-${rev}`);
   const counts = spyBindings(h.env);
-  h.sql.prepare("UPDATE revisions SET size = ?").run(32 * 1048576 + 1);
+  const backup = await h.lib.exportBackup(h.ctx, "proj-s");
+  assert.equal(backup.revisions.reduce((n, r) => n + Buffer.byteLength(r.body), 0), 32 * 1048576);
+  assert.equal(counts.gets, 4);
+  counts.gets = 0;
+  await h.lib.saveMarkdown(h.ctx, "proj-s", id, { expected_revision: 4, body: "x" }, "export-cap-over");
   await assert.rejects(h.lib.exportBackup(h.ctx, "proj-s"), e => e.status === 413 && e.code === "backup_too_large" && /32 MiB/.test(e.message));
   assert.equal(counts.gets, 0);
-  h.sql.prepare("UPDATE revisions SET size = ?").run(32 * 1048576);
-  assert.equal((await h.lib.exportBackup(h.ctx, "proj-s")).revisions[0].body, "synthetic");
-  assert.equal(counts.gets, 1);
 });
 
 test("comments publish immutable UTF-8 objects, replay without another put, and retain the length limit", async () => {

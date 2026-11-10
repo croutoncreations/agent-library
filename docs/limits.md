@@ -24,7 +24,7 @@ remove. A string that's too long is `413 too_large`; a number out of range is `4
 
 | Limit | Default | Scope | Configure | When you hit it |
 |---|---|---|---|---|
-| Text document size (Markdown, HTML, JSON, CSV) | 1 MiB (UTF-8 bytes) | document version | fixed; text versions are stored in R2; the 1 MiB limit is unchanged in this release | `413 too_large` "Markdown exceeds 1 MiB" |
+| Text document size (Markdown, HTML, JSON, CSV) | 10 MiB (10,485,760 UTF-8 bytes) | document version | fixed; text versions are stored in R2, not a D1 row | `413 too_large` "Markdown exceeds 10 MiB" |
 | File size (images, PDF, video, other uploads) | 25 MiB | file version | `FILE_MAX_BYTES`; plan `file_bytes`. Never above 90 MiB (_ceiling_: Cloudflare refuses requests over 100 MB, and a file is sent in one PUT). Measured on Cloudflare (Workers Paid, 2026-11-10): 25 MiB works; 50 and 80 MiB uploads fail with 1102 (resource limits), so keep `file_bytes` at 25 MiB or less until uploads stop passing the file through the Worker twice | `413 too_large` "Files can be up to 25 MB on this plan", `{ limit: "file_bytes", allowed }` |
 | Storage | unlimited | workspace | plan `storage_bytes` | `402 limit_reached` |
 | JSON nesting | 64 levels | document | fixed | `422 invalid_content` |
@@ -34,6 +34,8 @@ remove. A string that's too long is `413 too_large`; a number out of range is `4
 | Change note | 280 characters | version | fixed | `413 too_large` |
 | Comment | 1–10,000 characters | comment | fixed; new bodies are stored in R2, legacy inline D1 bodies remain readable | `413 too_large` |
 | Versions kept | all, forever | document | fixed (only `storage_bytes` bounds them) | — |
+
+The text limit is a storage bound, not a memory guarantee. CSV validation/preview/spreadsheet export and JSON validation/records parse whole files; a pathological CSV with millions of tiny rows can exceed the Worker's 128 MB memory ceiling even below 10 MiB. There is no new generic CSV row/cell cap in this release (the measurements schema still caps records at 100,000).
 
 ## Projects & folders
 
@@ -72,7 +74,7 @@ remove. A string that's too long is `413 too_large`; a number out of range is `4
 ## Search & lists
 
 The owner's document-list filter matches titles only, for both legacy inline and R2-backed documents. Body matching
-will return through the blind index in slice 4b. The separate ranked search still searches titles and stored text.
+will return through the blind index in slice 4b. The separate ranked search searches titles and the first 1 MiB of stored text until the blind-index slice.
 
 | Limit | Default | Scope | Configure | When you hit it |
 |---|---|---|---|---|
@@ -97,21 +99,22 @@ will return through the blind index in slice 4b. The separate ranked search stil
 | MCP inline image in `read_file` | 1 MiB | call | fixed | only a download link |
 | MCP download links | 10 minutes | link | fixed | link expires |
 | View links (rendered page / file) | 5 / 30 minutes | link | fixed | the app asks for a new one |
-| Request body: app API | 2 MiB | request | fixed | `413 too_large` |
+| Request body: app API | 11 MiB (11,534,336 bytes) for document/data create and save; 2 MiB for every other route (including backup import/restore) | request | fixed | `413 too_large`; message names the request-size limit |
 | Request body: legacy MCP (`/mcp` with a grant token) | 2 MiB | request | fixed | `413` JSON-RPC `-32600` |
 | Request body: OAuth MCP | 1 MiB; 3 MiB for connections with file access | request | fixed | `413` JSON-RPC `-32600` |
-| Request body: `/v1` API and publisher snapshots | 6.5 MB (6,500,000 bytes) | request | fixed | `413 too_large` |
+| Request body: `/v1` API and publisher snapshots | 11 MiB for `/v1` file create and save; 6.5 MB (6,500,000 bytes) for other `/v1` routes and publisher snapshots | request | fixed | `413 too_large`; message names the request-size limit |
 | Request body: publisher generation parts | 256 KiB | request | fixed | `413` |
 
-App API and legacy MCP bodies are counted in UTF-8 bytes as they arrive and never buffered past the cap. An over-cap
-body is read and discarded (up to 16 MiB) before the `413` is sent, so a client that sends the whole body still sees
+App API, `/v1` and legacy MCP bodies are counted in UTF-8 bytes as they arrive and never buffered past the cap. `Content-Length` is checked before buffering. The 10 MiB storage limit depends on the transport: JSON escaping can push a smaller document above the 11 MiB request cap, producing `413`. MCP caps are unchanged; not every transport can write a 10 MiB document.
+
+For app API and legacy MCP, an over-cap body is read and discarded (up to 16 MiB) before the `413` is sent, so a client that sends the whole body still sees
 the error instead of a reset connection.
 
 ## Import & export
 
 | Limit | Default | Scope | Configure | When you hit it |
 |---|---|---|---|---|
-| Backup export | 16 MiB of files (distinct file versions) | project | fixed | `413 backup_too_large`; download large files individually |
+| Backup export | 16 MiB of files (distinct file versions), and 32 MiB of text (sum of text revision sizes) | project | fixed; checked before reading any object | `413 backup_too_large`; download documents/files individually or export a smaller project |
 | Export of a project with App Connect files | refused | project | fixed | `409 backup_unsupported` |
 | Backup import request | 2 MiB | request | fixed | `413 backup_too_large` |
 | Imported documents and files | `items_per_project` (10,000 by default), and at most 2,000 per import (one D1 batch) | import | `PROJECT_ITEMS_MAX`; plan `items_per_project` | `400 bad_backup` |
