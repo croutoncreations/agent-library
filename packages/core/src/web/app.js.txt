@@ -1603,10 +1603,10 @@ async function uploadFile(pid, file, target, keys, status) {
 }
 
 // CSV / JSON files are text artifacts: they are created and replaced through the artifacts API (validated by the
-// server: RFC 4180 CSV / JSON, UTF-8, max 1 MiB), not through the binary upload path.
+// server: RFC 4180 CSV / JSON, UTF-8, max 10 MiB), not through the binary upload path.
 var BINARY_ACCEPT = ".png,.jpg,.jpeg,.webp,.gif,.pdf,.mp4,.webm,image/png,image/jpeg,image/webp,image/gif,application/pdf,video/mp4,video/webm";
 var DATA_ACCEPT = { csv: ".csv,text/csv", json: ".json,application/json" };
-var DATA_MAX_BYTES = 1048576;
+var DATA_MAX_BYTES = 10485760;
 function dataKindOf(file) {
   var n = (file.name || "").toLowerCase();
   if (/\.csv$/.test(n) || file.type === "text/csv") return "csv";
@@ -1618,12 +1618,12 @@ function dataKindOf(file) {
 // Problems found in the browser before anything is sent: shown as-is, with no "retry" hint.
 function localUploadError(text) { var e = new Error(text); e.local = true; return e; }
 async function readDataText(file) {
-  if (file.size > DATA_MAX_BYTES + 3) throw localUploadError(file.name + " is " + fmtBytes(file.size) + "; CSV and JSON files can be up to 1 MB");
+  if (file.size > DATA_MAX_BYTES + 3) throw localUploadError(file.name + " is " + fmtBytes(file.size) + "; CSV and JSON files can be up to 10 MB");
   var text;
   try { text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(await file.arrayBuffer()); }
   catch (e) { throw localUploadError(file.name + " isn't UTF-8 text. Save it as UTF-8 (e.g. \u201CCSV UTF-8\u201D) and try again"); }
   if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
-  if (utf8Len(text) > DATA_MAX_BYTES) throw localUploadError(file.name + " is " + fmtBytes(utf8Len(text)) + "; CSV and JSON files can be up to 1 MB");
+  if (utf8Len(text) > DATA_MAX_BYTES) throw localUploadError(file.name + " is " + fmtBytes(utf8Len(text)) + "; CSV and JSON files can be up to 10 MB");
   return text;
 }
 async function uploadDataFile(pid, file, kind, target, keys, status) {
@@ -1633,8 +1633,9 @@ async function uploadDataFile(pid, file, kind, target, keys, status) {
   try { if (kind === "csv") csvParse(text); else JSON.parse(text); }
   catch (e) { throw localUploadError(file.name + ": " + (kind === "csv" ? e.message : jsonErrorText(e, text)) + ". Fix the file and upload it again"); }
   // The content travels as a JSON string; quote-heavy files grow when escaped and the API caps the whole request
-  // body at 2 MiB (2,097,152 UTF-8 bytes, like this check). 2,000,000 leaves room for the other fields.
-  if (utf8Len(JSON.stringify(text)) > 2000000) throw localUploadError(file.name + " is too large to upload once encoded (lots of quotes or special characters). Split it or remove some rows");
+  // body at 11 MiB. Reserve 8 KiB for fields: even six-byte JSON escapes for title (200), folder (200)
+  // and change note (280), plus kind, identifiers and syntax, fit that allowance.
+  if (utf8Len(JSON.stringify(text)) > 11526144) throw localUploadError(file.name + " exceeds the 11 MB request-size limit once encoded (lots of quotes or special characters). Split it or remove some rows");
   var base = "/api/projects/" + enc(pid) + "/artifacts";
   var sha = hex(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)));
   var fp = [file.name, file.size, file.lastModified, sha, kind, target.artifact_id || "", target.expected_revision || "", target.title || ""].join("|");
@@ -1841,7 +1842,7 @@ async function viewList(pid, trash) {
     // The file size limit is the workspace plan's (usage endpoint: file_bytes); without it, no number.
     var upHelp = h("p", { class: "muted small" }), fileMax = null, dataOn = true;
     function drawUpHelp() {
-      upHelp.textContent = "Images (PNG, JPEG, WebP, GIF), videos (MP4, WebM) or PDF" + (fileMax ? ", up to " + fmtBytes(fileMax).replace(".0 ", " ") : "") + "." + (dataOn ? " CSV or JSON data files (UTF-8), up to 1 MB." : "");
+      upHelp.textContent = "Images (PNG, JPEG, WebP, GIF), videos (MP4, WebM) or PDF" + (fileMax ? ", up to " + fmtBytes(fileMax).replace(".0 ", " ") : "") + "." + (dataOn ? " CSV or JSON data files (UTF-8), up to 10 MB." : "");
     }
     drawUpHelp();
     dataFilesEnabled(pid).then(function (on) { if (on === false) { dataOn = false; drawUpHelp(); } });
@@ -3344,7 +3345,7 @@ function renderDataFile(A, data, ui) {
   ui.addTab("raw", "Raw", null);
   ui.panels.raw.append(raw);
   ui.below.prepend(h("details", { dataset: { write: "1" } }, h("summary", { text: "Replace with a new version" }),
-    h("p", { class: "muted small", text: "Upload a " + (A.meta.kind === "csv" ? "CSV" : "JSON") + " file (UTF-8, up to 1 MB). The current version stays in History." }),
+    h("p", { class: "muted small", text: "Upload a " + (A.meta.kind === "csv" ? "CSV" : "JSON") + " file (UTF-8, up to 10 MB). The current version stays in History." }),
     uploadForm(A.pid, function () { return { artifact_id: A.aid, expected_revision: A.rev }; }, function () { A.reload(); }, A.meta.kind)));
   draw(data).catch(function (e) { holder.replaceChildren(dataProblem("Couldn't load this file (" + e.message + ")", "Reload the page to try again.")); });
 }

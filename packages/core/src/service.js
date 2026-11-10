@@ -1,3 +1,4 @@
+import { TEXT_MAX_BYTES } from "./text-limits.js";
 import { commitTextWrites, getText, isTextWriteFenceError, mapContent, stageTextWrite, textWriteComplete } from "./content-store.js";
 import { authorizeProject, authzSql, contentWriteSql, credentialGate, protectSql, requireHuman } from "./auth.js";
 import { chQuery, cleanupChanges, listChanges } from "./changes/service.js";
@@ -258,8 +259,8 @@ async function history(ctx, projectId, artifactId, opts = {}) {
   return historyPage(ctx, projectId, artifactId, opts);
 }
 function mdBody(v, kind = "markdown") {
-  const body2 = str(v, "body", LIMITS.markdownBytes);
-  if (new TextEncoder().encode(body2).length > LIMITS.markdownBytes) throw new HttpError(413, "too_large", (kind === "html" ? "HTML" : "Markdown") + " exceeds 1 MiB");
+  const body2 = typeof v === "string" ? v : str(v, "body", LIMITS.markdownBytes);
+  if (body2.length > LIMITS.markdownBytes || new TextEncoder().encode(body2).length > LIMITS.markdownBytes) throw new HttpError(413, "too_large", (kind === "html" ? "HTML" : "Markdown") + " exceeds 10 MiB");
   return body2;
 }
 async function createFile(ctx, projectId, input, key) {
@@ -676,7 +677,7 @@ async function listAudit(ctx, projectId) {
 var appConnectEnabled, LIMITS, ascii, BINARY_TYPES, IMAGE_TYPES, VIDEO_TYPES, TEXT_MIME, db, artifactView, ART_COLS;
 appConnectEnabled = (env) => env?.APP_CONNECT_ENABLED === "1";
 LIMITS = {
-  markdownBytes: 1024 * 1024,
+  markdownBytes: TEXT_MAX_BYTES,
   // File size and documents per project are workspace limits (limits.js: file_bytes, items_per_project).
   pageSize: 50,
   commentChars: 1e4

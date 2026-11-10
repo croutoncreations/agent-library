@@ -1,3 +1,4 @@
+import { TEXT_WRITE_BODY_BYTES } from "./text-limits.js";
 import { adapters, notify, resolveAdapters, withAdapters } from "./adapters.js";
 import { browserSignInEnabled, checkEmailPage, signinCallback, signinChoices, signinStart } from "./identity/browser.js";
 import { TURNSTILE_ORIGIN, turnstileSiteKey } from "./identity/turnstile.js";
@@ -61,13 +62,13 @@ function withSec(res) {
   for (const [k, v] of Object.entries(SEC_HEADERS)) if (!r.headers.has(k)) r.headers.set(k, v);
   return r;
 }
-// App JSON request bodies: at most 2 MiB of UTF-8 bytes.
+// App JSON request bodies: 2 MiB except document/data create and save (11 MiB).
 var APP_BODY_BYTES = 2 * 1024 * 1024;
 // Backup import request bodies: also 2 MiB of UTF-8 bytes (refused with backup_too_large).
 var BACKUP_IMPORT_BYTES = 2 * 1024 * 1024;
-async function body(req) {
-  const t = await readTextCapped(req, APP_BODY_BYTES);
-  if (t === null) throw new HttpError(413, "too_large", "Request body too large");
+async function body(req, maxBytes = APP_BODY_BYTES) {
+  const t = await readTextCapped(req, maxBytes);
+  if (t === null) throw new HttpError(413, "too_large", `Request body exceeds ${maxBytes / 1048576} MiB request-size limit`);
   try {
     return t ? JSON.parse(t) : {};
   } catch {
@@ -274,7 +275,7 @@ async function route3(req, env, url, requestId, seen = {}) {
       return json(await listArtifacts(ctx, pid, { query: url.searchParams.get("q") ?? void 0, cursor: url.searchParams.get("cursor") ?? void 0, trashed: url.searchParams.get("trashed") === "1", kind, folderId, withMime: ctx.principal.kind === "human" && url.searchParams.get("include") === "mime" }));
     }
     if (rest.length === 1 && m === "POST") {
-      const b = await body(req);
+      const b = await body(req, TEXT_WRITE_BODY_BYTES);
       if (appConnectEnabled(env)) return out(await createFile(ctx, pid, b, key()));
       if (b?.kind !== void 0 && b.kind !== "markdown" && b.kind !== "html") throw new HttpError(422, "unsupported_kind", "kind must be markdown or html");
       return out(await createMarkdown(ctx, pid, b, key(), b?.kind === "html" ? "html" : "markdown"));
@@ -286,7 +287,7 @@ async function route3(req, env, url, requestId, seen = {}) {
       const r = await getArtifact(ctx, pid, aid, revQ ? Number(revQ) : void 0);
       return json(r, 200, { etag: `"${r.revision.sha256}"` });
     }
-    if (!sub && m === "PUT") return out(appConnectEnabled(env) ? await saveFile(ctx, pid, aid, await body(req), key()) : await saveMarkdown(ctx, pid, aid, await body(req), key()));
+    if (!sub && m === "PUT") return out(appConnectEnabled(env) ? await saveFile(ctx, pid, aid, await body(req, TEXT_WRITE_BODY_BYTES), key()) : await saveMarkdown(ctx, pid, aid, await body(req, TEXT_WRITE_BODY_BYTES), key()));
     if (sub === "records" && m === "GET") {
       const sp = url.searchParams;
       return json(await readRecords(ctx, pid, aid, { from: sp.get("from"), to: sp.get("to"), metric: sp.get("metric"), limit: sp.get("limit"), cursor: sp.get("cursor") }));

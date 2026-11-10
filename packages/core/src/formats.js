@@ -1,3 +1,4 @@
+import { TEXT_MAX_BYTES } from "./text-limits.js";
 import { HttpError } from "./util.js";
 
 function isCalendarDate(v) {
@@ -14,7 +15,7 @@ function byteLength(s) {
 }
 function checkCommon(text, format, file) {
   if (typeof text !== "string") throw new HttpError(400, "invalid_input", "content must be a string");
-  if (byteLength(text) > MAX_FILE_BYTES) throw new HttpError(413, "too_large", `${format} file exceeds 1 MiB`, file ? { file } : void 0);
+  if (byteLength(text) > MAX_FILE_BYTES) throw new HttpError(413, "too_large", `${format} file exceeds 10 MiB`, file ? { file } : void 0);
   if (text.charCodeAt(0) === 65279) throw invalid({ format, file, detail: "byte order mark not allowed" });
   if (/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(text)) throw invalid({ format, file, detail: "invalid UTF-16 surrogate (not encodable as UTF-8)" });
 }
@@ -182,7 +183,7 @@ function spreadsheetSafeCsv(text) {
 var MEASUREMENTS, SCHEMAS, MAX_FILE_BYTES, CSV_MEASUREMENT_COLUMNS, MAX_RECORDS, MAX_DEPTH, DATE_RE, METRIC_RE, NUM_RE, invalid, MIME, CONTENT_TYPE;
 MEASUREMENTS = "agentlib.measurements/1";
 SCHEMAS = /* @__PURE__ */ new Set([MEASUREMENTS]);
-MAX_FILE_BYTES = 1024 * 1024;
+MAX_FILE_BYTES = TEXT_MAX_BYTES;
 CSV_MEASUREMENT_COLUMNS = ["id", "recorded_at", "date", "metric", "value", "unit", "source_id"];
 MAX_RECORDS = 1e5;
 MAX_DEPTH = 64;

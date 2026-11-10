@@ -1,3 +1,4 @@
+import { TEXT_MAX_BYTES } from "./text-limits.js";
 import { personalWorkspaceId } from "./tenancy.js";
 import { commitTextWrites, deleteBlob, getBlob, putBlob, getText, mapContent, stageTextWrites, textKey, textWriteComplete } from "./content-store.js";
 import { textSearchBridge } from "./search/service.js";
@@ -86,7 +87,8 @@ async function validateBackup(backup) {
   const decoded = /* @__PURE__ */ new Map();
   for (const r of backup.revisions) {
     if (r.blob_key === null) {
-      if (typeof r.body !== "string" || await sha256Hex(r.body) !== r.sha256) throw new HttpError(400, "bad_backup", `Revision ${r.id} hash mismatch`);
+      if (typeof r.body !== "string" || new TextEncoder().encode(r.body).length > TEXT_MAX_BYTES) throw new HttpError(400, "bad_backup", "Text revision exceeds 10 MiB or is not a string");
+      if (await sha256Hex(r.body) !== r.sha256) throw new HttpError(400, "bad_backup", `Revision ${r.id} hash mismatch`);
       continue;
     }
     if (!new RegExp(`^blobs/${pid}/[A-Za-z0-9_-]+/[A-Za-z0-9_-]+$`).test(r.blob_key)) throw new HttpError(400, "bad_backup", "Bad blob key");

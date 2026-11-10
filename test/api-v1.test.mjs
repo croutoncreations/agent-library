@@ -143,10 +143,10 @@ test("Muse round trip: list, create, read, update, stale 409, idempotent replay,
   assert.equal((await call("POST", `/v1/projects/${PA}/files`, { token: t, idem: key(), raw: "title=x", headers: { "content-type": "application/x-www-form-urlencoded" } })).status, 415);
   assert.equal((await call("POST", `/v1/projects/${PA}/files`, { token: t, idem: key(), raw: "{", headers: { "content-type": "application/json" } })).status, 400);
   // Oversized declared body: the server answers 413 from Content-Length before reading the body. Send only a
-  // prefix and read the response; streaming all 6.6 MB races the early reply (the client then sees EPIPE).
+  // prefix and read the response; streaming all 11+ MiB races the early reply (the client then sees EPIPE).
   const big = await new Promise((res, rej) => {
     const rq = httpRequest({ host: "127.0.0.1", port: PORT, method: "POST", path: `/v1/projects/${PA}/files`,
-      headers: { authorization: `Bearer ${t}`, "idempotency-key": key(), "content-type": "application/json", "content-length": "6600000" } },
+      headers: { authorization: `Bearer ${t}`, "idempotency-key": key(), "content-type": "application/json", "content-length": "11534337" } },
       (r) => { let b = ""; r.setEncoding("utf8"); r.on("data", (c) => { b += c; }); r.on("end", () => { res({ status: r.statusCode, body: b }); rq.destroy(); }); });
     rq.on("error", (e) => { if (e.code !== "ECONNRESET" && e.code !== "EPIPE") rej(e); });
     rq.write("x".repeat(65536));
@@ -256,8 +256,8 @@ test("contract details: case-insensitive Bearer scheme; escaped non-ASCII Markdo
   assert.equal(r.status, 201, r.text.slice(0, 200));
   const back = await call("GET", `/v1/projects/${PA}/files/${r.json.artifact_id}`, { token: k.secret });
   assert.equal(back.json.body, body);
-  // Over 1 MiB decoded is still refused by the service limit.
-  const big = await call("POST", `/v1/projects/${PA}/files`, { token: k.secret, idem: key(), body: { title: "big", body: "漢".repeat(400_000) } });
+  // Over 10 MiB decoded is still refused by the service limit.
+  const big = await call("POST", `/v1/projects/${PA}/files`, { token: k.secret, idem: key(), body: { title: "big", body: "漢".repeat(3_495_254) } });
   assert.equal(big.status, 413);
   // Revoke writes exactly one audit row, atomically.
   await owner.req("POST", `/api/api-keys/${k.id}/revoke`, {});

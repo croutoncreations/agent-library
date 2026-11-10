@@ -1,3 +1,4 @@
+import { TEXT_WRITE_BODY_BYTES } from "../text-limits.js";
 import { readOnlyError } from "../tenancy.js";
 import { verifyApiKey } from "./credentials.js";
 import { agentRate, limitsFor, rateLimit } from "../auth.js";
@@ -30,11 +31,12 @@ var R2 = {
   folders: new RegExp(`^/v1/projects/${SEG}/folders$`)
 };
 var isV1Path = (p) => p === "/v1" || p.startsWith("/v1/");
-async function readJson(req) {
+async function readJson(req, maxBytes = MAX_BODY2) {
+  const tooLarge = () => new HttpError(413, "too_large", `Request body exceeds ${maxBytes === TEXT_WRITE_BODY_BYTES ? "11 MiB" : "6,500,000 bytes"} request-size limit`);
   const ct = (req.headers.get("content-type") ?? "").toLowerCase();
   if (!ct.startsWith("application/json")) throw new HttpError(415, "unsupported_media_type", "Content-Type must be application/json");
   const declared = req.headers.get("content-length");
-  if (declared !== null && !(Number(declared) <= MAX_BODY2)) throw new HttpError(413, "too_large", "Request body too large");
+  if (declared !== null && !(Number(declared) <= maxBytes)) throw tooLarge();
   const reader = req.body?.getReader();
   const parts = [];
   let n = 0;
@@ -42,10 +44,9 @@ async function readJson(req) {
     const { done, value } = await reader.read();
     if (done) break;
     n += value.byteLength;
-    if (n > MAX_BODY2) {
-      await reader.cancel().catch(() => {
-      });
-      throw new HttpError(413, "too_large", "Request body too large");
+    if (n > maxBytes) {
+      await reader.cancel().catch(() => {});
+      throw tooLarge();
     }
     parts.push(value);
   }
@@ -162,7 +163,7 @@ async function route2(req, env, url, requestId, seen = {}) {
     if (m === "POST") {
       writeAllowed(k, pid);
       const key = idemKey(req.headers.get("idempotency-key"));
-      const b = await readJson(req);
+      const b = await readJson(req, TEXT_WRITE_BODY_BYTES);
       if (!appConnectEnabled(env)) {
         if (b.kind !== void 0 && b.kind !== "markdown" && b.kind !== "html") throw new HttpError(422, "unsupported_kind", 'Only kind "markdown" or "html" is supported in this version');
         const r2 = await createMarkdown(projectCtx(env, k, requestId, pid), pid, { title: b.title, body: b.body ?? "", folder: b.folder, change_note: b.change_note }, key, b.kind === "html" ? "html" : "markdown");
@@ -193,7 +194,7 @@ async function route2(req, env, url, requestId, seen = {}) {
     if (m === "PUT") {
       writeAllowed(k, pid);
       const key = idemKey(req.headers.get("idempotency-key"));
-      const b = await readJson(req);
+      const b = await readJson(req, TEXT_WRITE_BODY_BYTES);
       const r = appConnectEnabled(env) ? await saveFile(projectCtx(env, k, requestId, pid), pid, fid, { expected_revision: b.expected_revision, body: b.body, content: b.content, change_note: b.change_note }, key) : await saveMarkdown(projectCtx(env, k, requestId, pid), pid, fid, { expected_revision: b.expected_revision, body: b.body, change_note: b.change_note }, key);
       return json(withLinks(origin, pid, r).body, r.status);
     }
