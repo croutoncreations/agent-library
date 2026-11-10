@@ -31,13 +31,20 @@ export async function putBlob(env, key, bytes, options) {
 /**
  * Write a stream of exactly `length` bytes under an immutable key without buffering it (R2 accepts a stream only
  * with a known length, hence FixedLengthStream). Rejects, storing nothing, if the stream errors or is not exactly
- * `length` bytes long.
+ * `length` bytes long, or if `options.sha256` is given and the stored bytes hash differently. Returns the R2 object
+ * (size, checksums).
  */
 export async function putBlobStream(env, key, stream, length, options) {
   return env.BLOBS.put(key, stream.pipeThrough(new FixedLengthStream(length)), options);
 }
 
-/** Object metadata (size), or null. */
+/** The SHA-256 (lowercase hex) R2 recorded for an object from put() or head(), or null if it has none. */
+export function blobSha256Hex(obj) {
+  const b = obj?.checksums?.sha256;
+  return b ? [...new Uint8Array(b)].map((x) => x.toString(16).padStart(2, "0")).join("") : null;
+}
+
+/** Object metadata (size, checksums), or null. */
 export async function headBlob(env, key) {
   return env.BLOBS.head(key);
 }
