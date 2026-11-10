@@ -44,8 +44,11 @@ unknown batch errors retain bytes because the transaction may have committed des
 
 One leak remains: if a put lands after the sweep deleted its intent, and the Worker dies before best-effort cleanup,
 the late unreferenced object has no intent left for another sweep. It can never publish; project purge sweeps the
-text prefix. Multi-put imports and snapshots remain sequential: an operation taking over ten minutes expires its
-early intents and rolls back atomically rather than publishing partial data.
+text prefix. Imports, restores and snapshot commits insert intents in chunks of 100 immediately before each
+chunk's puts, with at most six object operations in flight. Exports use the same bounded read concurrency.
+An operation taking over ten minutes can still expire its early intents and rolls back atomically rather than
+publishing partial data. Settled-batch cleanup queries all unreferenced keys together, deletes objects in R2
+batches of at most 1,000, then removes their intents in one statement; failed deletes leave intents for cron.
 
 Comments remain inline through `storeText`/`readText`. Publisher generation commits also remain inline until a later
 slice. `test/content-store.test.mjs` checks NULL revision inserts (with explicit generation exceptions), restricts R2

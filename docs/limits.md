@@ -116,6 +116,13 @@ the error instead of a reset connection.
 | Imported file bytes | `PROJECT_BINARY_BYTES` (`"0"` = no cap) | import | `PROJECT_BINARY_BYTES` | `400 bad_backup` |
 | Workspace limits on import | `projects`, `storage_bytes` | workspace | plan | `402 limit_reached` |
 
+Text versions cost one R2 call per version on import, restore and export. Import and restore also use about
+one D1 call per 100 text versions for staging, plus the publication batch and fixed validation/cleanup calls.
+Cloudflare's [subrequest limits](https://developers.cloudflare.com/workers/platform/limits/#subrequests) mean
+the 2,000-version import cap fits Workers Paid (10,000 subrequests). On Workers Free (1,000 calls to Cloudflare
+services), an import, restore or export with more than roughly 900 text versions fails. This is a platform ceiling,
+not a plan check; file versions and other request work also consume calls.
+
 ## Sign-in & sessions
 
 | Limit | Default | Scope | Configure | When you hit it |

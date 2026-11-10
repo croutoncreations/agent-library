@@ -55,6 +55,11 @@ export async function deleteBlob(env, key) {
   return env.BLOBS.delete(key);
 }
 
+/** R2 accepts at most 1,000 keys in one delete call. Callers remove intents only after this succeeds. */
+export async function deleteBlobs(env, keys) {
+  for (let i = 0; i < keys.length; i += 1000) await env.BLOBS.delete(keys.slice(i, i + 1000));
+}
+
 /** Up to `limit` object keys under a prefix (one page), for cleanup sweeps. */
 export async function listBlobKeys(env, prefix, limit = 100) {
   const r = await env.BLOBS.list({ prefix, limit });
@@ -112,6 +117,33 @@ export async function stageTextWrite(env, projectId, artifactId, revisionId, tex
   return key;
 }
 
+// Stay within Workers' six simultaneous connections, and await every in-flight operation on failure.
+const CONTENT_CONCURRENCY = 6;
+export async function mapContent(items, operation) {
+  const results = new Array(items.length);
+  let next = 0, failed = false, failure;
+  await Promise.all(Array.from({ length: Math.min(CONTENT_CONCURRENCY, items.length) }, async () => {
+    while (!failed && next < items.length) {
+      const i = next++;
+      try { results[i] = await operation(items[i], i); }
+      catch (error) { if (!failed) { failed = true; failure = error; } }
+    }
+  }));
+  if (failed) throw failure;
+  return results;
+}
+
+/** Stage multi-version operations in fresh 100-intent batches immediately before each chunk's bounded puts. */
+export async function stageTextWrites(env, writes) {
+  const staged = writes.map(w => ({ ...w, key: textKey(w.projectId, w.artifactId, w.revisionId, w.attempt) }));
+  for (let i = 0; i < staged.length; i += 100) {
+    const chunk = staged.slice(i, i + 100), now = Date.now();
+    await env.DB.batch(chunk.map(w => env.DB.prepare("INSERT INTO content_writes (key, project_id, created_at) VALUES (?, ?, ?)").bind(w.key, w.projectId, now)));
+    await mapContent(chunk, w => putText(env, { projectId: w.projectId }, w.key, w.text));
+  }
+  return staged.map(w => w.key);
+}
+
 /** Include in the same transaction that references the immutable key. */
 export function textWriteComplete(env, key) {
   return env.DB.prepare("DELETE FROM content_writes WHERE key = ? AND EXISTS (SELECT 1 FROM revisions WHERE body_key = ?)").bind(key, key);
@@ -150,12 +182,15 @@ export async function commitTextWrites(env, keys, commit) {
     throw new HttpError(503, "text_write_expired", "Text write expired before publication; retry with the same idempotency key");
   } finally {
     // Unknown errors may be a lost acknowledgement of a successful commit. Leave their intent/bytes to cron.
-    if (settled) for (const key of keys) {
+    if (settled && keys.length) {
       try {
-        const referenced = await env.DB.prepare("SELECT 1 FROM revisions WHERE body_key = ? LIMIT 1").bind(key).first();
-        if (!referenced) {
-          await deleteBlob(env, key);
-          await env.DB.prepare("DELETE FROM content_writes WHERE key = ?").bind(key).run();
+        const unreferenced = await env.DB.prepare(`SELECT j.value AS key FROM json_each(?) j
+          WHERE NOT EXISTS (SELECT 1 FROM revisions WHERE body_key = j.value)
+            AND NOT EXISTS (SELECT 1 FROM comments WHERE body_key = j.value)`).bind(JSON.stringify(keys)).all();
+        const orphanKeys = unreferenced.results.map(r => r.key);
+        if (orphanKeys.length) {
+          await deleteBlobs(env, orphanKeys);
+          await env.DB.prepare("DELETE FROM content_writes WHERE key IN (SELECT value FROM json_each(?))").bind(JSON.stringify(orphanKeys)).run();
         }
       } catch { console.error(JSON.stringify({ event: "text_write_cleanup_failed" })); }
     }

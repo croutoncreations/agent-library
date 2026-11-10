@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { putText, getText, getTextRange } from "../packages/core/src/content-store.js";
+import { putText, getText, getTextRange, textKey } from "../packages/core/src/content-store.js";
 import { DatabaseSync } from "node:sqlite";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
@@ -10,13 +10,13 @@ import { SERVER_PORTS } from "./ports.mjs";
 import { commitTextWrites, isTextWriteFenceError } from "../packages/core/src/content-store.js";
 
 async function harness() {
-  const lib = await loadWorker({ "service.js": ["createMarkdown", "saveMarkdown", "getArtifact", "restoreRevision", "updateMetadata", "listArtifacts"], "reads/service.js": ["readTextChunk"], "uploads.js": ["serveContent"], "history/service.js": ["diffRevisions"], "backup.js": ["exportBackup", "restoreBackup"], "cleanup.js": ["reconcileUploads"], "adapters.js": ["withAdapters", "defaultAdapters"] });
+  const lib = await loadWorker({ "service.js": ["createMarkdown", "saveMarkdown", "getArtifact", "restoreRevision", "updateMetadata", "listArtifacts"], "reads/service.js": ["readTextChunk"], "uploads.js": ["serveContent"], "history/service.js": ["diffRevisions"], "backup.js": ["exportBackup", "restoreBackup", "importBackup"], "cleanup.js": ["reconcileUploads"], "content-store.js": ["stageTextWrites", "commitTextWrites"], "adapters.js": ["withAdapters", "defaultAdapters"] });
   const sql = new DatabaseSync(":memory:");
   for (const f of readdirSync(join(ROOT, "migrations")).filter(f => f.endsWith(".sql")).sort()) sql.exec(readFileSync(join(ROOT, "migrations", f), "utf8"));
   const stmt = (q, p = []) => ({ q, p, bind: (...p) => stmt(q, p), async first(c) { const r = sql.prepare(q).get(...p); return c ? r?.[c] ?? null : r ?? null; }, async all() { return { results: sql.prepare(q).all(...p) }; }, async run() { return { meta: { changes: sql.prepare(q).run(...p).changes } }; } });
   const DB = { prepare: q => stmt(q), async batch(stmts) { sql.exec("BEGIN"); try { const out = stmts.map(s => /^\s*(SELECT|WITH)/i.test(s.q) || /RETURNING/i.test(s.q) ? { results: sql.prepare(s.q).all(...s.p), meta: { changes: 0 } } : { meta: { changes: sql.prepare(s.q).run(...s.p).changes } }); sql.exec("COMMIT"); return out; } catch (e) { sql.exec("ROLLBACK"); throw e; } } };
   const objects = new Map();
-  const BLOBS = { async put(k, b) { objects.set(k, new Uint8Array(b)); }, async delete(k) { objects.delete(k); }, async get(k, o) { let b = objects.get(k); if (!b) return null; if (o?.range) b = b.slice(o.range.offset, o.range.offset + o.range.length); return { async arrayBuffer() { return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength); } }; } };
+  const BLOBS = { async put(k, b) { objects.set(k, new Uint8Array(b)); }, async delete(k) { for (const key of Array.isArray(k) ? k : [k]) objects.delete(key); }, async get(k, o) { let b = objects.get(k); if (!b) return null; if (o?.range) b = b.slice(o.range.offset, o.range.offset + o.range.length); return { async arrayBuffer() { return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength); } }; } };
   const env = lib.withAdapters({ DB, BLOBS }, lib.defaultAdapters());
   const at = new Date().toISOString();
   sql.prepare("INSERT INTO principals (id, kind, issuer, subject, label, created_at) VALUES ('hum_s','human','synthetic','s','Owner',?)").run(at);
@@ -258,12 +258,156 @@ test("restore preserves unusual legacy IDs without aliasing text keys and refuse
   assert.deepEqual((await roundTrip.lib.exportBackup(roundTrip.ctx, "proj-s")).revisions, backup.revisions);
   for (const revision of backup.revisions) assert.equal((await target.lib.getArtifact(target.ctx, "proj-s", revision.artifact_id)).body, revision.body);
   const tooLong = structuredClone(backup);
-  tooLong.revisions[1].id = "x".repeat(1025);
+  // The three-segment form fits exactly; restore's attempt suffix must be included in preflight.
+  tooLong.revisions[1].id = "x".repeat(1024 - new TextEncoder().encode(textKey("proj-s", tooLong.revisions[1].artifact_id, "")).length);
+  assert.equal(new TextEncoder().encode(textKey("proj-s", tooLong.revisions[1].artifact_id, tooLong.revisions[1].id)).length, 1024);
   const empty = await harness();
   empty.sql.exec("DELETE FROM projects");
   await assert.rejects(empty.lib.restoreBackup(empty.ctx, tooLong), e => e.status === 400 && e.code === "bad_backup");
   assert.equal(empty.objects.size, 0);
   assert.equal(empty.sql.prepare("SELECT COUNT(*) AS n FROM content_writes").get().n, 0);
+});
+
+function spyBindings(env) {
+  const counts = { db: 0, puts: 0, gets: 0, deletes: 0, inFlight: 0, maxInFlight: 0 };
+  const prepare = env.DB.prepare;
+  const wrap = statement => new Proxy(statement, { get(target, prop) {
+    if (prop === "bind") return (...args) => wrap(target.bind(...args));
+    if (["first", "all", "run"].includes(prop)) return (...args) => { counts.db++; return target[prop](...args); };
+    return target[prop];
+  } });
+  env.DB.prepare = (...args) => wrap(prepare(...args));
+  const batch = env.DB.batch;
+  env.DB.batch = async statements => { counts.db++; return batch(statements); };
+  for (const method of ["put", "get", "delete"]) {
+    const original = env.BLOBS[method];
+    env.BLOBS[method] = async (...args) => {
+      counts[method === "delete" ? "deletes" : `${method}s`]++;
+      counts.maxInFlight = Math.max(counts.maxInFlight, ++counts.inFlight);
+      try { await new Promise(resolve => setImmediate(resolve)); return await original(...args); }
+      finally { counts.inFlight--; }
+    };
+  }
+  return counts;
+}
+
+async function bulkBackup(n = 250) {
+  const backup = await twoVersionBackup();
+  const revision = backup.revisions[0];
+  backup.revisions = await Promise.all(Array.from({ length: n }, async (_, i) => {
+    const body = `version ${i + 1} café🙂`;
+    return { ...revision, id: `bulk-rev-${i + 1}`, rev_no: i + 1, body, size: new TextEncoder().encode(body).length,
+      sha256: Buffer.from(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(body))).toString("hex") };
+  }));
+  backup.artifacts[0].head_rev = n;
+  backup.artifacts[0].head_revision_id = backup.revisions.at(-1).id;
+  return backup;
+}
+
+test("250-version import batches intents, bounds object concurrency and exports every body", async t => {
+  const backup = await bulkBackup();
+  const target = await harness();
+  const counts = spyBindings(target.env);
+  const batch = target.env.DB.batch;
+  let beforePublish;
+  target.env.DB.batch = async statements => {
+    if (statements.some(s => /INSERT INTO revisions/.test(s.q))) beforePublish = counts.db;
+    return batch(statements);
+  };
+  const result = await target.lib.importBackup(target.ctx, "wsp_hum_s", { backup }, "bulk-import");
+  assert.equal(counts.puts, 250);
+  assert.ok(beforePublish <= 10, `D1 calls before publication: ${beforePublish}`);
+  assert.ok(counts.maxInFlight <= 6, `object concurrency: ${counts.maxInFlight}`);
+  assert.ok(counts.maxInFlight > 1, "multi-key puts run concurrently");
+  assert.equal(target.sql.prepare("SELECT COUNT(*) AS n FROM content_writes").get().n, 0);
+  const putMaxInFlight = counts.maxInFlight;
+  counts.maxInFlight = 0;
+  const exported = await target.lib.exportBackup(target.ctx, result.project_id);
+  assert.equal(counts.gets, 250);
+  assert.ok(counts.maxInFlight <= 6, `export concurrency: ${counts.maxInFlight}`);
+  assert.deepEqual(exported.revisions.sort((a,b) => a.rev_no - b.rev_no).map(r => r.body), backup.revisions.map(r => r.body));
+  t.diagnostic(JSON.stringify({ beforePublish, puts: counts.puts, putMaxInFlight, exportGets: counts.gets, exportMaxInFlight: counts.maxInFlight }));
+});
+
+test("settled failed 250-key publication cleans objects and intents with bounded calls", async t => {
+  const backup = await bulkBackup();
+  const target = await harness();
+  const counts = spyBindings(target.env);
+  const batch = target.env.DB.batch;
+  let atFailure;
+  target.env.DB.batch = async statements => {
+    if (statements.some(s => /INSERT INTO revisions/.test(s.q))) {
+      target.sql.exec("UPDATE content_writes SET created_at = 0");
+      atFailure = counts.db;
+    }
+    return batch(statements);
+  };
+  await assert.rejects(target.lib.importBackup(target.ctx, "wsp_hum_s", { backup }, "bulk-expire"), e => e.code === "text_write_expired");
+  assert.equal(counts.puts, 250);
+  assert.ok(counts.db - atFailure <= 3, `failed batch plus cleanup D1 calls: ${counts.db - atFailure}`);
+  assert.equal(counts.deletes, 1);
+  assert.equal(target.objects.size, 0);
+  assert.equal(target.sql.prepare("SELECT COUNT(*) AS n FROM content_writes").get().n, 0);
+  t.diagnostic(JSON.stringify({ failedBatchAndCleanupDb: counts.db - atFailure, objectDeletes: counts.deletes }));
+});
+
+test("multi-key staging inserts only each current chunk and waits for in-flight puts on failure", async () => {
+  const target = await harness();
+  const writes = Array.from({ length: 250 }, (_, i) => ({ projectId: "proj-s", artifactId: "chunk", revisionId: `r${i}`, text: `body ${i}` }));
+  const batch = target.env.DB.batch;
+  const sizes = [];
+  target.env.DB.batch = async statements => { sizes.push(statements.length); return batch(statements); };
+  const put = target.env.BLOBS.put;
+  const stagedAtPut = [];
+  target.env.BLOBS.put = async (key, bytes) => {
+    const i = Number(key.split("/").at(-1).slice(1));
+    assert.equal(target.sql.prepare("SELECT COUNT(*) AS n FROM content_writes").get().n, Math.min(250, (Math.floor(i / 100) + 1) * 100));
+    if (i % 100 === 0) stagedAtPut.push(i);
+    return put(key, bytes);
+  };
+  await target.lib.stageTextWrites(target.env, writes);
+  assert.deepEqual(sizes, [100, 100, 50]);
+  assert.deepEqual(stagedAtPut, [0, 100, 200]);
+  const failed = await harness();
+  let inFlight = 0;
+  failed.env.BLOBS.put = async key => {
+    inFlight++;
+    try {
+      if (key.endsWith("/r1")) throw new Error("synthetic chunk failure");
+      await new Promise(resolve => setImmediate(resolve));
+    } finally { inFlight--; }
+  };
+  await assert.rejects(failed.lib.stageTextWrites(failed.env, writes), /chunk failure/);
+  assert.equal(inFlight, 0);
+  assert.equal(failed.sql.prepare("SELECT COUNT(*) AS n FROM content_writes").get().n, 100);
+});
+
+test("bulk disposal splits R2 deletes at 1000 and retains referenced text and intents on delete failure", async () => {
+  const target = await harness();
+  const created = await target.lib.createMarkdown(target.ctx, "proj-s", { title: "Referenced", body: "keep" }, "bulk-keep");
+  const referenced = target.sql.prepare("SELECT body_key FROM revisions").get().body_key;
+  const commentKey = "text/proj-s/comment/key";
+  target.sql.prepare("INSERT INTO comments (id, project_id, artifact_id, rev_no, author_id, body, body_key, created_at) VALUES ('comment', 'proj-s', ?, 1, 'hum_s', 'synthetic comment', ?, ?)").run(created.body.artifact_id, commentKey, new Date().toISOString());
+  const keys = Array.from({ length: 2005 }, (_, i) => `text/proj-s/dispose/r${i}`);
+  for (const key of [...keys, referenced, commentKey]) {
+    target.sql.prepare("INSERT INTO content_writes (key, project_id, created_at) VALUES (?, 'proj-s', ?)").run(key, Date.now());
+    if (!target.objects.has(key)) target.objects.set(key, new TextEncoder().encode("synthetic"));
+  }
+  const remove = target.env.BLOBS.delete, sizes = [];
+  target.env.BLOBS.delete = async keys => { sizes.push(keys.length); return remove(keys); };
+  await target.lib.commitTextWrites(target.env, [...keys, referenced, commentKey], async () => []);
+  assert.deepEqual(sizes, [1000, 1000, 5]);
+  assert.equal(target.objects.size, 2);
+  assert.ok(target.objects.has(referenced));
+  assert.ok(target.objects.has(commentKey));
+  assert.equal(target.sql.prepare("SELECT COUNT(*) AS n FROM content_writes").get().n, 2);
+  const key = keys[0];
+  target.sql.prepare("INSERT INTO content_writes (key, project_id, created_at) VALUES (?, 'proj-s', ?)").run(key, Date.now());
+  target.objects.set(key, new TextEncoder().encode("retry later"));
+  target.env.BLOBS.delete = async () => { throw new Error("synthetic bulk delete failure"); };
+  await target.lib.commitTextWrites(target.env, [key], async () => []);
+  assert.ok(target.objects.has(key));
+  assert.ok(target.sql.prepare("SELECT 1 FROM content_writes WHERE key = ?").get(key));
 });
 
 async function twoVersionBackup() {

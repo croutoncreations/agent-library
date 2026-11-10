@@ -1,5 +1,5 @@
 import { personalWorkspaceId } from "./tenancy.js";
-import { commitTextWrites, deleteBlob, getBlob, putBlob, getText, readText, stageTextWrite, storeText, textKey, textWriteComplete } from "./content-store.js";
+import { commitTextWrites, deleteBlob, getBlob, putBlob, getText, mapContent, readText, stageTextWrites, storeText, textKey, textWriteComplete } from "./content-store.js";
 import { textSearchBridge } from "./search/service.js";
 import { limitsFor, requireHuman } from "./auth.js";
 import { BINARY_TYPES, LIMITS, tplDate } from "./service.js";
@@ -54,7 +54,7 @@ async function exportBackup(ctx, projectId) {
     exported_at: nowIso(),
     project: { id: p.id, title: p.title, created_at: p.created_at },
     artifacts: arts.results,
-    revisions: await Promise.all(revs.results.map(async ({ body_key, ...r }) => ({ ...r, body: r.blob_key ? null : await getText(ctx.env, { ...r, body_key }) }))),
+    revisions: await mapContent(revs.results, async ({ body_key, ...r }) => ({ ...r, body: r.blob_key ? null : await getText(ctx.env, { ...r, body_key }) })),
     comments: comments.results.map((c) => ({ ...c, body: readText(c.body) })),
     meta_versions: metaVersionsExport,
     blobs
@@ -120,10 +120,11 @@ async function restoreBackup(ctx, backup) {
   for (const a of backup.artifacts)
     stmts.push(DB.prepare(`INSERT INTO artifacts (id, project_id, kind, title, folder, tags, head_rev, head_revision_id, meta_version, trashed_at, created_at, updated_at, is_template, template_description, source_artifact_id, source_revision, source_role, template_date)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(a.id, pid, a.kind, a.title, a.folder, a.tags, a.head_rev, a.head_revision_id, a.meta_version, a.trashed_at, a.created_at, a.updated_at, a.is_template ?? 0, a.template_description ?? "", a.source_artifact_id ?? null, a.source_revision ?? null, a.source_role ?? null, a.template_date ?? null));
-  const textKeys = [];
+  const textKeys = [], textWrites = [];
   const bridges = [];
   for (const r of backup.revisions) {
-    const bodyKey = r.blob_key ? null : await stageTextWrite(ctx.env, pid, r.artifact_id, r.id, r.body, attempt);
+    const bodyKey = r.blob_key ? null : textKey(pid, r.artifact_id, r.id, attempt);
+    if (bodyKey) textWrites.push({ projectId: pid, artifactId: r.artifact_id, revisionId: r.id, text: r.body, attempt });
     if (bodyKey) { textKeys.push(bodyKey); bridges.push(textSearchBridge(ctx.env, r.artifact_id, r.id, r.body), textWriteComplete(ctx.env, bodyKey)); }
     stmts.push(DB.prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, body_key, blob_key, size, sha256, mime, restored_from, created_at, via_kind, via_id, via_label, client_info, change_note)
       VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(r.id, r.artifact_id, pid, r.rev_no, r.author_id, bodyKey, r.blob_key, r.size, r.sha256, r.mime, r.restored_from, r.created_at, r.via_kind ?? null, r.via_id ?? null, r.via_label ?? null, r.client_info ?? null, r.change_note ?? null));
@@ -134,6 +135,7 @@ async function restoreBackup(ctx, backup) {
   for (const c of backup.comments)
     stmts.push(DB.prepare("INSERT INTO comments (id, project_id, artifact_id, rev_no, author_id, body, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(c.id, pid, c.artifact_id, c.rev_no, c.author_id, storeText(c.body), c.created_at));
   stmts.push(DB.prepare("INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id) VALUES (?, ?, ?, 'backup.restore', ?, 'ok', ?)").bind(nowIso(), ctx.principal.id, pid, pid, ctx.requestId));
+  await stageTextWrites(ctx.env, textWrites);
   try {
     await commitTextWrites(ctx.env, textKeys, (guarded) => DB.batch(guarded([...stmts, ...bridges])));
   } catch (error) {
@@ -258,11 +260,12 @@ async function importBackup(ctx, workspaceId, input, idemKeyValue, digest = "") 
     stmts.push(DB.prepare(`INSERT INTO artifacts (id, project_id, kind, title, folder, tags, head_rev, head_revision_id, meta_version, trashed_at, created_at, updated_at, is_template, template_description, source_artifact_id, source_revision, source_role, template_date)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(artId.get(a.id), pid, a.kind, a.title, a.folder ?? "", a.tags ?? "[]", a.head_rev, revId.get(a.head_revision_id) ?? null, a.meta_version, a.trashed_at ?? null, a.created_at, a.updated_at, a.is_template ?? 0, a.template_description ?? "", src ? artId.get(a.source_artifact_id) : null, src ? a.source_revision : null, src ? a.source_role : null, a.template_date ?? null));
   }
-  const textKeys = [];
+  const textKeys = [], textWrites = [];
   const bridges = [];
   for (const r of backup.revisions) {
     const aid = artId.get(r.artifact_id), rid = revId.get(r.id);
-    const bodyKey = r.blob_key ? null : await stageTextWrite(ctx.env, pid, aid, rid, r.body);
+    const bodyKey = r.blob_key ? null : textKey(pid, aid, rid);
+    if (bodyKey) textWrites.push({ projectId: pid, artifactId: aid, revisionId: rid, text: r.body });
     if (bodyKey) { textKeys.push(bodyKey); bridges.push(textSearchBridge(ctx.env, aid, rid, r.body), textWriteComplete(ctx.env, bodyKey)); }
     stmts.push(DB.prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, body_key, blob_key, size, sha256, mime, restored_from, created_at, via_kind, via_id, via_label, client_info, change_note)
       VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(rid, aid, pid, r.rev_no, me, bodyKey, r.blob_key === null ? null : keyMap.get(r.blob_key), r.size, r.sha256, r.mime, r.restored_from ?? null, r.created_at, r.via_kind ?? null, null, r.via_label ? `${r.via_label} (imported)` : "imported", r.client_info ?? null, r.change_note ?? null));
@@ -278,6 +281,7 @@ async function importBackup(ctx, workspaceId, input, idemKeyValue, digest = "") 
   if (idemKeyValue) stmts.push(DB.prepare(`INSERT INTO idempotency (principal_id, project_id, op, key, digest, status, response, created_at) SELECT ?, ?, 'backup.import', ?, ?, 201, ?, ? WHERE ${exists}`)
     .bind(me, workspaceId, idemKeyValue, digest, JSON.stringify(result), at, pid));
   // Statements are fully built (any bind error happens above, before bytes exist). Now write the bytes.
+  await stageTextWrites(ctx.env, textWrites);
   const written = [];
   const dropBlobs = async () => { for (const k of written) await deleteBlob(ctx.env, k).catch(() => {}); };
   try { for (const [k, bytes] of decoded) { await putBlob(ctx.env, keyMap.get(k), bytes); written.push(keyMap.get(k)); } }
