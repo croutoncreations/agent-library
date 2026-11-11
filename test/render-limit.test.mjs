@@ -9,13 +9,13 @@ import { promisify } from "node:util";
 import { startServer, LOCAL_CONFIG, ROOT, sha256 } from "./helpers.mjs";
 import { SERVER_PORTS } from "./ports.mjs";
 import { RENDER_MAX_BYTES } from "../packages/core/src/text-limits.js";
-const MAX = 1048576, port = SERVER_PORTS["render-limit"], APP = `http://localhost:${port}`, CONTENT = `content.localhost:${port}`;
+const MAX = RENDER_MAX_BYTES, port = SERVER_PORTS["render-limit"], APP = `http://localhost:${port}`, CONTENT = `content.localhost:${port}`;
 const NOTE = "Preview shows the first 1 MB. Open Edit for the full text.";
 const NOTICE = "This page is larger than 1 MB, so it isn't shown here. Open Edit to see its source.";
 const VIEW_NOTE = "Preview shows the first 1 MB. Use Show full text in History for the full text.";
 const VIEW_NOTICE = "This page is larger than 1 MB, so it isn't shown here. Use Show full text in History to see its source.";
 const CONTENT_NOTICE = "This page is larger than 1 MB and cannot be shown.";
-let s, owner, viewer, pid, ws;
+let s, owner, viewer, pid, ws, blockedPath;
 const ids = {};
 const base = id => `/api/projects/${pid}/artifacts/${id}`;
 const sql = async q => JSON.parse((await promisify(execFile)("wrangler", ["d1", "--config", LOCAL_CONFIG, "execute", "DB", "--local", "--persist-to", s.dir, "--json", "--command", q], { cwd: ROOT, encoding: "utf8" })).stdout)[0].results;
@@ -38,10 +38,26 @@ before(async () => {
   pid = (await owner.req("POST", "/api/projects", { title: "Render limits", workspace_id: ws })).body.id;
   const invite = await owner.req("POST", `/api/workspaces/${ws}/invites`, { email: "viewer@example.test", role: "viewer" });
   assert.equal((await viewer.req("POST", "/api/invites/accept", { token: invite.body.accept_url.split("/").pop() })).status, 200);
+  const early = "# early-render-marker\n";
+  const largeMarkdown = early + "word ".repeat(Math.ceil(MAX / 5)).slice(0, MAX - early.length - 2) + "\né";
+  await make("markdown", largeMarkdown, "largeMarkdown");
+  await make("markdown", "# Small Markdown", "smallMarkdown");
+  await make("html", "<h1>Exact HTML</h1>".padEnd(MAX, " "), "exactHtml");
+  await make("html", "<h1>Large HTML source</h1>".padEnd(MAX + 1, " "), "largeHtml");
+  await make("html", "<h1>Small HTML</h1>", "smallHtml");
+  for (const kind of ["markdown", "html"]) {
+    const heading = kind === "markdown" ? "# Crossing Markdown\n" : "<h1>Crossing HTML</h1>\n";
+    const line = kind === "markdown" ? "word ".repeat(40) + "\n" : "<!-- " + "word ".repeat(40) + " -->\n";
+    const body = (heading + line.repeat(Math.ceil(MAX / line.length))).slice(0, MAX - 16);
+    assert.equal(Buffer.byteLength(body), MAX - 16);
+    await make(kind, body, `crossing-${kind}`);
+  }
+  // A previously issued link from before this restriction: repoint a small-page link.
+  const old = await nav(ids.exactHtml); blockedPath = new URL(old.headers.get("location")).pathname;
+  await sql(`UPDATE view_links SET artifact_id = '${ids.largeHtml}' WHERE token_hash = '${sha256(blockedPath.slice(3))}'`);
 });
 after(async () => { await s?.stop(); });
 test("browser render budget matches the one server constant", () => {
-  assert.equal(RENDER_MAX_BYTES, MAX);
   const js = readFileSync(new URL("../packages/core/src/web/app.js.txt", import.meta.url), "utf8");
   assert.equal(Number(js.match(/var RENDER_MAX_BYTES = (\d+);/)[1]), RENDER_MAX_BYTES);
 });
@@ -49,7 +65,6 @@ test("Markdown boundary, line cut, UTF-8 boundary, suffix references and 10 MiB 
   const early = "# early-render-marker\n";
   const body = early + "word ".repeat(Math.ceil(MAX / 5)).slice(0, MAX - early.length - 2) + "\né";
   assert.equal(Buffer.byteLength(body), MAX + 1); // é straddles the read boundary
-  await make("markdown", body, "largeMarkdown");
   const r = await owner.req("GET", base(ids.largeMarkdown) + "/preview");
   assert.equal(r.status, 200); assert.equal(r.body.truncated, true);
   assert.match(r.body.html, /early-render-marker/); assert.doesNotMatch(r.body.html, /é|\ufffd/);
@@ -74,28 +89,92 @@ test("Markdown boundary, line cut, UTF-8 boundary, suffix references and 10 MiB 
   assert.match(ten.body.html, /early-render-marker/); assert.match(ten.body.html, /last-complete-line/);
   assert.doesNotMatch(ten.body.html, /after-cut-marker|art_aftercut|x{100}/);
   assert.ok(Buffer.byteLength(JSON.stringify(ten.body)) < MAX + 1024);
-  await make("markdown", "# Small Markdown", "smallMarkdown");
 });
-let blockedPath;
 test("HTML boundary, refusal before redirect, old large links/media and still-valid small links", async () => {
-  await make("html", "<h1>Exact HTML</h1>".padEnd(MAX, " "), "exactHtml");
   const exact = await owner.req("GET", base(ids.exactHtml) + "/render");
   assert.equal(exact.status, 200); assert.match(exact.body, /Exact HTML/);
   const good = await nav(ids.exactHtml), goodPath = new URL(good.headers.get("location")).pathname;
   assert.equal((await content(goodPath)).status, 200);
-  await make("html", "<h1>Large HTML source</h1>".padEnd(MAX + 1, " "), "largeHtml");
+  const linkCount = (await sql(`SELECT COUNT(*) AS n FROM view_links WHERE artifact_id = '${ids.largeHtml}'`))[0].n;
   const tooLarge = await owner.req("GET", base(ids.largeHtml) + "/render");
   assert.equal(tooLarge.status, 413); assert.equal(tooLarge.body.error.code, "render_too_large");
   assert.equal((await nav(ids.largeHtml)).status, 413);
-  assert.equal((await sql(`SELECT COUNT(*) AS n FROM view_links WHERE artifact_id = '${ids.largeHtml}'`))[0].n, 0);
-  // A previously issued link from before this restriction: seed by repointing a small-page link.
-  const old = await nav(ids.exactHtml); blockedPath = new URL(old.headers.get("location")).pathname;
-  await sql(`UPDATE view_links SET artifact_id = '${ids.largeHtml}' WHERE token_hash = '${sha256(blockedPath.slice(3))}'`);
+  assert.equal((await sql(`SELECT COUNT(*) AS n FROM view_links WHERE artifact_id = '${ids.largeHtml}'`))[0].n, linkCount);
   for (const path of [blockedPath, blockedPath + "/m/art_aftercut"]) {
     const r = await content(path); assert.equal(r.status, 413); assert.equal(r.body, CONTENT_NOTICE);
   }
   assert.equal((await content(goodPath)).status, 200);
-  await make("html", "<h1>Small HTML</h1>", "smallHtml");
+});
+test("wrong-kind render routes look up the revision before checking kind", async () => {
+  for (const [key, route, message] of [["smallHtml", "preview", "Not Markdown"], ["smallMarkdown", "render", "Not an HTML document"]]) {
+    for (const rev of [999, 1]) {
+      const r = await owner.req("GET", base(ids[key]) + `/${route}?rev=${rev}`);
+      assert.equal(r.status, rev === 999 ? 404 : 400);
+      assert.equal(r.body.error.code, rev === 999 ? "not_found" : "invalid_input");
+      assert.equal(r.body.error.message, rev === 999 ? "Revision not found" : message);
+    }
+  }
+});
+test("Chrome: saved editor changes cross the render limit in both directions without reloading", { timeout: 180000 }, async () => {
+  const puppeteer = createRequire(import.meta.url)(`${process.env.HOME}/.npm-packages/lib/node_modules/puppeteer`);
+  const browser = await puppeteer.launch({ executablePath: process.env.CHROME_PATH ?? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", headless: true, args: ["--no-sandbox"] });
+  try {
+    const page = await browser.newPage();
+    const [name, value] = owner.cookie.split("="); await page.setCookie({ name, value, url: APP });
+    const errors = [], renders = [];
+    page.on("pageerror", e => errors.push(e.message));
+    page.on("request", r => { if (new URL(r.url()).pathname.endsWith("/render")) renders.push(r.url()); });
+    const tab = async text => {
+      await page.evaluate(text => [...document.querySelectorAll('[role="tab"]')].find(e => e.textContent === text).click(), text);
+    };
+    const saved = async rev => page.waitForFunction(rev => document.querySelector(".status")?.textContent === `Saved - rev ${rev}`, {}, rev);
+    const loadedPage = async () => {
+      const frame = await page.waitForFrame(f => f.url().startsWith(`http://${CONTENT}/c/`));
+      await frame.waitForFunction(() => document.querySelector("h1")?.textContent === "Crossing HTML");
+    };
+    for (const kind of ["markdown", "html"]) {
+      const id = ids[`crossing-${kind}`], html = kind === "html", view = html ? "Page" : "Preview";
+      await page.goto(`${APP}/#/p/${pid}/a/${id}`);
+      if (html) await loadedPage();
+      else await page.waitForFunction(() => document.querySelector(".preview h1")?.textContent === "Crossing Markdown");
+      assert.equal(await page.$eval(html ? ".render-notice" : ".preview-note", e => e.hidden), true);
+      // A document-local marker proves neither crossing reloads the app document.
+      await page.evaluate(() => { window.renderLimitDocument = true; });
+      await tab("Edit"); await page.waitForSelector(".cm-content", { visible: true });
+      renders.length = 0;
+      await page.click(".cm-content");
+      await page.keyboard.sendCharacter("x".repeat(64));
+      await page.click(".footbar button"); await saved(2);
+      const over = await owner.req("GET", base(id));
+      assert.equal(over.body.revision.size, MAX + 48);
+      await tab(view);
+      const note = html ? NOTICE : NOTE;
+      await page.waitForFunction((selector, text) => {
+        const e = document.querySelector(selector); return e && !e.hidden && e.textContent === text;
+      }, {}, html ? ".render-notice" : ".preview-note", note);
+      if (html) {
+        assert.deepEqual(renders, [], "over-limit saved version never requests /render");
+        assert.equal(await page.$eval("iframe.htmlview", e => e.getAttribute("src")), null);
+      }
+      await tab("Edit"); await page.click(".cm-content");
+      // Undo the single insertion through the editor, then use the normal Save now path again.
+      const modifier = process.platform === "darwin" ? "Meta" : "Control";
+      await page.keyboard.down(modifier); await page.keyboard.press("z"); await page.keyboard.up(modifier);
+      await page.click(".footbar button"); await saved(3);
+      const under = await owner.req("GET", base(id));
+      assert.equal(under.body.revision.size, MAX - 16);
+      await tab(view);
+      if (html) {
+        await page.waitForFunction(() => document.querySelector("iframe.htmlview")?.getAttribute("src")?.endsWith("/render?rev=3"));
+        await loadedPage();
+        assert.ok(renders.some(url => url.endsWith("/render?rev=3")));
+      } else await page.waitForFunction(() => document.querySelector(".preview h1")?.textContent === "Crossing Markdown" && document.querySelector(".preview-note")?.hidden);
+      assert.equal(await page.$eval(html ? ".render-notice" : ".preview-note", e => e.hidden), true);
+      assert.equal(await page.$eval(html ? ".render-notice" : ".preview-note", e => e.textContent), "");
+      assert.equal(await page.evaluate(() => window.renderLimitDocument), true);
+    }
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
 });
 test("Chrome: exact owner/viewer notes, small views, offline copies, and synthetic design captures", { timeout: 180000 }, async () => {
   const puppeteer = createRequire(import.meta.url)(`${process.env.HOME}/.npm-packages/lib/node_modules/puppeteer`);
@@ -126,6 +205,7 @@ test("Chrome: exact owner/viewer notes, small views, offline copies, and synthet
             assert.equal(await page.$eval(".preview-note", e => e.textContent), "");
             if (html) assert.equal(await page.$eval(".render-notice", e => e.hidden), true);
           }
+          assert.deepEqual(await page.$eval(".preview-note", e => [e.getAttribute("role"), e.getAttribute("aria-live")]), [null, null]);
           if (role === "viewer") assert.equal(await page.evaluate(() => [...document.querySelectorAll('[role="tab"]')].some(el => el.textContent === "Edit")), false);
         }
       }
