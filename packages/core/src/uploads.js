@@ -271,8 +271,9 @@ async function uploadPut(req, env, requestId, uploadId, linkCtx) {
 //    409 finish_in_progress while another finisher still holds the lease.
 var FINALIZE_LEASE_MS = 60 * 1e3;
 var FINALIZE_WAIT_MS = 3e3;
-// Isolate-local, non-queuing backpressure before any full text read. This does not bound other text operations.
-let textFinishBusy = false;
+// Isolate-local, non-queuing backpressure before any full text read. Expiry follows the holder's finalize lease,
+// including renewal; token-owned release cannot clear a successor if an expired request settles late.
+let textFinishSlot = null;
 async function uploadFinish(ctx, projectId, uploadId, key) {
   await authorizeProject(ctx, projectId, true);
   const u = await db2(ctx).prepare("SELECT * FROM uploads WHERE id = ? AND project_id = ?").bind(uploadId, projectId).first();
@@ -386,8 +387,9 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
       const a = await loadArtifact(ctx, projectId, u.artifact_id, { allowUnpublished: u.base_rev === 0 });
       assertWritable(ctx, a, "content");
       if (a.kind !== kind) throw new HttpError(400, "invalid_input", "mime must match the existing document kind");
-      if (textFinishBusy) throw new HttpError(503, "text_finish_busy", "Another text upload is being finalized on this server; retry upload_finish shortly with the same idempotency key", { retry_after_seconds: 1 });
-      textFinishBusy = hasTextFinishSlot = true;
+      if (textFinishSlot && textFinishSlot.until > nowMs()) throw new HttpError(503, "text_finish_busy", "Another text upload is being finalized on this server; retry upload_finish shortly with the same idempotency key", { retry_after_seconds: 1 });
+      textFinishSlot = { token, until: held.finalize_until };
+      hasTextFinishSlot = true;
       try {
         text = await getUploadedText(ctx.env, finalKey, kind);
         if (text === null) return fail(409, "missing_bytes", "Uploaded bytes missing", "failed");
@@ -405,8 +407,10 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
       if (!BINARY_TYPES[u.mime](head)) return fail(415, "signature_mismatch", `Bytes are not a valid ${u.mime}`, "failed");
     }
     // Still the finisher? Renew the lease for the publication.
-    const renew = await db2(ctx).prepare("UPDATE uploads SET finalize_until = ? WHERE id = ? AND state = 'sealed' AND finalize_token = ?").bind(nowMs() + FINALIZE_LEASE_MS, uploadId, token).run();
+    const renewedUntil = nowMs() + FINALIZE_LEASE_MS;
+    const renew = await db2(ctx).prepare(`UPDATE uploads SET finalize_until = ? WHERE id = ? AND state = 'sealed' AND finalize_token = ?${kind ? " AND finalize_until > ?" : ""}`).bind(renewedUntil, uploadId, token, ...kind ? [nowMs()] : []).run();
     if (!renew.meta.changes) return lostAfterWrite();
+    if (hasTextFinishSlot && textFinishSlot?.token === token) textFinishSlot.until = renewedUntil;
     const ok2 = { artifact_id: u.artifact_id, revision: u.base_rev + 1, revision_id: revId, sha256: sha2, size };
     const gate = "EXISTS (SELECT 1 FROM revisions WHERE id = ?)";
     try {
@@ -445,7 +449,7 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
       await db2(ctx).prepare("UPDATE uploads SET finalize_token = NULL, finalize_until = NULL WHERE id = ? AND finalize_token = ?").bind(uploadId, token).run().catch(() => {
       });
     } finally {
-      if (hasTextFinishSlot) textFinishBusy = false;
+      if (hasTextFinishSlot && textFinishSlot?.token === token) textFinishSlot = null;
     }
   }
 }
