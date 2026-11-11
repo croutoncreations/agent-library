@@ -10,10 +10,11 @@ import { jsonFixture } from "./formats-json-memory-fixtures.mjs";
 import assert from "node:assert/strict";
 const root = fileURLToPath(new URL("../", import.meta.url));
 const source = shape => shape === "ascii" ? "x".repeat(MAX) : shape === "two-byte" ? "x".repeat(MAX - 2) + "Ā" : shape === "csv" ? csvFixture("tiny").text : shape === "json" ? jsonFixture("ordinary").text : " ".repeat(MAX - 1) + "{";
-export async function runTextUploadMemory(shape, copies, modulePath) {
-  const { uploadBegin, uploadFinish } = await import(modulePath ?? "../packages/core/src/uploads.js");
+export async function runTextUploadMemory(shape, copies) {
+  const { uploadBegin, uploadFinish } = await import("../packages/core/src/uploads.js");
   const counts = { reads: 0, writes: 0, written_bytes: 0, bound_bytes: 0 }, peak = { heap: 0, arrayBuffers: 0, external: 0, rss: 0 };
-  const sample = () => { const m = process.memoryUsage(); for (const [k, n] of Object.entries({ heap: m.heapUsed, arrayBuffers: m.arrayBuffers, external: m.external, rss: m.rss })) peak[k] = Math.max(peak[k], n); };
+  // Collect at boundaries so ceilings measure retained copies, not variable GC scheduling between equal workloads.
+  const sample = () => { global.gc(); const m = process.memoryUsage(); for (const [k, n] of Object.entries({ heap: m.heapUsed, arrayBuffers: m.arrayBuffers, external: m.external, rss: m.rss })) peak[k] = Math.max(peak[k], n); };
   const worlds = [];
   for (let n = 0; n < copies; n++) {
     const sql = new DatabaseSync(":memory:");
