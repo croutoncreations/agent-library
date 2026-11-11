@@ -64,8 +64,8 @@ async function uploadBegin(ctx, projectId, input, key, { allowText = false } = {
     note = provenance(ctx, input)[4];
     if (input.artifact_id) {
       if (input.title !== void 0 || input.folder !== void 0 || input.folder_id !== void 0) throw new HttpError(400, "invalid_input", "Pass title and optional create metadata for a new document, or artifact_id and expected_revision for a new version");
-      target = await loadArtifact(ctx, projectId, str(input.artifact_id, "artifact_id", 64));
-      assertWritable(ctx, target, "content");
+      // Schema is immutable and part of the digest. Allow trash here so a saved begin can replay like a JSON save.
+      target = await loadArtifact(ctx, projectId, str(input.artifact_id, "artifact_id", 64), { allowTrashed: true });
       if (target.kind !== kind) throw new HttpError(400, "invalid_input", "mime must match the existing document kind");
       if (input.schema !== void 0 && (input.schema == null ? null : String(input.schema)) !== target.schema_id) throw new HttpError(400, "invalid_input", "schema must match the existing document schema");
       int(input.expected_revision, "expected_revision", 1);
@@ -79,6 +79,10 @@ async function uploadBegin(ctx, projectId, input, key, { allowText = false } = {
   const i = { op: "upload.begin", key, projectId, digest: await sha256Hex(JSON.stringify(kind ? [mime, size, sha2, target?.id ?? null, input.expected_revision ?? null, metadata ?? { schema: target.schema_id }, note] : parts)) };
   const prior = await idemLookup(ctx, i);
   if (prior) return prior;
+  if (target) {
+    target = await loadArtifact(ctx, projectId, target.id);
+    assertWritable(ctx, target, "content");
+  }
   await reconcileUploads(ctx.env, { projectId, limit: 20 });
   const limits = limitsFor(ctx.env);
   let artifactId;
