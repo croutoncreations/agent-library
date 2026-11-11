@@ -180,7 +180,8 @@ test("near-10 MiB JSON measurements and CSV validate, preview, query and replace
     }
     const opened = performance.now();
     await page.goto(`${APP}/#/p/large-text/a/${documentId}`);
-    await page.waitForFunction(() => document.querySelector(".preview p")?.textContent.length > 1000000);
+    await page.waitForFunction(() => document.querySelector(".preview p")?.textContent.length > 1000000 && document.querySelector(".preview-note")?.textContent === "Preview shows the first 1 MB. Open Edit for the full text.");
+    assert.ok(await page.$eval(".preview p", el => el.textContent.length <= 1048576));
     const previewMs = performance.now() - opened;
     await page.evaluate(() => [...document.querySelectorAll('[role="tab"]')].find(el => el.textContent === "Edit").click());
     await page.waitForSelector(".cm-editor");

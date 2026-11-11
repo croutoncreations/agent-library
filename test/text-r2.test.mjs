@@ -10,7 +10,7 @@ import { SERVER_PORTS } from "./ports.mjs";
 import { commitTextWrites, isTextWriteFenceError } from "../packages/core/src/content-store.js";
 
 async function harness() {
-  const lib = await loadWorker({ "service.js": ["createMarkdown", "saveMarkdown", "getArtifact", "restoreRevision", "updateMetadata", "listArtifacts", "addComment", "listComments"], "reads/service.js": ["readTextChunk"], "uploads.js": ["serveContent"], "history/service.js": ["diffRevisions"], "backup.js": ["exportBackup", "restoreBackup", "importBackup"], "cleanup.js": ["reconcileUploads"], "project-deletion.js": ["purgeDueProjects"], "content-store.js": ["stageTextWrites", "commitTextWrites"], "adapters.js": ["withAdapters", "defaultAdapters"] });
+  const lib = await loadWorker({ "service.js": ["createMarkdown", "saveMarkdown", "getArtifact", "restoreRevision", "updateMetadata", "listArtifacts", "addComment", "listComments"], "reads/service.js": ["readTextChunk"], "uploads.js": ["serveContent"], "history/service.js": ["diffRevisions"], "backup.js": ["exportBackup", "restoreBackup", "importBackup"], "cleanup.js": ["reconcileUploads"], "project-deletion.js": ["purgeDueProjects"], "render-source.js": ["getRenderSource"], "content-store.js": ["stageTextWrites", "commitTextWrites"], "adapters.js": ["withAdapters", "defaultAdapters"] });
   const sql = new DatabaseSync(":memory:");
   for (const f of readdirSync(join(ROOT, "migrations")).filter(f => f.endsWith(".sql")).sort()) sql.exec(readFileSync(join(ROOT, "migrations", f), "utf8"));
   const stmt = (q, p = []) => ({ q, p, bind: (...p) => stmt(q, p), async first(c) { const r = sql.prepare(q).get(...p); return c ? r?.[c] ?? null : r ?? null; }, async all() { return { results: sql.prepare(q).all(...p) }; }, async run() { return { meta: { changes: sql.prepare(q).run(...p).changes } }; } });
@@ -156,6 +156,27 @@ test("R2 chunked reads match legacy UTF-8 bytes; legacy rows still diff, restore
   await lib.restoreRevision(ctx, "proj-s", id, { from_revision: 1, expected_revision: 2 }, "restore-read");
   assert.equal((await lib.getArtifact(ctx, "proj-s", id)).body, body);
   assert.equal((await lib.exportBackup(ctx, "proj-s")).revisions.find(r => r.rev_no === 1).body, body);
+});
+
+test("large Markdown rendering only reads a 1 MiB range and resolves references from that prefix", async () => {
+  const { lib, ctx, env } = await harness();
+  const prefix = "# early\n" + "word ".repeat(209720);
+  const c = await lib.createMarkdown(ctx, "proj-s", { title: "Bounded preview", body: prefix + "\n![late](art_late)" + " word".repeat(1800000) }, "render-range");
+  const reads = [], get = env.BLOBS.get;
+  env.BLOBS.get = async (...args) => { reads.push(args); return get(...args); };
+  const r = await lib.getRenderSource(ctx, "proj-s", c.body.artifact_id, undefined, "markdown");
+  assert.equal(r.truncated, true);
+  assert.deepEqual(reads.map(args => args[1]), [{ range: { offset: 0, length: 1048576 } }]);
+  assert.ok(Buffer.byteLength(r.body) <= 1048576);
+  assert.doesNotMatch(r.body, /art_late/);
+});
+
+test("oversized HTML rendering refuses before any object read", async () => {
+  const { lib, ctx, env } = await harness();
+  const c = await lib.createMarkdown(ctx, "proj-s", { title: "Large page", body: " ".repeat(1048577) }, "render-html", "html");
+  const counts = spyBindings(env);
+  await assert.rejects(lib.getRenderSource(ctx, "proj-s", c.body.artifact_id, undefined, "html"), e => e.status === 413 && e.code === "render_too_large");
+  assert.equal(counts.gets, 0);
 });
 
 test("text storage and legacy fallback preserve UTF-8 byte ranges", async () => {
