@@ -2417,7 +2417,6 @@ async function viewArtifact(pid, aid, initialTab) {
         var desc = h("input", { type: "text", maxLength: 280, "aria-label": "New template description" });
         var previewBox = h("div", { class: "template-preview prose", tabIndex: 0, "aria-label": "Source template preview" });
         previewBox.innerHTML = preview.html;
-        var limitNote = preview.truncated ? h("p", { class: "muted small", text: "Preview shows the first 256 KB. The template copies the full saved revision." }) : null;
         var smsg = h("p", { class: "msg", role: "status" }), attempt = null, busy = false;
         var submit = h("button", { type: "submit" }, "Save template");
         templateForm.replaceChildren(h("form", { class: "template-form", onsubmit: async function (e) {
@@ -2431,8 +2430,8 @@ async function viewArtifact(pid, aid, initialTab) {
           } catch (err) { showErr(smsg, err); }
           finally { busy = false; submit.disabled = false; }
         } }, h("label", null, "Template name", name), h("label", null, "Description (optional)", desc),
-          h("p", { class: "muted small", text: "Project: " + (projectTitles[pid] || pid) + ". Copies saved revision v" + pinned + " shown below. Unsaved edits are excluded. {{title}}, {{project}} and {{date}} are replaced once when used; other braces stay literal." }),
-          limitNote, previewBox, h("div", { class: "row" }, submit, h("button", { type: "button", class: "secondary", onclick: function () { templateForm.hidden = true; saveTemplateBtn.focus(); } }, "Cancel")), smsg));
+          h("p", { class: "muted small", text: "Project: " + (projectTitles[pid] || pid) + ". Copies saved revision v" + pinned + " shown below. Unsaved edits are excluded. {{title}}, {{project}} and {{date}} are replaced once when used; other braces stay literal." + (preview.truncated ? " Preview shows the first 256 KB. The template copies the full saved revision." : "") }),
+          previewBox, h("div", { class: "row" }, submit, h("button", { type: "button", class: "secondary", onclick: function () { templateForm.hidden = true; saveTemplateBtn.focus(); } }, "Cancel")), smsg));
         templateForm.hidden = false; name.focus();
       } catch (err) { showErr(metaMsg, err); }
       finally { saveTemplateBtn.disabled = false; }

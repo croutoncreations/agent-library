@@ -425,12 +425,14 @@ test("Chrome: exact owner/viewer notes, small views, offline copies, and synthet
         await page.waitForFunction(() => document.querySelector(".preview h1")?.textContent === "early-render-marker");
         await page.evaluate(() => { const button = [...document.querySelectorAll("button")].find(el => el.textContent === "Save as template"); button.closest("details").open = true; button.click(); });
         const templateNote = PREVIEW_PREFIX + " The template copies the full saved revision.";
-        await page.waitForFunction(text => document.querySelector(".template-preview")?.previousElementSibling?.textContent === text, {}, templateNote);
+        const templateHelp = "Project: Render limits. Copies saved revision v2 shown below. Unsaved edits are excluded. {{title}}, {{project}} and {{date}} are replaced once when used; other braces stay literal.";
+        await page.waitForFunction(text => document.querySelector(".template-preview")?.previousElementSibling?.textContent === text, {}, templateHelp + " " + templateNote);
+        assert.equal(await page.$$eval(".template-form > p.muted.small", es => es.length), 1, "the truncation sentence is part of the existing help paragraph, not a separate note");
         assert.deepEqual(await page.$eval(".template-preview", e => [e.previousElementSibling.getAttribute("role"), e.previousElementSibling.getAttribute("aria-live")]), [null, null]);
         if (captures) for (const width of [1280, 390]) {
           await page.setViewport({ width, height: 900 });
           await page.$eval(".template-preview", e => e.previousElementSibling.scrollIntoView({ block: "center" }));
-          await page.screenshot({ path: `${out}/template-${width}.png` });
+          await page.screenshot({ path: `${out}/3-template-${width}.png` });
         }
         const savedTemplate = page.waitForResponse(r => r.request().method() === "POST" && r.url().endsWith("/templates"));
         await page.click('.template-form button[type="submit"]');
@@ -443,6 +445,7 @@ test("Chrome: exact owner/viewer notes, small views, offline copies, and synthet
         await page.waitForSelector(".template-preview");
         assert.deepEqual(await page.$eval(".template-preview", e => [e.previousElementSibling.tagName, e.previousElementSibling.className, e.previousElementSibling.textContent.startsWith("Project: ")]), ["P", "muted small", true]);
         assert.equal(await page.$eval(".template-form", (e, prefix) => e.textContent.includes(prefix), PREVIEW_PREFIX), false);
+        assert.equal(await page.$eval(".template-preview", e => e.previousElementSibling.textContent), templateHelp.replace("v2", "v1"));
         for (const key of ["largeMarkdown", "largeHtml", "smallMarkdown", "smallHtml"]) {
           await page.goto(`${APP}/#/p/${pid}/a/${ids[key]}`);
           const toggle = await page.waitForSelector('[aria-label="Make available offline"]'); await toggle.click();
