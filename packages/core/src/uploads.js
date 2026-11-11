@@ -59,15 +59,12 @@ async function uploadBegin(ctx, projectId, input, key, { allowText = false } = {
   if (!kind && size > lg.limits.file_bytes) throw fileTooLarge(lg.limits.file_bytes);
   const sha2 = str(input.sha256, "sha256", 64);
   if (!/^[0-9a-f]{64}$/.test(sha2)) throw new HttpError(400, "invalid_input", "sha256 must be 64 lowercase hex chars");
-  let metadata, note = null, target;
+  let metadata, note = null, targetId, target;
   if (kind) {
     note = provenance(ctx, input)[4];
     if (input.artifact_id) {
       if (input.title !== void 0 || input.folder !== void 0 || input.folder_id !== void 0) throw new HttpError(400, "invalid_input", "Pass title and optional create metadata for a new document, or artifact_id and expected_revision for a new version");
-      // Schema is immutable and part of the digest. Allow trash here so a saved begin can replay like a JSON save.
-      target = await loadArtifact(ctx, projectId, str(input.artifact_id, "artifact_id", 64), { allowTrashed: true });
-      if (target.kind !== kind) throw new HttpError(400, "invalid_input", "mime must match the existing document kind");
-      if (input.schema !== void 0 && (input.schema == null ? null : String(input.schema)) !== target.schema_id) throw new HttpError(400, "invalid_input", "schema must match the existing document schema");
+      targetId = str(input.artifact_id, "artifact_id", 64);
       int(input.expected_revision, "expected_revision", 1);
     } else {
       if (input.expected_revision !== void 0) throw new HttpError(400, "invalid_input", "Pass title and optional create metadata for a new document, or artifact_id and expected_revision for a new version");
@@ -76,12 +73,15 @@ async function uploadBegin(ctx, projectId, input, key, { allowText = false } = {
   }
   // Preserve the binary digest byte-for-byte for old replay compatibility.
   const parts = [mime, size, sha2, input.artifact_id ?? null, input.expected_revision ?? null, input.title ?? null];
-  const i = { op: "upload.begin", key, projectId, digest: await sha256Hex(JSON.stringify(kind ? [mime, size, sha2, target?.id ?? null, input.expected_revision ?? null, metadata ?? { schema: target.schema_id }, note] : parts)) };
+  // Replacement digests depend only on the request, so replay needs no read of a changed or trashed document.
+  const i = { op: "upload.begin", key, projectId, digest: await sha256Hex(JSON.stringify(kind ? [mime, size, sha2, targetId ?? null, input.expected_revision ?? null, metadata ?? input.schema ?? null, note] : parts)) };
   const prior = await idemLookup(ctx, i);
   if (prior) return prior;
-  if (target) {
-    target = await loadArtifact(ctx, projectId, target.id);
+  if (targetId) {
+    target = await loadArtifact(ctx, projectId, targetId);
     assertWritable(ctx, target, "content");
+    if (target.kind !== kind) throw new HttpError(400, "invalid_input", "mime must match the existing document kind");
+    if (input.schema !== void 0 && (input.schema == null ? null : String(input.schema)) !== target.schema_id) throw new HttpError(400, "invalid_input", "schema must match the existing document schema");
   }
   await reconcileUploads(ctx.env, { projectId, limit: 20 });
   const limits = limitsFor(ctx.env);
