@@ -70,7 +70,12 @@ for (const projectId of [undefined, P]) test(`real cron upload SQL plans: ${proj
     const failureLane = q.startsWith("SELECT id, final_key") || q.startsWith("SELECT final_key");
     if (failureLane) assert.ok(plan.includes("SCAN r"), "pre-existing binary reference guard remains unchanged");
     else assert.ok(!plan.includes("SCAN r"), "no full revision scan on success paths");
-    if (q.startsWith("SELECT id, staging_key")) assert.ok(plan.some(d => /uploads_cleanup \(state=\? AND staging_purged_at=\?\)/.test(d)));
+    if (q.startsWith("SELECT id, staging_key")) {
+      const expected = projectId
+        ? "SEARCH uploads USING INDEX uploads_project_state (project_id=? AND state=?)"
+        : "SEARCH uploads USING INDEX uploads_cleanup (state=? AND staging_purged_at=?)";
+      assert.ok(plan.includes(expected), `staging lane: ${expected}`);
+    }
   }
 });
 
