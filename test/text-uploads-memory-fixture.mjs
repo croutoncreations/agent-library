@@ -41,7 +41,7 @@ export async function runTextUploadMemory(shape, copies, modulePath) {
     const ctx = { env, principal: { id: "hum_memory", kind: "human", label: "Synthetic memory owner" }, requestId: "req_memory" };
     const kind = shape === "csv" ? "csv" : shape === "json" || shape === "invalid" ? "json" : "markdown";
     const mime = { markdown: "text/markdown", csv: "text/csv", json: "application/json" }[kind];
-    const b = await uploadBegin(ctx, "prj_memory", { title: "Synthetic memory", mime, size, sha256: sha, ...shape === "json" ? { schema: "agentlib.measurements/1" } : {} }, "begin-memory");
+    const b = await uploadBegin(ctx, "prj_memory", { title: "Synthetic memory", mime, size, sha256: sha, ...shape === "json" ? { schema: "agentlib.measurements/1" } : {} }, "begin-memory", { allowText: true });
     // Seed the verified input, not an in-memory R2 Map or a second retained copy of the request body.
     sql.prepare("UPDATE uploads SET state = 'received', received_size = ?, received_sha256 = ? WHERE id = ?").run(size, sha, b.body.upload_id);
     worlds.push({ sql, ctx, id: b.body.upload_id });

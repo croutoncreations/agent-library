@@ -9,19 +9,21 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { startAppConnectServer } from "./fixtures/app-connect-harness.mjs";
 import { SERVER_PORTS } from "./ports.mjs";
-import { ROOT, LOCAL_CONFIG, key } from "./helpers.mjs";
+import { ROOT, LOCAL_CONFIG, key, mcpClient, grant, sha256, agentHttp } from "./helpers.mjs";
 import { PNG } from "./upload-world.mjs";
-let h, sdk;
+let h, sdk, legacy, legacyToken, owner;
 const P = "text-inline-guard";
 const expected = { status: 415, code: "unsupported_type", message: "Allowed: image/png, image/jpeg, image/webp, image/gif, application/pdf, video/mp4, video/webm, application/octet-stream" };
 before(async () => {
   h = await startAppConnectServer({ port: SERVER_PORTS["text-uploads-oauth"] });
-  const owner = await h.owner(); assert.equal((await owner.req("POST", "/api/projects", { id: P, title: "Synthetic inline guard" })).status, 201);
+  owner = await h.owner(); assert.equal((await owner.req("POST", "/api/projects", { id: P, title: "Synthetic inline guard" })).status, 201);
   const rw = await h.connectMcpAgent({ [P]: "write" }, { clientName: "Synthetic inline guard" });
   sdk = new Client({ name: "synthetic-text-inline-guard", version: "1" });
   await sdk.connect(new StreamableHTTPClientTransport(new URL(h.issuer + "/mcp"), { requestInit: { headers: { authorization: `Bearer ${rw.access_token}` } } }));
+  legacyToken = (await grant(owner, P, "Synthetic legacy guard")).token;
+  legacy = await mcpClient(h.appUi, legacyToken);
 });
-after(async () => { await sdk?.close(); await h?.stop(); });
+after(async () => { await legacy?.close(); await sdk?.close(); await h?.stop(); });
 const call = more => sdk.callTool({ name: "upload_file", arguments: { title: "Synthetic", mime: "text/markdown", content_base64: "eA==", change_note: "Synthetic guard regression", idempotency_key: key(), ...more } });
 const counts = () => {
   const result = JSON.parse(execFileSync("wrangler", ["d1", "--config", LOCAL_CONFIG, "execute", "DB", "--local", "--persist-to", h.dir, "--json", "--command", "SELECT (SELECT COUNT(*) FROM artifacts) AS artifacts, (SELECT COUNT(*) FROM uploads) AS uploads"], { cwd: ROOT, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }))[0].results[0];
@@ -51,4 +53,22 @@ test("upload_file preserves baseline validation error precedence for doubly inva
 test("binary upload_file continues to publish normally", async () => {
   const r = await call({ mime: "image/png", content_base64: PNG.toString("base64") });
   assert.equal(r.isError, false, JSON.stringify(r.structuredContent)); assert.equal(r.structuredContent.revision, 1);
+});
+test("OAuth and legacy upload_begin retain binary-only refusal for all text MIME types without writing anything", async () => {
+  const before = counts();
+  for (const mime of ["text/markdown", "text/html", "application/json", "text/csv"]) {
+    const args = { project_id: P, title: "Synthetic refused text", mime, size: 1, sha256: sha256("x"), idempotency_key: key() };
+    const oauth = await sdk.callTool({ name: "upload_begin", arguments: { ...args, change_note: "Synthetic binary-only begin" } });
+    assert.equal(oauth.isError, true); assert.deepEqual(oauth.structuredContent.error, expected);
+    const old = await legacy.call("upload_begin", args); assert.equal(old.isError, true); assert.deepEqual(old.data.error, expected);
+    assert.deepEqual(counts(), before);
+  }
+});
+test("MCP principals cannot PUT or finish an app-owner text upload", async () => {
+  const b = await owner.req("POST", `/api/projects/${P}/uploads`, { title: "Synthetic owner-only input", mime: "text/markdown", size: 1, sha256: sha256("x") });
+  assert.equal(b.status, 201, JSON.stringify(b.body));
+  const put = await agentHttp(h.appUi, legacyToken)("PUT", b.body.put_url, undefined, { raw: "x" });
+  assert.equal(put.status, 404); assert.equal(put.body.error.code, "not_found");
+  const finish = await sdk.callTool({ name: "upload_finish", arguments: { project_id: P, upload_id: b.body.upload_id, idempotency_key: key() } });
+  assert.equal(finish.isError, true); assert.equal(finish.structuredContent.error.status, 404); assert.equal(finish.structuredContent.error.code, "not_found");
 });

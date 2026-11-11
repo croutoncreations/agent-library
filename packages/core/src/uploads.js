@@ -38,11 +38,12 @@ async function dropUnpublished(env, uploadId, finalKey) {
 }
 // Upload-owned bytes: immutable published binary content, or temporary raw input for text publication.
 var finalKeyFor = (projectId, artifactId) => `blobs/${projectId}/${artifactId}/${randomId("rev")}`;
-async function uploadBegin(ctx, projectId, input, key) {
+async function uploadBegin(ctx, projectId, input, key, { allowText = false } = {}) {
   await authorizeProject(ctx, projectId, true);
   const mime = str(input.mime, "mime", 100);
-  const kind = Object.hasOwn(TEXT_UPLOAD_KINDS, mime) ? TEXT_UPLOAD_KINDS[mime] : null;
-  if (!kind && !BINARY_TYPES[mime]) throw new HttpError(415, "unsupported_type", "Allowed: " + [...Object.keys(BINARY_TYPES), ...Object.keys(TEXT_UPLOAD_KINDS)].join(", "));
+  // Text acceptance is transport-owned, never a request field; MCP stays binary-only until its own slice.
+  const kind = allowText && Object.hasOwn(TEXT_UPLOAD_KINDS, mime) ? TEXT_UPLOAD_KINDS[mime] : null;
+  if (!kind && !BINARY_TYPES[mime]) throw new HttpError(415, "unsupported_type", "Allowed: " + [...Object.keys(BINARY_TYPES), ...allowText ? Object.keys(TEXT_UPLOAD_KINDS) : []].join(", "));
   const size = int(input.size, "size", kind ? 0 : 1, Number.MAX_SAFE_INTEGER);
   if (kind && size > TEXT_MAX_BYTES) throw new HttpError(413, "too_large", kind === "markdown" ? "Markdown exceeds 10 MiB" : kind === "html" ? "HTML exceeds 10 MiB" : `${kind} file exceeds 10 MiB`);
   if (kind === "json" || kind === "csv") requireAppConnect(ctx);

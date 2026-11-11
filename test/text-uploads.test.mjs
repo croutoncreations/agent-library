@@ -16,7 +16,7 @@ const source = { markdown: "# upload-marker\nraw 😀\n", html: "<h1>upload-mark
 const configured = () => { const w = world(); w.env.APP_CONNECT_ENABLED = "1"; w.ctx.env = lib.withAdapters(w.env, lib.defaultAdapters()); return w; };
 async function begin(w, kind, text, extra = {}, idem = key()) {
   const bytes = Buffer.isBuffer(text) ? text : Buffer.from(text);
-  const r = await lib.uploadBegin(w.ctx, P, { title: "Synthetic document", mime: kinds[kind], size: bytes.length, sha256: sha256(bytes), ...extra }, idem);
+  const r = await lib.uploadBegin(w.ctx, P, { title: "Synthetic document", mime: kinds[kind], size: bytes.length, sha256: sha256(bytes), ...extra }, idem, { allowText: true });
   return { ...r.body, bytes };
 }
 async function received(w, kind, text, extra = {}) { const b = await begin(w, kind, text, extra); await w.put(b.upload_id, b.bytes); return b; }

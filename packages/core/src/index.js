@@ -266,7 +266,7 @@ async function route3(req, env, url, requestId, seen = {}) {
   if (rest[0] === "artifacts" && rest[1] === "from-template" && rest.length === 2 && m === "POST") return out(await createFromTemplate(ctx, pid, await body(req), key()));
   if (rest[0] === "backup" && m === "GET") return json(await exportBackup(ctx, pid));
   if (rest[0] === "uploads") {
-    if (rest.length === 1 && m === "POST") return out(await uploadBegin(ctx, pid, await body(req), key()));
+    if (rest.length === 1 && m === "POST") return out(await uploadBegin(ctx, pid, await body(req), key(), { allowText: true }));
     if (rest.length === 3 && rest[2] === "finish" && m === "POST") return out(await uploadFinish(ctx, pid, rest[1], key()));
   }
   if (rest[0] === "artifacts") {
