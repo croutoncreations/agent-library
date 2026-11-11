@@ -95,6 +95,16 @@ will return through the blind index in slice 4b. The separate ranked search sear
 
 ## Uploads & transfers
 
+The app API upload endpoints accept Markdown, HTML, JSON and CSV text up to 10 MiB (10,485,760 bytes).
+One text finish runs at a time per isolate. Another receives retryable `503 text_finish_busy` with
+`retry_after_seconds: 1`; retry with the same idempotency key. The slot expires with its finalize lease.
+MCP tools and `/v1` do not accept text uploads yet.
+
+Before rolling the Worker back to a version from before text uploads, let text uploads finish or expire.
+The older Worker returns `500` when finishing one and does not clean up its text placeholder or temporary object.
+Its cron can mark `staging_purged_at` without removing the temporary object. After rolling forward, that object
+is no longer found by cleanup and remains until the project is purged.
+
 | Limit | Default | Scope | Configure | When you hit it |
 |---|---|---|---|---|
 | Upload reservation | 15 minutes, at most 24 hours | upload | `UPLOAD_TTL_SECONDS` (larger values are capped at 86400) | `410 upload_expired` |
@@ -176,7 +186,7 @@ The cron job runs every 15 minutes. Each step is bounded per run and later runs 
 | Change feed | 30 days, up to 10,000 rows per run | project | fixed | `410 cursor_expired` for older cursors |
 | Deleted projects | purged after 30 days | project | fixed | large projects take several runs |
 | Abandoned uploads | removed after their reservation plus a 10-minute grace | upload | `UPLOAD_CLEANUP_GRACE_SECONDS` | — |
-| A new file whose upload never finished | its hidden placeholder is removed a day after the upload expired, up to 100 per run | project | fixed | until then it counts toward `items_per_project` |
+| A new document or file whose upload never finished | its hidden placeholder is removed a day after the upload expired, up to 100 per run | project | fixed | until then it counts toward `items_per_project` |
 
 A full batch logs a warning (`retention_cleanup_batch_full`, `project_changes_cleanup_batch_full`); a failed
 retention run logs `retention_failed` and the next run tries again.

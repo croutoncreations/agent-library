@@ -2,8 +2,8 @@
 
 Upload finalization lives in `packages/core/src/uploads.js` (`uploadFinish`) with the cron reconciler in `packages/core/src/cleanup.js`.
 
-Files reach 90 MiB (`FILE_BYTES_CEILING`) and a Worker has 128 MB, so no step holds a whole file in memory, and a
-file passes through the Worker once:
+Binary files reach 90 MiB (`FILE_BYTES_CEILING`) and a Worker has 128 MB, so no binary step holds a whole file in
+memory. Binary bytes pass through the Worker once. Text uploads are limited to 10 MiB:
 
 - `uploadBegin` fixes the upload's `final_key` (`blobs/{project}/{artifact}/rev_…`) in the reservation insert.
   `staging_key` is still filled in but nothing is ever written there.
@@ -17,9 +17,11 @@ file passes through the Worker once:
   Start again with a new `upload_begin`. `final_writes - 1` runs when the put settles. On success it records R2's `size` and `checksums.sha256`.
   Each PUT has a deadline: the body is aborted at the upload's `expires_at`, and the put is abandoned at `expires_at +
   PUT_MARGIN_MS` (60 s; `410 upload_expired`), so no put commits later than that.
-- `uploadFinish` writes nothing. Under its lease it checks `head(final_key)` (size equals the declaration and the
-  recorded SHA-256 equals the declared one; no recorded checksum fails closed with `500 publish_failed`) and the type
-  signature on the first 16 bytes, then publishes that object with the fenced revision insert.
+- `uploadFinish` checks `head(final_key)` under its lease: size and recorded SHA-256 must match the declaration.
+  No recorded checksum fails closed with `500 publish_failed`. Binary finish checks the type signature in the first
+  16 bytes and publishes that object without moving or rewriting it. Text finish reads the temporary input once,
+  decodes strict UTF-8, runs the ordinary document validator and publishes through the intent-fenced text writer.
+  Its isolate-local finish slot expires with its lease, follows renewal and can only be released by its holder.
 
 Why this is safe:
 
@@ -33,10 +35,11 @@ Why this is safe:
   uploads holds a live finish lease, is `receiving`, or has a live (not stale) write count. A PUT whose row was ended
   or removed mid-transfer deletes the object it just stored (best effort; a fresh `rev_` key is never referenced
   before publish), and the purge's prefix sweep catches anything left.
-- A failed, conflicting or expired upload's `final_key` is purged by the existing cleanup rule (terminal,
-  `final_writes = 0`, unreferenced by any revision); finish also removes it at once when that holds.
-- Rollback: the previous Worker's cleanup deletes `staging_key` for published uploads. Live bytes are never at
-  `staging_key`, so that deletes nothing referenced.
+- Failed or conflicting uploads retain the reference-guarded final-key cleanup: no live write and no revision
+  referencing the key. Published binary objects are never final-key cleanup candidates. Published text inputs are
+  purged immediately or by the indexed staging-cleanup lane once writes are idle or stale. Text `staging_purged_at`
+  is set only after `final_purged_at`, so a failed temporary-input delete remains discoverable without revisiting
+  every published binary upload.
 
 Migration `0011_upload_finalize_lease.sql` must precede the new Worker. It adds:
 
@@ -83,12 +86,13 @@ and `final_writes > 0`. Don't reset counters by hand: cleanup releases them once
 
 ## Rollback and deploy
 
-- Uploads in flight across a deploy must restart. An upload the previous Worker already PUT has its bytes at
-  `staging_key` and no `final_key`; this Worker's finish ends it `failed` with `409 reupload_required` ("start it again
-  with upload_begin"), and cleanup deletes its `staging_key`.
-- After a rollback, uploads this Worker received (bytes at `final_key`) fail at the previous Worker's finish with
-  `409 missing_bytes` (it reads `staging_key`). Nothing leaks: the row is terminal and cleanup purges its `final_key`.
+- Uploads received by a pre-single-pass Worker must restart. Their bytes are at `staging_key` with no `final_key`;
+  this Worker's finish ends them with `409 reupload_required`, and cleanup deletes `staging_key`.
+- A pre-single-pass Worker reads `staging_key`, so it cannot finish this Worker's binary uploads at `final_key`.
+  Such a rollback also restores the original concurrency bugs: those Workers ignore leases and write accounting.
+- Before rolling back to a Worker from before text uploads, let text uploads finish or expire. The older Worker
+  returns `500` when finishing one and does not clean up its text placeholder or temporary input. Its cron can mark
+  `staging_purged_at` without removing that input; after rolling forward, cleanup no longer finds the object and it
+  remains until the project is purged. See also [limits.md#uploads--transfers](limits.md#uploads--transfers).
 
-The migration is additive, so the old Worker accepts the schema, but it ignores leases
-and write accounting and restores the original concurrency bugs. Drain in-flight
-finishes before rollback; schema compatibility alone is not concurrency safety.
+Additive schema compatibility alone is not rollback safety.
