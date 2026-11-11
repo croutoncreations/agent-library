@@ -1607,9 +1607,10 @@ async function uploadFile(pid, file, target, keys, status) {
 var BINARY_ACCEPT = ".png,.jpg,.jpeg,.webp,.gif,.pdf,.mp4,.webm,image/png,image/jpeg,image/webp,image/gif,application/pdf,video/mp4,video/webm";
 var DATA_ACCEPT = { csv: ".csv,text/csv", json: ".json,application/json" };
 var DATA_MAX_BYTES = 10485760;
-var RENDER_MAX_BYTES = 1048576;
-function previewLimitNote(destination) { return "Preview shows the first 1 MB. " + destination + " for the full text."; }
-function pageLimitNotice(destination) { return "This page is larger than 1 MB, so it isn't shown here. " + destination + " to see its source."; }
+var MARKDOWN_PREVIEW_MAX_BYTES = 262144;
+var HTML_RENDER_MAX_BYTES = 1048576;
+function previewLimitNote(destination) { return "Preview shows the first 256 KB." + (destination ? " " + destination + " for the full text." : ""); }
+function pageLimitNotice(destination) { return "This page is larger than 1 MB, so it isn't shown here." + (destination ? " " + destination + " to see its source." : ""); }
 function dataKindOf(file) {
   var n = (file.name || "").toLowerCase();
   if (/\.csv$/.test(n) || file.type === "text/csv") return "csv";
@@ -2416,7 +2417,7 @@ async function viewArtifact(pid, aid, initialTab) {
         var desc = h("input", { type: "text", maxLength: 280, "aria-label": "New template description" });
         var previewBox = h("div", { class: "template-preview prose", tabIndex: 0, "aria-label": "Source template preview" });
         previewBox.innerHTML = preview.html;
-        if (preview.truncated) previewBox.prepend(h("p", { class: "muted small", role: "status", text: "Preview shows the first 1 MB. The template copies the full saved revision." }));
+        var limitNote = preview.truncated ? h("p", { class: "muted small", text: "Preview shows the first 256 KB. The template copies the full saved revision." }) : null;
         var smsg = h("p", { class: "msg", role: "status" }), attempt = null, busy = false;
         var submit = h("button", { type: "submit" }, "Save template");
         templateForm.replaceChildren(h("form", { class: "template-form", onsubmit: async function (e) {
@@ -2431,7 +2432,7 @@ async function viewArtifact(pid, aid, initialTab) {
           finally { busy = false; submit.disabled = false; }
         } }, h("label", null, "Template name", name), h("label", null, "Description (optional)", desc),
           h("p", { class: "muted small", text: "Project: " + (projectTitles[pid] || pid) + ". Copies saved revision v" + pinned + " shown below. Unsaved edits are excluded. {{title}}, {{project}} and {{date}} are replaced once when used; other braces stay literal." }),
-          previewBox, h("div", { class: "row" }, submit, h("button", { type: "button", class: "secondary", onclick: function () { templateForm.hidden = true; saveTemplateBtn.focus(); } }, "Cancel")), smsg));
+          limitNote, previewBox, h("div", { class: "row" }, submit, h("button", { type: "button", class: "secondary", onclick: function () { templateForm.hidden = true; saveTemplateBtn.focus(); } }, "Cancel")), smsg));
         templateForm.hidden = false; name.focus();
       } catch (err) { showErr(metaMsg, err); }
       finally { saveTemplateBtn.disabled = false; }
@@ -2823,7 +2824,7 @@ async function viewArtifact(pid, aid, initialTab) {
   } }, comText, h("div", { class: "row" }, h("button", { type: "submit" }, "Add comment")));
 
   var below = h("div", { class: "below" });
-  if (isTextDoc(A.meta.kind)) renderMarkdownEditor(A, data, { titleEl: titleEl, details: details, tabNav: tabNav, panels: panels, addTab: addTab, showTab: showTab, fillMeta: fillMeta, below: below });
+  if (isTextDoc(A.meta.kind)) renderMarkdownEditor(A, data, { titleEl: titleEl, details: details, tabNav: tabNav, panels: panels, addTab: addTab, showTab: showTab, openHistory: function (rev) { VH.open(rev); showTab("history"); }, fillMeta: fillMeta, below: below });
   else if (isDataKind(A.meta.kind)) renderDataFile(A, data, { titleEl: titleEl, details: details, tabNav: tabNav, panels: panels, addTab: addTab, showTab: showTab, below: below });
   else renderBinary(A, data, { titleEl: titleEl, details: details, tabNav: tabNav, panels: panels, addTab: addTab, showTab: showTab, below: below });
 
@@ -3370,7 +3371,30 @@ function renderMarkdownEditor(A, data, ui) {
   var previewBox = h("div", { class: "preview" });
   var savedSize = data.revision.size;
   var previewNote = h("p", { class: "muted small preview-note" });
-  var renderNotice = h("p", { class: "muted small render-notice", role: "status", "aria-live": "polite", hidden: true });
+  // Preserve the hidden small-document DOM; only large pages replace it with a non-live state box.
+  var smallRenderNotice = h("p", { class: "muted small render-notice", role: "status", "aria-live": "polite", hidden: true });
+  var renderNotice = smallRenderNotice;
+  var previewTruncated = false, previewSavedNote = "", shownRev = A.rev;
+  function showSourceHistory() { ui.openHistory(shownRev); }
+  function setPreviewNote(savedNote, truncated) {
+    previewSavedNote = savedNote; previewTruncated = truncated;
+    previewNote.textContent = savedNote + (truncated ? (savedNote ? " " : "") + previewLimitNote(A.readOnly ? null : "Open Edit") : "");
+    if (truncated && A.readOnly) previewNote.append(" ", h("a", { href: docUrl(pid, aid) + "?v=" + shownRev, onclick: function (e) {
+      if (e.button || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+      e.preventDefault(); showSourceHistory();
+    } }, "Show full text in History"));
+    previewNote.hidden = !previewNote.textContent;
+  }
+  function showPageLimit() {
+    if (renderNotice === smallRenderNotice) {
+      renderNotice = h("div", { class: "render-notice" }); smallRenderNotice.replaceWith(renderNotice);
+    }
+    renderNotice.replaceChildren(stateBox("neutral", "doc", "Page too large to show here", pageLimitNotice(),
+      h("button", { type: "button", onclick: function () {
+        if (A.readOnly) showSourceHistory();
+        else { ui.showTab("edit"); ui.tabNav.querySelector('[aria-selected="true"]').focus(); }
+      } }, A.readOnly ? "Show source in History" : "Open Edit")));
+  }
   // HTML documents render in a sandboxed iframe: no scripts, forms or top navigation (see src/html.ts).
   // allow-same-origin only so its <img>/<video> carry the session; allow-popups so links open in a new tab.
   // NEVER add allow-scripts.
@@ -3453,8 +3477,8 @@ function renderMarkdownEditor(A, data, ui) {
   // View-only (now or later): no more saves. Returns unsaved text so the person can copy it, else null.
   A.stopEditing = function () {
     clearTimeout(D.timer); clearTimeout(D.retryTimer); D.stopped = true; ta.readOnly = true;
-    previewNote.textContent = previewNote.textContent.replace(previewLimitNote("Open Edit"), previewLimitNote("Use Show full text in History"));
-    renderNotice.textContent = renderNotice.textContent.replace(pageLimitNotice("Open Edit"), pageLimitNotice("Use Show full text in History"));
+    setPreviewNote(previewSavedNote, previewTruncated);
+    if (!renderNotice.hidden) showPageLimit();
     conflictBox.hidden = true; // the unsaved-text box holds the text from here on
     var dr = readDraft(pid, aid);
     var text = isDirty() ? ta.value : dr && typeof dr.body === "string" && dr.body !== D.savedBody ? dr.body : null;
@@ -3555,14 +3579,14 @@ function renderMarkdownEditor(A, data, ui) {
   });
 
   async function loadPreview() {
+    shownRev = A.rev;
     var savedNote = isDirty() ? "Showing saved rev " + A.rev + " (unsaved edits are not included)." : "";
-    previewNote.textContent = savedNote;
-    previewNote.hidden = !previewNote.textContent;
+    setPreviewNote(savedNote, false);
     if (isHtml) {
-      var largePage = savedSize > RENDER_MAX_BYTES;
+      var largePage = savedSize > HTML_RENDER_MAX_BYTES;
       renderNotice.hidden = !largePage; frame.hidden = largePage;
-      renderNotice.textContent = largePage ? pageLimitNotice(A.readOnly ? "Use Show full text in History" : "Open Edit") : "";
-      if (largePage) { frame.removeAttribute("src"); return; }
+      if (largePage) { showPageLimit(); frame.removeAttribute("src"); return; }
+      if (renderNotice !== smallRenderNotice) { renderNotice.replaceWith(smallRenderNotice); renderNotice = smallRenderNotice; renderNotice.hidden = true; }
       // The response carries CSP script-src 'none' + sandbox, and the iframe sandbox has no allow-scripts.
       var src = A.base + "/render?rev=" + A.rev;
       if (frame.getAttribute("src") !== src) frame.setAttribute("src", src);
@@ -3570,8 +3594,7 @@ function renderMarkdownEditor(A, data, ui) {
     }
     try {
       var r = await api("GET", A.base + "/preview?rev=" + A.rev); previewBox.innerHTML = r.html; enhanceTables(previewBox);
-      previewNote.textContent = savedNote + (r.truncated ? (savedNote ? " " : "") + previewLimitNote(A.readOnly ? "Use Show full text in History" : "Open Edit") : "");
-      previewNote.hidden = !previewNote.textContent;
+      setPreviewNote(savedNote, r.truncated);
       previewBox.querySelectorAll("video[data-artifact]").forEach(function (v) { v.preload = "metadata"; });
       previewBox.querySelectorAll("img[data-artifact]").forEach(function (im) {
         im.tabIndex = 0; im.title = "View full size";
@@ -3707,7 +3730,7 @@ async function offSave(pid, aid) {
   } else if (d.artifact.kind === "html") {
     // The server-sanitized rendered page (no scripts); shown offline in a sandboxed iframe via srcdoc.
     it.body = d.body;
-    it.renderTooLarge = d.revision.size > RENDER_MAX_BYTES;
+    it.renderTooLarge = d.revision.size > HTML_RENDER_MAX_BYTES;
     if (!it.renderTooLarge) {
       var rp = await fetch(base + "/render?rev=" + d.revision.rev, { credentials: "same-origin", cache: "no-store" });
       if (!rp.ok) throw new Error("Could not save the rendered page (" + rp.status + ")");
@@ -3853,20 +3876,21 @@ async function viewOfflineItem(pid, aid, tab) {
       if (b) { var u = blobUrl(b); im.src = u; im.tabIndex = 0; im.addEventListener("click", function () { openLightbox(u, im.alt || "image"); }); }
       else { im.replaceWith(h("span", { class: "muted small", text: "[image not saved offline]" })); }
     });
-    if (it.truncated) pv.prepend(h("p", { class: "muted small", role: "status", text: previewLimitNote("Open Text") }));
+    var limitNote = it.truncated ? h("p", { class: "muted small", text: previewLimitNote("Open Text") }) : null;
+    var previewPanel = it.truncated ? h("div", null, limitNote, pv) : pv;
     var raw = h("pre", { class: "raw", text: it.body || "" });
     var tabs = tabList("Saved copy views");
     var sel = tab === "raw" ? "raw" : "preview";
-    [["preview", "Preview", pv], ["raw", "Text", raw]].forEach(function (t) {
-      var b = tabButton(t[1], t[2], function () { selectTab(tabs, b); pv.hidden = t[0] !== "preview"; raw.hidden = t[0] !== "raw"; });
+    [["preview", "Preview", previewPanel], ["raw", "Text", raw]].forEach(function (t) {
+      var b = tabButton(t[1], t[2], function () { selectTab(tabs, b); previewPanel.hidden = t[0] !== "preview"; raw.hidden = t[0] !== "raw"; });
       tabs.append(b); if (t[0] === sel) selectTab(tabs, b);
     });
-    pv.hidden = sel !== "preview"; raw.hidden = sel !== "raw";
-    body.append(tabs, pv, raw);
+    previewPanel.hidden = sel !== "preview"; raw.hidden = sel !== "raw";
+    body.append(tabs, previewPanel, raw);
   } else if (it.kind === "html") {
     // No scripts, opaque origin (links still open in a new tab); the stored page was sanitized by the server. Media need the network.
     var fr = it.renderTooLarge
-      ? h("p", { class: "muted small", role: "status", text: pageLimitNotice("Open Source") })
+      ? stateBox("neutral", "doc", "Page too large to show here", pageLimitNotice("Open Source"))
       : h("iframe", { class: "htmlview", title: "Rendered page (saved copy)", sandbox: "allow-popups allow-popups-to-escape-sandbox", referrerpolicy: "no-referrer" });
     if (!it.renderTooLarge) fr.srcdoc = it.page || "";
     var rawH = h("pre", { class: "raw", text: it.body || "", hidden: true });

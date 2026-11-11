@@ -56,6 +56,10 @@ before(async () => {
     assert.equal(Buffer.byteLength(body), MAX - 16);
     await make(kind, body, `crossing-${kind}`);
   }
+  for (const key of ["largeMarkdown", "largeHtml"]) {
+    const current = await owner.req("GET", base(ids[key]));
+    assert.equal((await owner.req("PUT", base(ids[key]), { expected_revision: 1, body: current.body.body })).status, 200);
+  }
   // A previously issued link from before this restriction: repoint a small-page link.
   const old = await nav(ids.exactHtml); blockedPath = new URL(old.headers.get("location")).pathname;
   await sql(`UPDATE view_links SET artifact_id = '${ids.largeHtml}' WHERE token_hash = '${sha256(blockedPath.slice(3))}'`);
@@ -72,6 +76,7 @@ test("visible render sizes stay tied to their kind's threshold", () => {
   const helpers = js.match(/^function (?:previewLimitNote|pageLimitNotice)\(.*$/gm).join("\n");
   const context = {}; runInNewContext(helpers, context);
   assert.equal(context.previewLimitNote("Open Edit"), NOTE);
+  assert.equal(context.previewLimitNote(), PREVIEW_PREFIX);
   assert.equal(context.previewLimitNote("Open Text"), PREVIEW_PREFIX + " Open Text for the full text.");
   assert.equal(context.pageLimitNotice(), NOTICE);
   assert.equal(context.pageLimitNotice("Open Source"), NOTICE + " Open Source to see its source.");
@@ -204,6 +209,61 @@ test("Chrome: saved editor changes cross the render limit in both directions wit
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
 });
+test("Chrome: refresh, conflict reload, History restore and reload use each kind's budget; saved-revision notes coexist", { timeout: 180000 }, async () => {
+  const puppeteer = createRequire(import.meta.url)(`${process.env.HOME}/.npm-packages/lib/node_modules/puppeteer`);
+  const browser = await puppeteer.launch({ executablePath: process.env.CHROME_PATH ?? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", headless: true, args: ["--no-sandbox"] });
+  try {
+    const page = await browser.newPage();
+    const [name, value] = owner.cookie.split("="); await page.setCookie({ name, value, url: APP });
+    page.on("dialog", d => d.accept());
+    const tab = async label => page.evaluate(label => [...document.querySelectorAll('[role="tab"]')].find(e => e.textContent === label).click(), label);
+    const saved = rev => page.waitForFunction(rev => document.querySelector(".status")?.textContent === `Saved - rev ${rev}`, {}, rev);
+    for (const kind of ["markdown", "html"]) {
+      const html = kind === "html", limit = html ? HTML_MAX : MAX, view = html ? "Page" : "Preview";
+      const small = html ? "<h1>Refresh source</h1>" : "# Refresh source\n";
+      const large = small + "word ".repeat(Math.ceil(limit / 5));
+      const id = await make(kind, small, `refresh-${kind}`);
+      await page.goto(`${APP}/#/p/${pid}/a/${id}`); await saved(1);
+      await owner.req("PUT", base(id), { expected_revision: 1, body: large, change_note: "Synthetic large revision" });
+      await page.evaluate(() => window.dispatchEvent(new Event("focus"))); await saved(2);
+      await page.waitForFunction(html => html ? !document.querySelector(".render-notice")?.hidden : document.querySelector(".preview-note")?.textContent.includes("Preview shows"), {}, html);
+      // Pause the real save request, not its response/body: both notices remain readable while edits are unsaved.
+      let resolveSave; const pausedSave = new Promise(resolve => { resolveSave = resolve; });
+      await page.setRequestInterception(true);
+      const intercept = r => { if (r.method() === "PUT" && r.url().endsWith(base(id))) resolveSave(r); else r.continue(); };
+      page.on("request", intercept);
+      await tab("Edit"); await page.waitForSelector(".cm-content", { visible: true }); await page.click(".cm-content");
+      await page.keyboard.sendCharacter("local edit"); await tab(view);
+      const expected = "Showing saved rev 2 (unsaved edits are not included)." + (html ? "" : " " + NOTE);
+      await page.waitForFunction(text => document.querySelector(".preview-note")?.textContent === text, {}, expected);
+      assert.deepEqual(await page.$eval(".preview-note", e => [e.getAttribute("role"), e.getAttribute("aria-live")]), [null, null]);
+      await owner.req("PUT", base(id), { expected_revision: 2, body: small });
+      await page.click(".footbar button"); await (await pausedSave).continue();
+      await page.waitForSelector(".conflict:not([hidden])");
+      await page.waitForFunction(() => document.querySelector("#conflict-theirs")?.value.startsWith("<h1>") || document.querySelector("#conflict-theirs")?.value.startsWith("# Refresh"));
+      await page.$$eval(".conflict button", es => es.find(e => e.textContent === "Load latest (discard mine)").click());
+      await saved(3); await page.setRequestInterception(false); page.off("request", intercept);
+      await tab(view);
+      await page.waitForFunction(html => document.querySelector(html ? ".render-notice" : ".preview-note")?.hidden, {}, html);
+      // Restoring invokes A.reload without reloading the browser document.
+      await page.evaluate(() => { window.renderLimitDocument = true; });
+      for (const [from, rev, isLarge] of [[2, 4, true], [3, 5, false]]) {
+        await tab("History"); await page.waitForSelector(`.vh-row[data-rev="${from}"] button`);
+        await page.click(`.vh-row[data-rev="${from}"] button`);
+        await page.waitForFunction(() => [...document.querySelectorAll(".vh-detail button")].some(e => e.textContent === "Restore this version"));
+        await page.$$eval(".vh-detail button", es => es.find(e => e.textContent === "Restore this version").click());
+        await saved(rev); await tab(view);
+        await page.waitForFunction((html, isLarge) => document.querySelector(html ? ".render-notice" : ".preview-note")?.hidden === !isLarge, {}, html, isLarge);
+        assert.equal(await page.evaluate(() => window.renderLimitDocument), true);
+        if (isLarge) {
+          await page.reload(); await saved(rev);
+          await page.waitForFunction(html => !document.querySelector(html ? ".render-notice" : ".preview-note")?.hidden, {}, html);
+          await page.evaluate(() => { window.renderLimitDocument = true; });
+        }
+      }
+    }
+  } finally { await browser.close(); }
+});
 test("Chrome: exact owner/viewer notes, small views, offline copies, and synthetic design captures", { timeout: 180000 }, async () => {
   const puppeteer = createRequire(import.meta.url)(`${process.env.HOME}/.npm-packages/lib/node_modules/puppeteer`);
   const browser = await puppeteer.launch({ executablePath: process.env.CHROME_PATH ?? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", headless: true, args: ["--no-sandbox"] });
@@ -231,7 +291,10 @@ test("Chrome: exact owner/viewer notes, small views, offline copies, and synthet
               assert.deepEqual(await page.$eval(".render-notice", e => [e.getAttribute("role"), e.getAttribute("aria-live")]), [null, null]);
             } else {
               assert.equal(await page.$eval(".preview-note", e => e.nextElementSibling.nextElementSibling.className), "preview");
-              if (role === "viewer") assert.equal(await page.$eval(".preview-note button", e => e.textContent), "Show full text in History");
+              if (role === "viewer") {
+                assert.equal(await page.$eval(".preview-note a", e => e.textContent), "Show full text in History");
+                assert.equal(await page.$eval(".preview-note a", e => e.href), `${APP}/synthetic-rendering/render-limits/a/${ids[key]}?v=2`);
+              }
             }
             if (html) { assert.deepEqual(requests, []); assert.equal(await page.$eval("iframe.htmlview", e => e.getAttribute("src")), null); }
             else await page.waitForFunction(() => document.querySelector(".preview h1")?.textContent === "early-render-marker");
@@ -244,7 +307,8 @@ test("Chrome: exact owner/viewer notes, small views, offline copies, and synthet
             if (html || role === "viewer") {
               // Start at the tab row, walk with real Tab keys, then activate the supported next step.
               await page.$eval('[role="tab"][aria-selected="true"]', e => e.focus());
-              const selector = html ? ".render-notice button" : ".preview-note button";
+              await page.evaluate(() => { window.renderLimitDocument = true; });
+              const selector = html ? ".render-notice button" : ".preview-note a";
               let reached = false;
               for (let i = 0; i < 12; i++) {
                 await page.keyboard.press("Tab");
@@ -257,22 +321,40 @@ test("Chrome: exact owner/viewer notes, small views, offline copies, and synthet
                 await page.waitForFunction(() => document.querySelector('[role="tab"][aria-selected="true"]')?.textContent === "Edit");
                 await page.waitForSelector(".cm-content", { visible: true });
               } else {
-                await page.waitForFunction(() => document.activeElement?.textContent === "Version 1 (current)");
+                await page.waitForFunction(() => document.activeElement?.textContent === "Version 2 (current)");
                 assert.equal(await page.$eval('[role="tab"][aria-selected="true"]', e => e.textContent), "History");
-                assert.equal(await page.$eval('.vh-row[aria-current="true"]', e => e.dataset.rev), "1");
-                assert.equal(await page.$eval(".vh-detail .row button", e => e.textContent), "Show full text");
-                assert.equal(await page.$eval(".vh-body", e => e.textContent), "This is the first version.");
+                assert.equal(await page.$eval('.vh-row[aria-current="true"]', e => e.dataset.rev), "2");
+                assert.equal(await page.$$eval(".vh-detail .row button", es => es.some(e => e.textContent === "Show full text")), true);
+                assert.match(await page.$eval(".vh-body", e => e.textContent), /identical/);
                 if (captures) await page.screenshot({ path: `${out}/viewer-history-${key}-${width}.png` });
-                await page.$eval(".vh-detail .row button", e => e.click());
+                await page.$$eval(".vh-detail .row button", es => es.find(e => e.textContent === "Show full text").click());
                 await page.waitForSelector(".vh-body pre.raw");
                 assert.equal(await page.$eval(".vh-body pre.raw", e => e.textContent), (await owner.req("GET", base(ids[key]))).body.body);
+                assert.equal(await page.evaluate(() => window.renderLimitDocument), true, "History opens without a reload");
+                if (!html) {
+                  const linked = await browser.newPage();
+                  await linked.goto(`${APP}/synthetic-rendering/render-limits/a/${ids[key]}?v=2`);
+                  await linked.waitForFunction(() => document.activeElement?.textContent === "Version 2 (current)");
+                  assert.equal(await linked.$eval('[role="tab"][aria-selected="true"]', e => e.textContent), "History");
+                  await linked.close();
+                  await page.evaluate(() => [...document.querySelectorAll('[role="tab"]')].find(e => e.textContent === "Preview").click());
+                  await page.waitForSelector(".preview-note a", { visible: true });
+                  await page.evaluate(() => { window.renderLimitDocument = true; });
+                  await page.click(".preview-note a");
+                  await page.waitForFunction(() => document.activeElement?.textContent === "Version 2 (current)");
+                  assert.equal(await page.evaluate(() => window.renderLimitDocument), true);
+                  assert.equal(await page.$$eval(".vh-detail .row button", es => es.some(e => e.textContent === "Show full text")), true);
+                }
               }
             }
           } else {
             if (html) await page.waitForFunction(() => document.querySelector("iframe.htmlview")?.getAttribute("src"));
             else await page.waitForFunction(() => document.querySelector(".preview h1")?.textContent === "Small Markdown");
             assert.equal(await page.$eval(".preview-note", e => e.textContent), "");
-            if (html) assert.equal(await page.$eval(".render-notice", e => e.hidden), true);
+            if (html) {
+              assert.deepEqual(await page.$eval(".render-notice", e => [e.hidden, e.tagName, e.className, e.getAttribute("role"), e.getAttribute("aria-live")]), [true, "P", "muted small render-notice", "status", "polite"]);
+              assert.equal(await page.$(".render-notice .state"), null);
+            }
           }
           assert.deepEqual(await page.$eval(".preview-note", e => [e.getAttribute("role"), e.getAttribute("aria-live")]), [null, null]);
           if (role === "viewer") assert.equal(await page.evaluate(() => [...document.querySelectorAll('[role="tab"]')].some(el => el.textContent === "Edit")), false);
@@ -310,7 +392,7 @@ test("Chrome: exact owner/viewer notes, small views, offline copies, and synthet
           } else {
             assert.equal(await page.$eval(".state h3", e => e.textContent), TITLE);
             assert.equal(await page.$(".state button"), null);
-            assert.deepEqual(await page.$eval(".state", e => [e.getAttribute("role"), e.getAttribute("aria-live"), e.classList.contains("error")]), [null, null, false]);
+            assert.deepEqual(await page.$eval(".state", e => [e.getAttribute("role"), e.getAttribute("aria-live"), e.classList.contains("error")]), ["tabpanel", null, false]);
           }
           if (captures) for (const width of [1280, 390]) {
             await page.setViewport({ width, height: 900 });

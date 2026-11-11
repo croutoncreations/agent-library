@@ -36,7 +36,7 @@ remove. A string that's too long is `413 too_large`; a number out of range is `4
 | Comment | 1–10,000 characters | comment | fixed; new bodies are stored in R2, legacy inline D1 bodies remain readable | `413 too_large` |
 | Versions kept | all, forever | document | fixed (only `storage_bytes` bounds them) | — |
 
-Server rendering is limited to 1 MiB (shown as 1 MB in the app): Markdown preview shows only the beginning of a larger document, cut back to a nearby line break; HTML pages over 1 MiB are not rendered in the app or through view links. Editing, download, history and agent reads still work up to 10 MiB.
+Server rendering has separate limits: Markdown preview shows the first 256 KiB (shown as 256 KB in the app) of a larger document, cut back to a line break within the final 16 KiB; HTML pages over 1 MiB (shown as 1 MB) are not rendered in the app or through view links. A cut-off preview is still useful but a cut-off page is not, and the Markdown renderer costs more memory per byte. Editing, download, history and agent reads still work up to 10 MiB.
 
 For non-identical text versions, history diff returns a summary with no line hunks when either version exceeds 1 MiB; identical hashes still return the identical result.
 

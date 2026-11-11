@@ -50,7 +50,7 @@ Every artifact has a stable owner URL: `https://APP_HOST/p/<project>/a/<artifact
 
 ## User-content host
 
-Server rendering has a [1 MiB limit](limits.md#documents--files): larger Markdown previews show only the beginning, and larger HTML pages are refused before issuing a view link (existing links also refuse them).
+Server rendering has [separate limits](limits.md#documents--files): larger Markdown previews show the first 256 KiB, cut back to a nearby line break; HTML pages over 1 MiB are not rendered in the app or through view links (including existing links). A cut-off preview is still useful but a cut-off page is not, and the Markdown renderer costs more memory per byte. Editing, download, history and agent reads still work up to 10 MiB.
 
 Uploaded HTML documents and PDFs are written by agents and other people, so they are never run on the app's origin.
 Without `CONTENT_HOST`, HTML pages are sanitized and shown in a sandboxed frame with `script-src 'none'` on the app

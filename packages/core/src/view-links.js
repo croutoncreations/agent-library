@@ -103,7 +103,7 @@ export async function handleContentHost(req, env, url) {
       "x-revision": String(r.revision.rev_no)
     } });
   } catch (e) {
-    if (e instanceof HttpError && e.code === "render_too_large") return textPage(env, 413, e.message);
+    if (e instanceof HttpError && e.code === "render_too_large") return textPage(env, 413, e.message + " Open it in Agent Library to see its source.");
     if (e instanceof HttpError) return textPage(env, e.status === 429 ? 429 : 404, e.status === 429 ? "Too many requests" : "Not found");
     console.error("content_host_error", requestId, e?.message);
     return textPage(env, 500, "Internal error");
