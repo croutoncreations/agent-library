@@ -305,6 +305,32 @@ for (const transport of ["app", "v1"]) test(`${transport} tiny-row CSV at the JS
   t.diagnostic(`${transport}: ${rows} rows, ${Buffer.byteLength(input.content)} CSV bytes, spreadsheet SHA-256 ${sha256(exported.body)}`);
 });
 
+for (const transport of ["app", "v1"]) test(`${transport} CSV header column boundary and spreadsheet HEAD parity`, async () => {
+  const request = transport === "app" ? owner.req : api;
+  const base = transport === "app" ? "/api/projects/large-text/artifacts" : "/v1/projects/large-text/files";
+  const content = Array.from({ length: 16384 }, (_, i) => `c${i}`).join(",") + "\n";
+  const input = { title: `Column boundary ${transport}`, kind: "csv", content };
+  const made = await request("POST", base, input);
+  assert.equal(made.status, 201, JSON.stringify(made.body));
+  const path = base + "/" + made.body.artifact_id;
+  const exported = await request("GET", path + "/content?format=spreadsheet", undefined, { binary: true });
+  const head = await request("HEAD", path + "/content?format=spreadsheet", undefined, { binary: true });
+  assert.equal(exported.status, 200);
+  assert.equal(head.status, exported.status);
+  assert.equal(head.body.length, 0);
+  assert.equal(sha256(exported.body), sha256(content.replace(/\n/g, "\r\n")));
+  for (const header of ["content-length", "content-type", "content-disposition", "cache-control", "content-security-policy", "cross-origin-resource-policy", "x-content-type-options"]) assert.equal(head.headers.get(header), exported.headers.get(header));
+  const over = content.trimEnd() + ",extra\n";
+  for (const [method, url, body] of [["POST", base, { ...input, content: over }], ["PUT", path, { expected_revision: 1, content: over }]]) {
+    const refused = await request(method, url, body);
+    assert.equal(refused.status, 422);
+    const { request_id, ...error } = refused.body.error;
+    assert.deepEqual(error, { code: "invalid_content", message: "Invalid csv: more than 16384 columns", format: "csv", line: 1, detail: "more than 16384 columns" });
+  }
+  const unchanged = await request("GET", path + "/content", undefined, { binary: true });
+  assert.equal(sha256(unchanged.body), sha256(content));
+});
+
 async function declaredOversize(path, bytes) {
   return new Promise((resolve, reject) => {
     const req = httpRequest({ host: "127.0.0.1", port, method: "POST", path, headers: { authorization: `Bearer ${token}`, "content-type": "application/json", "content-length": bytes, "idempotency-key": "declared-cap" } }, res => {

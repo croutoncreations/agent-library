@@ -175,32 +175,56 @@ function* measurementRecords(text) {
   const { records } = measurementMembers(text);
   for (const { start, end } of jsonArrayElements(text, records.start)) yield text.slice(start, end);
 }
-// The grammar emits one row at a time; consumers choose whether to retain it.
+const MAX_CSV_COLUMNS = 16384;
+const CSV_CELL_CHUNK_CHARS = 16384;
+// V8's replace can retain per-match ropes. Join batches of at most 2 bounded
+// replacements so no whole-cell collection of per-quote nodes remains alive.
+function unescapeCsvCell(value) {
+  let output = "";
+  const chunks = [];
+  for (let start = 0; start < value.length;) {
+    let end = Math.min(start + CSV_CELL_CHUNK_CHARS, value.length);
+    if (end < value.length) {
+      const last = value.charCodeAt(end - 1);
+      if (last >= 0xD800 && last <= 0xDBFF) end--;
+      let quotes = 0;
+      for (let j = end - 1; j >= start && value[j] === '"'; j--) quotes++;
+      if (quotes % 2) end--;
+    }
+    chunks.push(value.slice(start, end).replace(/""/g, '"'));
+    if (chunks.length === 2) { output += chunks.join(""); chunks.length = 0; }
+    start = end;
+  }
+  return output + chunks.join("");
+}
+// Retain at most the bounded header width, but count every cell and scan all syntax.
 function scanCsv(text, file, onRow) {
-  checkCommon(text, "csv", file);
-  let i = 0, line = 1;
+  let i = 0, line = 1, width = MAX_CSV_COLUMNS;
   const n = text.length;
   while (i < n) {
     const startLine = line;
     const cells = [];
+    let count = 0;
     for (; ; ) {
+      const retain = count < width;
       let cell = "";
       if (text[i] === '"') {
         i++;
-        let start = i;
-        const pieces = [];
+        const start = i;
+        let escaped = false;
         for (; ; ) {
           if (i >= n) throw invalid({ format: "csv", file, line: startLine, detail: "unterminated quoted field" });
           const c = text[i];
           if (c === '"') {
             if (text[i + 1] === '"') {
-              pieces.push(text.slice(start, i + 1));
+              escaped = true;
               i += 2;
-              start = i;
               continue;
             }
-            cell = text.slice(start, i);
-            if (pieces.length) { pieces.push(cell); cell = pieces.join(""); }
+            if (retain) {
+              cell = text.slice(start, i);
+              if (escaped) cell = unescapeCsvCell(cell);
+            }
             i++;
             break;
           }
@@ -214,9 +238,10 @@ function scanCsv(text, file, onRow) {
           if (text[i] === '"') throw invalid({ format: "csv", file, line, detail: "quote inside unquoted field" });
           i++;
         }
-        cell = text.slice(start, i);
+        if (retain) cell = text.slice(start, i);
       }
-      cells.push(cell);
+      count++;
+      if (retain) cells.push(cell);
       if (i >= n) break;
       if (text[i] === ",") {
         i++;
@@ -234,7 +259,8 @@ function scanCsv(text, file, onRow) {
         break;
       }
     }
-    onRow(cells, startLine);
+    if (startLine === 1) width = Math.min(count, MAX_CSV_COLUMNS);
+    onRow(cells, startLine, count);
   }
 }
 function checkCsvHeader(header, file) {
@@ -245,16 +271,20 @@ function checkCsvHeader(header, file) {
     seen.add(h);
   }
 }
-function visitCsv(text, file, onRow) {
+function visitCsv(text, file, onRow, commonChecked = false) {
+  if (!commonChecked) checkCommon(text, "csv", file);
   let header, headerError, columnError, rowCount = 0;
-  scanCsv(text, file, (cells, line) => {
+  scanCsv(text, file, (cells, line, count) => {
     if (!header) {
       header = cells;
-      try { checkCsvHeader(header, file); } catch (e) { headerError = e; }
+      try {
+        if (count > MAX_CSV_COLUMNS) throw invalid({ format: "csv", file, line: 1, detail: `more than ${MAX_CSV_COLUMNS} columns` });
+        checkCsvHeader(header, file);
+      } catch (e) { headerError = e; }
     } else {
       rowCount++;
-      if (!columnError && cells.length !== header.length)
-        columnError = invalid({ format: "csv", file, line, detail: `expected ${header.length} columns, found ${cells.length}` });
+      if (!columnError && count !== header.length)
+        columnError = invalid({ format: "csv", file, line, detail: `expected ${header.length} columns, found ${count}` });
     }
     if (!headerError && !columnError) onRow(cells, line, rowCount);
   });
@@ -352,7 +382,20 @@ function checkFile(kind, content, schema, file) {
   if (schemaError) throw schemaError;
   return { kind, schema: sch, record_count: null, row_count: rowCount };
 }
-function spreadsheetSafeCsv(text) {
+// checkCommon has ruled out lone surrogates before export reaches this counter.
+function csvUtf8Length(text, doubleQuotes = false) {
+  let length = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if (c < 0x80) length += doubleQuotes && c === 34 ? 2 : 1;
+    else if (c < 0x800) length += 2;
+    else if (c >= 0xD800 && c <= 0xDBFF) { length += 4; i++; }
+    else length += 3;
+  }
+  return length;
+}
+function spreadsheetSafeCsv(text, { headOnly = false } = {}) {
+  checkCommon(text, "csv");
   const encoder = new TextEncoder();
   // Two scans avoid retaining per-row strings or a second output-sized buffer.
   // Count UTF-8 bytes first, then fill one exactly-sized output allocation.
@@ -360,18 +403,23 @@ function spreadsheetSafeCsv(text) {
     let offset = 0;
     const append = (s) => {
       if (output) offset += encoder.encodeInto(s, output.subarray(offset)).written;
-      else offset += encoder.encode(s).length;
+      else offset += csvUtf8Length(s);
     };
     visitCsv(text, undefined, (cells) => {
       for (let i = 0; i < cells.length; i++) {
         if (i) append(",");
         const value = cells[i];
         const quoted = /[",\r\n]/.test(value);
+        const prefix = /^[=+\-@\t\r]/.test(value);
+        if (!output) {
+          offset += csvUtf8Length(value, quoted) + (quoted ? 2 : 0) + (prefix ? 1 : 0);
+          continue;
+        }
         if (quoted) append('"');
-        if (/^[=+\-@\t\r]/.test(value)) append("'");
+        if (prefix) append("'");
         // Slice bounded pieces, doubling quotes without making another large cell.
         for (let start = 0; start < value.length;) {
-          let end = Math.min(start + 16384, value.length);
+          let end = Math.min(start + CSV_CELL_CHUNK_CHARS, value.length);
           const last = value.charCodeAt(end - 1);
           if (end < value.length && last >= 0xD800 && last <= 0xDBFF) end--;
           append(value.slice(start, end).replace(/"/g, '""'));
@@ -380,10 +428,11 @@ function spreadsheetSafeCsv(text) {
         if (quoted) append('"');
       }
       append("\r\n");
-    });
+    }, true);
     return offset;
   };
   const length = write(null);
+  if (headOnly) return { length };
   const output = new Uint8Array(length);
   write(output);
   return output;
@@ -409,4 +458,4 @@ CONTENT_TYPE = {
   "text/html": "text/plain; charset=utf-8"
 };
 
-export { CONTENT_TYPE, MEASUREMENTS, MIME, byteLength, checkFile, isCalendarDate, measurementRecords, parseCsv, spreadsheetSafeCsv, validJson };
+export { CONTENT_TYPE, CSV_CELL_CHUNK_CHARS, MEASUREMENTS, MIME, byteLength, checkFile, isCalendarDate, measurementRecords, parseCsv, spreadsheetSafeCsv, validJson };

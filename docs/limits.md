@@ -28,6 +28,7 @@ remove. A string that's too long is `413 too_large`; a number out of range is `4
 | File size (images, PDF, video, other uploads) | 25 MiB | file version | `FILE_MAX_BYTES`; plan `file_bytes`. Never above 90 MiB (_ceiling_: Cloudflare refuses requests over 100 MB, and a file is sent in one PUT). Measured on Cloudflare (Workers Paid, 2026-11-10): 25 MiB works; 50 and 80 MiB uploads fail with 1102 (resource limits), so keep `file_bytes` at 25 MiB or less until uploads stop passing the file through the Worker twice | `413 too_large` "Files can be up to 25 MB on this plan", `{ limit: "file_bytes", allowed }` |
 | Storage | unlimited | workspace | plan `storage_bytes` | `402 limit_reached` |
 | JSON nesting | 64 levels | document | fixed | `422 invalid_content` |
+| CSV columns | 16,384 | header and each data row | fixed (`MAX_CSV_COLUMNS`) | `422 invalid_content`, format `csv`, line 1: "Invalid csv: more than 16384 columns"; also refused on spreadsheet export of older files |
 | Measurement records | 100,000 per file; JSON records at most 16,384 characters each | JSON and CSV measurements documents | fixed (`MAX_MEASUREMENT_RECORD_CHARS` for JSON record size) | `422 invalid_content`; oversized JSON record: "Invalid schema: record larger than 16384 characters" |
 | Title | 1–200 characters | document, file, project, template | fixed | `413 too_large` |
 | Tags | 20 per document, each 1–50 characters | document | fixed | `400 invalid_input` / `413 too_large` |
@@ -39,7 +40,7 @@ Server rendering is limited to 1 MiB (shown as 1 MB in the app): Markdown previe
 
 For non-identical text versions, history diff returns a summary with no line hunks when either version exceeds 1 MiB; identical hashes still return the identical result.
 
-The text limit is a storage bound, not a memory guarantee. Server CSV validation and spreadsheet export scan one row at a time without retaining all rows or cells; export allocates the output bytes after counting their size. Measurements validation also retains at most 100,000 ids for duplicate detection. There is no generic CSV row/cell cap. Browser CSV preview still parses whole files; JSON files are validated without being built in memory, and record queries read one record at a time, but concurrent requests still share the Worker's 128 MB memory ceiling.
+The text limit is a storage bound, not a memory guarantee. Server CSV validation and spreadsheet export handle rows one at a time; one row's cells, at most the header's column count (bounded by 16,384), are held at a time. Export allocates output bytes after counting their size; HEAD only counts. Measurements validation also retains at most 100,000 ids for duplicate detection. There is no generic CSV row-count or cell-size cap beyond the text size limit. Browser CSV preview still parses whole files; JSON files are validated without being built in memory, and record queries read one record at a time, but concurrent requests still share the Worker's 128 MB memory ceiling.
 
 ## Projects & folders
 
