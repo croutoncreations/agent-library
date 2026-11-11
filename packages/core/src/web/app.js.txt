@@ -3903,7 +3903,9 @@ async function viewOfflineItem(pid, aid, tab) {
       var b = tabButton(t[1], t[2], function () { selectTab(tabsH, b); fr.hidden = t[0] !== "page"; rawH.hidden = t[0] !== "raw"; });
       tabsH.append(b); if (t[0] === "page") selectTab(tabsH, b);
     });
-    body.append(tabsH, h("p", { class: "muted small", text: "Images and videos in pages need a connection." }), fr, rawH);
+    body.append(tabsH);
+    if (!it.renderTooLarge) body.append(h("p", { class: "muted small", text: "Images and videos in pages need a connection." }));
+    body.append(fr, rawH);
   } else if (isDataKind(it.kind)) {
     // Copies saved before data previews existed hold a blob instead of text.
     var dtext = typeof it.body === "string" ? it.body : it.blob ? await it.blob.text() : "";

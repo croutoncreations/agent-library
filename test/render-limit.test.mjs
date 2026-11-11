@@ -460,18 +460,20 @@ test("Chrome: exact owner/viewer notes, small views, offline copies, and synthet
             assert.deepEqual(await page.$eval(".preview", e => [e.previousElementSibling.textContent, e.previousElementSibling.getAttribute("role"), e.previousElementSibling.getAttribute("aria-live")]), [text, null, null]);
           } else {
             assert.equal(await page.$eval(".state h3", e => e.textContent), TITLE);
+            assert.equal(await page.evaluate(() => document.body.innerText.includes("Images and videos in pages need a connection.")), false);
             assert.equal(await page.$(".state button"), null);
             assert.deepEqual(await page.$eval(".state", e => [e.getAttribute("role"), e.getAttribute("aria-live"), e.classList.contains("error")]), ["tabpanel", null, false]);
           }
-          if (captures) for (const width of [1280, 390]) {
+          if (captures && key === "largeHtml") for (const width of [1280, 390]) {
             await page.setViewport({ width, height: 900 });
-            await page.screenshot({ path: `${out}/offline-${key}-${width}.png` });
+            await page.screenshot({ path: `${out}/4-offline-html-${width}.png` });
           }
         }
         for (const key of ["smallMarkdown", "smallHtml"]) {
           await page.goto(`${APP}/#/p/${pid}/a/${ids[key]}`); await page.reload();
           await page.waitForSelector(key === "smallHtml" ? "iframe.htmlview" : ".preview h1");
           const selector = key === "smallHtml" ? "iframe.htmlview" : ".preview";
+          if (key === "smallHtml") assert.equal(await page.$eval(selector, e => e.previousElementSibling.textContent), "Images and videos in pages need a connection.");
           assert.deepEqual(await page.$eval(selector, e => [e.tagName, e.getAttribute("role"), e.parentElement.className]), [key === "smallHtml" ? "IFRAME" : "DIV", "tabpanel", ""]);
         }
         await page.setOfflineMode(false);
