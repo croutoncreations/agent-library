@@ -3374,7 +3374,7 @@ function renderMarkdownEditor(A, data, ui) {
   // Preserve the hidden small-document DOM; only large pages replace it with a non-live state box.
   var smallRenderNotice = h("p", { class: "muted small render-notice", role: "status", "aria-live": "polite", hidden: true });
   var renderNotice = smallRenderNotice;
-  var previewTruncated = false, previewSavedNote = "", shownRev = A.rev;
+  var previewTruncated = false, previewSavedNote = "", shownRev = A.rev, requestedPreviewRev = A.rev;
   function showSourceHistory() { ui.openHistory(shownRev); }
   function setPreviewNote(savedNote, truncated) {
     previewSavedNote = savedNote; previewTruncated = truncated;
@@ -3389,7 +3389,7 @@ function renderMarkdownEditor(A, data, ui) {
     if (renderNotice === smallRenderNotice) {
       renderNotice = h("div", { class: "render-notice" }); smallRenderNotice.replaceWith(renderNotice);
     }
-    renderNotice.replaceChildren(stateBox("neutral", "doc", "Page too large to show here", pageLimitNotice(),
+    renderNotice.replaceChildren(stateBox("", "doc", "Page too large to show here", pageLimitNotice(),
       h("button", { type: "button", onclick: function () {
         if (A.readOnly) showSourceHistory();
         else { ui.showTab("edit"); ui.tabNav.querySelector('[aria-selected="true"]').focus(); }
@@ -3579,10 +3579,12 @@ function renderMarkdownEditor(A, data, ui) {
   });
 
   async function loadPreview() {
-    shownRev = A.rev;
-    var savedNote = isDirty() ? "Showing saved rev " + A.rev + " (unsaved edits are not included)." : "";
-    setPreviewNote(savedNote, false);
+    var rev = A.rev;
+    requestedPreviewRev = rev;
+    var savedNote = isDirty() ? "Showing saved rev " + rev + " (unsaved edits are not included)." : "";
     if (isHtml) {
+      shownRev = rev;
+      setPreviewNote(savedNote, false);
       var largePage = savedSize > HTML_RENDER_MAX_BYTES;
       renderNotice.hidden = !largePage; frame.hidden = largePage;
       if (largePage) { showPageLimit(); frame.removeAttribute("src"); return; }
@@ -3593,7 +3595,10 @@ function renderMarkdownEditor(A, data, ui) {
       return;
     }
     try {
-      var r = await api("GET", A.base + "/preview?rev=" + A.rev); previewBox.innerHTML = r.html; enhanceTables(previewBox);
+      var r = await api("GET", A.base + "/preview?rev=" + rev);
+      if (!A.alive || rev !== requestedPreviewRev) return;
+      shownRev = rev;
+      previewBox.innerHTML = r.html; enhanceTables(previewBox);
       setPreviewNote(savedNote, r.truncated);
       previewBox.querySelectorAll("video[data-artifact]").forEach(function (v) { v.preload = "metadata"; });
       previewBox.querySelectorAll("img[data-artifact]").forEach(function (im) {
@@ -3603,7 +3608,7 @@ function renderMarkdownEditor(A, data, ui) {
         im.addEventListener("keydown", function (e) { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); } });
       });
     }
-    catch (err) { previewBox.replaceChildren(h("p", { class: "msg", role: "alert", text: "Preview failed: " + err.message })); }
+    catch (err) { if (A.alive && rev === requestedPreviewRev) previewBox.replaceChildren(h("p", { class: "msg", role: "alert", text: "Preview failed: " + err.message })); }
   }
 
   var docMeta = h("p", { class: "doc-meta" }, (isHtml ? "Page" : "Doc") + " · ", h("span", { dataset: { projectTitle: pid }, text: projectTitles[pid] || pid }), " · updated " + fmtDate(A.meta.updated_at));
@@ -3890,7 +3895,7 @@ async function viewOfflineItem(pid, aid, tab) {
   } else if (it.kind === "html") {
     // No scripts, opaque origin (links still open in a new tab); the stored page was sanitized by the server. Media need the network.
     var fr = it.renderTooLarge
-      ? stateBox("neutral", "doc", "Page too large to show here", pageLimitNotice("Open Source"))
+      ? stateBox("", "doc", "Page too large to show here", pageLimitNotice("Open Source"))
       : h("iframe", { class: "htmlview", title: "Rendered page (saved copy)", sandbox: "allow-popups allow-popups-to-escape-sandbox", referrerpolicy: "no-referrer" });
     if (!it.renderTooLarge) fr.srcdoc = it.page || "";
     var rawH = h("pre", { class: "raw", text: it.body || "", hidden: true });

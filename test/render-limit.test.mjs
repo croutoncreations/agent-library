@@ -117,6 +117,16 @@ test("Markdown boundary, line cut, UTF-8 boundary, suffix references and 10 MiB 
   await make("markdown", "a".repeat(outside) + "\n" + "b".repeat(MAX - outside), "outsideLineWindow");
   const outsideResult = await owner.req("GET", base(ids.outsideLineWindow) + "/preview");
   assert.equal(outsideResult.body.truncated, true); assert.match(outsideResult.body.html, /b{16384}/);
+  for (const [key, prefix] of [
+    ["crLineWindow", "a".repeat(MAX - 100) + "\r"],
+    ["lastByteLine", "a".repeat(MAX - 1) + "\n"]
+  ]) {
+    await make("markdown", prefix + "b".repeat(MAX + 1 - prefix.length), key);
+    const cut = await owner.req("GET", base(ids[key]) + "/preview");
+    assert.equal(cut.body.truncated, true);
+    assert.doesNotMatch(cut.body.html, /b/);
+    assert.match(cut.body.html, new RegExp("a{" + (prefix.length - 1) + "}"));
+  }
 });
 test("HTML boundary, refusal before redirect, old large links/media and still-valid small links", async () => {
   await make("html", "<h1>Between thresholds</h1>".padEnd(MAX + 1, " "), "mediumHtml");
@@ -146,6 +156,54 @@ test("wrong-kind render routes look up the revision before checking kind", async
       assert.equal(r.body.error.message, rev === 999 ? "Revision not found" : message);
     }
   }
+});
+test("Chrome: overlapping previews and viewer refresh keep the body, note and revision link together", { timeout: 180000 }, async () => {
+  const puppeteer = createRequire(import.meta.url)(`${process.env.HOME}/.npm-packages/lib/node_modules/puppeteer`);
+  const browser = await puppeteer.launch({ executablePath: process.env.CHROME_PATH ?? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", headless: true, args: ["--no-sandbox"] });
+  try {
+    const standalone = await make("markdown", "# standalone\n" + "word ".repeat(MAX), "standaloneMarkdown");
+    const legacyPage = await browser.newPage();
+    const [on, ov] = viewer.cookie.split("="); await legacyPage.setCookie({ name: on, value: ov, url: APP });
+    // Exercise the supported list-projects response without an address (the server normally assigns one).
+    await legacyPage.setRequestInterception(true);
+    legacyPage.on("request", async r => {
+      if (new URL(r.url()).pathname === "/api/projects") {
+        const response = await viewer.req("GET", "/api/projects");
+        for (const project of response.body.projects) delete project.path;
+        await r.respond({ status: response.status, contentType: "application/json", body: JSON.stringify(response.body) });
+      } else await r.continue();
+    });
+    await legacyPage.goto(`${APP}/#/p/${pid}/a/${standalone}`);
+    await legacyPage.waitForSelector(".preview-note a");
+    assert.equal(await legacyPage.$eval(".preview-note a", e => e.href), `${APP}/p/${pid}/a/${standalone}?v=1`);
+    await legacyPage.close();
+    const id = await make("markdown", "# first-overlap\n" + "word ".repeat(MAX), "overlapMarkdown");
+    const page = await browser.newPage();
+    const [name, value] = viewer.cookie.split("="); await page.setCookie({ name, value, url: APP });
+    let release, started;
+    const intercepted = new Promise(resolve => { started = resolve; });
+    let first = true;
+    await page.setRequestInterception(true);
+    page.on("request", async r => {
+      if (first && r.url().endsWith(base(id) + "/preview?rev=1")) {
+        first = false;
+        const response = await viewer.req("GET", base(id) + "/preview?rev=1");
+        release = () => r.respond({ status: response.status, contentType: "application/json", body: JSON.stringify(response.body) });
+        started();
+      } else await r.continue();
+    });
+    await page.goto(`${APP}/#/p/${pid}/a/${id}`); await intercepted;
+    await owner.req("PUT", base(id), { expected_revision: 1, body: "# latest-overlap\n" + "word ".repeat(MAX) });
+    await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+    await page.waitForFunction(() => document.querySelector(".preview h1")?.textContent === "latest-overlap");
+    const latest = `${APP}/synthetic-rendering/render-limits/a/${id}?v=2`;
+    assert.equal(await page.$eval(".preview-note a", e => e.href), latest, "refresh updates the viewer link to the new revision");
+    await release(); await page.waitForNetworkIdle({ idleTime: 100 });
+    assert.equal(await page.$eval(".preview h1", e => e.textContent), "latest-overlap");
+    assert.equal(await page.$eval(".preview-note", e => e.textContent), VIEW_NOTE);
+    assert.equal(await page.$eval(".preview-note a", e => e.href), latest);
+    await page.close();
+  } finally { await browser.close(); }
 });
 test("Chrome: saved editor changes cross the render limit in both directions without reloading", { timeout: 180000 }, async () => {
   const puppeteer = createRequire(import.meta.url)(`${process.env.HOME}/.npm-packages/lib/node_modules/puppeteer`);
@@ -198,6 +256,8 @@ test("Chrome: saved editor changes cross the render limit in both directions wit
       assert.equal(under.body.revision.size, MAX - 16);
       await tab(view);
       if (html) {
+        assert.deepEqual(await page.$eval(".render-notice", e => [e.tagName, e.className, e.getAttribute("role"), e.getAttribute("aria-live"), e.hidden]), ["P", "muted small render-notice", "status", "polite", true]);
+        assert.equal(await page.$$eval(".render-notice", es => es.length), 1);
         await page.waitForFunction(() => document.querySelector("iframe.htmlview")?.getAttribute("src")?.endsWith("/render?rev=3"));
         await loadedPage();
         assert.ok(renders.some(url => url.endsWith("/render?rev=3")));
@@ -377,7 +437,13 @@ test("Chrome: exact owner/viewer notes, small views, offline copies, and synthet
         const response = await savedTemplate; assert.equal(response.status(), 201);
         const copied = await response.json();
         assert.equal((await owner.req("GET", base(copied.artifact_id))).body.body, (await owner.req("GET", base(ids.largeMarkdown))).body.body);
-        for (const key of ["largeMarkdown", "largeHtml"]) {
+        await page.goto(`${APP}/#/p/${pid}/a/${ids.smallMarkdown}`);
+        await page.waitForSelector(".preview h1");
+        await page.evaluate(() => { const b = [...document.querySelectorAll("button")].find(e => e.textContent === "Save as template"); b.closest("details").open = true; b.click(); });
+        await page.waitForSelector(".template-preview");
+        assert.deepEqual(await page.$eval(".template-preview", e => [e.previousElementSibling.tagName, e.previousElementSibling.className, e.previousElementSibling.textContent.startsWith("Project: ")]), ["P", "muted small", true]);
+        assert.equal(await page.$eval(".template-form", (e, prefix) => e.textContent.includes(prefix), PREVIEW_PREFIX), false);
+        for (const key of ["largeMarkdown", "largeHtml", "smallMarkdown", "smallHtml"]) {
           await page.goto(`${APP}/#/p/${pid}/a/${ids[key]}`);
           const toggle = await page.waitForSelector('[aria-label="Make available offline"]'); await toggle.click();
           await page.waitForSelector('[aria-label="Available offline (tap to remove from this device)"]');
@@ -398,6 +464,12 @@ test("Chrome: exact owner/viewer notes, small views, offline copies, and synthet
             await page.setViewport({ width, height: 900 });
             await page.screenshot({ path: `${out}/offline-${key}-${width}.png` });
           }
+        }
+        for (const key of ["smallMarkdown", "smallHtml"]) {
+          await page.goto(`${APP}/#/p/${pid}/a/${ids[key]}`); await page.reload();
+          await page.waitForSelector(key === "smallHtml" ? "iframe.htmlview" : ".preview h1");
+          const selector = key === "smallHtml" ? "iframe.htmlview" : ".preview";
+          assert.deepEqual(await page.$eval(selector, e => [e.tagName, e.getAttribute("role"), e.parentElement.className]), [key === "smallHtml" ? "IFRAME" : "DIV", "tabpanel", ""]);
         }
         await page.setOfflineMode(false);
       }
