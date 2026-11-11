@@ -328,10 +328,11 @@ test("Chrome: exact owner/viewer notes, small views, offline copies, and synthet
   const puppeteer = createRequire(import.meta.url)(`${process.env.HOME}/.npm-packages/lib/node_modules/puppeteer`);
   const browser = await puppeteer.launch({ executablePath: process.env.CHROME_PATH ?? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", headless: true, args: ["--no-sandbox"] });
   const captures = process.env.AGENT_LIBRARY_RENDER_CAPTURES === "1";
-  const out = "tmp/design-captures/s2b2-render2"; if (captures) mkdirSync(out, { recursive: true });
+  const out = "tmp/design-captures/s2b2-ui3"; if (captures) mkdirSync(out, { recursive: true });
   try {
     for (const [who, role] of [[owner, "owner"], [viewer, "viewer"]]) {
       const page = await browser.newPage(); const [name, value] = who.cookie.split("="); await page.setCookie({ name, value, url: APP });
+      await page.emulateMediaFeatures([{ name: "prefers-color-scheme", value: "dark" }]);
       const requests = []; page.on("request", r => { if (r.url().includes("/render")) requests.push(r.url()); });
       const errors = []; page.on("pageerror", e => errors.push(e.message));
       for (const width of captures ? [1280, 390] : [1280]) {
@@ -347,6 +348,7 @@ test("Chrome: exact owner/viewer notes, small views, offline copies, and synthet
             if (html) {
               assert.equal(await page.$eval(".render-notice h3", e => e.textContent), TITLE);
               assert.equal(await page.$eval(".render-notice button", e => e.textContent), role === "owner" ? "Open Edit" : "Show source in History");
+              assert.equal(await page.$eval(".render-notice button", e => e.className), "", "keep the existing primary button");
               assert.equal(await page.$eval(".render-notice .state", e => e.classList.contains("error")), false);
               assert.deepEqual(await page.$eval(".render-notice", e => [e.getAttribute("role"), e.getAttribute("aria-live")]), [null, null]);
             } else {
@@ -358,12 +360,7 @@ test("Chrome: exact owner/viewer notes, small views, offline copies, and synthet
             }
             if (html) { assert.deepEqual(requests, []); assert.equal(await page.$eval("iframe.htmlview", e => e.getAttribute("src")), null); }
             else await page.waitForFunction(() => document.querySelector(".preview h1")?.textContent === "early-render-marker");
-            if (captures) await page.screenshot({ path: `${out}/${role}-${key}-${width}.png` });
-            if (captures && role === "owner" && html && width === 1280) {
-              await page.emulateMediaFeatures([{ name: "prefers-color-scheme", value: "light" }]);
-              await page.screenshot({ path: `${out}/owner-largeHtml-1280-light.png` });
-              await page.emulateMediaFeatures([{ name: "prefers-color-scheme", value: "dark" }]);
-            }
+            if (captures && role === "owner" && html && width === 1280) await page.screenshot({ path: `${out}/1-button-owner-1280.png` });
             if (html || role === "viewer") {
               // Start at the tab row, walk with real Tab keys, then activate the supported next step.
               await page.$eval('[role="tab"][aria-selected="true"]', e => e.focus());
@@ -386,7 +383,7 @@ test("Chrome: exact owner/viewer notes, small views, offline copies, and synthet
                 assert.equal(await page.$eval('.vh-row[aria-current="true"]', e => e.dataset.rev), "2");
                 assert.equal(await page.$$eval(".vh-detail .row button", es => es.some(e => e.textContent === "Show full text")), true);
                 assert.match(await page.$eval(".vh-body", e => e.textContent), /identical/);
-                if (captures) await page.screenshot({ path: `${out}/viewer-history-${key}-${width}.png` });
+                assert.equal(await page.$(".vh-body pre.raw"), null, "limit actions keep the diff landing");
                 await page.$$eval(".vh-detail .row button", es => es.find(e => e.textContent === "Show full text").click());
                 await page.waitForSelector(".vh-body pre.raw");
                 assert.equal(await page.$eval(".vh-body pre.raw", e => e.textContent), (await owner.req("GET", base(ids[key]))).body.body);
@@ -396,14 +393,26 @@ test("Chrome: exact owner/viewer notes, small views, offline copies, and synthet
                   await linked.goto(`${APP}/synthetic-rendering/render-limits/a/${ids[key]}?v=2`);
                   await linked.waitForFunction(() => document.activeElement?.textContent === "Version 2 (current)");
                   assert.equal(await linked.$eval('[role="tab"][aria-selected="true"]', e => e.textContent), "History");
+                  assert.match(await linked.$eval(".vh-body", e => e.textContent), /identical/);
+                  assert.equal(await linked.$(".vh-body pre.raw"), null);
                   await linked.close();
                   await page.evaluate(() => [...document.querySelectorAll('[role="tab"]')].find(e => e.textContent === "Preview").click());
                   await page.waitForSelector(".preview-note a", { visible: true });
                   await page.evaluate(() => { window.renderLimitDocument = true; });
+                  if (width === 390) {
+                    const placement = await page.$eval(".preview-note a", e => {
+                      const r = e.getBoundingClientRect();
+                      return { top: r.top, bottom: r.bottom, scrollY, hit: document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2)?.closest("a") === e };
+                    });
+                    console.log("390px kept diff landing → Preview link placement:", JSON.stringify(placement));
+                    assert.equal(placement.hit, true, "the repeated link click is not under the sticky header");
+                    if (captures) await page.screenshot({ path: `${out}/markdown-history-link-return-390.png` });
+                  }
                   await page.click(".preview-note a");
                   await page.waitForFunction(() => document.activeElement?.textContent === "Version 2 (current)");
                   assert.equal(await page.evaluate(() => window.renderLimitDocument), true);
                   assert.equal(await page.$$eval(".vh-detail .row button", es => es.some(e => e.textContent === "Show full text")), true);
+                  assert.equal(await page.$(".vh-body pre.raw"), null, "repeated link entry still lands on the diff");
                 }
               }
             }
@@ -473,16 +482,15 @@ test("Chrome: exact owner/viewer notes, small views, offline copies, and synthet
           await page.goto(`${APP}/#/p/${pid}/a/${ids[key]}`); await page.reload();
           await page.waitForSelector(key === "smallHtml" ? "iframe.htmlview" : ".preview h1");
           const selector = key === "smallHtml" ? "iframe.htmlview" : ".preview";
-          if (key === "smallHtml") assert.equal(await page.$eval(selector, e => e.previousElementSibling.textContent), "Images and videos in pages need a connection.");
+          if (key === "smallHtml") {
+            assert.equal(await page.$eval(selector, e => e.previousElementSibling.textContent), "Images and videos in pages need a connection.");
+            if (captures) { await page.setViewport({ width: 1280, height: 900 }); await page.screenshot({ path: `${out}/4-offline-html-small-1280.png` }); }
+          }
           assert.deepEqual(await page.$eval(selector, e => [e.tagName, e.getAttribute("role"), e.parentElement.className]), [key === "smallHtml" ? "IFRAME" : "DIV", "tabpanel", ""]);
         }
         await page.setOfflineMode(false);
       }
       assert.deepEqual(errors, []); await page.close();
-    }
-    if (captures) {
-      const page = await browser.newPage();
-      for (const width of [1280, 390]) { await page.setViewport({ width, height: 900 }); await page.goto(`http://${CONTENT}${blockedPath}`); await page.screenshot({ path: `${out}/content-413-${width}.png` }); }
     }
   } finally { await browser.close(); }
 });
