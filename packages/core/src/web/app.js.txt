@@ -2636,8 +2636,8 @@ async function viewArtifact(pid, aid, initialTab) {
       try {
         var d = await api("GET", base + "/diff?from=" + from + "&to=" + to);
         var what = to === A.rev && from !== to - 1 ? "Current (v" + to + ") compared with v" + from : "Changes from v" + from + " to v" + to;
-        var cap = h("p", { class: "muted small", text: (note ? note + " " : "") + what + (d.identical ? " · identical" : d.binary ? " · file changed (" + fmtBytes(d.from.size) + " → " + fmtBytes(d.to.size) + ")" : d.too_many_lines ? " · too many lines to compare here (" + fmtBytes(d.from.size) + " → " + fmtBytes(d.to.size) + "); use Show full text" : " · " + d.added + " added, " + d.removed + " removed" + (d.truncated ? " (large change: partly shown)" : "")) });
-        if (d.binary || d.identical || d.too_many_lines) { into.replaceChildren(cap); return; }
+        var cap = h("p", { class: "muted small", text: (note ? note + " " : "") + what + (d.identical ? " · identical" : d.binary ? " · file changed (" + fmtBytes(d.from.size) + " → " + fmtBytes(d.to.size) + ")" : d.too_many_lines ? " · too many lines to compare here (" + fmtBytes(d.from.size) + " → " + fmtBytes(d.to.size) + "); use Show full text" : d.added == null ? " · too large to compare here (" + fmtBytes(d.from.size) + " → " + fmtBytes(d.to.size) + "); use Show full text" : " · " + d.added + " added, " + d.removed + " removed" + (d.truncated ? " (large change: partly shown)" : "")) });
+        if (d.binary || d.identical || d.too_many_lines || d.added == null) { into.replaceChildren(cap); return; }
         var pre = h("div", { class: "vh-diff", role: "group", tabindex: "0", "aria-label": what });
         d.hunks.forEach(function (hk, i) {
           if (i) pre.append(h("div", { class: "vh-gap", "aria-hidden": "true", text: "⋯" }));

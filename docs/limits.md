@@ -35,6 +35,8 @@ remove. A string that's too long is `413 too_large`; a number out of range is `4
 | Comment | 1–10,000 characters | comment | fixed; new bodies are stored in R2, legacy inline D1 bodies remain readable | `413 too_large` |
 | Versions kept | all, forever | document | fixed (only `storage_bytes` bounds them) | — |
 
+For non-identical text versions, history diff returns a summary with no line hunks when either version exceeds 1 MiB; identical hashes still return the identical result.
+
 The text limit is a storage bound, not a memory guarantee. CSV validation/preview/spreadsheet export and JSON validation/records parse whole files; a pathological CSV with millions of tiny rows can exceed the Worker's 128 MB memory ceiling even below 10 MiB. There is no new generic CSV row/cell cap in this release (the measurements schema still caps records at 100,000).
 
 ## Projects & folders

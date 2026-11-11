@@ -432,5 +432,15 @@ test("browser: History shows who/why, groups autosave bursts, compares, restores
     assert.match(said, /This also moves the document to the trash/);
     assert.equal((await owner.req("GET", docUrl(manyDetailsDoc) + "/history")).body.meta_versions[0].trashed, true);
     assert.doesNotMatch(await page.$eval(".vh .msg", (e) => e.textContent), /not found/i);
+    // Either side exceeding the detailed-diff budget produces a summary, not null counts in the caption.
+    const large = await owner.req("POST", `/api/projects/${P}/artifacts`, { title: "Large summary", body: "small" });
+    assert.equal(large.status, 201);
+    assert.equal((await owner.req("PUT", docUrl(large.body.artifact_id), { expected_revision: 1, body: "synthetic ".repeat(220000) })).status, 200);
+    await page.goto(`${APP}/p/${P}/a/${large.body.artifact_id}?v=2`);
+    await page.waitForSelector(".vh-body .muted.small");
+    const caption = await page.$eval(".vh-body .muted.small", e => e.textContent);
+    assert.match(caption, /too large to compare here \(.+ → .+\); use Show full text/);
+    assert.doesNotMatch(await page.$eval(".vh-body", e => e.textContent), /\bnull\b|undefined/);
+    assert.equal(await page.$(".vh-body .vh-diff"), null);
   } finally { await browser.close(); }
 });

@@ -2,7 +2,7 @@
 // consent page exist): comments page with next_cursor (app API and legacy MCP list_comments, real SDK client) and the
 // UI's "Show older comments"; at most 1,000 folders per project on every creation path (409 too_many_folders, consent
 // page error) and lists that show all of them; capped lists report `truncated: [names]`, and the UI shows
-// "Showing the first N". Also: tags up to 50 characters, and the 2 MiB app/legacy-MCP body caps count UTF-8 bytes.
+// "Showing the first N". Also: tags up to 50 characters, and the 2 MiB non-text app/legacy-MCP body caps count UTF-8 bytes.
 // Rows past a cap are inserted with wrangler d1 execute (synthetic data only). Real Chrome for the UI checks.
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
@@ -267,11 +267,12 @@ test("tags: up to 50 characters (as backup import); 51 refused", async () => {
   assert.equal(bad.status, 413); assert.match(bad.body.error.message, /tag exceeds 50 characters/);
 });
 
-test("request bodies: the 2 MiB app API and legacy MCP caps count UTF-8 bytes, not characters", async () => {
+test("request bodies: the 2 MiB non-text app API and legacy MCP caps count UTF-8 bytes, not characters", async () => {
   // 0.8 Mi characters of "€" = 2.4 MiB of UTF-8: under the cap by characters, over it by bytes.
   const big = "€".repeat(800 * 1024);
-  const r = await owner.req("POST", `/api/projects/${P}/artifacts`, { title: "Too big", body: big });
+  const r = await owner.req("POST", `/api/projects/${P}/folders`, { title: "Too big", padding: big });
   assert.equal(r.status, 413); assert.equal(r.body.error.code, "too_large");
+  assert.match(r.body.error.message, /2 MiB request-size limit/);
   const g = ok(await owner.req("POST", `/api/projects/${P}/grants`, { label: "body cap", can_write: true }), 201);
   const mcp = await fetch(`${h.appUi}/mcp`, { method: "POST", headers: { authorization: `Bearer ${g.token}`, "content-type": "application/json", accept: "application/json, text/event-stream" },
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "create_markdown", arguments: { project_id: P, title: "x", body: big, idempotency_key: key("b") } } }) });
