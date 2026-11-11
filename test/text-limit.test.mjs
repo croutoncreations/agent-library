@@ -56,6 +56,7 @@ for (const kind of ["markdown", "html"]) for (const transport of ["app", "v1"]) 
 });
 
 test("10 MiB search prefix is ranked; known gap excludes suffix-only words; rename and trash restore work", async t => {
+  assert.ok(documentId, "setup document missing: app Markdown create must succeed first");
   const start = performance.now();
   const ascii = "prefixneedle " + large.slice(13, 1048576) + " suffixneedle " + large.slice(1048590);
   const body = ascii.slice(0, 524286) + "é🙂" + ascii.slice(524292);
@@ -76,6 +77,7 @@ test("10 MiB search prefix is ranked; known gap excludes suffix-only words; rena
 });
 
 test("10 MiB chunks and HTTP Range reconstruct identical UTF-8 SHA-256", async () => {
+  assert.ok(documentId, "setup document missing: app Markdown create must succeed first");
   const expected = (await owner.req("GET", artifactPath(documentId))).body.body;
   const chunks = [];
   let cursor;
@@ -94,6 +96,7 @@ test("10 MiB chunks and HTTP Range reconstruct identical UTF-8 SHA-256", async (
 });
 
 test("two 10 MiB revisions return a bounded summary within 5 seconds", async t => {
+  assert.ok(documentId, "setup document missing: app Markdown create must succeed first");
   const start = performance.now();
   const diff = await owner.req("GET", artifactPath(documentId) + "/diff?from=2&to=3");
   const elapsed = performance.now() - start;
@@ -106,6 +109,7 @@ test("two 10 MiB revisions return a bounded summary within 5 seconds", async t =
 });
 
 test("10 MiB template copy and restore-from-history retain the exact body", async () => {
+  assert.ok(documentId, "setup document missing: app Markdown create must succeed first");
   const source = (await owner.req("GET", artifactPath(documentId))).body.body;
   const template = await owner.req("POST", "/api/projects/large-text/templates", { source_artifact_id: documentId, source_revision: 3, title: "Large template" });
   assert.equal(template.status, 201, JSON.stringify(template.body));
@@ -118,6 +122,7 @@ test("10 MiB template copy and restore-from-history retain the exact body", asyn
 });
 
 test("near-10 MiB JSON measurements and CSV validate, preview, query and replace with an added record/row", async t => {
+  assert.ok(documentId, "setup document missing: app Markdown create must succeed first");
   const M = "agentlib.measurements/1";
   const records = Array.from({ length: 1100 }, (_, i) => ({ id: `syn-${i}`, recorded_at: "synthetic-clock", date: "2026-01-02", metric: "counter", value: i, unit: "n" }));
   const doc = { schema: M, records, meta: { padding: "" } };
@@ -184,6 +189,88 @@ test("near-10 MiB JSON measurements and CSV validate, preview, query and replace
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
   t.diagnostic(`JSON ${Buffer.byteLength(json)} bytes; CSV ${Buffer.byteLength(csv)} bytes; JSON read_records ${elapsed.toFixed(1)} ms`);
+});
+
+for (const transport of ["app", "v1"]) test(`${transport} JSON value budget: boundary, refusal without storage, measurements at request cap`, async t => {
+  const request = transport === "app" ? owner.req : api;
+  const base = transport === "app" ? "/api/projects/large-text/artifacts" : "/v1/projects/large-text/files";
+  const content = "[" + "0,".repeat(999999) + "0]";
+  const input = { title: `Budget ${transport}`, kind: "json", content };
+  const made = await request("POST", base, input);
+  assert.equal(made.status, 201, JSON.stringify(made.body));
+  assert.equal(made.body.sha256, sha256(content));
+  const before = (await owner.req("GET", "/api/projects/large-text/artifacts")).body.artifacts.map(a => a.id).sort();
+  const refused = await request("POST", base, { ...input, title: "Must not be stored", content: content.slice(0, -1) + ",0]" });
+  assert.equal(refused.status, 422, JSON.stringify(refused.body));
+  assert.equal(refused.body.error.code, "invalid_content");
+  assert.equal(refused.body.error.format, "json");
+  assert.equal(refused.body.error.detail, "more than 1,000,000 values");
+  assert.equal(refused.body.error.message, "Invalid json: more than 1,000,000 values");
+  assert.deepEqual((await owner.req("GET", "/api/projects/large-text/artifacts")).body.artifacts.map(a => a.id).sort(), before);
+  const refusedSave = await request("PUT", base + "/" + made.body.artifact_id, { expected_revision: 1, content: content.slice(0, -1) + ",0]" });
+  assert.equal(refusedSave.status, 422, JSON.stringify(refusedSave.body));
+  assert.equal(refusedSave.body.error.message, "Invalid json: more than 1,000,000 values");
+  const unchanged = await request("GET", base + "/" + made.body.artifact_id + "/content", undefined, { binary: true });
+  assert.equal(unchanged.status, 200);
+  assert.equal(sha256(unchanged.body), made.body.sha256);
+  const records = Array.from({ length: 100000 }, (_, i) => ({ id: i.toString(36), recorded_at: "x", date: "2000-01-01", metric: "m", value: 1, unit: "u", source_id: "" }));
+  const schema = "agentlib.measurements/1";
+  const measurements = JSON.stringify({ schema, records });
+  assert.ok(Buffer.byteLength(measurements) <= MAX);
+  const measurementInput = { title: `Full measurements ${transport}`, kind: "json", schema, content: JSON.stringify({ schema, records: [] }) };
+  let requestBytes = Buffer.byteLength(JSON.stringify(measurementInput)), count = 0;
+  for (const record of records) {
+    const cost = Buffer.byteLength(JSON.stringify(JSON.stringify(record))) - 2 + (count ? 1 : 0);
+    if (requestBytes + cost >= TEXT_WRITE_BODY_BYTES) break;
+    requestBytes += cost; count++;
+  }
+  measurementInput.content = JSON.stringify({ schema, records: records.slice(0, count) });
+  assert.equal(Buffer.byteLength(JSON.stringify(measurementInput)), requestBytes);
+  const checked = await request("POST", base, measurementInput);
+  assert.equal(checked.status, 201, JSON.stringify(checked.body));
+  assert.equal(checked.body.sha256, sha256(measurementInput.content));
+  const fullInput = { ...measurementInput, content: measurements };
+  // /v1 cancels over-cap bodies; declare the exact full-file envelope size without racing its early 413.
+  const full = transport === "v1" ? await declaredOversize(base, Buffer.byteLength(JSON.stringify(fullInput))) : await request("POST", base, fullInput);
+  assert.equal(full.status, 413, JSON.stringify(full.body));
+  assert.match(full.body.error.message, /11 MiB request-size/);
+  const requiredOnly = JSON.stringify({ schema, records: records.map(({ date, source_id, ...record }) => record) });
+  const required = await request("POST", base, { ...measurementInput, content: requiredOnly });
+  assert.equal(required.status, 201, JSON.stringify(required.body));
+  assert.equal(required.body.sha256, sha256(requiredOnly));
+  t.diagnostic(`${transport}: seven fields ${count} records, ${Buffer.byteLength(measurementInput.content)} file bytes, ${requestBytes} request bytes, ratio ${(requestBytes / Buffer.byteLength(measurementInput.content)).toFixed(4)}; full seven-field cap ${Buffer.byteLength(measurements)} file bytes / ${Buffer.byteLength(JSON.stringify({ ...measurementInput, content: measurements }))} request bytes; five fields 100000 records accepted`);
+});
+
+for (const transport of ["app", "v1"]) test(`${transport} tiny-row CSV at the JSON request cap saves and exports without row retention`, async t => {
+  const request = transport === "app" ? owner.req : api;
+  const base = transport === "app" ? "/api/projects/large-text/artifacts" : "/v1/projects/large-text/files";
+  const input = { title: `Tiny rows ${transport}`, kind: "csv", content: "h\n" };
+  const rows = Math.floor((TEXT_WRITE_BODY_BYTES - 1 - Buffer.byteLength(JSON.stringify(input))) / 3);
+  input.content += "a\n".repeat(rows);
+  assert.ok(Buffer.byteLength(JSON.stringify(input)) < TEXT_WRITE_BODY_BYTES);
+  const made = await request("POST", base, input);
+  assert.equal(made.status, 201, JSON.stringify(made.body));
+  assert.equal(made.body.sha256, sha256(input.content));
+  const raw = await request("GET", base + "/" + made.body.artifact_id + "/content", undefined, { binary: true });
+  assert.equal(raw.status, 200);
+  assert.equal(raw.body.length, 2 + 2 * rows);
+  let newlines = 0;
+  for (const byte of raw.body) if (byte === 10) newlines++;
+  assert.equal(newlines - 1, rows);
+  const path = base + "/" + made.body.artifact_id + "/content?format=spreadsheet";
+  const exported = await request("GET", path, undefined, { binary: true });
+  assert.equal(exported.status, 200);
+  assert.equal(exported.headers.get("content-length"), String(3 + 3 * rows));
+  assert.equal(sha256(exported.body), sha256("h\r\n" + "a\r\n".repeat(rows)));
+  const head = await request("HEAD", path, undefined, { binary: true });
+  assert.equal(head.status, 200);
+  assert.equal(head.body.length, 0);
+  for (const header of ["content-length", "content-type", "content-disposition", "cache-control", "content-security-policy", "cross-origin-resource-policy", "x-content-type-options"]) assert.equal(head.headers.get(header), exported.headers.get(header));
+  const fullInput = { ...input, content: "h\n" + "a\n".repeat((MAX - 2) / 2) };
+  const over = transport === "v1" ? await declaredOversize(base, Buffer.byteLength(JSON.stringify(fullInput))) : await request("POST", base, fullInput);
+  assert.equal(over.status, 413, JSON.stringify(over.body));
+  assert.match(over.body.error.message, /11 MiB request-size/);
+  t.diagnostic(`${transport}: ${rows} rows, ${Buffer.byteLength(input.content)} CSV bytes, spreadsheet SHA-256 ${sha256(exported.body)}`);
 });
 
 async function declaredOversize(path, bytes) {

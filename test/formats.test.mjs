@@ -1,6 +1,9 @@
 // Pure-format checks for packages/core/src/formats.js (no server), loaded from the shipped source.
 import { test, before } from "node:test";
 import assert from "node:assert/strict";
+import { moduleScript } from "./module-source.mjs";
+import { TEXT_MAX_BYTES } from "../packages/core/src/text-limits.js";
+import { HttpError } from "../packages/core/src/util.js";
 
 
 
@@ -109,6 +112,43 @@ test("CSV measurements preserve syntax, header, columns, then schema error prece
     e.extra.format === format && e.extra.line === line && e.extra.detail === detail);
 });
 
+test("JSON value budget ignores commas, brackets and escaped quotes inside strings", () => {
+  const text = JSON.stringify([',{}[]\\"'.repeat(1000000)]);
+  assert.equal(F.checkFile("json", text).kind, "json");
+});
+
+test("JSON value budget also rejects measurements before schema validation", () => {
+  const text = "[" + "0,".repeat(1000000) + "0]";
+  assert.throws(() => F.checkFile("json", text, M), e => e.status === 422 && e.code === "invalid_content" && e.extra.format === "json" && e.extra.detail === "more than 1,000,000 values");
+});
+
+test("100,000 JSON measurement records with all seven fields use exactly 800,002 budget units", () => {
+  const text = json(Array.from({ length: 100000 }, (_, i) => ({ id: i.toString(36), recorded_at: "x", date: "2000-01-01", metric: "m", value: 1, unit: "u", source_id: "" })));
+  assert.equal(F.checkFile("json", text, M).record_count, 100000);
+  // Execute the maintained module with a smaller budget to pin the scan's exact count.
+  const atBudget = new Function("TEXT_MAX_BYTES", "HttpError", moduleScript("packages/core/src/formats.js") + "\nMAX_JSON_VALUES = 800002; return checkFile;")(TEXT_MAX_BYTES, HttpError);
+  assert.equal(atBudget("json", text, M).record_count, 100000);
+  const belowBudget = new Function("TEXT_MAX_BYTES", "HttpError", moduleScript("packages/core/src/formats.js") + "\nMAX_JSON_VALUES = 800001; return checkFile;")(TEXT_MAX_BYTES, HttpError);
+  assert.throws(() => belowBudget("json", text, M), e => e.extra.detail === "more than 800,001 values");
+});
+
+test("CSV measurements enforce the documented 100,000-record cap after structure", () => {
+  const text = csv(Array.from({ length: 100000 }, (_, i) => `${i},x,,m,1,u,`));
+  assert.equal(F.checkFile("csv", text, M).row_count, 100000);
+  const over = text + "extra,x,,m,1,u,\n";
+  assert.throws(() => F.checkFile("csv", over, M), e => e.status === 422 && e.code === "invalid_content" && e.extra.format === "schema" && e.extra.line === 100002 && e.extra.detail === "more than 100000 records");
+  assert.throws(() => F.checkFile("csv", over + '"open', M), e => e.extra.format === "csv" && e.extra.line === 100003 && e.extra.detail === "unterminated quoted field");
+  assert.throws(() => F.checkFile("csv", text.replace("0,x,,m,1,u,", "0,x,,m,no,u,") + "extra,x,,m,1,u,\n", M), e => e.extra.line === 2 && e.extra.detail === "value must be a finite decimal number");
+  assert.throws(() => F.checkFile("csv", over + "bad,row\n", M), e => e.extra.format === "csv" && e.extra.line === 100003 && e.extra.detail === "expected 7 columns, found 2");
+});
+
+test("spreadsheetSafeCsv preserves UTF-8 and doubled quotes across bounded piece edges", () => {
+  const value = "x".repeat(16383) + '🙂é漢"' + "x".repeat(16383) + '"🙂';
+  const quoted = '"' + value.replace(/"/g, '""') + '"';
+  assert.deepEqual(F.parseCsv("h\n" + quoted).rows[0].cells, [value]);
+  assert.equal(new TextDecoder("utf-8", { fatal: true }).decode(F.spreadsheetSafeCsv("h\n" + quoted)), "h\r\n" + quoted + "\r\n");
+});
+
 test("spreadsheetSafeCsv exact output characterisation", () => {
   for (const [text, expected] of [
     ["a,b\n=1+1,ok\n@x,\"-2\"\n", "a,b\r\n'=1+1,ok\r\n'@x,'-2\r\n"],
@@ -117,5 +157,8 @@ test("spreadsheetSafeCsv exact output characterisation", () => {
     ["a\n", "a\r\n"],
     ['"=header"', "'=header\r\n"],
     ["a\n\n", "a\r\n\r\n"]
-  ]) assert.equal(new TextDecoder().decode(typeof F.spreadsheetSafeCsv(text) === "string" ? new TextEncoder().encode(F.spreadsheetSafeCsv(text)) : F.spreadsheetSafeCsv(text)), expected, JSON.stringify(text));
+  ]) {
+    const output = F.spreadsheetSafeCsv(text);
+    assert.equal(new TextDecoder().decode(output), expected, JSON.stringify(text));
+  }
 });

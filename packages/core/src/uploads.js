@@ -394,7 +394,7 @@ async function serveContent(ctx, req, projectId, artifactId, revParam) {
   const sp = new URL(req.url).searchParams;
   if (sp.get("format") === "spreadsheet" && ctx.env.APP_CONNECT_ENABLED === "1") {
     if (r.mime !== "text/csv") throw new HttpError(400, "invalid_input", "format=spreadsheet applies to CSV files only");
-    const safe = new TextEncoder().encode(spreadsheetSafeCsv(await getText(ctx.env, r)));
+    const safe = spreadsheetSafeCsv(await getText(ctx.env, r));
     const nm = (a.title.replace(/[^A-Za-z0-9._ -]/g, "_").slice(0, 100) || "download").replace(/\.csv$/i, "") + ".spreadsheet.csv";
     return new Response(req.method === "HEAD" ? null : safe, { status: 200, headers: {
       "content-type": CONTENT_TYPE["text/csv"],

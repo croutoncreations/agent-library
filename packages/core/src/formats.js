@@ -20,7 +20,7 @@ function checkCommon(text, format, file) {
   if (/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(text)) throw invalid({ format, file, detail: "invalid UTF-16 surrogate (not encodable as UTF-8)" });
 }
 function depthOk(text) {
-  let depth = 0, inStr = false, esc4 = false;
+  let depth = 0, values = 0, inStr = false, esc4 = false;
   for (let i = 0; i < text.length; i++) {
     const c = text[i];
     if (inStr) {
@@ -31,23 +31,27 @@ function depthOk(text) {
     }
     if (c === '"') inStr = true;
     else if (c === "{" || c === "[") {
-      if (++depth > MAX_DEPTH) return false;
+      if (++depth > MAX_DEPTH) return `nesting deeper than ${MAX_DEPTH} levels`;
+      if (++values > MAX_JSON_VALUES) return `more than ${MAX_JSON_VALUES.toLocaleString("en-US")} values`;
+    } else if (c === ",") {
+      if (++values > MAX_JSON_VALUES) return `more than ${MAX_JSON_VALUES.toLocaleString("en-US")} values`;
     } else if (c === "}" || c === "]") depth--;
   }
-  return true;
+  return null;
 }
 function parseJson(text, file) {
   checkCommon(text, "json", file);
-  if (!depthOk(text)) throw invalid({ format: "json", file, detail: `nesting deeper than ${MAX_DEPTH} levels` });
+  const detail = depthOk(text);
+  if (detail) throw invalid({ format: "json", file, detail });
   try {
     return JSON.parse(text);
   } catch (e) {
     throw invalid({ format: "json", file, detail: "not valid JSON" });
   }
 }
-function parseCsv(text, file) {
+// The grammar emits one row at a time; consumers choose whether to retain it.
+function scanCsv(text, file, onRow) {
   checkCommon(text, "csv", file);
-  const rows = [];
   let i = 0, line = 1;
   const n = text.length;
   while (i < n) {
@@ -104,18 +108,43 @@ function parseCsv(text, file) {
         break;
       }
     }
-    rows.push({ line: startLine, cells });
+    onRow(cells, startLine);
   }
-  if (!rows.length) throw invalid({ format: "csv", file, line: 1, detail: "header row required" });
-  const header = rows.shift().cells;
+}
+function checkCsvHeader(header, file) {
   const seen = /* @__PURE__ */ new Set();
   for (const h of header) {
     if (!h.trim()) throw invalid({ format: "csv", file, line: 1, detail: "empty header name" });
     if (seen.has(h)) throw invalid({ format: "csv", file, line: 1, detail: `duplicate header "${h.slice(0, 40)}"` });
     seen.add(h);
   }
-  for (const r of rows) if (r.cells.length !== header.length)
-    throw invalid({ format: "csv", file, line: r.line, detail: `expected ${header.length} columns, found ${r.cells.length}` });
+}
+function visitCsv(text, file, onRow) {
+  let header, headerError, columnError, rowCount = 0;
+  scanCsv(text, file, (cells, line) => {
+    if (!header) {
+      header = cells;
+      try { checkCsvHeader(header, file); } catch (e) { headerError = e; }
+    } else {
+      rowCount++;
+      if (!columnError && cells.length !== header.length)
+        columnError = invalid({ format: "csv", file, line, detail: `expected ${header.length} columns, found ${cells.length}` });
+    }
+    if (!headerError && !columnError) onRow(cells, line, rowCount);
+  });
+  // Syntax anywhere beats header errors, which beat column-count errors anywhere.
+  if (!header) throw invalid({ format: "csv", file, line: 1, detail: "header row required" });
+  if (headerError) throw headerError;
+  if (columnError) throw columnError;
+  return rowCount;
+}
+function parseCsv(text, file) {
+  let header;
+  const rows = [];
+  visitCsv(text, file, (cells, line, rowCount) => {
+    if (!rowCount) header = cells;
+    else rows.push({ line, cells });
+  });
   return { header, rows };
 }
 function strField(v, min, max) {
@@ -145,25 +174,26 @@ function checkMeasurementsJson(doc, file) {
   });
   return doc.records.length;
 }
-function checkMeasurementsCsv(csv, file) {
-  const bad = (line, detail) => invalid({ format: "schema", file, line, detail });
-  CSV_MEASUREMENT_COLUMNS.forEach((c, i) => {
-    if (csv.header[i] !== c) throw bad(1, `header must begin with ${CSV_MEASUREMENT_COLUMNS.join(",")}`);
-  });
-  const ids = /* @__PURE__ */ new Set();
-  for (const r of csv.rows) {
-    const [id, recordedAt, date, metric, value, unit, sourceId] = r.cells;
-    if (!(id.length >= 1 && id.length <= 128)) throw bad(r.line, "id must be 1-128 chars");
-    if (ids.has(id)) throw bad(r.line, "duplicate id");
-    ids.add(id);
-    if (!(recordedAt.length >= 1 && recordedAt.length <= 64)) throw bad(r.line, "recorded_at must be 1-64 chars");
-    if (date !== "" && !isCalendarDate(date)) throw bad(r.line, "date must be empty or a real calendar date YYYY-MM-DD");
-    if (!METRIC_RE.test(metric)) throw bad(r.line, "metric must match [a-z][a-z0-9_]{0,39}");
-    if (!NUM_RE.test(value) || !Number.isFinite(Number(value))) throw bad(r.line, "value must be a finite decimal number");
-    if (!(unit.length >= 1 && unit.length <= 16)) throw bad(r.line, "unit must be 1-16 chars");
-    if (sourceId.length > 128) throw bad(r.line, "source_id must be at most 128 chars");
+function checkMeasurementsCsv(cells, line, rowCount, ids, file) {
+  const bad = (detail) => invalid({ format: "schema", file, line, detail });
+  if (!rowCount) {
+    CSV_MEASUREMENT_COLUMNS.forEach((c, i) => {
+      if (cells[i] !== c) throw bad(`header must begin with ${CSV_MEASUREMENT_COLUMNS.join(",")}`);
+    });
+    return;
   }
-  return csv.rows.length;
+  // Bound duplicate-id state by the documented measurements record cap.
+  if (rowCount > MAX_RECORDS) throw bad(`more than ${MAX_RECORDS} records`);
+  const [id, recordedAt, date, metric, value, unit, sourceId] = cells;
+  if (!(id.length >= 1 && id.length <= 128)) throw bad("id must be 1-128 chars");
+  if (ids.has(id)) throw bad("duplicate id");
+  ids.add(id);
+  if (!(recordedAt.length >= 1 && recordedAt.length <= 64)) throw bad("recorded_at must be 1-64 chars");
+  if (date !== "" && !isCalendarDate(date)) throw bad("date must be empty or a real calendar date YYYY-MM-DD");
+  if (!METRIC_RE.test(metric)) throw bad("metric must match [a-z][a-z0-9_]{0,39}");
+  if (!NUM_RE.test(value) || !Number.isFinite(Number(value))) throw bad("value must be a finite decimal number");
+  if (!(unit.length >= 1 && unit.length <= 16)) throw bad("unit must be 1-16 chars");
+  if (sourceId.length > 128) throw bad("source_id must be at most 128 chars");
 }
 function checkFile(kind, content, schema, file) {
   if (kind !== "json" && kind !== "csv") throw new HttpError(422, "unsupported_kind", "kind must be json or csv");
@@ -174,25 +204,61 @@ function checkFile(kind, content, schema, file) {
     const doc = parseJson(content, file);
     return { kind, schema: sch, record_count: sch ? checkMeasurementsJson(doc, file) : null, row_count: null };
   }
-  const csv = parseCsv(content, file);
-  if (sch) checkMeasurementsCsv(csv, file);
-  return { kind, schema: sch, record_count: null, row_count: csv.rows.length };
+  const ids = sch ? new Set() : null;
+  let schemaError;
+  const rowCount = visitCsv(content, file, (cells, line, count) => {
+    if (sch && !schemaError) {
+      try { checkMeasurementsCsv(cells, line, count, ids, file); } catch (e) { schemaError = e; }
+    }
+  });
+  // Structural errors from the complete scan take precedence over schema errors.
+  if (schemaError) throw schemaError;
+  return { kind, schema: sch, record_count: null, row_count: rowCount };
 }
 function spreadsheetSafeCsv(text) {
-  const { header, rows } = parseCsv(text);
-  const cell = (v) => {
-    const s = /^[=+\-@\t\r]/.test(v) ? "'" + v : v;
-    return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  const encoder = new TextEncoder();
+  // Two scans avoid retaining per-row strings or a second output-sized buffer.
+  // Count UTF-8 bytes first, then fill one exactly-sized output allocation.
+  const write = (output) => {
+    let offset = 0;
+    const append = (s) => {
+      if (output) offset += encoder.encodeInto(s, output.subarray(offset)).written;
+      else offset += encoder.encode(s).length;
+    };
+    visitCsv(text, undefined, (cells) => {
+      for (let i = 0; i < cells.length; i++) {
+        if (i) append(",");
+        const value = cells[i];
+        const quoted = /[",\r\n]/.test(value);
+        if (quoted) append('"');
+        if (/^[=+\-@\t\r]/.test(value)) append("'");
+        // Slice bounded pieces, doubling quotes without making another large cell.
+        for (let start = 0; start < value.length;) {
+          let end = Math.min(start + 16384, value.length);
+          const last = value.charCodeAt(end - 1);
+          if (end < value.length && last >= 0xD800 && last <= 0xDBFF) end--;
+          append(value.slice(start, end).replace(/"/g, '""'));
+          start = end;
+        }
+        if (quoted) append('"');
+      }
+      append("\r\n");
+    });
+    return offset;
   };
-  return [header, ...rows.map((r) => r.cells)].map((r) => r.map(cell).join(",")).join("\r\n") + "\r\n";
+  const length = write(null);
+  const output = new Uint8Array(length);
+  write(output);
+  return output;
 }
-var MEASUREMENTS, SCHEMAS, MAX_FILE_BYTES, CSV_MEASUREMENT_COLUMNS, MAX_RECORDS, MAX_DEPTH, DATE_RE, METRIC_RE, NUM_RE, invalid, MIME, CONTENT_TYPE;
+var MEASUREMENTS, SCHEMAS, MAX_FILE_BYTES, CSV_MEASUREMENT_COLUMNS, MAX_RECORDS, MAX_DEPTH, MAX_JSON_VALUES, DATE_RE, METRIC_RE, NUM_RE, invalid, MIME, CONTENT_TYPE;
 MEASUREMENTS = "agentlib.measurements/1";
 SCHEMAS = /* @__PURE__ */ new Set([MEASUREMENTS]);
 MAX_FILE_BYTES = TEXT_MAX_BYTES;
 CSV_MEASUREMENT_COLUMNS = ["id", "recorded_at", "date", "metric", "value", "unit", "source_id"];
 MAX_RECORDS = 1e5;
 MAX_DEPTH = 64;
+MAX_JSON_VALUES = 1000000;
 DATE_RE = /^(\d{4})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$/;
 METRIC_RE = /^[a-z][a-z0-9_]{0,39}$/;
 NUM_RE = /^-?(0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)?$/;
