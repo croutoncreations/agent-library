@@ -270,6 +270,8 @@ async function uploadPut(req, env, requestId, uploadId, linkCtx) {
 //    409 finish_in_progress while another finisher still holds the lease.
 var FINALIZE_LEASE_MS = 60 * 1e3;
 var FINALIZE_WAIT_MS = 3e3;
+// Isolate-local, non-queuing backpressure before any full text read. This does not bound other text operations.
+let textFinishBusy = false;
 async function uploadFinish(ctx, projectId, uploadId, key) {
   await authorizeProject(ctx, projectId, true);
   const u = await db2(ctx).prepare("SELECT * FROM uploads WHERE id = ? AND project_id = ?").bind(uploadId, projectId).first();
@@ -338,6 +340,7 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
     } else if (nowMs() >= deadline) throw busy(row);
   }
   const fenced = "EXISTS (SELECT 1 FROM uploads WHERE id = ? AND state = 'sealed' AND finalize_token = ?)";
+  let hasTextFinishSlot = false;
   try {
     const held = await current();
     const finalKey = held?.final_key;
@@ -382,6 +385,8 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
       const a = await loadArtifact(ctx, projectId, u.artifact_id, { allowUnpublished: u.base_rev === 0 });
       assertWritable(ctx, a, "content");
       if (a.kind !== kind) throw new HttpError(400, "invalid_input", "mime must match the existing document kind");
+      if (textFinishBusy) throw new HttpError(503, "text_finish_busy", "Another text upload is being finalized on this server; retry upload_finish shortly with the same idempotency key", { retry_after_seconds: 1 });
+      textFinishBusy = hasTextFinishSlot = true;
       try {
         text = await getUploadedText(ctx.env, finalKey, kind);
         if (text === null) return fail(409, "missing_bytes", "Uploaded bytes missing", "failed");
@@ -435,8 +440,12 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
     }
   } finally {
     // Unexpected errors release the lease at once so a retry can take over; a no-op once it was cleared or taken.
-    await db2(ctx).prepare("UPDATE uploads SET finalize_token = NULL, finalize_until = NULL WHERE id = ? AND finalize_token = ?").bind(uploadId, token).run().catch(() => {
-    });
+    try {
+      await db2(ctx).prepare("UPDATE uploads SET finalize_token = NULL, finalize_until = NULL WHERE id = ? AND finalize_token = ?").bind(uploadId, token).run().catch(() => {
+      });
+    } finally {
+      if (hasTextFinishSlot) textFinishBusy = false;
+    }
   }
 }
 async function serveContent(ctx, req, projectId, artifactId, revParam) {
