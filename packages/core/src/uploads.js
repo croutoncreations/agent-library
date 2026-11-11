@@ -20,10 +20,11 @@ var quotaUsedSql = (now) => `(SELECT COALESCE(SUM(size),0) FROM revisions WHERE 
   + (SELECT COALESCE(SUM(expected_size),0) FROM uploads WHERE project_id = ?1 AND ${BINARY_UPLOAD_SQL}
        AND (state IN ('failed','conflict') OR (state IN ('pending','received') AND expires_at <= ${Math.trunc(now)}))
        AND (staging_purged_at IS NULL OR (final_key IS NOT NULL AND final_purged_at IS NULL)))`;
+// From the first deployed text-upload version, text staging_purged_at is set only after final_purged_at (raw input purged).
 async function purgeStaging(env, u) {
   try {
     await deleteBlob(env, u.staging_key);
-    await env.DB.prepare("UPDATE uploads SET staging_purged_at = ? WHERE id = ? AND staging_purged_at IS NULL").bind(nowMs(), u.id).run();
+    await env.DB.prepare("UPDATE uploads SET staging_purged_at = ? WHERE id = ? AND staging_purged_at IS NULL AND (mime NOT IN ('text/markdown','text/html','application/json','text/csv') OR final_purged_at IS NOT NULL)").bind(nowMs(), u.id).run();
   } catch {
   }
 }
@@ -31,8 +32,12 @@ async function purgeStaging(env, u) {
 // can start) and no write is in flight (so none can re-create it afterwards); otherwise cleanup purges it once the last
 // write settles. Absent is harmless (R2 delete of a missing key is a no-op).
 async function dropUnpublished(env, uploadId, finalKey) {
-  const idle = await env.DB.prepare("SELECT 1 AS x FROM uploads u WHERE id = ? AND (state IN ('failed','conflict') OR (state = 'published' AND mime IN ('text/markdown','text/html','application/json','text/csv'))) AND final_writes = 0 AND final_purged_at IS NULL AND NOT EXISTS (SELECT 1 FROM revisions r WHERE r.blob_key = u.final_key)").bind(uploadId).first("x");
-  if (!idle) return;
+  const publishedText = await env.DB.prepare("SELECT 1 AS x FROM uploads WHERE id = ? AND state = 'published' AND mime IN ('text/markdown','text/html','application/json','text/csv') AND final_writes = 0 AND final_purged_at IS NULL").bind(uploadId).first("x");
+  // Published text uses body_key, never this raw input key. Failed/conflicting uploads retain the binary reference guard.
+  if (!publishedText) {
+    const idle = await env.DB.prepare("SELECT 1 AS x FROM uploads u WHERE id = ? AND state IN ('failed','conflict') AND final_writes = 0 AND final_purged_at IS NULL AND NOT EXISTS (SELECT 1 FROM revisions r WHERE r.blob_key = u.final_key)").bind(uploadId).first("x");
+    if (!idle) return;
+  }
   await deleteBlob(env, finalKey);
   await env.DB.prepare("UPDATE uploads SET final_purged_at = ? WHERE id = ? AND final_purged_at IS NULL").bind(nowMs(), uploadId).run();
 }

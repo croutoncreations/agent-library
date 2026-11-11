@@ -26,18 +26,29 @@ async function reconcileUploads(env, opts = {}) {
   const e2 = await DB.prepare(`UPDATE uploads SET state = 'failed', result = ? WHERE state = 'receiving' AND expires_at <= ?${pf}`).bind(EXPIRED, now - grace, ...pp).run();
   const e3 = await DB.prepare(`UPDATE uploads SET state = 'failed', result = ?, finalize_token = NULL, finalize_until = NULL WHERE state = 'sealed' AND expires_at <= ? AND (finalize_until IS NULL OR finalize_until <= ?)${pf}
       AND NOT EXISTS (SELECT 1 FROM revisions r WHERE r.id = uploads.final_revision_id)`).bind(CRASHED, now - grace, now, ...pp).run();
-  // Stale counts on failed or conflicting uploads are released below, so they are not reported as retained.
+  // Stale counts on failed/conflicting uploads and published text inputs are released below; published binaries stay referenced.
   const retained = await DB.prepare(`SELECT COUNT(*) AS count, MIN(expires_at) AS oldest_expiry FROM uploads WHERE state IN ('failed','conflict','published') AND final_writes > 0 AND final_key IS NOT NULL AND final_purged_at IS NULL
-      AND (state = 'published' OR expires_at > ?)${pf}`).bind(stale, ...pp).first();
+      AND ((state = 'published' AND mime NOT IN ('text/markdown','text/html','application/json','text/csv')) OR expires_at > ?)${pf}`).bind(stale, ...pp).first();
   if (retained?.count > 0) console.warn(JSON.stringify({ event: "upload_final_writes_retained", count: retained.count, oldest_expiry_age_ms: Math.max(0, now - retained.oldest_expiry) }));
   let purgedStaging = 0, purgedFinal = 0;
-  const st = await DB.prepare(`SELECT id, staging_key FROM uploads WHERE staging_purged_at IS NULL AND state IN ('failed','conflict','published')${pf} LIMIT ?`).bind(...pp, limit).all();
+  const st = await DB.prepare(`SELECT id, staging_key, mime, state, final_key, final_purged_at, final_writes, expires_at FROM uploads INDEXED BY uploads_cleanup WHERE staging_purged_at IS NULL AND state IN ('failed','conflict','published')${pf} LIMIT ?`).bind(...pp, limit).all();
   for (const u of st.results) {
+    const text = ['text/markdown','text/html','application/json','text/csv'].includes(u.mime);
+    if (text) {
+      if (u.final_writes > 0 && u.expires_at > stale) continue;
+      if (u.final_purged_at === null) {
+        // Failed/conflicting rows go through the unchanged reference-guarded final lane below.
+        if (u.state !== 'published') continue;
+        await deleteBlob(env, u.final_key);
+        const r = await DB.prepare("UPDATE uploads SET final_purged_at = ?, final_writes = 0 WHERE id = ? AND final_purged_at IS NULL").bind(now, u.id).run();
+        purgedFinal += r.meta.changes ? 1 : 0;
+      }
+    }
     await deleteBlob(env, u.staging_key);
-    const r = await DB.prepare("UPDATE uploads SET staging_purged_at = ? WHERE id = ? AND staging_purged_at IS NULL AND state IN ('failed','conflict','published')").bind(now, u.id).run();
+    const r = await DB.prepare("UPDATE uploads SET staging_purged_at = ? WHERE id = ? AND staging_purged_at IS NULL AND state IN ('failed','conflict','published') AND (mime NOT IN ('text/markdown','text/html','application/json','text/csv') OR final_purged_at IS NOT NULL)").bind(now, u.id).run();
     purgedStaging += r.meta.changes ? 1 : 0;
   }
-  const fi = await DB.prepare(`SELECT id, final_key FROM uploads u WHERE final_key IS NOT NULL AND final_purged_at IS NULL AND (state IN ('failed','conflict') OR (state = 'published' AND mime IN ('text/markdown','text/html','application/json','text/csv'))) AND (final_writes = 0 OR expires_at <= ?)
+  const fi = await DB.prepare(`SELECT id, final_key FROM uploads u WHERE final_key IS NOT NULL AND final_purged_at IS NULL AND state IN ('failed','conflict') AND (final_writes = 0 OR expires_at <= ?)
       AND NOT EXISTS (SELECT 1 FROM revisions r WHERE r.blob_key = u.final_key)${pf.replace("project_id", "u.project_id")} LIMIT ?`).bind(stale, ...pp, limit).all();
   for (const u of fi.results) {
     await deleteBlob(env, u.final_key);
