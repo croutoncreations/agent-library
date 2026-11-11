@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { ROOT } from "./helpers.mjs";
 import { loadWorker } from "./load-worker.mjs";
 
-export const lib = await loadWorker({ "uploads.js": ["quotaUsedSql", "uploadBegin", "uploadFinish", "uploadPut"], "cleanup.js": ["reconcileUploads"], "project-deletion.js": ["purgeDueProjects"], "adapters.js": ["withAdapters", "defaultAdapters"] });
+export const lib = await loadWorker({ "uploads.js": ["quotaUsedSql", "uploadBegin", "uploadFinish", "uploadPut"], "cleanup.js": ["reconcileUploads"], "project-deletion.js": ["purgeDueProjects"], "adapters.js": ["withAdapters", "defaultAdapters"], "service.js": ["loadArtifact", "saveFile"] });
 // The workerd stream class uploadPut uses, a minimal Node stand-in with workerd's messages: FixedLengthStream (errors
 // unless exactly n bytes).
 globalThis.FixedLengthStream ??= class extends TransformStream {
@@ -58,14 +58,14 @@ export function world() {
     },
     async put(k, b, opts) {
       const bytes = b instanceof ReadableStream ? Buffer.from(await new Response(b).arrayBuffer()) : b;
-      if (opts?.sha256 && createHash("sha256").update(bytes).digest("hex") !== opts.sha256) throw new Error("put: The SHA-256 checksum you specified did not match what we received. (10037)");
+      if (opts?.sha256 && createHash("sha256").update(bytes).digest("hex") !== (typeof opts.sha256 === "string" ? opts.sha256 : Buffer.from(opts.sha256).toString("hex"))) throw new Error("put: The SHA-256 checksum you specified did not match what we received. (10037)");
       if (r2.beforeCommit) await r2.beforeCommit(k);
       blobs.set(k, bytes);
       if (r2.onPut) await r2.onPut(k);
       return { size: bytes.length, checksums: { sha256: digest(bytes) } };
     },
     async head(k) { if (r2.failHead) throw new Error("synthetic R2 head failure"); return blobs.has(k) ? { size: blobs.get(k).length, checksums: { sha256: digest(blobs.get(k)) } } : null; },
-    async delete(k) { blobs.delete(k); },
+    async delete(k) { for (const key of Array.isArray(k) ? k : [k]) blobs.delete(key); },
     async list({ prefix, limit }) { return { objects: [...blobs.keys()].filter((k) => k.startsWith(prefix)).slice(0, limit).map((key) => ({ key })) }; },
   };
   const at = new Date().toISOString();

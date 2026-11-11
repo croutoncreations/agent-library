@@ -19,6 +19,19 @@ export async function getBlobBytes(env, key) {
   return o ? new Uint8Array(await o.arrayBuffer()) : null;
 }
 
+/** Decode upload-owned raw text once, strictly, without consuming a leading BOM. */
+export async function getUploadedText(env, key, kind) {
+  const bytes = await getBlobBytes(env, key);
+  if (bytes === null) return null;
+  try {
+    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+  } catch (error) {
+    if (!(error instanceof TypeError)) throw error;
+    const detail = "bytes are not valid UTF-8";
+    throw new HttpError(422, "invalid_content", `Invalid ${kind}: ${detail}`, { format: kind, detail });
+  }
+}
+
 /** The first `length` bytes of a stored object (fewer if it is shorter), or null if missing. */
 export async function getBlobHead(env, key, length) {
   const o = await env.BLOBS.get(key, { range: { offset: 0, length } });

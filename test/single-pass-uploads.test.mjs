@@ -1,4 +1,4 @@
-// Single-pass uploads (PR2 slice 1): a file passes through the Worker once. uploadPut streams the body straight to the
+// Single-pass binary uploads: a file passes through the Worker once. uploadPut streams the body straight to the
 // upload's final_key with R2 verifying the declared SHA-256 and length; uploadFinish writes nothing and reads only R2's
 // recorded checksum and the first bytes. Unit tests drive the production code in upload-world.mjs (BLOBS spy); the
 // local wrangler tests check real R2 (miniflare) behaviour end to end. Synthetic data only.
@@ -11,7 +11,7 @@ import { ROOT, startServer, agentHttp, setupProject, grant, sha256 } from "./hel
 import { SERVER_PORTS } from "./ports.mjs";
 import { P, PNG, SHA, lib, world } from "./upload-world.mjs";
 
-test("uploads.js: no stream hashing, no whole-object read, and the PUT is the only R2 write", () => {
+test("uploads.js: no direct byte buffering or stream hashing; exactly one streaming PUT call site", () => {
   const src = readFileSync(join(ROOT, "packages", "core", "src", "uploads.js"), "utf8");
   assert.doesNotMatch(src, /DigestStream|sha256HexStream|getBlobBytes|\.arrayBuffer\(\)/);
   // getBlob always gets a range argument (serveContent's is undefined only to stream a whole-file GET response).

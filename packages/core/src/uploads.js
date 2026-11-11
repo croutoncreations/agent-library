@@ -1,20 +1,23 @@
-import { blobSha256Hex, deleteBlob, getBlob, getBlobHead, headBlob, putBlobStream, getText, getTextRange } from "./content-store.js";
-import { authenticate, authorizeProject, authzSql, enforceRate, limitsFor, requireCsrf } from "./auth.js";
+import { blobSha256Hex, deleteBlob, getBlob, getBlobHead, headBlob, putBlobStream, getText, getTextRange, getUploadedText } from "./content-store.js";
+import { authenticate, authorizeProject, authzSql, contentWriteSql, enforceRate, limitsFor, requireCsrf } from "./auth.js";
 import { PUT_MARGIN_MS, reconcileUploads } from "./cleanup.js";
-import { CONTENT_TYPE, spreadsheetSafeCsv } from "./formats.js";
+import { CONTENT_TYPE, checkFile, spreadsheetSafeCsv } from "./formats.js";
 import { __name } from "./runtime.js";
 import { explainLimit, fileTooLarge, guardSql, projectLimitGuard } from "./limits.js";
-import { BINARY_TYPES, IMAGE_TYPES, VIDEO_TYPES, assertWritable, audit, idemLookup, loadArtifact, publishRevision } from "./service.js";
+import { BINARY_TYPES, IMAGE_TYPES, VIDEO_TYPES, assertWritable, audit, idemLookup, loadArtifact, mdBody, provenance, publishRevision, requireAppConnect, textCreateMetadata } from "./service.js";
+import { TEXT_MAX_BYTES } from "./text-limits.js";
 import { HttpError, int, nowIso, nowMs, randomId, sha256Hex, str } from "./util.js";
 
 var db2 = /* @__PURE__ */ __name((ctx) => ctx.env.DB, "db");
+const TEXT_UPLOAD_KINDS = { "text/markdown": "markdown", "text/html": "html", "application/json": "json", "text/csv": "csv" };
+const BINARY_UPLOAD_SQL = "mime NOT IN ('text/markdown','text/html','application/json','text/csv')";
 // Bytes charged to a project: published revisions, live reservations, and each ended (or expired) upload once while
 // any object it may have written is not yet deleted: its staging_key (written only by an older Worker, which a rollback
 // can bring back, so an unpurged one counts) or its final_key. One SUM with an OR, so a row is never charged twice.
 var quotaUsedSql = (now) => `(SELECT COALESCE(SUM(size),0) FROM revisions WHERE project_id = ?1 AND blob_key IS NOT NULL)
-  + (SELECT COALESCE(SUM(expected_size),0) FROM uploads WHERE project_id = ?1
+  + (SELECT COALESCE(SUM(expected_size),0) FROM uploads WHERE project_id = ?1 AND ${BINARY_UPLOAD_SQL}
        AND (state IN ('receiving','sealed') OR (state IN ('pending','received') AND expires_at > ${Math.trunc(now)})))
-  + (SELECT COALESCE(SUM(expected_size),0) FROM uploads WHERE project_id = ?1
+  + (SELECT COALESCE(SUM(expected_size),0) FROM uploads WHERE project_id = ?1 AND ${BINARY_UPLOAD_SQL}
        AND (state IN ('failed','conflict') OR (state IN ('pending','received') AND expires_at <= ${Math.trunc(now)}))
        AND (staging_purged_at IS NULL OR (final_key IS NOT NULL AND final_purged_at IS NULL)))`;
 async function purgeStaging(env, u) {
@@ -28,26 +31,46 @@ async function purgeStaging(env, u) {
 // can start) and no write is in flight (so none can re-create it afterwards); otherwise cleanup purges it once the last
 // write settles. Absent is harmless (R2 delete of a missing key is a no-op).
 async function dropUnpublished(env, uploadId, finalKey) {
-  const idle = await env.DB.prepare("SELECT 1 AS x FROM uploads u WHERE id = ? AND state IN ('failed','conflict') AND final_writes = 0 AND final_purged_at IS NULL AND NOT EXISTS (SELECT 1 FROM revisions r WHERE r.blob_key = u.final_key)").bind(uploadId).first("x");
+  const idle = await env.DB.prepare("SELECT 1 AS x FROM uploads u WHERE id = ? AND (state IN ('failed','conflict') OR (state = 'published' AND mime IN ('text/markdown','text/html','application/json','text/csv'))) AND final_writes = 0 AND final_purged_at IS NULL AND NOT EXISTS (SELECT 1 FROM revisions r WHERE r.blob_key = u.final_key)").bind(uploadId).first("x");
   if (!idle) return;
   await deleteBlob(env, finalKey);
   await env.DB.prepare("UPDATE uploads SET final_purged_at = ? WHERE id = ? AND final_purged_at IS NULL").bind(nowMs(), uploadId).run();
 }
-// The immutable R2 key of an upload's bytes, which the revision publishing them references.
+// Upload-owned bytes: immutable published binary content, or temporary raw input for text publication.
 var finalKeyFor = (projectId, artifactId) => `blobs/${projectId}/${artifactId}/${randomId("rev")}`;
 async function uploadBegin(ctx, projectId, input, key) {
   await authorizeProject(ctx, projectId, true);
   const mime = str(input.mime, "mime", 100);
-  if (!BINARY_TYPES[mime]) throw new HttpError(415, "unsupported_type", "Allowed: " + Object.keys(BINARY_TYPES).join(", "));
-  const size = int(input.size, "size", 1, Number.MAX_SAFE_INTEGER);
+  const kind = Object.hasOwn(TEXT_UPLOAD_KINDS, mime) ? TEXT_UPLOAD_KINDS[mime] : null;
+  if (!kind && !BINARY_TYPES[mime]) throw new HttpError(415, "unsupported_type", "Allowed: " + [...Object.keys(BINARY_TYPES), ...Object.keys(TEXT_UPLOAD_KINDS)].join(", "));
+  const size = int(input.size, "size", kind ? 0 : 1, Number.MAX_SAFE_INTEGER);
+  if (kind && size > TEXT_MAX_BYTES) throw new HttpError(413, "too_large", kind === "markdown" ? "Markdown exceeds 10 MiB" : kind === "html" ? "HTML exceeds 10 MiB" : `${kind} file exceeds 10 MiB`);
+  if (kind === "json" || kind === "csv") requireAppConnect(ctx);
   // Workspace limits (limits.js): file size, storage (the reservation counts as used until it publishes or is
   // released) and, for a new file, its placeholder document counts toward the project's items.
   const adds = input.artifact_id ? { storage_bytes: size } : { storage_bytes: size, items_per_project: 1 };
   const lg = await projectLimitGuard(ctx.env, projectId, adds);
-  if (size > lg.limits.file_bytes) throw fileTooLarge(lg.limits.file_bytes);
+  if (!kind && size > lg.limits.file_bytes) throw fileTooLarge(lg.limits.file_bytes);
   const sha2 = str(input.sha256, "sha256", 64);
   if (!/^[0-9a-f]{64}$/.test(sha2)) throw new HttpError(400, "invalid_input", "sha256 must be 64 lowercase hex chars");
-  const i = { op: "upload.begin", key, projectId, digest: await sha256Hex(JSON.stringify([mime, size, sha2, input.artifact_id ?? null, input.expected_revision ?? null, input.title ?? null])) };
+  let metadata, note = null, target;
+  if (kind) {
+    note = provenance(ctx, input)[4];
+    if (input.artifact_id) {
+      if (input.title !== void 0 || input.folder !== void 0 || input.folder_id !== void 0) throw new HttpError(400, "invalid_input", "Pass title and optional create metadata for a new document, or artifact_id and expected_revision for a new version");
+      target = await loadArtifact(ctx, projectId, str(input.artifact_id, "artifact_id", 64));
+      assertWritable(ctx, target, "content");
+      if (target.kind !== kind) throw new HttpError(400, "invalid_input", "mime must match the existing document kind");
+      if (input.schema !== void 0 && (input.schema == null ? null : String(input.schema)) !== target.schema_id) throw new HttpError(400, "invalid_input", "schema must match the existing document schema");
+      int(input.expected_revision, "expected_revision", 1);
+    } else {
+      if (input.expected_revision !== void 0) throw new HttpError(400, "invalid_input", "Pass title and optional create metadata for a new document, or artifact_id and expected_revision for a new version");
+      metadata = await textCreateMetadata(ctx, projectId, input, kind);
+    }
+  }
+  // Preserve the binary digest byte-for-byte for old replay compatibility.
+  const parts = [mime, size, sha2, input.artifact_id ?? null, input.expected_revision ?? null, input.title ?? null];
+  const i = { op: "upload.begin", key, projectId, digest: await sha256Hex(JSON.stringify(kind ? [mime, size, sha2, target?.id ?? null, input.expected_revision ?? null, metadata ?? { schema: target.schema_id }, note] : parts)) };
   const prior = await idemLookup(ctx, i);
   if (prior) return prior;
   await reconcileUploads(ctx.env, { projectId, limit: 20 });
@@ -55,19 +78,22 @@ async function uploadBegin(ctx, projectId, input, key) {
   let artifactId;
   let baseRev;
   const stmts = [];
-  const az = authzSql(ctx, projectId);
+  const azBase = authzSql(ctx, projectId);
+  const cw = kind && target ? contentWriteSql(ctx, target.id) : { sql: "1", params: [] };
+  const az = { sql: `${azBase.sql} AND ${cw.sql}`, params: [...azBase.params, ...cw.params] };
   if (input.artifact_id) {
     artifactId = str(input.artifact_id, "artifact_id", 64);
-    const a = await loadArtifact(ctx, projectId, artifactId);
+    const a = target ?? await loadArtifact(ctx, projectId, artifactId);
     assertWritable(ctx, a, "content");
-    if (a.kind !== "binary") throw new HttpError(400, "invalid_input", "Not a binary artifact");
+    if (!kind && a.kind !== "binary") throw new HttpError(400, "invalid_input", "Not a binary artifact");
     baseRev = int(input.expected_revision, "expected_revision", 1);
   } else {
-    const title = str(input.title, "title", 200, { min: 1 });
+    const title = metadata?.title ?? str(input.title, "title", 200, { min: 1 });
     artifactId = randomId("art");
     baseRev = 0;
-    stmts.push(db2(ctx).prepare(`INSERT INTO artifacts (id, project_id, kind, title, folder, head_rev, created_at, updated_at)
-      SELECT ?, ?, 'binary', ?, ?, 0, ?, ? WHERE ${az.sql} AND ${lg.sql}`).bind(artifactId, projectId, title, str(input.folder, "folder", 200, { optional: true }), nowIso(), nowIso(), ...az.params, ...lg.params));
+    stmts.push(db2(ctx).prepare(`INSERT INTO artifacts (id, project_id, kind, title, folder, folder_id, schema_id, head_rev, created_at, updated_at)
+      SELECT ?, ?, ?, ?, ?, ?, ?, 0, ?, ? WHERE ${az.sql} AND ${lg.sql}
+      AND (? IS NULL OR EXISTS (SELECT 1 FROM folders WHERE id = ? AND project_id = ?))`).bind(artifactId, projectId, kind ?? "binary", title, metadata?.folder ?? str(input.folder, "folder", 200, { optional: true }), metadata?.folderId ?? null, metadata?.schema ?? null, nowIso(), nowIso(), ...az.params, ...lg.params, metadata?.folderId ?? null, metadata?.folderId ?? null, projectId));
   }
   const uploadId = randomId("upl", 18);
   const expires = nowMs() + limits.uploadTtlMs;
@@ -78,7 +104,7 @@ async function uploadBegin(ctx, projectId, input, key) {
     put_url: `/api/transfers/${uploadId}`,
     method: "PUT",
     expires_at: new Date(expires).toISOString(),
-    instructions: "PUT the raw file bytes to put_url with the same Authorization, then call upload_finish."
+    instructions: kind ? "PUT the raw bytes to put_url with the same credentials (and CSRF token for a cookie session), then call upload_finish. Text must be UTF-8." : "PUT the raw file bytes to put_url with the same Authorization, then call upload_finish."
   };
   const gate = "EXISTS (SELECT 1 FROM uploads WHERE id = ?)";
   // The reservation re-checks storage only: a new file's placeholder (above) already passed the items limit, and the
@@ -89,10 +115,10 @@ async function uploadBegin(ctx, projectId, input, key) {
     // The partial unique index uploads_one_active rejects a second concurrent active upload outright.
     // final_key, the one object this upload ever writes (by its PUT), is fixed here. staging_key is still filled in
     // because the previous Worker's cleanup deletes it for published uploads, but nothing is ever written there.
-    db2(ctx).prepare(`INSERT INTO uploads (id, project_id, artifact_id, principal_id, base_rev, expected_size, expected_sha256, mime, state, staging_key, final_key, expires_at, created_at)
-      SELECT ?2, ?1, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', ?9, ?13, ?10, ?11
+    db2(ctx).prepare(`INSERT INTO uploads (id, project_id, artifact_id, principal_id, base_rev, expected_size, expected_sha256, mime, state, staging_key, final_key, expires_at, created_at, change_note)
+      SELECT ?2, ?1, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', ?9, ?13, ?10, ?11, ?14
       WHERE (?12 = 0 OR ${quotaUsedSql(nowMs())} + ?6 <= ?12) AND EXISTS (SELECT 1 FROM artifacts WHERE id = ?3 AND project_id = ?1)
-        AND ${az.sql} AND ${sg.sql}`).bind(projectId, uploadId, artifactId, ctx.principal.id, baseRev, size, sha2, mime, `staging/${projectId}/${uploadId}`, expires, nowIso(), limits.projectBinaryBytes, finalKeyFor(projectId, artifactId), ...az.params, ...sg.params),
+        AND ${az.sql} AND ${sg.sql}`).bind(projectId, uploadId, artifactId, ctx.principal.id, baseRev, size, sha2, mime, `staging/${projectId}/${uploadId}`, expires, nowIso(), kind ? 0 : limits.projectBinaryBytes, finalKeyFor(projectId, artifactId), note, ...az.params, ...sg.params),
     db2(ctx).prepare(`INSERT INTO idempotency (principal_id, project_id, op, key, digest, status, response, created_at)
       SELECT ?, ?, ?, ?, ?, 201, ?, ? WHERE ${gate}`).bind(ctx.principal.id, projectId, i.op, i.key, i.digest, JSON.stringify(body2), nowIso(), uploadId),
     audit(ctx, projectId, "upload.begin", artifactId, baseRev, "ok", gate, [uploadId])
@@ -109,7 +135,7 @@ async function uploadBegin(ctx, projectId, input, key) {
   if (!uploadRow.meta.changes) {
     if (!input.artifact_id) await db2(ctx).prepare("DELETE FROM artifacts WHERE id = ? AND head_rev = 0 AND NOT EXISTS (SELECT 1 FROM uploads WHERE artifact_id = ?)").bind(artifactId, artifactId).run();
     const used = await db2(ctx).prepare(`SELECT ${quotaUsedSql(nowMs())} AS n`).bind(projectId).first("n");
-    if (limits.projectBinaryBytes > 0 && (used ?? 0) + size > limits.projectBinaryBytes)
+    if (!kind && limits.projectBinaryBytes > 0 && (used ?? 0) + size > limits.projectBinaryBytes)
       throw new HttpError(413, "quota_exceeded", "Project binary storage quota exceeded", { used_bytes: used, limit_bytes: limits.projectBinaryBytes });
     if (lg.workspaceId) await explainLimit(ctx.env, lg.workspaceId, adds, lg.limits, projectId);
     throw new HttpError(403, "forbidden", "Grant no longer valid");
@@ -131,8 +157,15 @@ async function uploadPut(req, env, requestId, uploadId, linkCtx) {
   const declared = cl === null ? NaN : Number(cl);
   if (Number.isFinite(declared) && declared > u.expected_size) throw new HttpError(413, "too_large", "Body exceeds declared size");
   if (Number.isFinite(declared) && declared < u.expected_size) throw new HttpError(400, "incomplete_body", "Content-Length is smaller than the declared size; PUT the whole file");
-  if (!req.body) throw new HttpError(400, "invalid_input", "Missing body");
-  const az = authzSql(ctx, u.project_id);
+  if (!req.body && u.expected_size !== 0) throw new HttpError(400, "invalid_input", "Missing body");
+  const textKind = Object.hasOwn(TEXT_UPLOAD_KINDS, u.mime) ? TEXT_UPLOAD_KINDS[u.mime] : null;
+  if (textKind) {
+    if (textKind === "json" || textKind === "csv") requireAppConnect(ctx);
+    assertWritable(ctx, await loadArtifact(ctx, u.project_id, u.artifact_id, { allowUnpublished: u.base_rev === 0 }), "content");
+  }
+  const azBase = authzSql(ctx, u.project_id);
+  const cw = textKind ? contentWriteSql(ctx, u.artifact_id) : { sql: "1", params: [] };
+  const az = { sql: `${azBase.sql} AND ${cw.sql}`, params: [...azBase.params, ...cw.params] };
   // Claim the upload and register the write in one statement: cleanup purges final_key only once final_writes is 0.
   // An upload begun by the previous Worker has no final_key yet; it is fixed here (nothing else writes it while pending).
   const finalKey = u.final_key ?? finalKeyFor(u.project_id, u.artifact_id);
@@ -147,7 +180,7 @@ async function uploadPut(req, env, requestId, uploadId, linkCtx) {
     const deadline = u.expires_at;
     const expired = () => new HttpError(410, "upload_expired", "Upload expired during transfer");
     let stored, bodyCtl, abortTimer, marginTimer, timedOut = false, abandoned = false;
-    const body = req.body.pipeThrough(new TransformStream({
+    const body = (req.body ?? new ReadableStream({ start(c) { c.close(); } })).pipeThrough(new TransformStream({
       start(c) { bodyCtl = c; },
       transform(chunk, out) {
         if (nowMs() > deadline) { timedOut = true; throw expired(); }
@@ -227,8 +260,8 @@ async function uploadPut(req, env, requestId, uploadId, linkCtx) {
 //    so cleanup can never delete bytes under a publication that then succeeds.
 //  - Single pass (docs/upload-finalization.md): the final R2 key is fixed at upload begin (uploads.final_key; the lease
 //    COALESCE only covers rows begun by an older Worker) and only uploadPut writes it, from 'pending', with R2
-//    verifying length and SHA-256. Finish writes nothing: it checks R2's recorded size and checksum and the first
-//    bytes' type signature, then publishes that object. Every attempt and takeover publishes the same object.
+//    verifying length and SHA-256. Binary finish writes nothing: it checks metadata and the first bytes' signature.
+//    Text finish reads this temporary input once and publishes through the ordinary intent-fenced text writer.
 //  - Every final-object write is counted in uploads.final_writes (taken in the PUT's claim, released when the put
 //    settles). Cleanup purges a failed upload's final object only once no write is in flight; a failed upload can
 //    start no new write, so nothing re-creates the object afterwards. A Worker that dies mid-put leaves the count
@@ -311,7 +344,8 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
     const prefix = `blobs/${projectId}/${u.artifact_id}/`;
     if (held?.finalize_token !== token || typeof finalKey !== "string" || !finalKey.startsWith(prefix) || !/^rev_[A-Za-z0-9_-]+$/.test(finalKey.slice(prefix.length)))
       throw new HttpError(500, "publish_failed", "Upload finalization state is inconsistent");
-    const revId = finalKey.slice(prefix.length);
+    const kind = Object.hasOwn(TEXT_UPLOAD_KINDS, u.mime) ? TEXT_UPLOAD_KINDS[u.mime] : null;
+    const revId = kind ? randomId("rev") : finalKey.slice(prefix.length);
     // Ends the upload with an error, only while this finisher still holds the lease.
     const end = async (status, code, message, state, extra) => {
       const r = await db2(ctx).prepare("UPDATE uploads SET state = ?, result = ?, finalize_token = NULL, finalize_until = NULL WHERE id = ? AND state = 'sealed' AND finalize_token = ?").bind(state, JSON.stringify({ status, code, message, extra }), uploadId, token).run();
@@ -321,7 +355,7 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
     };
     const fail = async (status, code, message, state, extra) => {
       if (!await end(status, code, message, state, extra)) return lost();
-      await dropUnpublished(ctx.env, uploadId, finalKey);
+      await dropUnpublished(ctx.env, uploadId, finalKey).catch(() => {});
       await purgeStaging(ctx.env, u);
       throw new HttpError(status, code, message, extra);
     };
@@ -342,9 +376,28 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
     if (sha2 === null) return fail(500, "publish_failed", "Stored object has no SHA-256 checksum", "failed");
     if (size !== u.expected_size || sha2 !== u.expected_sha256)
       return fail(422, "integrity_mismatch", "Byte length or SHA-256 does not match declaration", "failed", { received_size: size, received_sha256: sha2 });
-    const head = await getBlobHead(ctx.env, finalKey, 16);
-    if (!head) return fail(409, "missing_bytes", "Uploaded bytes missing", "failed");
-    if (!BINARY_TYPES[u.mime](head)) return fail(415, "signature_mismatch", `Bytes are not a valid ${u.mime}`, "failed");
+    let text;
+    if (kind) {
+      if (kind === "json" || kind === "csv") requireAppConnect(ctx);
+      const a = await loadArtifact(ctx, projectId, u.artifact_id, { allowUnpublished: u.base_rev === 0 });
+      assertWritable(ctx, a, "content");
+      if (a.kind !== kind) throw new HttpError(400, "invalid_input", "mime must match the existing document kind");
+      try {
+        text = await getUploadedText(ctx.env, finalKey, kind);
+        if (text === null) return fail(409, "missing_bytes", "Uploaded bytes missing", "failed");
+        if (kind === "markdown" || kind === "html") mdBody(text, kind);
+        else checkFile(kind, text, a.schema_id);
+      } catch (e) {
+        // Only document validation errors are terminal. R2/D1 failures retain their retryable sealed state.
+        if (e instanceof HttpError && (e.code === "invalid_content" || e.code === "too_large" || e.code === "invalid_input")) return fail(e.status, e.code, e.message, "failed", e.extra);
+        throw e;
+      }
+    } else {
+      // Binary finish must never read the whole object or perform a second write.
+      const head = await getBlobHead(ctx.env, finalKey, 16);
+      if (!head) return fail(409, "missing_bytes", "Uploaded bytes missing", "failed");
+      if (!BINARY_TYPES[u.mime](head)) return fail(415, "signature_mismatch", `Bytes are not a valid ${u.mime}`, "failed");
+    }
     // Still the finisher? Renew the lease for the publication.
     const renew = await db2(ctx).prepare("UPDATE uploads SET finalize_until = ? WHERE id = ? AND state = 'sealed' AND finalize_token = ?").bind(nowMs() + FINALIZE_LEASE_MS, uploadId, token).run();
     if (!renew.meta.changes) return lostAfterWrite();
@@ -358,11 +411,12 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
         u.base_rev,
         i,
         // change_note: recorded at upload_begin by OAuth connections (migration 0013); undefined on older schemas.
-        { blobKey: finalKey, size, sha256: sha2, mime: u.mime, revId, change_note: u.change_note ?? void 0, fence: { sql: fenced, params: [uploadId, token] } },
+        { ...kind ? { body: text, reservedUpload: { id: uploadId, token } } : { blobKey: finalKey }, size, sha256: sha2, mime: u.mime, revId, change_note: u.change_note ?? void 0, fence: { sql: fenced, params: [uploadId, token] } },
         [db2(ctx).prepare(`UPDATE uploads SET state = 'published', final_revision_id = ?, result = ?, finalize_token = NULL, finalize_until = NULL WHERE id = ? AND state = 'sealed' AND finalize_token = ? AND ${gate}`).bind(revId, JSON.stringify({ status: 200, body: ok2 }), uploadId, token, revId)],
         "upload.publish"
       );
       if (!res.body?.idempotent_replay) {
+        if (kind) await dropUnpublished(ctx.env, uploadId, finalKey).catch(() => {});
         await purgeStaging(ctx.env, u);
         return { status: 200, body: ok2 };
       }

@@ -212,7 +212,7 @@ async function updateGrant(ctx, projectId, grantId, input) {
 }
 async function loadArtifact(ctx, projectId, artifactId, opts = {}) {
   const a = await db(ctx).prepare(`SELECT ${ART_COLS} FROM artifacts a WHERE a.id = ? AND a.project_id = ?`).bind(artifactId, projectId).first();
-  if (!a || a.head_rev === 0 && a.kind === "binary" && !opts.allowTrashed) throw new HttpError(404, "not_found", "Artifact not found");
+  if (!a || a.head_rev === 0 && !opts.allowUnpublished) throw new HttpError(404, "not_found", "Artifact not found");
   if (a.trashed_at && !opts.allowTrashed) throw new HttpError(404, "not_found", "Artifact not found");
   return a;
 }
@@ -281,6 +281,17 @@ async function folderCheck(ctx, projectId, folderId) {
   if (!f) throw new HttpError(404, "not_found", "Folder not found");
   return id;
 }
+// Shared create metadata for inline text and upload reservations. Tags retain their create default ([]).
+async function textCreateMetadata(ctx, projectId, input, kind) {
+  if (kind === "json" || kind === "csv" || input.folder_id != null) requireAppConnect(ctx);
+  const schema = input.schema == null ? null : String(input.schema);
+  if (kind === "markdown" || kind === "html") {
+    if (schema !== null) throw new HttpError(400, "invalid_input", "schema is only allowed for json or csv files");
+  } else if (schema !== null && schema !== MEASUREMENTS) {
+    throw new HttpError(400, "invalid_input", `unknown schema (supported: ${MEASUREMENTS})`);
+  }
+  return { title: str(input.title, "title", 200, { min: 1 }), folder: str(input.folder, "folder", 200, { optional: true }), folderId: await folderCheck(ctx, projectId, input.folder_id), schema };
+}
 async function createMarkdown(ctx, projectId, input, key, kind = "markdown") {
   await authorizeProject(ctx, projectId, true);
   const title = str(input.title, "title", 200, { min: 1 });
@@ -292,8 +303,7 @@ async function createMarkdown(ctx, projectId, input, key, kind = "markdown") {
     schema = c.schema;
     mime = MIME[kind];
   }
-  const folder = str(input.folder, "folder", 200, { optional: true });
-  const folderId = await folderCheck(ctx, projectId, input.folder_id);
+  const { folder, folderId } = await textCreateMetadata(ctx, projectId, input, kind);
   const digestParts = kind === "markdown" && folderId === null ? ["md", title, body2, folder] : [kind, title, body2, folder, folderId, schema];
   const i = { op: "artifact.create", key, projectId, digest: await sha256Hex(JSON.stringify(digestParts)) };
   const prior = await idemLookup(ctx, i);
@@ -334,12 +344,21 @@ async function publishRevision(ctx, projectId, artifactId, expected, i, rev, ext
   const cw = contentWriteSql(ctx, artifactId);
   // Text revisions count against storage here; new file revisions were reserved (and counted) when the upload began.
   // A restored file version adds a revision row of its size (counted in usage), so it is checked here too.
-  const addBytes = rev.blobKey && !rev.restoredFrom ? 0 : rev.size ?? 0;
-  const lg = addBytes ? await projectLimitGuard(ctx.env, projectId, { storage_bytes: addBytes }) : { sql: "1", params: [], limits: {} };
-  const az = { sql: `${azBase.sql} AND ${cw.sql} AND ${lg.sql}${rev.fence ? " AND " + rev.fence.sql : ""}`, params: [...azBase.params, ...cw.params, ...lg.params, ...rev.fence?.params ?? []] };
+  const reserved = rev.reservedUpload;
+  const addBytes = reserved || rev.blobKey && !rev.restoredFrom ? 0 : rev.size ?? 0;
+  // A text reservation is exchanged for its revision in this batch. Check today's plan even at zero increment.
+  const lg = addBytes || reserved ? await projectLimitGuard(ctx.env, projectId, { storage_bytes: addBytes }) : { sql: "1", params: [], limits: {} };
+  const reservation = reserved ? {
+    sql: `EXISTS (SELECT 1 FROM uploads u JOIN artifacts a ON a.id = u.artifact_id
+      WHERE u.id = ? AND u.project_id = ? AND u.artifact_id = ? AND u.state = 'sealed' AND u.finalize_token = ?
+        AND u.expected_size = ? AND u.expected_sha256 = ? AND u.mime = ?
+        AND (a.folder_id IS NULL OR EXISTS (SELECT 1 FROM folders f WHERE f.id = a.folder_id AND f.project_id = u.project_id)))`,
+    params: [reserved.id, projectId, artifactId, reserved.token, rev.size, rev.sha256, rev.mime]
+  } : { sql: "1", params: [] };
+  const az = { sql: `${azBase.sql} AND ${cw.sql} AND ${lg.sql} AND ${reservation.sql}${rev.fence ? " AND " + rev.fence.sql : ""}`, params: [...azBase.params, ...cw.params, ...lg.params, ...reservation.params, ...rev.fence?.params ?? []] };
   const now = nowIso();
   const gate = "EXISTS (SELECT 1 FROM revisions WHERE id = ?)";
-  const body2 = { artifact_id: artifactId, revision: next, revision_id: revId, sha256: rev.sha256 };
+  const body2 = { artifact_id: artifactId, revision: next, revision_id: revId, sha256: rev.sha256, ...reserved ? { size: rev.size } : {} };
   const bodyKey = rev.body == null ? null : await stageTextWrite(ctx.env, projectId, artifactId, revId, rev.body);
   const out2 = await commitTextWrites(ctx.env, [bodyKey], (guarded) => runBatch(ctx, guarded([
     db(ctx).prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, body_key, blob_key, size, sha256, mime, restored_from, created_at, via_kind, via_id, via_label, client_info, change_note)
@@ -380,7 +399,7 @@ async function publishRevision(ctx, projectId, artifactId, expected, i, rev, ext
     if (cur?.trashed_at) throw new HttpError(409, "trashed", "Artifact is in trash");
     if (cur && cur.head_rev !== expected)
       throw new HttpError(409, "revision_conflict", "Expected revision is stale", { current_revision: cur.head_rev, expected_revision: expected });
-    if (addBytes && lg.workspaceId) await explainLimit(ctx.env, lg.workspaceId, { storage_bytes: addBytes }, lg.limits);
+    if ((addBytes || reserved) && lg.workspaceId) await explainLimit(ctx.env, lg.workspaceId, { storage_bytes: addBytes }, lg.limits);
     const pub = await db(ctx).prepare("SELECT publisher_id FROM artifacts WHERE id = ?").bind(artifactId).first("publisher_id");
     if (pub && !ctx.publisher) throw new HttpError(403, "protected_source", "This file is a source export owned by a connected app and cannot be modified here");
     throw new HttpError(403, "forbidden", "Grant no longer valid");
@@ -724,4 +743,4 @@ artifactView = (a, appConnect = true) => ({
 });
 ART_COLS = "a.*, (SELECT display_name FROM publishers WHERE id = a.publisher_id) AS pub_name";
 
-export { BINARY_TYPES, FOLDERS_PER_PROJECT, FOLDER_ROOM_SQL, IMAGE_TYPES, LIMITS, RS_SCHEMA, RT_ID_TOO_LONG, RT_KINDS_ALL, RT_KINDS_DOCS, VIDEO_TYPES, addComment, appConnectEnabled, assertWritable, audit, auditDenied, chQuery, cleanupChanges, connectionInfo, createFile, createFolder, createFromTemplate, createGrant, createMarkdown, createProject, updateProject, db, diffRevisions, folderCheck, folderName, getArtifact, history, idemInsert, idemLookup, legacyConnectionInfo, listArtifacts, listAudit, listChanges, listComments, listFolders, listGrants, listProjects, listTemplates, loadArtifact, mdBody, metaHistory, previewTemplate, provenance, publishRevision, readRecords, readRecordsPage, readTextChunk, requireAppConnect, restoreMetadata, restoreRevision, rsQuery, rsReady, rsToolReady, rtChunkLimit, rtFit, rtIdBytes, rtQuery, rtReadAuthzSql, runBatch, saveAsTemplate, saveFile, saveMarkdown, searchArtifacts, tplDate, tplTools, tooManyFolders, updateGrant, updateMetadata };
+export { BINARY_TYPES, FOLDERS_PER_PROJECT, FOLDER_ROOM_SQL, IMAGE_TYPES, LIMITS, RS_SCHEMA, RT_ID_TOO_LONG, RT_KINDS_ALL, RT_KINDS_DOCS, VIDEO_TYPES, addComment, appConnectEnabled, assertWritable, audit, auditDenied, chQuery, cleanupChanges, connectionInfo, createFile, createFolder, createFromTemplate, createGrant, createMarkdown, createProject, updateProject, db, diffRevisions, folderCheck, folderName, getArtifact, history, idemInsert, idemLookup, legacyConnectionInfo, listArtifacts, listAudit, listChanges, listComments, listFolders, listGrants, listProjects, listTemplates, loadArtifact, textCreateMetadata, mdBody, metaHistory, previewTemplate, provenance, publishRevision, readRecords, readRecordsPage, readTextChunk, requireAppConnect, restoreMetadata, restoreRevision, rsQuery, rsReady, rsToolReady, rtChunkLimit, rtFit, rtIdBytes, rtQuery, rtReadAuthzSql, runBatch, saveAsTemplate, saveFile, saveMarkdown, searchArtifacts, tplDate, tplTools, tooManyFolders, updateGrant, updateMetadata };

@@ -37,7 +37,7 @@ async function reconcileUploads(env, opts = {}) {
     const r = await DB.prepare("UPDATE uploads SET staging_purged_at = ? WHERE id = ? AND staging_purged_at IS NULL AND state IN ('failed','conflict','published')").bind(now, u.id).run();
     purgedStaging += r.meta.changes ? 1 : 0;
   }
-  const fi = await DB.prepare(`SELECT id, final_key FROM uploads u WHERE final_key IS NOT NULL AND final_purged_at IS NULL AND state IN ('failed','conflict') AND (final_writes = 0 OR expires_at <= ?)
+  const fi = await DB.prepare(`SELECT id, final_key FROM uploads u WHERE final_key IS NOT NULL AND final_purged_at IS NULL AND (state IN ('failed','conflict') OR (state = 'published' AND mime IN ('text/markdown','text/html','application/json','text/csv'))) AND (final_writes = 0 OR expires_at <= ?)
       AND NOT EXISTS (SELECT 1 FROM revisions r WHERE r.blob_key = u.final_key)${pf.replace("project_id", "u.project_id")} LIMIT ?`).bind(stale, ...pp, limit).all();
   for (const u of fi.results) {
     await deleteBlob(env, u.final_key);
@@ -73,11 +73,11 @@ async function reconcileUploads(env, opts = {}) {
 // from every list but counts toward items_per_project, so the cron deletes it, with its upload rows (they reference
 // it), once every upload for it is finished with: terminal, expired more than PLACEHOLDER_GRACE_MS ago (finish keeps
 // answering 410 upload_expired until then) and with its R2 objects purged. Nothing can start a new upload for it
-// (loadArtifact hides binary artifacts at head_rev 0). A stale write count (PUT_MARGIN_MS) does not keep it. Bounded per run.
+// (loadArtifact hides all artifacts at head_rev 0). A stale write count (PUT_MARGIN_MS) does not keep it. Bounded per run.
 var PLACEHOLDER_GRACE_MS = 864e5;
 // Only a placeholder nothing else refers to: a comment, details version or revision on it (all foreign keys to
 // artifacts) leaves it alone, so the delete can never fail a foreign key and roll the cleanup batch back.
-var ORPHAN_PLACEHOLDER_SQL = `a.head_rev = 0 AND a.kind = 'binary' AND a.publisher_id IS NULL
+var ORPHAN_PLACEHOLDER_SQL = `a.head_rev = 0 AND a.publisher_id IS NULL
   AND NOT EXISTS (SELECT 1 FROM meta_versions m WHERE m.artifact_id = a.id)
   AND NOT EXISTS (SELECT 1 FROM comments c WHERE c.artifact_id = a.id)
   AND NOT EXISTS (SELECT 1 FROM revisions r WHERE r.artifact_id = a.id)
