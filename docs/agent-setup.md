@@ -44,6 +44,11 @@ Routes (all under `https://YOUR_MCP_HOST`):
 | `…/files/{file}/revisions`, `…/diff`, `…/revisions/{n}/restore` | GET, GET, POST | version history |
 | `…/files/{file}/meta-versions`, `…/meta-versions/{n}/restore` | GET, POST | title, folder and tag history |
 | `/v1/projects/{project}/folders`, `…/files/{file}/records` | GET (+POST folders) | folders and data records (with App Connect enabled) |
+| `/v1/projects/{project}/uploads` | POST | start a text upload (Markdown, HTML, JSON or CSV, up to 10 MiB of UTF-8) |
+| `/v1/projects/{project}/uploads/{upload}/content` | PUT | the raw bytes, with the same API key |
+| `/v1/projects/{project}/uploads/{upload}/finish` | POST | validate and publish one version |
+
+An upload sends a document as raw bytes rather than inside JSON, so escaping can't push a valid document over the request limit. Begin takes `mime`, exact `size`, lowercase `sha256`, and either `title` (new document) or `artifact_id` + `expected_revision` (new version), and returns a relative `put_url`. API keys can't upload binary files.
 
 Writes need an `Idempotency-Key` header. Request and response shapes are in `packages/core/src/api/v1.js`, and `test/api-v1.test.mjs` has working examples. Don't log request headers.
 
