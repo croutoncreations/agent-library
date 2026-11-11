@@ -52,6 +52,56 @@ test("CSV structure: header, columns, quoting, BOM, line numbers; measurements h
   assert.equal(F.checkFile("csv", csv(["r1,1693552440000,,weight_kg,80.1,kg,", "r2,2024-02-29T08:00:00-08:00,2024-02-29,waist_cm,-1e2,cm,s"]), M).row_count, 2);
 });
 
+test("measurements JSON exact pre-streaming characterisation", () => {
+  const good = JSON.stringify(rec());
+  const bad = (path, detail, format = "schema") => ({ status: 422, code: "invalid_content", format, path, detail });
+  const cases = [
+    [json([]), 0], [json([rec()]), 1],
+    ...["null", "[]", "1", '"x"', "true"].map(t => [t, bad("$", "top level must be an object")]),
+    ['{"extra":0}', bad("extra", "unexpected top-level key")],
+    ['{}', bad("schema", `must be "${M}"`)],
+    ...["null", "[]", "1", '"x"', "true", "false"].map(t => [`{"schema":"${M}","meta":${t},"records":[]}`, bad("meta", "must be an object")]),
+    [`{"schema":"${M}","meta":{},"records":[]}`, 0],
+    ...["null", "{}", "1", '"x"', "true"].map(t => [`{"schema":"${M}","records":${t}}`, bad("records", "must be an array")]),
+    [`{"schema":"${M}"}`, bad("records", "must be an array")],
+    [json(Array.from({ length: 100001 }, () => rec())), bad("records", "more than 100000 records")],
+    ...[[], 1, "x", null, true].map(r => [json([r]), bad("records[0]", "must be an object")]),
+    ...[[{ id: "" }, "id", "string of 1-128 chars required"],
+      [{ recorded_at: "" }, "recorded_at", "source timestamp string of 1-64 chars required"],
+      [{ date: "2026-02-30" }, "date", "must be a real calendar date YYYY-MM-DD when present"],
+      [{ metric: "Bad" }, "metric", "must match [a-z][a-z0-9_]{0,39}"],
+      [{ value: "1" }, "value", "finite number required"],
+      [{ unit: "" }, "unit", "string of 1-16 chars required"],
+      [{ source_id: 1 }, "source_id", "string of at most 128 chars"]].map(([patch, field, detail]) => [json([rec(patch)]), bad(`records[0].${field}`, detail)]),
+    [json([rec(), rec({ recorded_at: "" })]), bad("records[1].id", "duplicate id")],
+    [`{"schema":"${M}","records":[${good.replace('80', '1e400')}]}`, bad("records[0].value", "finite number required")],
+    [`{"schema":0,"schema":"${M}","meta":null,"meta":{},"records":0,"records":[${good}]}`, 1],
+    [`{"schema":"${M}","schema":0,"records":[]}`, bad("schema", `must be "${M}"`)],
+    [`{"schema":"${M}","records":[null],"records":[]}`, 0],
+    [`{"schema":"${M}","records":[],"records":[null]}`, bad("records[0]", "must be an object")],
+    [`{"schema":"${M}","records":[],"meta":{},"meta":null}`, bad("meta", "must be an object")],
+    [JSON.stringify({ schema: M, records: [rec({ extra: '[,]:"\\', nested: { x: [1, {}] } })], meta: {} }, null, 2), 1],
+    [` \t{ "sch\\u0065ma" \r:\n "${M}" , "rec\\u006frds" : [ ${good.replace('"id"', '"\\u0069d"')} ] }\r\n`, 1],
+    [`{"schema":0,"records":[null],}`, bad(undefined, "not valid JSON", "json")]
+  ];
+  // Every pair of schema-error classes, with their members in both document orders.
+  const classes = [
+    ['"extra":0', bad("extra", "unexpected top-level key")],
+    ['"schema":0', bad("schema", `must be "${M}"`)],
+    ['"meta":null', bad("meta", "must be an object")],
+    ['"records":0', bad("records", "must be an array")]
+  ];
+  for (let i = 0; i < classes.length; i++) for (let j = i + 1; j < classes.length; j++) {
+    for (const order of [[i, j], [j, i]]) cases.push([`{"schema":"${M}","records":[],${order.map(k => classes[k][0]).join(",")}}`, classes[i][1]]);
+  }
+  for (const [text, expected] of cases) {
+    let actual;
+    try { actual = F.checkFile("json", text, M).record_count; }
+    catch (e) { actual = { status: e.status, code: e.code, format: e.extra.format, path: e.extra.path, detail: e.extra.detail }; }
+    assert.deepEqual(actual, expected, text.slice(0, 240));
+  }
+});
+
 test("JSON structure and schema", () => {
   const err = (t, s = M) => { try { F.checkFile("json", t, s); return null; } catch (e) { return e; } };
   assert.equal(err("{").code, "invalid_content");
