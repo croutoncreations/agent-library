@@ -32,6 +32,11 @@ async function reconcileUploads(env, opts = {}) {
   if (retained?.count > 0) console.warn(JSON.stringify({ event: "upload_final_writes_retained", count: retained.count, oldest_expiry_age_ms: Math.max(0, now - retained.oldest_expiry) }));
   let purgedStaging = 0, purgedFinal = 0;
   const st = await DB.prepare(`SELECT id, staging_key, mime, state, final_key, final_purged_at, final_writes, expires_at FROM uploads INDEXED BY uploads_cleanup WHERE staging_purged_at IS NULL AND state IN ('failed','conflict','published')${pf} LIMIT ?`).bind(...pp, limit).all();
+  const purgeStagingRow = async (u) => {
+    await deleteBlob(env, u.staging_key);
+    const r = await DB.prepare("UPDATE uploads SET staging_purged_at = ? WHERE id = ? AND staging_purged_at IS NULL AND state IN ('failed','conflict','published') AND (mime NOT IN ('text/markdown','text/html','application/json','text/csv') OR final_purged_at IS NOT NULL)").bind(now, u.id).run();
+    purgedStaging += r.meta.changes ? 1 : 0;
+  };
   for (const u of st.results) {
     const text = ['text/markdown','text/html','application/json','text/csv'].includes(u.mime);
     if (text) {
@@ -44,9 +49,7 @@ async function reconcileUploads(env, opts = {}) {
         purgedFinal += r.meta.changes ? 1 : 0;
       }
     }
-    await deleteBlob(env, u.staging_key);
-    const r = await DB.prepare("UPDATE uploads SET staging_purged_at = ? WHERE id = ? AND staging_purged_at IS NULL AND state IN ('failed','conflict','published') AND (mime NOT IN ('text/markdown','text/html','application/json','text/csv') OR final_purged_at IS NOT NULL)").bind(now, u.id).run();
-    purgedStaging += r.meta.changes ? 1 : 0;
+    await purgeStagingRow(u);
   }
   const fi = await DB.prepare(`SELECT id, final_key FROM uploads u WHERE final_key IS NOT NULL AND final_purged_at IS NULL AND state IN ('failed','conflict') AND (final_writes = 0 OR expires_at <= ?)
       AND NOT EXISTS (SELECT 1 FROM revisions r WHERE r.blob_key = u.final_key)${pf.replace("project_id", "u.project_id")} LIMIT ?`).bind(stale, ...pp, limit).all();
@@ -54,6 +57,9 @@ async function reconcileUploads(env, opts = {}) {
     await deleteBlob(env, u.final_key);
     const r = await DB.prepare("UPDATE uploads SET final_purged_at = ?, final_writes = 0 WHERE id = ? AND final_purged_at IS NULL").bind(now, u.id).run();
     purgedFinal += r.meta.changes ? 1 : 0;
+    // Complete a failed text row's staging lane in this run too, before orphan-placeholder deletion.
+    const waitingText = st.results.find(s => s.id === u.id && ['text/markdown','text/html','application/json','text/csv'].includes(s.mime));
+    if (waitingText) await purgeStagingRow(waitingText);
   }
   // Second delete of ended uploads' final keys, 1 to 3 hours after the first: R2 can't abort a put whose body fully
   // arrived, so an abandoned put that commits after the first purge is removed here (deletes of absent keys are free).
