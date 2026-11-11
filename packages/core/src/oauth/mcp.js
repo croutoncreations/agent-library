@@ -505,7 +505,15 @@ function ftDecodeBase64(v) {
 async function ftUploadInline(c, p, a) {
   const bytes = ftDecodeBase64(a.content_base64);
   const { content_base64: _b, ...rest } = a;
-  const begun = await ftUploadBegin(c, p, { ...rest, size: bytes.length, sha256: await sha256Hex(bytes) }, { link: false });
+  const begun = await ftUploadBegin(c, p, {
+    ...rest, size: bytes.length, sha256: await sha256Hex(bytes),
+    // Evaluate at ftUploadBegin's shared-begin call, after its note/target/access checks, preserving error precedence.
+    get mime() {
+      const mime = str(rest.mime, "mime", 100);
+      if (!BINARY_TYPES[mime]) throw new HttpError(415, "unsupported_type", "Allowed: " + Object.keys(BINARY_TYPES).join(", "));
+      return mime;
+    }
+  }, { link: false });
   if (begun.state === "pending") {
     const uc = await ftUploadCtx(c, false);
     await uploadPut(new Request("https://upload.invalid/inline", { method: "PUT", body: bytes, headers: { "content-length": String(bytes.length) } }), c.env, c.requestId, begun.upload_id, uc);
