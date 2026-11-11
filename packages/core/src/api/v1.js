@@ -6,7 +6,7 @@ import { appOrigin, artifactWebUrl, previewWebUrl, projectWebUrl } from "../link
 import { addressLinksResponse, projectPaths, resolveProjectRef } from "../paths.js";
 import { __name } from "../runtime.js";
 import { RT_KINDS_ALL, RT_KINDS_DOCS, appConnectEnabled, chQuery, connectionInfo, createFile, createFolder, createFromTemplate, createMarkdown, diffRevisions, getArtifact, history, listArtifacts, listChanges, listFolders, listTemplates, metaHistory, readRecords, readTextChunk, requireAppConnect, restoreMetadata, restoreRevision, rsQuery, rtQuery, saveFile, saveMarkdown, searchArtifacts } from "../service.js";
-import { serveContent } from "../uploads.js";
+import { serveContent, uploadBegin, uploadFinish, uploadPut } from "../uploads.js";
 import { HttpError, errorBody, idemKey, int, json, randomId } from "../util.js";
 
 var MAX_BODY2 = 65e5;
@@ -28,7 +28,10 @@ var R2 = {
   metaVersions: new RegExp(`^/v1/projects/${SEG}/files/${SEG}/meta-versions$`),
   metaRestore: new RegExp(`^/v1/projects/${SEG}/files/${SEG}/meta-versions/([0-9]{1,9})/restore$`),
   records: new RegExp(`^/v1/projects/${SEG}/files/${SEG}/records$`),
-  folders: new RegExp(`^/v1/projects/${SEG}/folders$`)
+  folders: new RegExp(`^/v1/projects/${SEG}/folders$`),
+  uploads: new RegExp(`^/v1/projects/${SEG}/uploads$`),
+  uploadContent: new RegExp(`^/v1/projects/${SEG}/uploads/${SEG}/content$`),
+  uploadFinish: new RegExp(`^/v1/projects/${SEG}/uploads/${SEG}/finish$`)
 };
 var isV1Path = (p) => p === "/v1" || p.startsWith("/v1/");
 async function readJson(req, maxBytes = MAX_BODY2) {
@@ -234,6 +237,34 @@ async function route2(req, env, url, requestId, seen = {}) {
       return json(r.body, r.status);
     }
     throw new HttpError(405, "method_not_allowed", "Method not allowed");
+  }
+  // Text uploads (begin, raw PUT, finish). The shared handlers get the server-built API-key context; text is enabled
+  // here, binary is not (API keys have no binary write). The PUT was charged to the write rate limit above.
+  if (g = R2.uploads.exec(path)) {
+    const pid = g[1];
+    if (m !== "POST") throw new HttpError(405, "method_not_allowed", "Method not allowed");
+    writeAllowed(k, pid);
+    const key = idemKey(req.headers.get("idempotency-key"));
+    const transfer = (uploadId) => ({
+      put_url: `/v1/projects/${pid}/uploads/${uploadId}/content`,
+      instructions: `PUT the raw bytes to put_url with the same API key, then POST to /v1/projects/${pid}/uploads/${uploadId}/finish with an Idempotency-Key header. Text must be UTF-8.`
+    });
+    const r = await uploadBegin(projectCtx(env, k, requestId, pid), pid, await readJson(req), key, { allowText: true, allowBinary: false, transfer });
+    return json(r.body, r.status);
+  }
+  if (g = R2.uploadContent.exec(path)) {
+    const [, pid, uid] = g;
+    if (m !== "PUT") throw new HttpError(405, "method_not_allowed", "Method not allowed");
+    writeAllowed(k, pid);
+    return uploadPut(req, env, requestId, uid, projectCtx(env, k, requestId, pid), { projectId: pid, rateCharged: true });
+  }
+  if (g = R2.uploadFinish.exec(path)) {
+    const [, pid, uid] = g;
+    if (m !== "POST") throw new HttpError(405, "method_not_allowed", "Method not allowed");
+    writeAllowed(k, pid);
+    const key = idemKey(req.headers.get("idempotency-key"));
+    const r = await uploadFinish(projectCtx(env, k, requestId, pid), pid, uid, key);
+    return json(r.body, r.status);
   }
   if (g = R2.revisions.exec(path)) {
     const [, pid, fid] = g;

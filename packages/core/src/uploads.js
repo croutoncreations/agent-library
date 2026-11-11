@@ -43,12 +43,13 @@ async function dropUnpublished(env, uploadId, finalKey) {
 }
 // Upload-owned bytes: immutable published binary content, or temporary raw input for text publication.
 var finalKeyFor = (projectId, artifactId) => `blobs/${projectId}/${artifactId}/${randomId("rev")}`;
-async function uploadBegin(ctx, projectId, input, key, { allowText = false } = {}) {
+// Options are transport-owned, never request fields. transfer(uploadId) gives the transport's own { put_url, instructions }.
+async function uploadBegin(ctx, projectId, input, key, { allowText = false, allowBinary = true, transfer } = {}) {
   await authorizeProject(ctx, projectId, true);
   const mime = str(input.mime, "mime", 100);
   // Text acceptance is transport-owned, never a request field; MCP stays binary-only until its own slice.
   const kind = allowText && Object.hasOwn(TEXT_UPLOAD_KINDS, mime) ? TEXT_UPLOAD_KINDS[mime] : null;
-  if (!kind && !BINARY_TYPES[mime]) throw new HttpError(415, "unsupported_type", "Allowed: " + [...Object.keys(BINARY_TYPES), ...allowText ? Object.keys(TEXT_UPLOAD_KINDS) : []].join(", "));
+  if (!kind && !(allowBinary && BINARY_TYPES[mime])) throw new HttpError(415, "unsupported_type", "Allowed: " + [...allowBinary ? Object.keys(BINARY_TYPES) : [], ...allowText ? Object.keys(TEXT_UPLOAD_KINDS) : []].join(", "));
   const size = int(input.size, "size", kind ? 0 : 1, Number.MAX_SAFE_INTEGER);
   if (kind && size > TEXT_MAX_BYTES) throw new HttpError(413, "too_large", kind === "markdown" ? "Markdown exceeds 10 MiB" : kind === "html" ? "HTML exceeds 10 MiB" : `${kind} file exceeds 10 MiB`);
   if (kind === "json" || kind === "csv") requireAppConnect(ctx);
@@ -107,14 +108,15 @@ async function uploadBegin(ctx, projectId, input, key, { allowText = false } = {
   }
   const uploadId = randomId("upl", 18);
   const expires = nowMs() + limits.uploadTtlMs;
+  const own = transfer?.(uploadId);
   const body2 = {
     upload_id: uploadId,
     artifact_id: artifactId,
     base_revision: baseRev,
-    put_url: `/api/transfers/${uploadId}`,
+    put_url: own?.put_url ?? `/api/transfers/${uploadId}`,
     method: "PUT",
     expires_at: new Date(expires).toISOString(),
-    instructions: kind ? "PUT the raw bytes to put_url with the same credentials (and CSRF token for a cookie session), then call upload_finish. Text must be UTF-8." : "PUT the raw file bytes to put_url with the same Authorization, then call upload_finish."
+    instructions: own?.instructions ?? (kind ? "PUT the raw bytes to put_url with the same credentials (and CSRF token for a cookie session), then call upload_finish. Text must be UTF-8." : "PUT the raw file bytes to put_url with the same Authorization, then call upload_finish.")
   };
   const gate = "EXISTS (SELECT 1 FROM uploads WHERE id = ?)";
   // The reservation re-checks storage only: a new file's placeholder (above) already passed the items limit, and the
@@ -152,13 +154,15 @@ async function uploadBegin(ctx, projectId, input, key, { allowText = false } = {
   }
   return { status: 201, body: body2 };
 }
-async function uploadPut(req, env, requestId, uploadId, linkCtx) {
-  // linkCtx: built by handleFileTransfer from a live OAuth connection (no cookie, so no CSRF).
+async function uploadPut(req, env, requestId, uploadId, linkCtx, { projectId, rateCharged = false } = {}) {
+  // linkCtx: built by the server from a live credential, never from the request: handleFileTransfer's OAuth connection,
+  // or /v1's verified API key (no cookie on either, so no CSRF). /v1 passes its route's projectId and has already
+  // charged this request to the write rate limit (rateCharged).
   const ctx = linkCtx ?? await authenticate(req, env, requestId);
   if (!linkCtx) requireCsrf(ctx, req);
-  await enforceRate(ctx, true);
+  if (!rateCharged) await enforceRate(ctx, true);
   const u = await env.DB.prepare("SELECT * FROM uploads WHERE id = ?").bind(uploadId).first();
-  if (!u || u.principal_id !== ctx.principal.id) throw new HttpError(404, "not_found", "Upload not found");
+  if (!u || u.principal_id !== ctx.principal.id || projectId !== void 0 && u.project_id !== projectId) throw new HttpError(404, "not_found", "Upload not found");
   await authorizeProject(ctx, u.project_id, true);
   if (u.expires_at <= nowMs()) throw new HttpError(410, "upload_expired", "Upload expired");
   // R2 checks the stored length against the declared size anyway: refuse any other Content-Length before writing.
