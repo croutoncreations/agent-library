@@ -5,7 +5,7 @@ import { startServer, agentHttp, sha256 } from "./helpers.mjs";
 import { request as httpRequest } from "node:http";
 import { readFileSync, existsSync } from "node:fs";
 import { createRequire } from "node:module";
-import { TEXT_MAX_BYTES, TEXT_WRITE_BODY_BYTES } from "../packages/core/src/text-limits.js";
+import { TEXT_MAX_BYTES, TEXT_WRITE_BODY_BYTES, MARKDOWN_PREVIEW_MAX_BYTES } from "../packages/core/src/text-limits.js";
 import { SERVER_PORTS } from "./ports.mjs";
 
 const MAX = 10 * 1048576, REQUEST = 11 * 1048576;
@@ -180,8 +180,8 @@ test("near-10 MiB JSON measurements and CSV validate, preview, query and replace
     }
     const opened = performance.now();
     await page.goto(`${APP}/#/p/large-text/a/${documentId}`);
-    await page.waitForFunction(() => document.querySelector(".preview p")?.textContent.length > 1000000 && document.querySelector(".preview-note")?.textContent === "Preview shows the first 1 MB. Open Edit for the full text.");
-    assert.ok(await page.$eval(".preview p", el => el.textContent.length <= 1048576));
+    await page.waitForFunction(max => document.querySelector(".preview p")?.textContent.length > max - 16384 && document.querySelector(".preview-note")?.textContent === `Preview shows the first ${max / 1024} KB. Open Edit for the full text.`, {}, MARKDOWN_PREVIEW_MAX_BYTES);
+    assert.ok(await page.$eval(".preview p", (el, max) => el.textContent.length <= max, MARKDOWN_PREVIEW_MAX_BYTES));
     const previewMs = performance.now() - opened;
     await page.evaluate(() => [...document.querySelectorAll('[role="tab"]')].find(el => el.textContent === "Edit").click());
     await page.waitForSelector(".cm-editor");

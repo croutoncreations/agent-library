@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { ROOT } from "./helpers.mjs";
 import { loadWorker } from "./load-worker.mjs";
 import { SERVER_PORTS } from "./ports.mjs";
+import { MARKDOWN_PREVIEW_MAX_BYTES } from "../packages/core/src/text-limits.js";
 import { commitTextWrites, isTextWriteFenceError } from "../packages/core/src/content-store.js";
 
 async function harness() {
@@ -158,7 +159,7 @@ test("R2 chunked reads match legacy UTF-8 bytes; legacy rows still diff, restore
   assert.equal((await lib.exportBackup(ctx, "proj-s")).revisions.find(r => r.rev_no === 1).body, body);
 });
 
-test("large Markdown rendering only reads a 1 MiB range and resolves references from that prefix", async () => {
+test("large Markdown rendering only reads a 256 KiB range and resolves references from that prefix", async () => {
   const { lib, ctx, env } = await harness();
   const prefix = "# early\n" + "word ".repeat(209720);
   const c = await lib.createMarkdown(ctx, "proj-s", { title: "Bounded preview", body: prefix + "\n![late](art_late)" + " word".repeat(1800000) }, "render-range");
@@ -166,8 +167,8 @@ test("large Markdown rendering only reads a 1 MiB range and resolves references 
   env.BLOBS.get = async (...args) => { reads.push(args); return get(...args); };
   const r = await lib.getRenderSource(ctx, "proj-s", c.body.artifact_id, undefined, "markdown");
   assert.equal(r.truncated, true);
-  assert.deepEqual(reads.map(args => args[1]), [{ range: { offset: 0, length: 1048576 } }]);
-  assert.ok(Buffer.byteLength(r.body) <= 1048576);
+  assert.deepEqual(reads.map(args => args[1]), [{ range: { offset: 0, length: MARKDOWN_PREVIEW_MAX_BYTES } }]);
+  assert.ok(Buffer.byteLength(r.body) <= MARKDOWN_PREVIEW_MAX_BYTES);
   assert.doesNotMatch(r.body, /art_late/);
 });
 
