@@ -9,7 +9,7 @@ const cwd = fileURLToPath(new URL("../", import.meta.url));
 const MiB = 1048576;
 // Boundary sampling includes synthetic input generation; unread R2 inputs are not retained in JS.
 // Margins stay below one full document (the smallest here is 9.59 MiB).
-for (const [shape, copies, heapMiB, buffersMiB] of [["ascii", 1, 24, 16], ["two-byte", 1, 34, 16], ["csv", 1, 24, 16], ["json", 1, 24, 16], ["invalid", 1, 24, 16], ["two-byte", 2, 34, 16]]) {
+for (const [shape, copies, heapMiB, buffersMiB] of [["ascii", 1, 24, 16], ["two-byte", 1, 34, 16], ["csv", 1, 24, 16], ["json", 1, 12, 16], ["invalid", 1, 24, 16], ["two-byte", 2, 34, 16]]) {
   test(`text upload finish 64 MiB heap: ${shape}, ${copies} simultaneous`, () => {
     const child = spawnSync(process.execPath, ["--max-old-space-size=64", "--expose-gc", "--input-type=module", "-e", `
       import { runTextUploadMemory } from "./test/text-uploads-memory-fixture.mjs";
