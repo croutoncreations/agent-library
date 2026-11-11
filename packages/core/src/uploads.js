@@ -355,7 +355,7 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
     };
     const fail = async (status, code, message, state, extra) => {
       if (!await end(status, code, message, state, extra)) return lost();
-      await dropUnpublished(ctx.env, uploadId, finalKey).catch(() => {});
+      await dropUnpublished(ctx.env, uploadId, finalKey).catch((e) => { if (!kind) throw e; });
       await purgeStaging(ctx.env, u);
       throw new HttpError(status, code, message, extra);
     };
