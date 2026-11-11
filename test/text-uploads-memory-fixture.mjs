@@ -1,4 +1,4 @@
-// D1 over all real migrations; R2 inputs are released on read and outputs counted/discarded, never retained.
+// D1 over all real migrations; R2 inputs are generated on read and outputs counted/discarded, never retained.
 import { DatabaseSync } from "node:sqlite";
 import { readFileSync, readdirSync } from "node:fs";
 import { createHash } from "node:crypto";
@@ -29,9 +29,10 @@ export async function runTextUploadMemory(shape, copies) {
     let raw = new TextEncoder().encode(source(shape));
     const size = raw.byteLength, sha = createHash("sha256").update(raw).digest("hex");
     const digest = Uint8Array.from(Buffer.from(sha, "hex")).buffer;
+    raw = null; // R2's unread inputs live outside the isolate, including the contender refused before its GET.
     const BLOBS = {
       async head() { sample(); return { size, checksums: { sha256: digest } }; },
-      async get() { counts.reads++; sample(); return { async arrayBuffer() { const b = raw.buffer; raw = null; sample(); return b; } }; },
+      async get() { counts.reads++; sample(); return { async arrayBuffer() { const b = new TextEncoder().encode(source(shape)).buffer; sample(); return b; } }; },
       async put(k, bytes) { counts.writes++; counts.written_bytes += bytes.byteLength; sample(); await new Promise(setImmediate); sample(); return { size: bytes.byteLength }; },
       async delete() { sample(); }
     };

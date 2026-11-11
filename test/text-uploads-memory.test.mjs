@@ -7,9 +7,9 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 const cwd = fileURLToPath(new URL("../", import.meta.url));
 const MiB = 1048576;
-// Three fresh-child runs: heap <= 6.23 MiB; buffers <= 10.14 MiB (one input), 20.14 MiB (two inputs).
-// About 6 MiB margin, less than one more full document (the smallest here is 9.59 MiB).
-for (const [shape, copies, heapMiB, buffersMiB] of [["ascii", 1, 12, 16], ["two-byte", 1, 12, 16], ["csv", 1, 12, 16], ["json", 1, 12, 16], ["invalid", 1, 12, 16], ["two-byte", 2, 12, 26]]) {
+// Boundary sampling includes synthetic input generation; unread R2 inputs are not retained in JS.
+// Margins stay below one full document (the smallest here is 9.59 MiB).
+for (const [shape, copies, heapMiB, buffersMiB] of [["ascii", 1, 24, 16], ["two-byte", 1, 34, 16], ["csv", 1, 24, 16], ["json", 1, 24, 16], ["invalid", 1, 24, 16], ["two-byte", 2, 34, 16]]) {
   test(`text upload finish 64 MiB heap: ${shape}, ${copies} simultaneous`, () => {
     const child = spawnSync(process.execPath, ["--max-old-space-size=64", "--expose-gc", "--input-type=module", "-e", `
       import { runTextUploadMemory } from "./test/text-uploads-memory-fixture.mjs";
