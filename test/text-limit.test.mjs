@@ -191,25 +191,26 @@ test("near-10 MiB JSON measurements and CSV validate, preview, query and replace
   t.diagnostic(`JSON ${Buffer.byteLength(json)} bytes; CSV ${Buffer.byteLength(csv)} bytes; JSON read_records ${elapsed.toFixed(1)} ms`);
 });
 
-for (const transport of ["app", "v1"]) test(`${transport} JSON value budget: boundary, refusal without storage, measurements at request cap`, async t => {
+for (const transport of ["app", "v1"]) test(`${transport} JSON streaming: millions of values, record-size refusal without storage, measurements at request cap`, async t => {
   const request = transport === "app" ? owner.req : api;
   const base = transport === "app" ? "/api/projects/large-text/artifacts" : "/v1/projects/large-text/files";
-  const content = "[" + "0,".repeat(999999) + "0]";
-  const input = { title: `Budget ${transport}`, kind: "json", content };
+  const content = "[" + "{},".repeat(3000000) + "{}]";
+  const input = { title: `Streaming ${transport}`, kind: "json", content };
   const made = await request("POST", base, input);
   assert.equal(made.status, 201, JSON.stringify(made.body));
   assert.equal(made.body.sha256, sha256(content));
   const before = (await owner.req("GET", "/api/projects/large-text/artifacts")).body.artifacts.map(a => a.id).sort();
-  const refused = await request("POST", base, { ...input, title: "Must not be stored", content: content.slice(0, -1) + ",0]" });
+  const oversized = JSON.stringify({ schema: "agentlib.measurements/1", records: [{ id: "large", recorded_at: "x", metric: "m", value: 1, unit: "u", extra: "x".repeat(16384) }] });
+  const refused = await request("POST", base, { ...input, schema: "agentlib.measurements/1", title: "Must not be stored", content: oversized });
   assert.equal(refused.status, 422, JSON.stringify(refused.body));
   assert.equal(refused.body.error.code, "invalid_content");
-  assert.equal(refused.body.error.format, "json");
-  assert.equal(refused.body.error.detail, "more than 1,000,000 values");
-  assert.equal(refused.body.error.message, "Invalid json: more than 1,000,000 values");
+  assert.equal(refused.body.error.format, "schema");
+  assert.equal(refused.body.error.path, "records[0]");
+  assert.equal(refused.body.error.detail, "record larger than 16384 characters");
+  assert.equal(refused.body.error.message, "Invalid schema: record larger than 16384 characters");
   assert.deepEqual((await owner.req("GET", "/api/projects/large-text/artifacts")).body.artifacts.map(a => a.id).sort(), before);
-  const refusedSave = await request("PUT", base + "/" + made.body.artifact_id, { expected_revision: 1, content: content.slice(0, -1) + ",0]" });
-  assert.equal(refusedSave.status, 422, JSON.stringify(refusedSave.body));
-  assert.equal(refusedSave.body.error.message, "Invalid json: more than 1,000,000 values");
+  const saved = await request("PUT", base + "/" + made.body.artifact_id, { expected_revision: 1, content });
+  assert.equal(saved.status, 200, JSON.stringify(saved.body));
   const unchanged = await request("GET", base + "/" + made.body.artifact_id + "/content", undefined, { binary: true });
   assert.equal(unchanged.status, 200);
   assert.equal(sha256(unchanged.body), made.body.sha256);
@@ -239,6 +240,36 @@ for (const transport of ["app", "v1"]) test(`${transport} JSON value budget: bou
   assert.equal(required.status, 201, JSON.stringify(required.body));
   assert.equal(required.body.sha256, sha256(requiredOnly));
   t.diagnostic(`${transport}: seven fields ${count} records, ${Buffer.byteLength(measurementInput.content)} file bytes, ${requestBytes} request bytes, ratio ${(requestBytes / Buffer.byteLength(measurementInput.content)).toFixed(4)}; full seven-field cap ${Buffer.byteLength(measurements)} file bytes / ${Buffer.byteLength(JSON.stringify({ ...measurementInput, content: measurements }))} request bytes; five fields 100000 records accepted`);
+});
+
+for (const transport of ["app", "v1"]) test(`${transport} measurements iterator preserves duplicate keys, extras and filtered pages`, async () => {
+  const request = transport === "app" ? owner.req : api;
+  const base = transport === "app" ? "/api/projects/large-text/artifacts" : "/v1/projects/large-text/files";
+  const schema = "agentlib.measurements/1";
+  const records = Array.from({ length: 7 }, (_, i) => ({ id: `odd-${i}`, recorded_at: "synthetic [,]:\\\"", ...(i % 3 ? { date: `2026-01-0${i + 1}` } : {}), metric: i % 2 ? "m" : "n", value: i, unit: "u", extra: { nested: [i, { punctuation: '[],:"\\' }] } }));
+  const content = ` \n { "schema":0,"schema":"${schema}", "meta":null,"meta":{}, "records":[null], "rec\\u006frds" : ${JSON.stringify(records, null, 2)} } \t`;
+  const made = await request("POST", base, { title: "Odd measurements", kind: "json", schema, content });
+  assert.equal(made.status, 201, JSON.stringify(made.body));
+  for (const [query, expected, undated, next] of [
+    ["limit=2", records.slice(0, 2), 0, "2"],
+    ["metric=m&limit=2", [records[1], records[3]], 0, "2"],
+    ["metric=m&limit=2&cursor=2", [records[5]], 0, null],
+    ["from=2026-01-02&to=2026-01-06&limit=2", [records[1], records[2]], 3, "2"],
+    ["from=2026-01-02&to=2026-01-06&limit=2&cursor=2", [records[4], records[5]], 3, null],
+    ["limit=2&cursor=6", [records[6]], 0, null],
+    ["cursor=100", [], 0, null]
+  ]) {
+    const page = await request("GET", base + "/" + made.body.artifact_id + "/records?" + query);
+    assert.equal(page.status, 200, JSON.stringify(page.body));
+    assert.deepEqual(page.body, { schema, file_id: made.body.artifact_id, revision: 1, records: expected, undated_excluded: undated, next_cursor: next });
+  }
+  const before = (await owner.req("GET", "/api/projects/large-text/artifacts")).body.artifacts.map(a => a.id).sort();
+  const refused = await request("PUT", base + "/" + made.body.artifact_id, { expected_revision: 1, content: JSON.stringify({ schema, records: [{ ...records[0], extra: "x".repeat(16384) }] }) });
+  assert.equal(refused.status, 422, JSON.stringify(refused.body));
+  assert.equal(refused.body.error.message, "Invalid schema: record larger than 16384 characters");
+  assert.deepEqual((await owner.req("GET", "/api/projects/large-text/artifacts")).body.artifacts.map(a => a.id).sort(), before);
+  const unchanged = await request("GET", base + "/" + made.body.artifact_id + "/content", undefined, { binary: true });
+  assert.equal(sha256(unchanged.body), sha256(content));
 });
 
 for (const transport of ["app", "v1"]) test(`${transport} tiny-row CSV at the JSON request cap saves and exports without row retention`, async t => {

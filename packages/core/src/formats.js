@@ -20,7 +20,7 @@ function checkCommon(text, format, file) {
   if (/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(text)) throw invalid({ format, file, detail: "invalid UTF-16 surrogate (not encodable as UTF-8)" });
 }
 function depthOk(text) {
-  let depth = 0, values = 0, inStr = false, esc4 = false;
+  let depth = 0, inStr = false, esc4 = false;
   for (let i = 0; i < text.length; i++) {
     const c = text[i];
     if (inStr) {
@@ -32,22 +32,148 @@ function depthOk(text) {
     if (c === '"') inStr = true;
     else if (c === "{" || c === "[") {
       if (++depth > MAX_DEPTH) return `nesting deeper than ${MAX_DEPTH} levels`;
-      if (++values > MAX_JSON_VALUES) return `more than ${MAX_JSON_VALUES.toLocaleString("en-US")} values`;
-    } else if (c === ",") {
-      if (++values > MAX_JSON_VALUES) return `more than ${MAX_JSON_VALUES.toLocaleString("en-US")} values`;
     } else if (c === "}" || c === "]") depth--;
   }
   return null;
 }
-function parseJson(text, file) {
+function jsonSpace(text, i) {
+  while (text[i] === " " || text[i] === "\t" || text[i] === "\n" || text[i] === "\r") i++;
+  return i;
+}
+function jsonStringEnd(text, i) {
+  for (i++; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if (c === 34) return i + 1;
+    if (c < 32) return -1;
+    if (c !== 92) continue;
+    const e = text[++i];
+    if (e === '"' || e === "\\" || e === "/" || e === "b" || e === "f" || e === "n" || e === "r" || e === "t") continue;
+    if (e !== "u") return -1;
+    for (let j = 0; j < 4; j++) {
+      const h = text.charCodeAt(++i);
+      if (!(h >= 48 && h <= 57 || h >= 65 && h <= 70 || h >= 97 && h <= 102)) return -1;
+    }
+  }
+  return -1;
+}
+function jsonDigit(text, i) {
+  const c = text.charCodeAt(i);
+  return c >= 48 && c <= 57;
+}
+// No values, keys, or tokens are retained. States encode container type and grammar
+// position; checkFile's preceding depth scan bounds this stack to 64 entries.
+function validJson(text) {
+  const stack = [];
+  let i = 0, state = 0;
+  for (;;) {
+    i = jsonSpace(text, i);
+    const c = text[i];
+    if (state === 9) {
+      if (!stack.length) return i === text.length;
+      state = stack.pop();
+      continue;
+    }
+    if (state === 1 || state === 2) {
+      if (c === "}" && state === 1) { i++; state = 9; continue; }
+      if (c !== '"') return false;
+      i = jsonStringEnd(text, i);
+      if (i < 0) return false;
+      state = 3;
+      continue;
+    }
+    if (state === 3) {
+      if (c !== ":") return false;
+      i++; state = 4; continue;
+    }
+    if (state === 5 || state === 8) {
+      if (c === (state === 5 ? "}" : "]")) { i++; state = 9; continue; }
+      if (c !== ",") return false;
+      i++; state = state === 5 ? 2 : 7; continue;
+    }
+    if (state === 6 && c === "]") { i++; state = 9; continue; }
+    const after = state === 4 ? 5 : state === 6 || state === 7 ? 8 : 9;
+    if (c === "{" || c === "[") {
+      stack.push(after);
+      state = c === "{" ? 1 : 6;
+      i++; continue;
+    }
+    if (c === '"') {
+      i = jsonStringEnd(text, i);
+      if (i < 0) return false;
+    } else if (c === "t" && text.startsWith("true", i)) i += 4;
+    else if (c === "f" && text.startsWith("false", i)) i += 5;
+    else if (c === "n" && text.startsWith("null", i)) i += 4;
+    else {
+      if (c === "-") i++;
+      if (text[i] === "0") i++;
+      else {
+        if (!(text.charCodeAt(i) >= 49 && text.charCodeAt(i) <= 57)) return false;
+        while (jsonDigit(text, ++i)) { /* integer */ }
+      }
+      if (text[i] === ".") {
+        if (!jsonDigit(text, ++i)) return false;
+        while (jsonDigit(text, ++i)) { /* fraction */ }
+      }
+      if (text[i] === "e" || text[i] === "E") {
+        i++;
+        if (text[i] === "+" || text[i] === "-") i++;
+        if (!jsonDigit(text, i)) return false;
+        while (jsonDigit(text, ++i)) { /* exponent */ }
+      }
+    }
+    state = after;
+  }
+}
+function checkJson(text, file) {
   checkCommon(text, "json", file);
   const detail = depthOk(text);
   if (detail) throw invalid({ format: "json", file, detail });
-  try {
-    return JSON.parse(text);
-  } catch (e) {
-    throw invalid({ format: "json", file, detail: "not valid JSON" });
+  if (!validJson(text)) throw invalid({ format: "json", file, detail: "not valid JSON" });
+}
+// The following walkers assume valid JSON (validated on save). Only offsets into
+// the source are retained, including for large metadata and duplicate top-level keys.
+function jsonValueEnd(text, i) {
+  let depth = 0;
+  for (; i < text.length; i++) {
+    const c = text[i];
+    if (c === '"') { i = jsonStringEnd(text, i) - 1; continue; }
+    if (c === "{" || c === "[") depth++;
+    else if (c === "}" || c === "]") {
+      if (!depth) return i;
+      if (!--depth) return i + 1;
+    } else if (!depth && (c === "," || c === " " || c === "\t" || c === "\r" || c === "\n")) return i;
   }
+  return i;
+}
+function measurementMembers(text) {
+  let i = jsonSpace(text, 0);
+  if (text[i++] !== "{") return null;
+  const members = { schema: null, meta: null, records: null, unexpected: null };
+  i = jsonSpace(text, i);
+  while (text[i] !== "}") {
+    const keyEnd = jsonStringEnd(text, i);
+    const key = JSON.parse(text.slice(i, keyEnd));
+    const start = jsonSpace(text, jsonSpace(text, keyEnd) + 1);
+    const end = jsonValueEnd(text, start);
+    if (key === "schema" || key === "meta" || key === "records") members[key] = { start, end };
+    else if (members.unexpected === null) members.unexpected = key;
+    i = jsonSpace(text, end);
+    if (text[i] === ",") i = jsonSpace(text, i + 1);
+  }
+  return members;
+}
+function* jsonArrayElements(text, start) {
+  let i = jsonSpace(text, start + 1);
+  while (text[i] !== "]") {
+    const end = jsonValueEnd(text, i);
+    yield { start: i, end };
+    i = jsonSpace(text, end);
+    if (text[i] === ",") i = jsonSpace(text, i + 1);
+  }
+}
+function* measurementRecords(text) {
+  const { records } = measurementMembers(text);
+  for (const { start, end } of jsonArrayElements(text, records.start)) yield text.slice(start, end);
 }
 // The grammar emits one row at a time; consumers choose whether to retain it.
 function scanCsv(text, file, onRow) {
@@ -150,29 +276,40 @@ function parseCsv(text, file) {
 function strField(v, min, max) {
   return typeof v === "string" && v.length >= min && v.length <= max;
 }
-function checkMeasurementsJson(doc, file) {
+function checkMeasurementsJson(text, file) {
   const bad = (path, detail) => invalid({ format: "schema", file, path, detail });
-  if (!doc || typeof doc !== "object" || Array.isArray(doc)) throw bad("$", "top level must be an object");
-  for (const k of Object.keys(doc)) if (!["schema", "records", "meta"].includes(k)) throw bad(k, "unexpected top-level key");
-  if (doc.schema !== MEASUREMENTS) throw bad("schema", `must be "${MEASUREMENTS}"`);
-  if (doc.meta !== void 0 && (typeof doc.meta !== "object" || doc.meta === null || Array.isArray(doc.meta))) throw bad("meta", "must be an object");
-  if (!Array.isArray(doc.records)) throw bad("records", "must be an array");
-  if (doc.records.length > MAX_RECORDS) throw bad("records", `more than ${MAX_RECORDS} records`);
+  const members = measurementMembers(text);
+  if (!members) throw bad("$", "top level must be an object");
+  if (members.unexpected !== null) throw bad(members.unexpected, "unexpected top-level key");
+  const { schema, meta, records } = members;
+  if (!schema || text[schema.start] !== '"' || schema.end - schema.start > MEASUREMENTS.length * 6 + 2 || JSON.parse(text.slice(schema.start, schema.end)) !== MEASUREMENTS)
+    throw bad("schema", `must be "${MEASUREMENTS}"`);
+  if (meta && text[meta.start] !== "{") throw bad("meta", "must be an object");
+  if (!records || text[records.start] !== "[") throw bad("records", "must be an array");
   const ids = /* @__PURE__ */ new Set();
-  doc.records.forEach((r, i) => {
-    const p = `records[${i}]`;
-    if (!r || typeof r !== "object" || Array.isArray(r)) throw bad(p, "must be an object");
-    if (!strField(r.id, 1, 128)) throw bad(`${p}.id`, "string of 1-128 chars required");
-    if (ids.has(r.id)) throw bad(`${p}.id`, "duplicate id");
-    ids.add(r.id);
-    if (!strField(r.recorded_at, 1, 64)) throw bad(`${p}.recorded_at`, "source timestamp string of 1-64 chars required");
-    if (r.date !== void 0 && !isCalendarDate(r.date)) throw bad(`${p}.date`, "must be a real calendar date YYYY-MM-DD when present");
-    if (!(typeof r.metric === "string" && METRIC_RE.test(r.metric))) throw bad(`${p}.metric`, "must match [a-z][a-z0-9_]{0,39}");
-    if (!(typeof r.value === "number" && Number.isFinite(r.value))) throw bad(`${p}.value`, "finite number required");
-    if (!strField(r.unit, 1, 16)) throw bad(`${p}.unit`, "string of 1-16 chars required");
-    if (r.source_id !== void 0 && !strField(r.source_id, 0, 128)) throw bad(`${p}.source_id`, "string of at most 128 chars");
-  });
-  return doc.records.length;
+  let count = 0, recordError;
+  for (const { start, end } of jsonArrayElements(text, records.start)) {
+    const i = count++;
+    if (count > MAX_RECORDS || recordError) continue;
+    try {
+      const p = `records[${i}]`;
+      if (text[start] !== "{") throw bad(p, "must be an object");
+      if (end - start > MAX_MEASUREMENT_RECORD_CHARS) throw bad(p, `record larger than ${MAX_MEASUREMENT_RECORD_CHARS} characters`);
+      const r = JSON.parse(text.slice(start, end));
+      if (!strField(r.id, 1, 128)) throw bad(`${p}.id`, "string of 1-128 chars required");
+      if (ids.has(r.id)) throw bad(`${p}.id`, "duplicate id");
+      ids.add(r.id);
+      if (!strField(r.recorded_at, 1, 64)) throw bad(`${p}.recorded_at`, "source timestamp string of 1-64 chars required");
+      if (r.date !== void 0 && !isCalendarDate(r.date)) throw bad(`${p}.date`, "must be a real calendar date YYYY-MM-DD when present");
+      if (!(typeof r.metric === "string" && METRIC_RE.test(r.metric))) throw bad(`${p}.metric`, "must match [a-z][a-z0-9_]{0,39}");
+      if (!(typeof r.value === "number" && Number.isFinite(r.value))) throw bad(`${p}.value`, "finite number required");
+      if (!strField(r.unit, 1, 16)) throw bad(`${p}.unit`, "string of 1-16 chars required");
+      if (r.source_id !== void 0 && !strField(r.source_id, 0, 128)) throw bad(`${p}.source_id`, "string of at most 128 chars");
+    } catch (e) { recordError = e; }
+  }
+  if (count > MAX_RECORDS) throw bad("records", `more than ${MAX_RECORDS} records`);
+  if (recordError) throw recordError;
+  return count;
 }
 function checkMeasurementsCsv(cells, line, rowCount, ids, file) {
   const bad = (detail) => invalid({ format: "schema", file, line, detail });
@@ -201,8 +338,8 @@ function checkFile(kind, content, schema, file) {
   const sch = schema === void 0 || schema === null ? null : String(schema);
   if (sch !== null && !SCHEMAS.has(sch)) throw new HttpError(400, "invalid_input", `unknown schema (supported: ${[...SCHEMAS].join(", ")})`);
   if (kind === "json") {
-    const doc = parseJson(content, file);
-    return { kind, schema: sch, record_count: sch ? checkMeasurementsJson(doc, file) : null, row_count: null };
+    checkJson(content, file);
+    return { kind, schema: sch, record_count: sch ? checkMeasurementsJson(content, file) : null, row_count: null };
   }
   const ids = sch ? new Set() : null;
   let schemaError;
@@ -251,14 +388,14 @@ function spreadsheetSafeCsv(text) {
   write(output);
   return output;
 }
-var MEASUREMENTS, SCHEMAS, MAX_FILE_BYTES, CSV_MEASUREMENT_COLUMNS, MAX_RECORDS, MAX_DEPTH, MAX_JSON_VALUES, DATE_RE, METRIC_RE, NUM_RE, invalid, MIME, CONTENT_TYPE;
+var MEASUREMENTS, SCHEMAS, MAX_FILE_BYTES, CSV_MEASUREMENT_COLUMNS, MAX_RECORDS, MAX_DEPTH, MAX_MEASUREMENT_RECORD_CHARS, DATE_RE, METRIC_RE, NUM_RE, invalid, MIME, CONTENT_TYPE;
 MEASUREMENTS = "agentlib.measurements/1";
 SCHEMAS = /* @__PURE__ */ new Set([MEASUREMENTS]);
 MAX_FILE_BYTES = TEXT_MAX_BYTES;
 CSV_MEASUREMENT_COLUMNS = ["id", "recorded_at", "date", "metric", "value", "unit", "source_id"];
 MAX_RECORDS = 1e5;
 MAX_DEPTH = 64;
-MAX_JSON_VALUES = 1000000;
+MAX_MEASUREMENT_RECORD_CHARS = 16384;
 DATE_RE = /^(\d{4})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$/;
 METRIC_RE = /^[a-z][a-z0-9_]{0,39}$/;
 NUM_RE = /^-?(0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)?$/;
@@ -272,4 +409,4 @@ CONTENT_TYPE = {
   "text/html": "text/plain; charset=utf-8"
 };
 
-export { CONTENT_TYPE, MEASUREMENTS, MIME, byteLength, checkFile, isCalendarDate, parseCsv, spreadsheetSafeCsv };
+export { CONTENT_TYPE, MEASUREMENTS, MIME, byteLength, checkFile, isCalendarDate, measurementRecords, parseCsv, spreadsheetSafeCsv, validJson };

@@ -1,16 +1,13 @@
 // Pure-format checks for packages/core/src/formats.js (no server), loaded from the shipped source.
 import { test, before } from "node:test";
 import assert from "node:assert/strict";
-import { moduleScript } from "./module-source.mjs";
-import { TEXT_MAX_BYTES } from "../packages/core/src/text-limits.js";
-import { HttpError } from "../packages/core/src/util.js";
 
 
 
 import { loadWorker } from "./load-worker.mjs";
 
 let F;
-before(async () => { F = await loadWorker({ "formats.js": ["checkFile", "parseCsv", "spreadsheetSafeCsv", "MEASUREMENTS", "MIME", "byteLength", "isCalendarDate"] }); });
+before(async () => { F = await loadWorker({ "formats.js": ["checkFile", "parseCsv", "spreadsheetSafeCsv", "MEASUREMENTS", "MIME", "byteLength", "isCalendarDate", "validJson", "measurementRecords"] }); });
 const M = "agentlib.measurements/1";
 const rec = (o = {}) => ({ id: "r1", recorded_at: "2026-02-28T23:59:00+14:00", metric: "weight_kg", value: 80, unit: "kg", ...o });
 const json = (records) => JSON.stringify({ schema: M, records });
@@ -102,6 +99,28 @@ test("measurements JSON exact pre-streaming characterisation", () => {
   }
 });
 
+test("measurements JSON preserves class/field precedence, including the approved unexpected-key ordering", () => {
+  const err = text => { try { F.checkFile("json", text, M); } catch (e) { return e.extra; } };
+  assert.equal(err(`{"z":0,"1":0,"schema":"${M}","records":[]}`).path, "z");
+  const tooMany = Array.from({ length: 100001 }, (_, i) => ({ id: String(i), recorded_at: "x", metric: "m", value: 1, unit: "u" }));
+  tooMany[0] = null;
+  assert.equal(err(json(tooMany)).detail, "more than 100000 records");
+  for (const reverse of [false, true]) {
+    const entries = [["records", tooMany], ["meta", null], ["schema", M]];
+    if (reverse) entries.reverse();
+    assert.equal(err(JSON.stringify(Object.fromEntries(entries))).path, "meta");
+  }
+  const fields = [["id", ""], ["recorded_at", ""], ["date", null], ["metric", "Bad"], ["value", null], ["unit", ""], ["source_id", null]];
+  for (let i = 0; i < fields.length; i++) for (let j = i + 1; j < fields.length; j++) {
+    for (const pair of [[fields[i], fields[j]], [fields[j], fields[i]]]) {
+      assert.equal(err(json([rec(Object.fromEntries(pair))])).path, `records[0].${fields[i][0]}`);
+    }
+  }
+  for (const text of [json([null]), json([rec({ id: "" })]), `{"extra":1,"schema":0}`, JSON.stringify({ schema: M, meta: null, records: [] })]) {
+    assert.deepEqual(err(text + "!"), { format: "json", file: undefined, detail: "not valid JSON" });
+  }
+});
+
 test("JSON structure and schema", () => {
   const err = (t, s = M) => { try { F.checkFile("json", t, s); return null; } catch (e) { return e; } };
   assert.equal(err("{").code, "invalid_content");
@@ -162,24 +181,42 @@ test("CSV measurements preserve syntax, header, columns, then schema error prece
     e.extra.format === format && e.extra.line === line && e.extra.detail === detail);
 });
 
-test("JSON value budget ignores commas, brackets and escaped quotes inside strings", () => {
-  const text = JSON.stringify([',{}[]\\"'.repeat(1000000)]);
-  assert.equal(F.checkFile("json", text).kind, "json");
+test("JSON grammar agrees with JSON.parse: edge cases and 200,000 seeded almost-valid strings", () => {
+  const edges = ["", "{}", "[]", "null", "true", "false", '"x"', "0", "-0", "01", "1.", ".1", "1e", "1e+", "1E5", "-", "+1", "1e400", "tru", "fals", "nul", "true false", "[1,]", '{"x":1,}', '{"x":1,"x":2}', "[}", "{]", "[", "{", '"', '"\\', '"\\u123"', '"\\uZZZZ"', '"\\v"', '"\\x00"', '"\\a"', '"\\0"', '"\\uD800"', '"\\uDC00"', '"\ud800"', "\ufeff0", "\u00a00", "0\u00a0", "[".repeat(63) + "0" + "]".repeat(63)];
+  for (const e of ['\\"', "\\\\", "\\/", "\\b", "\\f", "\\n", "\\r", "\\t", "\\u0000", "\\uAbCd"]) edges.push('"' + e + '"');
+  for (let c = 0; c < 32; c++) edges.push('"' + String.fromCharCode(c) + '"');
+  for (const w of [" ", "\t", "\n", "\r"]) edges.push(w + "0", "0" + w);
+  const agree = text => {
+    let accepted = true;
+    try { JSON.parse(text); } catch { accepted = false; }
+    assert.equal(F.validJson(text), accepted, JSON.stringify(text));
+  };
+  for (const text of edges) agree(text);
+  let seed = 0x2b2;
+  const rand = n => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed % n; };
+  const atoms = ['0', '-0', '1.25e-3', 'true', 'false', 'null', '"x"', '"a\\\\b\\"c"', '"\\uD800"', '"[,]{}:"'];
+  const chars = '{}[],:"\\0129-.eEtfnul +\t\n\r\u00a0';
+  for (let n = 0; n < 200000; n++) {
+    let text = atoms[rand(atoms.length)];
+    for (let d = rand(4); d > 0; d--) text = rand(2) ? '[' + text + ',' + atoms[rand(atoms.length)] + ']' : '{"a":' + text + '}';
+    if (rand(4)) {
+      const at = rand(text.length + 1), c = chars[rand(chars.length)];
+      text = text.slice(0, at) + (rand(2) ? c : "") + text.slice(at + rand(2));
+    }
+    agree(text);
+  }
 });
 
-test("JSON value budget also rejects measurements before schema validation", () => {
-  const text = "[" + "0,".repeat(1000000) + "0]";
-  assert.throws(() => F.checkFile("json", text, M), e => e.status === 422 && e.code === "invalid_content" && e.extra.format === "json" && e.extra.detail === "more than 1,000,000 values");
-});
-
-test("100,000 JSON measurement records with all seven fields use exactly 800,002 budget units", () => {
+test("JSON validation has no value budget, preserves depth precedence, and bounds individual measurements", () => {
+  assert.equal(F.checkFile("json", "[" + "{},".repeat(3000000) + "{}]").kind, "json");
+  assert.throws(() => F.checkFile("json", "[".repeat(65)), e => e.extra.detail === "nesting deeper than 64 levels");
+  const make = padding => json([rec({ padding })]);
+  const room = 16384 - JSON.stringify(rec({ padding: "" })).length;
+  assert.equal(F.checkFile("json", make("x".repeat(room)), M).record_count, 1);
+  assert.throws(() => F.checkFile("json", make("x".repeat(room + 1)), M), e => e.status === 422 && e.code === "invalid_content" && e.extra.format === "schema" && e.extra.path === "records[0]" && e.extra.detail === "record larger than 16384 characters");
+  assert.throws(() => F.checkFile("json", json([null, rec({ padding: "x".repeat(17000) })]), M), e => e.extra.path === "records[0]" && e.extra.detail === "must be an object");
   const text = json(Array.from({ length: 100000 }, (_, i) => ({ id: i.toString(36), recorded_at: "x", date: "2000-01-01", metric: "m", value: 1, unit: "u", source_id: "" })));
   assert.equal(F.checkFile("json", text, M).record_count, 100000);
-  // Execute the maintained module with a smaller budget to pin the scan's exact count.
-  const atBudget = new Function("TEXT_MAX_BYTES", "HttpError", moduleScript("packages/core/src/formats.js") + "\nMAX_JSON_VALUES = 800002; return checkFile;")(TEXT_MAX_BYTES, HttpError);
-  assert.equal(atBudget("json", text, M).record_count, 100000);
-  const belowBudget = new Function("TEXT_MAX_BYTES", "HttpError", moduleScript("packages/core/src/formats.js") + "\nMAX_JSON_VALUES = 800001; return checkFile;")(TEXT_MAX_BYTES, HttpError);
-  assert.throws(() => belowBudget("json", text, M), e => e.extra.detail === "more than 800,001 values");
 });
 
 test("CSV measurements enforce the documented 100,000-record cap after structure", () => {
