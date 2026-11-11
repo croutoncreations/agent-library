@@ -261,6 +261,30 @@ test("app API: exactly 10 MiB raw Markdown accepted; one byte more refused at be
   const bad = await h.req("POST", base + "/uploads", { title: "Too large", mime: kinds.markdown, size: 10485761, sha256: sha256("x") });
   assert.equal(bad.status, 413); assert.equal(bad.body.error.message, "Markdown exceeds 10 MiB");
 });
+for (const [kind, text, message] of [
+  ["html", "<p>" + "x".repeat(10485760 - 7) + "</p>", "HTML exceeds 10 MiB"],
+  ["json", '"' + "x".repeat(10485760 - 2) + '"', "json file exceeds 10 MiB"]
+]) test(`app API: exactly 10 MiB ${kind} accepted; one byte more refused at begin`, async () => {
+  assert.equal(Buffer.byteLength(text), 10485760);
+  const { f } = await httpUpload(kind, text);
+  assert.equal(f.status, 200, JSON.stringify(f.body)); assert.equal(f.body.size, 10485760);
+  const bad = await h.req("POST", base + "/uploads", { title: "Too large", mime: kinds[kind], size: 10485761, sha256: sha256("x") });
+  assert.equal(bad.status, 413); assert.equal(bad.body.error.code, "too_large"); assert.equal(bad.body.error.message, message);
+});
+test("app API: simultaneous finishes of one text upload publish exactly one revision", async () => {
+  const bytes = Buffer.from("synthetic simultaneous finishes");
+  const b = await h.req("POST", base + "/uploads", { title: "Simultaneous", mime: kinds.markdown, size: bytes.length, sha256: sha256(bytes) });
+  assert.equal(b.status, 201, JSON.stringify(b.body));
+  assert.equal((await h.req("PUT", b.body.put_url, undefined, { raw: bytes })).status, 200);
+  const finish = () => h.req("POST", base + `/uploads/${b.body.upload_id}/finish`, undefined, { idem: "simultaneous-finish" });
+  const results = await Promise.all([finish(), finish()]);
+  const winner = results.find(r => r.status === 200); assert.ok(winner, JSON.stringify(results));
+  for (const r of results) {
+    if (r.status === 200) assert.equal(r.body.revision_id, winner.body.revision_id);
+    else { assert.ok((r.status === 409 && r.body.error.code === "finish_in_progress") || (r.status === 503 && r.body.error.code === "text_finish_busy"), JSON.stringify(r)); assert.ok(r.body.error.retry_after_seconds >= 1); }
+  }
+  assert.equal(sql(`SELECT COUNT(*) AS n FROM revisions WHERE artifact_id = '${b.body.artifact_id}'`)[0].n, 1);
+});
 test("app API: malformed UTF-8 is rejected only at finish and replays exactly", async () => {
   for (const bytes of [Buffer.from([0xe2, 0x82]), Buffer.from([0xc0, 0xaf]), Buffer.from([0xed, 0xa0, 0x80])]) {
     const { b, f } = await httpUpload("markdown", bytes);
