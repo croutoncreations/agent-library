@@ -4,7 +4,8 @@
 import { enforceRate, limitsFor, rateLimit } from "./auth.js";
 import { RENDER_CSP, htmlRefs, renderHtmlDocument } from "./html.js";
 import { originFor } from "./oauth/server.js";
-import { IMAGE_TYPES, VIDEO_TYPES, getArtifact } from "./service.js";
+import { IMAGE_TYPES, VIDEO_TYPES } from "./service.js";
+import { getRenderSource } from "./render-source.js";
 import { serveContent } from "./uploads.js";
 import { HttpError, nowIso, nowMs, randomId, sha256Hex } from "./util.js";
 
@@ -82,8 +83,7 @@ export async function handleContentHost(req, env, url) {
       if (m[2]) return textPage(env, 404, "Not found");
       return await serveContent(ctx, inner(req, url, "?open=1"), row.project_id, row.artifact_id, String(row.rev_no));
     }
-    const r = await getArtifact(ctx, row.project_id, row.artifact_id, row.rev_no);
-    if (r.artifact.kind !== "html") return textPage(env, 404, "Not found");
+    const r = await getRenderSource(ctx, row.project_id, row.artifact_id, row.rev_no, "html");
     if (m[2]) {
       // An image or video this revision of the page shows (same project; the file's current version, as in the app).
       if (!htmlRefs(r.body).includes(m[2])) return textPage(env, 404, "Not found");
@@ -100,9 +100,10 @@ export async function handleContentHost(req, env, url) {
       // Same policy as the app-host render (no scripts, sandbox), framed only by the app.
       "content-security-policy": RENDER_CSP.replace("frame-ancestors 'self'", `frame-ancestors ${appOrigin(env)}`),
       "referrer-policy": "no-referrer",
-      "x-revision": String(r.revision.rev)
+      "x-revision": String(r.revision.rev_no)
     } });
   } catch (e) {
+    if (e instanceof HttpError && e.code === "render_too_large") return textPage(env, 413, e.message);
     if (e instanceof HttpError) return textPage(env, e.status === 429 ? 429 : 404, e.status === 429 ? "Too many requests" : "Not found");
     console.error("content_host_error", requestId, e?.message);
     return textPage(env, 500, "Internal error");

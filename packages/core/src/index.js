@@ -15,6 +15,7 @@ import { requireWorkspaceRole, visibleProjects } from "./tenancy.js";
 import { withRequestMemo, workspaceUsage } from "./limits.js";
 import { RESERVED_HANDLES, addressLinksResponse, resolveProjectRef } from "./paths.js";
 import { imageRefs, renderMarkdown } from "./markdown.js";
+import { getRenderSource } from "./render-source.js";
 import { handleMcp } from "./mcp.js";
 import { listAccess, listConnections, revokeConnection, revokeConnectionById } from "./oauth/connections.js";
 import { handleFileTransfer } from "./oauth/mcp.js";
@@ -294,18 +295,16 @@ async function route3(req, env, url, requestId, seen = {}) {
     }
     if (!sub && m === "PATCH") return out(await updateMetadata(ctx, pid, aid, await body(req), key()));
     if (sub === "preview" && m === "GET") {
-      const r = await getArtifact(ctx, pid, aid, revQ ? Number(revQ) : void 0);
-      if (r.artifact.kind !== "markdown") throw new HttpError(400, "invalid_input", "Not Markdown");
+      const r = await getRenderSource(ctx, pid, aid, revQ ? Number(revQ) : void 0, "markdown");
       const src = r.body;
       const media = await appMedia(env, pid, imageRefs(src));
       const html = renderMarkdown(src, (ref) => media(ref));
-      return json({ revision: r.revision.rev, html });
+      return json({ revision: r.revision.rev_no, html, truncated: r.truncated });
     }
     if (sub === "render" && m === "GET") {
-      const r = await getArtifact(ctx, pid, aid, revQ ? Number(revQ) : void 0);
-      if (r.artifact.kind !== "html") throw new HttpError(400, "invalid_input", "Not an HTML document");
+      const r = await getRenderSource(ctx, pid, aid, revQ ? Number(revQ) : void 0, "html");
       // A person's browser opens the page on the user-content host (another site), never on this origin.
-      if (wantsContentHost(env, req, ctx)) return viewLinkRedirect(ctx, pid, aid, r.revision.rev, "render");
+      if (wantsContentHost(env, req, ctx)) return viewLinkRedirect(ctx, pid, aid, r.revision.rev_no, "render");
       const src = r.body;
       const media = await appMedia(env, pid, htmlRefs(src));
       const page2 = renderHtmlDocument(src, (ref) => media(ref), r.artifact.title);
@@ -317,7 +316,7 @@ async function route3(req, env, url, requestId, seen = {}) {
         "referrer-policy": "no-referrer",
         "cross-origin-resource-policy": "same-origin",
         "x-frame-options": "SAMEORIGIN",
-        "x-revision": String(r.revision.rev)
+        "x-revision": String(r.revision.rev_no)
       } });
     }
     if (sub === "content" && m === "GET" && url.searchParams.get("open") === "1" && url.searchParams.get("download") !== "1" && wantsContentHost(env, req, ctx)) {

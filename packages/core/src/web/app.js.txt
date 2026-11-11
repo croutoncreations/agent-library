@@ -1607,6 +1607,9 @@ async function uploadFile(pid, file, target, keys, status) {
 var BINARY_ACCEPT = ".png,.jpg,.jpeg,.webp,.gif,.pdf,.mp4,.webm,image/png,image/jpeg,image/webp,image/gif,application/pdf,video/mp4,video/webm";
 var DATA_ACCEPT = { csv: ".csv,text/csv", json: ".json,application/json" };
 var DATA_MAX_BYTES = 10485760;
+var RENDER_MAX_BYTES = 1048576;
+function previewLimitNote(destination) { return "Preview shows the first 1 MB. " + destination + " for the full text."; }
+function pageLimitNotice(destination) { return "This page is larger than 1 MB, so it isn't shown here. " + destination + " to see its source."; }
 function dataKindOf(file) {
   var n = (file.name || "").toLowerCase();
   if (/\.csv$/.test(n) || file.type === "text/csv") return "csv";
@@ -2413,6 +2416,7 @@ async function viewArtifact(pid, aid, initialTab) {
         var desc = h("input", { type: "text", maxLength: 280, "aria-label": "New template description" });
         var previewBox = h("div", { class: "template-preview prose", tabIndex: 0, "aria-label": "Source template preview" });
         previewBox.innerHTML = preview.html;
+        if (preview.truncated) previewBox.prepend(h("p", { class: "muted small", role: "status", text: "Preview shows the first 1 MB. The template copies the full saved revision." }));
         var smsg = h("p", { class: "msg", role: "status" }), attempt = null, busy = false;
         var submit = h("button", { type: "submit" }, "Save template");
         templateForm.replaceChildren(h("form", { class: "template-form", onsubmit: async function (e) {
@@ -3364,7 +3368,9 @@ function renderMarkdownEditor(A, data, ui) {
   var saveBtn = h("button", { type: "button", class: "secondary", title: "Autosaves after you pause typing; unsaved text is kept in this browser", onclick: function () { saveNow(); } }, "Save now");
   var conflictBox = h("div", { class: "card conflict", hidden: true });
   var previewBox = h("div", { class: "preview" });
-  var previewNote = h("p", { class: "muted small" });
+  var savedSize = data.revision.size;
+  var previewNote = h("p", { class: "muted small preview-note", role: "status", "aria-live": "polite" });
+  var renderNotice = h("p", { class: "muted small render-notice", role: "status", "aria-live": "polite", hidden: true });
   // HTML documents render in a sandboxed iframe: no scripts, forms or top navigation (see src/html.ts).
   // allow-same-origin only so its <img>/<video> carry the session; allow-popups so links open in a new tab.
   // NEVER add allow-scripts.
@@ -3421,7 +3427,7 @@ function renderMarkdownEditor(A, data, ui) {
     D.saving = true; D.again = false; setStatus("saving", "Saving...");
     try {
       var r = await api("PUT", A.base, { expected_revision: att.base, body: att.body }, { key: att.key });
-      A.rev = r.revision; D.savedBody = att.body; D.attempt = null; D.errCount = 0;
+      A.rev = r.revision; D.savedBody = att.body; savedSize = utf8Len(att.body); D.attempt = null; D.errCount = 0;
       showBanner("");
     } catch (err) {
       D.saving = false;
@@ -3447,6 +3453,8 @@ function renderMarkdownEditor(A, data, ui) {
   // View-only (now or later): no more saves. Returns unsaved text so the person can copy it, else null.
   A.stopEditing = function () {
     clearTimeout(D.timer); clearTimeout(D.retryTimer); D.stopped = true; ta.readOnly = true;
+    previewNote.textContent = previewNote.textContent.replace(previewLimitNote("Open Edit"), previewLimitNote("Use Show full text in History"));
+    renderNotice.textContent = renderNotice.textContent.replace(pageLimitNotice("Open Edit"), pageLimitNotice("Use Show full text in History"));
     conflictBox.hidden = true; // the unsaved-text box holds the text from here on
     var dr = readDraft(pid, aid);
     var text = isDirty() ? ta.value : dr && typeof dr.body === "string" && dr.body !== D.savedBody ? dr.body : null;
@@ -3509,7 +3517,7 @@ function renderMarkdownEditor(A, data, ui) {
   }
   function exitConflict(body, rev) {
     D.conflict = null; conflictBox.hidden = true; conflictBox.replaceChildren();
-    A.rev = rev; D.savedBody = body; ta.value = body; ta.readOnly = false;
+    A.rev = rev; D.savedBody = body; savedSize = utf8Len(body); ta.value = body; ta.readOnly = false;
     clearDraft(pid, aid); showBanner(""); setSaved(); ui.fillMeta();
   }
 
@@ -3523,7 +3531,7 @@ function renderMarkdownEditor(A, data, ui) {
     if (r.revision.rev > A.rev) {
       if (isDirty()) showBanner("A newer revision (rev " + r.revision.rev + ") exists on the server. Your edits are kept; saving will open the conflict view.");
       else {
-        A.rev = r.revision.rev; D.savedBody = r.body; replaceEditorText(ta, r.body); setSaved(); if (A.tab === "preview") loadPreview();
+        A.rev = r.revision.rev; D.savedBody = r.body; savedSize = r.revision.size; replaceEditorText(ta, r.body); setSaved(); if (A.tab === "preview") loadPreview();
         showBanner("Updated to rev " + r.revision.rev + " (changed elsewhere). Your place was kept.");
         clearTimeout(D.noteTimer); D.noteTimer = setTimeout(function () { if (A.alive && !D.conflict && !isDirty()) showBanner(""); }, 6000);
       }
@@ -3531,7 +3539,7 @@ function renderMarkdownEditor(A, data, ui) {
   }
   A.reload = async function () {
     var r = await api("GET", A.base);
-    A.meta = r.artifact; A.rev = r.revision.rev; D.savedBody = r.body; ta.value = r.body; clearDraft(pid, aid); setSaved(); ui.fillMeta();
+    A.meta = r.artifact; A.rev = r.revision.rev; D.savedBody = r.body; savedSize = r.revision.size; ta.value = r.body; clearDraft(pid, aid); setSaved(); ui.fillMeta();
   };
   var poll = setInterval(refresh, 10000);
   var onFocus = function () { refresh(); };
@@ -3547,9 +3555,14 @@ function renderMarkdownEditor(A, data, ui) {
   });
 
   async function loadPreview() {
-    previewNote.textContent = (isDirty() ? "Showing saved rev " + A.rev + " (unsaved edits are not included)." : "");
+    var savedNote = isDirty() ? "Showing saved rev " + A.rev + " (unsaved edits are not included)." : "";
+    previewNote.textContent = savedNote;
     previewNote.hidden = !previewNote.textContent;
     if (isHtml) {
+      var largePage = savedSize > RENDER_MAX_BYTES;
+      renderNotice.hidden = !largePage; frame.hidden = largePage;
+      renderNotice.textContent = largePage ? pageLimitNotice(A.readOnly ? "Use Show full text in History" : "Open Edit") : "";
+      if (largePage) { frame.removeAttribute("src"); return; }
       // The response carries CSP script-src 'none' + sandbox, and the iframe sandbox has no allow-scripts.
       var src = A.base + "/render?rev=" + A.rev;
       if (frame.getAttribute("src") !== src) frame.setAttribute("src", src);
@@ -3557,6 +3570,8 @@ function renderMarkdownEditor(A, data, ui) {
     }
     try {
       var r = await api("GET", A.base + "/preview?rev=" + A.rev); previewBox.innerHTML = r.html; enhanceTables(previewBox);
+      previewNote.textContent = savedNote + (r.truncated ? (savedNote ? " " : "") + previewLimitNote(A.readOnly ? "Use Show full text in History" : "Open Edit") : "");
+      previewNote.hidden = !previewNote.textContent;
       previewBox.querySelectorAll("video[data-artifact]").forEach(function (v) { v.preload = "metadata"; });
       previewBox.querySelectorAll("img[data-artifact]").forEach(function (im) {
         im.tabIndex = 0; im.title = "View full size";
@@ -3577,7 +3592,7 @@ function renderMarkdownEditor(A, data, ui) {
   ui.below.append(h("div", { class: "footbar" }, statusEl, h("span", { class: "spacer" }), saveBtn), ui.details);
   ui.fillMeta();
   ui.addTab("preview", isHtml ? "Page" : "Preview", loadPreview);
-  ui.panels.preview.append(previewNote, isHtml ? frame : previewBox);
+  ui.panels.preview.append(previewNote, renderNotice, isHtml ? frame : previewBox);
   ui.addTab("edit", "Edit", function () { if (ta.view) ta.view.requestMeasure(); });
   ui.panels.edit.append(edHost);
   setSaved();
@@ -3683,7 +3698,7 @@ async function offSave(pid, aid) {
   if (d.artifact.kind === "markdown") {
     it.body = d.body;
     var pv = await api("GET", base + "/preview?rev=" + d.revision.rev, undefined, { noAuthRedirect: true });
-    it.html = pv.html; it.images = {};
+    it.html = pv.html; it.truncated = pv.truncated; it.images = {};
     var doc = new DOMParser().parseFromString(pv.html, "text/html");
     var srcs = Array.from(doc.querySelectorAll("img[data-artifact]")).map(function (im) { return im.getAttribute("src"); })
       .filter(function (s, i, a) { return s && s.charAt(0) === "/" && a.indexOf(s) === i; });
@@ -3692,10 +3707,13 @@ async function offSave(pid, aid) {
   } else if (d.artifact.kind === "html") {
     // The server-sanitized rendered page (no scripts); shown offline in a sandboxed iframe via srcdoc.
     it.body = d.body;
-    var rp = await fetch(base + "/render?rev=" + d.revision.rev, { credentials: "same-origin", cache: "no-store" });
-    if (!rp.ok) throw new Error("Could not save the rendered page (" + rp.status + ")");
-    it.page = await rp.text();
-    it.size = utf8Len(it.body) + utf8Len(it.page);
+    it.renderTooLarge = d.revision.size > RENDER_MAX_BYTES;
+    if (!it.renderTooLarge) {
+      var rp = await fetch(base + "/render?rev=" + d.revision.rev, { credentials: "same-origin", cache: "no-store" });
+      if (!rp.ok) throw new Error("Could not save the rendered page (" + rp.status + ")");
+      it.page = await rp.text();
+    }
+    it.size = utf8Len(it.body) + utf8Len(it.page || "");
   } else if (isDataKind(d.artifact.kind)) {
     // CSV / JSON: the text itself; the offline viewer renders the same preview from it.
     it.body = typeof d.content === "string" ? d.content : await (await offFetchBlob(d.content_url)).text();
@@ -3835,6 +3853,7 @@ async function viewOfflineItem(pid, aid, tab) {
       if (b) { var u = blobUrl(b); im.src = u; im.tabIndex = 0; im.addEventListener("click", function () { openLightbox(u, im.alt || "image"); }); }
       else { im.replaceWith(h("span", { class: "muted small", text: "[image not saved offline]" })); }
     });
+    if (it.truncated) pv.prepend(h("p", { class: "muted small", role: "status", text: previewLimitNote("Open Text") }));
     var raw = h("pre", { class: "raw", text: it.body || "" });
     var tabs = tabList("Saved copy views");
     var sel = tab === "raw" ? "raw" : "preview";
@@ -3846,8 +3865,10 @@ async function viewOfflineItem(pid, aid, tab) {
     body.append(tabs, pv, raw);
   } else if (it.kind === "html") {
     // No scripts, opaque origin (links still open in a new tab); the stored page was sanitized by the server. Media need the network.
-    var fr = h("iframe", { class: "htmlview", title: "Rendered page (saved copy)", sandbox: "allow-popups allow-popups-to-escape-sandbox", referrerpolicy: "no-referrer" });
-    fr.srcdoc = it.page || "";
+    var fr = it.renderTooLarge
+      ? h("p", { class: "muted small", role: "status", text: pageLimitNotice("Open Source") })
+      : h("iframe", { class: "htmlview", title: "Rendered page (saved copy)", sandbox: "allow-popups allow-popups-to-escape-sandbox", referrerpolicy: "no-referrer" });
+    if (!it.renderTooLarge) fr.srcdoc = it.page || "";
     var rawH = h("pre", { class: "raw", text: it.body || "", hidden: true });
     var tabsH = tabList("Saved page views");
     [["page", "Page", fr], ["raw", "Source", rawH]].forEach(function (t) {

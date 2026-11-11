@@ -171,6 +171,20 @@ test("large Markdown rendering only reads a 1 MiB range and resolves references 
   assert.doesNotMatch(r.body, /art_late/);
 });
 
+test("render-only reads preserve legacy inline versions and recheck access after R2", async () => {
+  const { lib, ctx, env, sql } = await harness();
+  const c = await lib.createMarkdown(ctx, "proj-s", { title: "Legacy preview", body: "# café 🙂" }, "legacy-render");
+  const id = c.body.artifact_id;
+  sql.prepare("UPDATE revisions SET body = ?, body_key = NULL WHERE artifact_id = ?").run("# café 🙂", id);
+  const counts = spyBindings(env);
+  const legacy = await lib.getRenderSource(ctx, "proj-s", id, 1, "markdown");
+  assert.equal(legacy.body, "# café 🙂"); assert.equal(legacy.truncated, false); assert.equal(counts.gets, 0);
+  await lib.saveMarkdown(ctx, "proj-s", id, { expected_revision: 1, body: "# R2" }, "fenced-render");
+  const get = env.BLOBS.get;
+  env.BLOBS.get = async (...args) => { const object = await get(...args); sql.exec("DELETE FROM workspace_members WHERE principal_id = 'hum_s'"); return object; };
+  await assert.rejects(lib.getRenderSource(ctx, "proj-s", id, 2, "markdown"), e => e.status === 404);
+});
+
 test("oversized HTML rendering refuses before any object read", async () => {
   const { lib, ctx, env } = await harness();
   const c = await lib.createMarkdown(ctx, "proj-s", { title: "Large page", body: " ".repeat(1048577) }, "render-html", "html");

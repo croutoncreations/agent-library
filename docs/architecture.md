@@ -50,6 +50,8 @@ Every artifact has a stable owner URL: `https://APP_HOST/p/<project>/a/<artifact
 
 ## User-content host
 
+Server rendering has a [1 MiB limit](limits.md#documents--files): larger Markdown previews show only the beginning, and larger HTML pages are refused before issuing a view link (existing links also refuse them).
+
 Uploaded HTML documents and PDFs are written by agents and other people, so they are never run on the app's origin.
 Without `CONTENT_HOST`, HTML pages are sanitized and shown in a sandboxed frame with `script-src 'none'` on the app
 host, and PDFs open there as sandboxed attachments. With `CONTENT_HOST` set to a hostname on a **different registrable

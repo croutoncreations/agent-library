@@ -35,6 +35,8 @@ remove. A string that's too long is `413 too_large`; a number out of range is `4
 | Comment | 1–10,000 characters | comment | fixed; new bodies are stored in R2, legacy inline D1 bodies remain readable | `413 too_large` |
 | Versions kept | all, forever | document | fixed (only `storage_bytes` bounds them) | — |
 
+Server rendering is limited to 1 MiB (shown as 1 MB in the app): Markdown preview shows only the beginning of a larger document, cut back to a nearby line break; HTML pages over 1 MiB are not rendered in the app or through view links. Editing, download, history and agent reads still work up to 10 MiB.
+
 For non-identical text versions, history diff returns a summary with no line hunks when either version exceeds 1 MiB; identical hashes still return the identical result.
 
 The text limit is a storage bound, not a memory guarantee. Server CSV validation and spreadsheet export scan one row at a time without retaining all rows or cells; export allocates the output bytes after counting their size. Measurements validation also retains at most 100,000 ids for duplicate detection. There is no generic CSV row/cell cap. Browser CSV preview still parses whole files; JSON files are validated without being built in memory, and record queries read one record at a time, but concurrent requests still share the Worker's 128 MB memory ceiling.

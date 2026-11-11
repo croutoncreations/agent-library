@@ -53,6 +53,12 @@ test("Markdown boundary, line cut, UTF-8 boundary, suffix references and 10 MiB 
   const r = await owner.req("GET", base(ids.largeMarkdown) + "/preview");
   assert.equal(r.status, 200); assert.equal(r.body.truncated, true);
   assert.match(r.body.html, /early-render-marker/); assert.doesNotMatch(r.body.html, /é|\ufffd/);
+  const noLine = early + "word ".repeat(Math.ceil(MAX / 5)).slice(0, MAX - early.length - 1) + "🙂";
+  await make("markdown", noLine, "utf8Markdown");
+  const utf8 = await owner.req("GET", base(ids.utf8Markdown) + "/preview");
+  assert.equal(utf8.status, 200); assert.equal(utf8.body.truncated, true);
+  assert.doesNotMatch(utf8.body.html, /🙂|\ufffd/);
+  assert.ok(utf8.body.html.length > MAX - 100, "without a nearby line break only the partial character is removed");
   const small = early + "word ".repeat(Math.ceil(MAX / 5)).slice(0, MAX - early.length - 18) + " exact-end-marker!";
   assert.equal(Buffer.byteLength(small), MAX);
   await make("markdown", small, "exactMarkdown");
@@ -113,17 +119,27 @@ test("Chrome: exact owner/viewer notes, small views, offline copies, and synthet
             assert.equal(await page.$eval(html ? ".render-notice" : ".preview-note", e => e.textContent), text);
             if (html) { assert.deepEqual(requests, []); assert.equal(await page.$eval("iframe.htmlview", e => e.getAttribute("src")), null); }
             else await page.waitForFunction(() => document.querySelector(".preview h1")?.textContent === "early-render-marker");
-            if (captures) await page.screenshot({ path: `${out}/${role}-${key}-${width}.png`, fullPage: true });
+            if (captures) await page.screenshot({ path: `${out}/${role}-${key}-${width}.png` });
           } else {
             if (html) await page.waitForFunction(() => document.querySelector("iframe.htmlview")?.getAttribute("src"));
             else await page.waitForFunction(() => document.querySelector(".preview h1")?.textContent === "Small Markdown");
             assert.equal(await page.$eval(".preview-note", e => e.textContent), "");
             if (html) assert.equal(await page.$eval(".render-notice", e => e.hidden), true);
           }
-          if (role === "viewer") assert.equal(await page.$('[role="tab"][data-tab="edit"]'), null);
+          if (role === "viewer") assert.equal(await page.evaluate(() => [...document.querySelectorAll('[role="tab"]')].some(el => el.textContent === "Edit")), false);
         }
       }
       if (role === "owner") {
+        await page.goto(`${APP}/#/p/${pid}/a/${ids.largeMarkdown}`);
+        await page.waitForFunction(() => document.querySelector(".preview h1")?.textContent === "early-render-marker");
+        await page.evaluate(() => { const button = [...document.querySelectorAll("button")].find(el => el.textContent === "Save as template"); button.closest("details").open = true; button.click(); });
+        const templateNote = "Preview shows the first 1 MB. The template copies the full saved revision.";
+        await page.waitForFunction(text => document.querySelector(".template-preview")?.innerText.includes(text), {}, templateNote);
+        const savedTemplate = page.waitForResponse(r => r.request().method() === "POST" && r.url().endsWith("/templates"));
+        await page.click('.template-form button[type="submit"]');
+        const response = await savedTemplate; assert.equal(response.status(), 201);
+        const copied = await response.json();
+        assert.equal((await owner.req("GET", base(copied.artifact_id))).body.body, (await owner.req("GET", base(ids.largeMarkdown))).body.body);
         for (const key of ["largeMarkdown", "largeHtml"]) {
           await page.goto(`${APP}/#/p/${pid}/a/${ids[key]}`);
           const toggle = await page.waitForSelector('[aria-label="Make available offline"]'); await toggle.click();
