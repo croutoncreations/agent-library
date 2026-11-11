@@ -31,7 +31,7 @@ async function reconcileUploads(env, opts = {}) {
       AND ((state = 'published' AND mime NOT IN ('text/markdown','text/html','application/json','text/csv')) OR expires_at > ?)${pf}`).bind(stale, ...pp).first();
   if (retained?.count > 0) console.warn(JSON.stringify({ event: "upload_final_writes_retained", count: retained.count, oldest_expiry_age_ms: Math.max(0, now - retained.oldest_expiry) }));
   let purgedStaging = 0, purgedFinal = 0;
-  const st = await DB.prepare(`SELECT id, staging_key, mime, state, final_key, final_purged_at, final_writes, expires_at FROM uploads INDEXED BY uploads_cleanup WHERE staging_purged_at IS NULL AND state IN ('failed','conflict','published')${pf} LIMIT ?`).bind(...pp, limit).all();
+  const st = await DB.prepare(`SELECT id, staging_key, mime, state, final_key, final_purged_at, final_writes, expires_at FROM uploads WHERE staging_purged_at IS NULL AND state IN ('failed','conflict','published')${pf} LIMIT ?`).bind(...pp, limit).all();
   const purgeStagingRow = async (u) => {
     await deleteBlob(env, u.staging_key);
     const r = await DB.prepare("UPDATE uploads SET staging_purged_at = ? WHERE id = ? AND staging_purged_at IS NULL AND state IN ('failed','conflict','published') AND (mime NOT IN ('text/markdown','text/html','application/json','text/csv') OR final_purged_at IS NOT NULL)").bind(now, u.id).run();

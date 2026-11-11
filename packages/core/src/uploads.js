@@ -351,8 +351,10 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
     } else if (nowMs() >= deadline) throw busy(row);
   }
   const fenced = "EXISTS (SELECT 1 FROM uploads WHERE id = ? AND state = 'sealed' AND finalize_token = ?)";
+  let text;
   let hasTextFinishSlot = false;
   const releaseTextFinishSlot = () => {
+    text = null;
     if (hasTextFinishSlot && textFinishSlot?.token === token) textFinishSlot = null;
   };
   try {
@@ -395,7 +397,6 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
     if (sha2 === null) return fail(500, "publish_failed", "Stored object has no SHA-256 checksum", "failed");
     if (size !== u.expected_size || sha2 !== u.expected_sha256)
       return fail(422, "integrity_mismatch", "Byte length or SHA-256 does not match declaration", "failed", { received_size: size, received_sha256: sha2 });
-    let text;
     if (kind) {
       if (kind === "json" || kind === "csv") requireAppConnect(ctx);
       const a = await loadArtifact(ctx, projectId, u.artifact_id, { allowUnpublished: u.base_rev === 0 });
@@ -406,6 +407,7 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
       hasTextFinishSlot = true;
       try {
         text = await getUploadedText(ctx.env, finalKey, kind);
+        if (textFinishSlot?.token !== token || textFinishSlot.until <= nowMs()) return lostAfterWrite();
         if (text === null) return fail(409, "missing_bytes", "Uploaded bytes missing", "failed");
         if (kind === "markdown" || kind === "html") mdBody(text, kind);
         else checkFile(kind, text, a.schema_id);

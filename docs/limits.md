@@ -96,8 +96,10 @@ will return through the blind index in slice 4b. The separate ranked search sear
 ## Uploads & transfers
 
 The app API upload endpoints accept Markdown, HTML, JSON and CSV text up to 10 MiB (10,485,760 bytes).
-One text finish runs at a time per isolate. Another receives retryable `503 text_finish_busy` with
-`retry_after_seconds: 1`; retry with the same idempotency key. The slot expires with its finalize lease.
+Normally one text finish runs at a time per isolate. The slot covers reading, validating and publishing the document.
+Another finish receives retryable `503 text_finish_busy` with `retry_after_seconds: 1`; retry with the same idempotency key.
+The slot expires with the 60-second finalize lease. A finish that stalls past its lease can overlap with the next one.
+The slot does not bound other operations on large text.
 MCP tools and `/v1` do not accept text uploads yet.
 
 Before rolling the Worker back to a version from before text uploads, let text uploads finish or expire.
