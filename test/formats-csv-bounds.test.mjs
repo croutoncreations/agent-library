@@ -14,11 +14,15 @@ test("CSV column limit: boundary, syntax precedence, header precedence and legac
   assert.equal(parseCsv(at).header.length, 16384);
   assert.equal(spreadsheetSafeCsv(at).length, at.length + 2);
   for (const fn of [t => checkFile("csv", t), parseCsv, spreadsheetSafeCsv, t => spreadsheetSafeCsv(t, { headOnly: true })]) {
-    for (const text of [over, over.replace("c1,", "c0,"), over.replace("c1,", ",")]) {
+    // The limit wins over duplicate and empty names and over a ragged data row.
+    for (const text of [over, over.replace("c1,", "c0,"), over.replace("c1,", ","), over + "\nx\n"]) {
       assert.throws(() => fn(text), exactError(1, "more than 16384 columns"));
     }
     assert.throws(() => fn(over + '\n"open'), exactError(2, "unterminated quoted field"));
   }
+  // With the measurements schema, the limit is still a csv error and wins over the wrong-header schema error.
+  assert.throws(() => checkFile("csv", over, "agentlib.measurements/1"), exactError(1, "more than 16384 columns"));
+  assert.throws(() => checkFile("csv", over + "\nx\n", "agentlib.measurements/1"), exactError(1, "more than 16384 columns"));
 });
 
 test("CSV exports retain common checks for legacy or imported content, including HEAD", () => {

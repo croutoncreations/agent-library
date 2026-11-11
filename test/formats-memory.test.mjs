@@ -23,7 +23,7 @@ for (const shape of ["chains", "combinations", "keys", "extra"]) {
   }
 }
 
-for (const shape of ["tiny", "normal", "measurements", "commas", "wide-header", "quotes"]) for (const operation of ["checkFile", "spreadsheetSafeCsv"]) {
+for (const shape of ["tiny", "normal", "measurements", "commas", "wide-header", "quotes", "formula", "columns"]) for (const operation of ["checkFile", "spreadsheetSafeCsv"]) {
   test(`formats bounded heap: ${operation} ${shape} CSV`, () => {
     const child = spawnSync(process.execPath, ["--max-old-space-size=64", "--input-type=module", "-e", `
       import assert from "node:assert/strict";

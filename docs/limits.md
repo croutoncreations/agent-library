@@ -28,7 +28,7 @@ remove. A string that's too long is `413 too_large`; a number out of range is `4
 | File size (images, PDF, video, other uploads) | 25 MiB | file version | `FILE_MAX_BYTES`; plan `file_bytes`. Never above 90 MiB (_ceiling_: Cloudflare refuses requests over 100 MB, and a file is sent in one PUT). Measured on Cloudflare (Workers Paid, 2026-11-10): 25 MiB works; 50 and 80 MiB uploads fail with 1102 (resource limits), so keep `file_bytes` at 25 MiB or less until uploads stop passing the file through the Worker twice | `413 too_large` "Files can be up to 25 MB on this plan", `{ limit: "file_bytes", allowed }` |
 | Storage | unlimited | workspace | plan `storage_bytes` | `402 limit_reached` |
 | JSON nesting | 64 levels | document | fixed | `422 invalid_content` |
-| CSV columns | 16,384 | header and each data row | fixed (`MAX_CSV_COLUMNS`) | `422 invalid_content`, format `csv`, line 1: "Invalid csv: more than 16384 columns"; also refused on spreadsheet export of older files |
+| CSV columns | 16,384 | header row (data rows must match the header's width) | fixed (`MAX_CSV_COLUMNS`) | `422 invalid_content`, format `csv`, line 1: "Invalid csv: more than 16384 columns"; also refused on spreadsheet export of older files |
 | Measurement records | 100,000 per file; JSON records at most 16,384 characters each | JSON and CSV measurements documents | fixed (`MAX_MEASUREMENT_RECORD_CHARS` for JSON record size) | `422 invalid_content`; oversized JSON record: "Invalid schema: record larger than 16384 characters" |
 | Title | 1–200 characters | document, file, project, template | fixed | `413 too_large` |
 | Tags | 20 per document, each 1–50 characters | document | fixed | `400 invalid_input` / `413 too_large` |
