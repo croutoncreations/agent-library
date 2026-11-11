@@ -281,7 +281,7 @@ async function folderCheck(ctx, projectId, folderId) {
   if (!f) throw new HttpError(404, "not_found", "Folder not found");
   return id;
 }
-// Shared create metadata for inline text and upload reservations. Tags retain their create default ([]).
+// Upload create metadata. JSON-route callers retain their own checks and error order; tags default to [].
 async function textCreateMetadata(ctx, projectId, input, kind) {
   if (kind === "json" || kind === "csv" || input.folder_id != null) requireAppConnect(ctx);
   const schema = input.schema == null ? null : String(input.schema);
@@ -303,7 +303,8 @@ async function createMarkdown(ctx, projectId, input, key, kind = "markdown") {
     schema = c.schema;
     mime = MIME[kind];
   }
-  const { folder, folderId } = await textCreateMetadata(ctx, projectId, input, kind);
+  const folder = str(input.folder, "folder", 200, { optional: true });
+  const folderId = await folderCheck(ctx, projectId, input.folder_id);
   const digestParts = kind === "markdown" && folderId === null ? ["md", title, body2, folder] : [kind, title, body2, folder, folderId, schema];
   const i = { op: "artifact.create", key, projectId, digest: await sha256Hex(JSON.stringify(digestParts)) };
   const prior = await idemLookup(ctx, i);
