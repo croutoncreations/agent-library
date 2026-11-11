@@ -3373,7 +3373,7 @@ function renderMarkdownEditor(A, data, ui) {
   // Preserve the hidden small-document DOM; only large pages replace it with a non-live state box.
   var smallRenderNotice = h("p", { class: "muted small render-notice", role: "status", "aria-live": "polite", hidden: true });
   var renderNotice = smallRenderNotice;
-  var previewTruncated = false, previewSavedNote = "", shownRev = A.rev, requestedPreviewRev = A.rev;
+  var previewTruncated = false, previewSavedNote = "", shownRev = A.rev, previewSeq = 0;
   function showSourceHistory() { ui.openHistory(shownRev); }
   function setPreviewNote(savedNote, truncated) {
     previewSavedNote = savedNote; previewTruncated = truncated;
@@ -3578,8 +3578,7 @@ function renderMarkdownEditor(A, data, ui) {
   });
 
   async function loadPreview() {
-    var rev = A.rev;
-    requestedPreviewRev = rev;
+    var rev = A.rev, seq = ++previewSeq;
     var savedNote = isDirty() ? "Showing saved rev " + rev + " (unsaved edits are not included)." : "";
     if (isHtml) {
       shownRev = rev;
@@ -3595,7 +3594,7 @@ function renderMarkdownEditor(A, data, ui) {
     }
     try {
       var r = await api("GET", A.base + "/preview?rev=" + rev);
-      if (!A.alive || rev !== requestedPreviewRev) return;
+      if (!A.alive || seq !== previewSeq) return;
       shownRev = rev;
       previewBox.innerHTML = r.html; enhanceTables(previewBox);
       setPreviewNote(savedNote, r.truncated);
@@ -3607,7 +3606,12 @@ function renderMarkdownEditor(A, data, ui) {
         im.addEventListener("keydown", function (e) { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); } });
       });
     }
-    catch (err) { if (A.alive && rev === requestedPreviewRev) previewBox.replaceChildren(h("p", { class: "msg", role: "alert", text: "Preview failed: " + err.message })); }
+    catch (err) {
+      if (!A.alive || seq !== previewSeq) return;
+      shownRev = rev;
+      setPreviewNote(savedNote, false);
+      previewBox.replaceChildren(h("p", { class: "msg", role: "alert", text: "Preview failed: " + err.message }));
+    }
   }
 
   var docMeta = h("p", { class: "doc-meta" }, (isHtml ? "Page" : "Doc") + " · ", h("span", { dataset: { projectTitle: pid }, text: projectTitles[pid] || pid }), " · updated " + fmtDate(A.meta.updated_at));

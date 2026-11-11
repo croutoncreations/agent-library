@@ -205,6 +205,118 @@ test("Chrome: overlapping previews and viewer refresh keep the body, note and re
     await page.close();
   } finally { await browser.close(); }
 });
+async function withPreviewPage(who, run) {
+  const puppeteer = createRequire(import.meta.url)(`${process.env.HOME}/.npm-packages/lib/node_modules/puppeteer`);
+  const browser = await puppeteer.launch({ executablePath: process.env.CHROME_PATH ?? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", headless: true, args: ["--no-sandbox"] });
+  try {
+    const page = await browser.newPage();
+    // A claimed service worker can otherwise bypass page-level interception after the first preview.
+    await page.setBypassServiceWorker(true);
+    const [name, value] = who.cookie.split("="); await page.setCookie({ name, value, url: APP });
+    const errors = []; page.on("pageerror", e => errors.push(e.message));
+    await run(page);
+    assert.deepEqual(errors, [], "pending previews do not throw in Chrome");
+  } finally { await browser.close(); }
+}
+async function holdPreviews(page, id, { holdWrites = false } = {}) {
+  const queued = [], waiting = [];
+  await page.setRequestInterception(true);
+  page.on("request", async r => {
+    // Keep autosave pending until this page closes, so the controlled calls stay on one revision.
+    if (holdWrites && r.method() === "PUT" && new URL(r.url()).pathname === base(id)) return;
+    if (new URL(r.url()).pathname === base(id) + "/preview") {
+      if (waiting.length) waiting.shift()(r); else queued.push(r);
+    } else await r.continue();
+  });
+  return () => queued.length ? Promise.resolve(queued.shift()) : new Promise(resolve => waiting.push(resolve));
+}
+async function answerPreview(r, fail = false) {
+  const response = fail ? { status: 503, body: { error: { code: "synthetic_preview_failure", message: "synthetic preview unavailable" } } } : await owner.req("GET", new URL(r.url()).pathname + new URL(r.url()).search);
+  await r.respond({ status: response.status, contentType: "application/json", body: JSON.stringify(response.body) });
+}
+const previewTab = (page, label) => page.evaluate(label => [...document.querySelectorAll('[role="tab"]')].find(e => e.textContent === label).click(), label);
+const previewFailed = page => page.waitForFunction(() => document.querySelector('.preview [role="alert"]')?.textContent === "Preview failed: synthetic preview unavailable");
+async function assertFailedPreviewRevision(page, rev) {
+  assert.equal(await page.$eval(".preview-note", e => e.textContent), "", "failed preview clears the previous revision's truncation note");
+  assert.equal(await page.$eval(".preview-note", e => e.hidden), true);
+  assert.equal(await page.$(".preview-note a"), null, "failed preview removes the previous revision's History link");
+  // A retained link invokes the real History callback, exposing its captured shownRev without app hooks.
+  await page.evaluate(() => window.previousPreviewLink.click());
+  await page.waitForSelector('.vh-row[aria-current="true"]');
+  assert.equal(await page.$eval('.vh-row[aria-current="true"]', e => e.dataset.rev), String(rev), "History targets the failed request's revision");
+}
+test("Chrome: newest preview request fails without retaining the previous revision note or History target", { timeout: 180000 }, async () => {
+  const id = await make("markdown", "# failure-first\n" + "word ".repeat(MAX), "failureMarkdown");
+  await withPreviewPage(viewer, async page => {
+    await page.goto(`${APP}/#/p/${pid}/a/${id}`); await page.waitForSelector(".preview-note a");
+    await page.evaluate(() => { window.previousPreviewLink = document.querySelector('.preview-note a'); });
+    const next = await holdPreviews(page, id);
+    await owner.req("PUT", base(id), { expected_revision: 1, body: "# failure-second" });
+    await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+    const pending = await next(); assert.ok(pending.url().endsWith("?rev=2"));
+    await answerPreview(pending, true); await previewFailed(page);
+    await assertFailedPreviewRevision(page, 2);
+  });
+});
+test("Chrome: superseded preview cannot replace a newer failure on late arrival", { timeout: 180000 }, async () => {
+  const id = await make("markdown", "# failure-initial\n" + "word ".repeat(MAX), "supersededFailureMarkdown");
+  await withPreviewPage(viewer, async page => {
+    await page.goto(`${APP}/#/p/${pid}/a/${id}`); await page.waitForSelector(".preview-note a");
+    await page.evaluate(() => { window.previousPreviewLink = document.querySelector('.preview-note a'); });
+    const next = await holdPreviews(page, id);
+    await owner.req("PUT", base(id), { expected_revision: 1, body: "# superseded-response-marker" });
+    await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+    const older = await next(); assert.ok(older.url().endsWith("?rev=2"));
+    await owner.req("PUT", base(id), { expected_revision: 2, body: "# newer-failure-marker" });
+    await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+    const newer = await next(); assert.ok(newer.url().endsWith("?rev=3"));
+    await answerPreview(newer, true); await previewFailed(page);
+    const before = await page.$eval(".preview", e => e.innerHTML);
+    await answerPreview(older); await page.waitForNetworkIdle({ idleTime: 100 });
+    assert.equal(await page.$eval(".preview", e => e.innerHTML), before, "late superseded response leaves the error untouched");
+    assert.equal(await page.$(".preview h1"), null, "no older response body appears");
+    await assertFailedPreviewRevision(page, 3);
+  });
+});
+test("Chrome: same-revision preview calls preserve the newer unsaved-edits note", { timeout: 180000 }, async () => {
+  const id = await make("markdown", "# same-revision", "sameRevisionMarkdown");
+  await withPreviewPage(owner, async page => {
+    const next = await holdPreviews(page, id, { holdWrites: true });
+    await page.goto(`${APP}/#/p/${pid}/a/${id}`); const older = await next();
+    await previewTab(page, "Edit"); await page.waitForSelector(".cm-content", { visible: true });
+    await page.click(".cm-content"); await page.keyboard.sendCharacter("unsaved ");
+    await page.waitForFunction(() => document.querySelector('.status')?.textContent === "Unsaved changes");
+    await previewTab(page, "Preview"); const newer = await next();
+    assert.equal(newer.url(), older.url(), "both calls request the same saved revision");
+    await answerPreview(newer);
+    const note = "Showing saved rev 1 (unsaved edits are not included).";
+    await page.waitForFunction(note => document.querySelector('.preview-note')?.textContent === note, {}, note);
+    await answerPreview(older); await page.waitForNetworkIdle({ idleTime: 100 });
+    assert.equal(await page.$eval(".preview-note", e => e.textContent), note, "older same-revision response must not erase the newer unsaved-edits note");
+  });
+});
+// Protection for existing A.alive behaviour, covering both successful and failed late completions.
+test("Chrome: closed document ignores pending preview success and failure", { timeout: 180000 }, async () => {
+  await withPreviewPage(viewer, async page => {
+    for (const fail of [false, true]) {
+      const id = await make("markdown", "# closed-preview-marker", `closedPreview${fail}`);
+      const next = await holdPreviews(page, id);
+      await page.goto(`${APP}/#/p/${pid}/a/${id}`); const pending = await next();
+      await page.evaluate(() => {
+        window.closedPreviewMutations = [];
+        new MutationObserver(records => window.closedPreviewMutations.push(...records.map(r => r.type)))
+          .observe(document.querySelector('.preview'), { childList: true, subtree: true, characterData: true });
+      });
+      await page.evaluate((hash) => { location.hash = hash; }, `#/p/${pid}/a/${ids.smallMarkdown}`);
+      await page.waitForFunction(() => document.querySelector('.preview h1')?.textContent === "Small Markdown");
+      const nextView = await page.$eval("main", e => e.innerHTML);
+      await answerPreview(pending, fail); await page.waitForNetworkIdle({ idleTime: 100 });
+      assert.equal(await page.$eval("main", e => e.innerHTML), nextView, "late completion writes nothing to the next view");
+      assert.deepEqual(await page.evaluate(() => window.closedPreviewMutations), [], `closed preview ${fail ? "error" : "success"} must not mutate its detached view`);
+      await page.setRequestInterception(false); page.removeAllListeners("request");
+    }
+  });
+});
 test("Chrome: saved editor changes cross the render limit in both directions without reloading", { timeout: 180000 }, async () => {
   const puppeteer = createRequire(import.meta.url)(`${process.env.HOME}/.npm-packages/lib/node_modules/puppeteer`);
   const browser = await puppeteer.launch({ executablePath: process.env.CHROME_PATH ?? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", headless: true, args: ["--no-sandbox"] });
@@ -334,11 +446,22 @@ test("Chrome: exact owner/viewer notes, small views, offline copies, and synthet
     await page.setViewport({ width, height: 900 });
     const layout = await page.evaluate(() => {
       const tabs = document.querySelector('.tabs');
-      const first = [...document.querySelectorAll('main .state, main pre.raw, main iframe.htmlview, main p.muted.small')]
+      const first = [...document.querySelectorAll('main .state, main .preview, main pre.raw, main iframe.htmlview, main p.muted.small')]
         .find(e => e.getBoundingClientRect().height && e.getBoundingClientRect().top >= tabs.getBoundingClientRect().bottom);
       const rect = e => { const r = e.getBoundingClientRect(); return [r.x, r.y + scrollY, r.width, r.height]; };
-      return { gap: first.getBoundingClientRect().top - tabs.getBoundingClientRect().bottom, elements: [...document.querySelectorAll('main, main *')].map(e => [e.tagName, e.className?.baseVal ?? e.className, ...rect(e)]) };
+      const snapshot = () => ({ gap: first.getBoundingClientRect().top - tabs.getBoundingClientRect().bottom, elements: [...document.querySelectorAll('main, main *')].map(e => [e.tagName, e.className?.baseVal ?? e.className, ...rect(e)]) });
+      const after = snapshot();
+      // Compare the exact same saved copy with and without the scoped rule: timestamps cannot change the geometry.
+      const sheet = [...document.styleSheets].find(s => [...s.cssRules].some(r => r.selectorText === '.offline-page-limit'));
+      if (!sheet) return after;
+      const index = [...sheet.cssRules].findIndex(r => r.selectorText === '.offline-page-limit');
+      const rule = sheet.cssRules[index].cssText;
+      sheet.deleteRule(index);
+      const before = snapshot();
+      sheet.insertRule(rule, index);
+      return { ...after, before };
     });
+    if (layout.before && view !== "offline-too-large-html") assert.deepEqual(layout.elements, layout.before.elements, `${view} at ${width}px: every element rectangle is identical without the scoped rule`);
     console.log('render-limit layout ' + JSON.stringify({ view, width, ...layout }));
     return layout.gap;
   }
@@ -495,10 +618,8 @@ test("Chrome: exact owner/viewer notes, small views, offline copies, and synthet
             }
             if (captures && key === "largeHtml") await page.screenshot({ path: `${out}/4-offline-html-${width}.png` });
           }
-          if (key === "largeHtml") {
-            await page.evaluate(() => [...document.querySelectorAll('[role="tab"]')].find(e => e.textContent === "Source").click());
-            for (const width of [1280, 390]) await measureLayout(page, "offline-too-large-html-source", width);
-          }
+          await previewTab(page, key === "largeHtml" ? "Source" : "Text");
+          for (const width of [1280, 390]) await measureLayout(page, key === "largeHtml" ? "offline-too-large-html-source" : "offline-markdown-text", width);
         }
         for (const key of ["smallMarkdown", "smallHtml"]) {
           await page.goto(`${APP}/#/p/${pid}/a/${ids[key]}`); await page.reload();
@@ -512,6 +633,11 @@ test("Chrome: exact owner/viewer notes, small views, offline copies, and synthet
             }
             await page.evaluate(() => [...document.querySelectorAll('[role="tab"]')].find(e => e.textContent === "Source").click());
             for (const width of [1280, 390]) await measureLayout(page, "offline-small-html-source", width);
+          }
+          if (key === "smallMarkdown") {
+            for (const width of [1280, 390]) await measureLayout(page, "offline-small-markdown", width);
+            await previewTab(page, "Text");
+            for (const width of [1280, 390]) await measureLayout(page, "offline-small-markdown-text", width);
           }
           assert.deepEqual(await page.$eval(selector, e => [e.tagName, e.getAttribute("role"), e.parentElement.className]), [key === "smallHtml" ? "IFRAME" : "DIV", "tabpanel", ""]);
         }
