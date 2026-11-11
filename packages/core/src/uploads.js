@@ -352,6 +352,9 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
   }
   const fenced = "EXISTS (SELECT 1 FROM uploads WHERE id = ? AND state = 'sealed' AND finalize_token = ?)";
   let hasTextFinishSlot = false;
+  const releaseTextFinishSlot = () => {
+    if (hasTextFinishSlot && textFinishSlot?.token === token) textFinishSlot = null;
+  };
   try {
     const held = await current();
     const finalKey = held?.final_key;
@@ -364,6 +367,7 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
     const end = async (status, code, message, state, extra) => {
       const r = await db2(ctx).prepare("UPDATE uploads SET state = ?, result = ?, finalize_token = NULL, finalize_until = NULL WHERE id = ? AND state = 'sealed' AND finalize_token = ?").bind(state, JSON.stringify({ status, code, message, extra }), uploadId, token).run();
       if (!r.meta.changes) return false;
+      releaseTextFinishSlot();
       await audit(ctx, projectId, "upload.finish", u.artifact_id, null, "failed:" + code).run();
       return true;
     };
@@ -376,6 +380,7 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
     // Lost the lease before publishing: if cleanup ended the upload, remove the unreferenced object now (cleanup would
     // too). A takeover finisher (upload still sealed) publishes the same object.
     const lostAfterWrite = async () => {
+      releaseTextFinishSlot();
       const row = await current();
       if (row && (row.state === "failed" || row.state === "conflict")) await dropUnpublished(ctx.env, uploadId, finalKey);
       return lost();
@@ -434,6 +439,7 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
         [db2(ctx).prepare(`UPDATE uploads SET state = 'published', final_revision_id = ?, result = ?, finalize_token = NULL, finalize_until = NULL WHERE id = ? AND state = 'sealed' AND finalize_token = ? AND ${gate}`).bind(revId, JSON.stringify({ status: 200, body: ok2 }), uploadId, token, revId)],
         "upload.publish"
       );
+      releaseTextFinishSlot();
       if (!res.body?.idempotent_replay) {
         if (kind) await dropUnpublished(ctx.env, uploadId, finalKey).catch(() => {});
         await purgeStaging(ctx.env, u);
@@ -458,7 +464,7 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
       await db2(ctx).prepare("UPDATE uploads SET finalize_token = NULL, finalize_until = NULL WHERE id = ? AND finalize_token = ?").bind(uploadId, token).run().catch(() => {
       });
     } finally {
-      if (hasTextFinishSlot && textFinishSlot?.token === token) textFinishSlot = null;
+      releaseTextFinishSlot();
     }
   }
 }

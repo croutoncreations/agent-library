@@ -54,6 +54,18 @@ test("text finish slot follows lease renewal through text staging", async t => {
   assert.equal((await lib.uploadFinish(b.w.ctx, P, b.id, "contender")).status, 200);
 });
 
+test("text finish slot ends with the lease, not a stalled post-publication raw delete", async () => {
+  const a = await textUpload(), b = await textUpload();
+  let release, entered;
+  const gate = new Promise(r => { release = r; }), ready = new Promise(r => { entered = r; });
+  const del = a.w.env.BLOBS.delete, raw = a.w.row(a.id).final_key;
+  a.w.env.BLOBS.delete = async k => { if (k === raw) { entered(); await gate; } return del(k); };
+  const slow = lib.uploadFinish(a.w.ctx, P, a.id, "published"); await ready;
+  assert.equal(a.w.row(a.id).finalize_until, null);
+  try { assert.equal((await lib.uploadFinish(b.w.ctx, P, b.id, "next")).status, 200); }
+  finally { release(); await slow; }
+});
+
 for (const failure of ["validation", "infrastructure", "normal"]) test(`text finish slot releases immediately after ${failure}`, async () => {
   const a = await textUpload(failure === "validation" ? Buffer.from([0xc0, 0xaf]) : "synthetic"), b = await textUpload();
   if (failure === "infrastructure") a.w.r2.onGet = async () => { throw new Error("synthetic read failure"); };
