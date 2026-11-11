@@ -3369,7 +3369,7 @@ function renderMarkdownEditor(A, data, ui) {
   var conflictBox = h("div", { class: "card conflict", hidden: true });
   var previewBox = h("div", { class: "preview" });
   var savedSize = data.revision.size;
-  var previewNote = h("p", { class: "muted small preview-note", role: "status", "aria-live": "polite" });
+  var previewNote = h("p", { class: "muted small preview-note" });
   var renderNotice = h("p", { class: "muted small render-notice", role: "status", "aria-live": "polite", hidden: true });
   // HTML documents render in a sandboxed iframe: no scripts, forms or top navigation (see src/html.ts).
   // allow-same-origin only so its <img>/<video> carry the session; allow-popups so links open in a new tab.

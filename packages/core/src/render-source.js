@@ -8,10 +8,10 @@ import { HttpError } from "./util.js";
 export async function getRenderSource(ctx, projectId, artifactId, revNo, kind) {
   await authorizeProject(ctx, projectId, false);
   const artifact = await loadArtifact(ctx, projectId, artifactId);
-  if (artifact.kind !== kind) throw new HttpError(400, "invalid_input", kind === "markdown" ? "Not Markdown" : "Not an HTML document");
   const revision = await db(ctx).prepare("SELECT id, rev_no, size, body_key FROM revisions WHERE artifact_id = ? AND project_id = ? AND rev_no = ?")
     .bind(artifactId, projectId, revNo ?? artifact.head_rev).first();
   if (!revision) throw new HttpError(404, "not_found", "Revision not found");
+  if (artifact.kind !== kind) throw new HttpError(400, "invalid_input", kind === "markdown" ? "Not Markdown" : "Not an HTML document");
   const truncated = revision.size > RENDER_MAX_BYTES;
   if (kind === "html" && truncated) throw new HttpError(413, "render_too_large", "This page is larger than 1 MB and cannot be shown.");
   // Legacy inline versions also defer their body read until after the size check.
