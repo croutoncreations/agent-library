@@ -64,6 +64,10 @@ test("JSON structure and schema", () => {
 test("parseCsv exact characterisation before large-cell allocation optimisation", () => {
   const cases = [
     ["a,b\n1,2\n", { header: ["a", "b"], rows: [{ line: 2, cells: ["1", "2"] }] }],
+    ['a\n""""', { header: ["a"], rows: [{ line: 2, cells: ['"'] }] }],
+    ['a\n"""x"', { header: ["a"], rows: [{ line: 2, cells: ['"x'] }] }],
+    ['a\n"x""y""""z"""', { header: ["a"], rows: [{ line: 2, cells: ['x"y""z"'] }] }],
+    ['a,b\n"a""",b', { header: ["a", "b"], rows: [{ line: 2, cells: ['a"', "b"] }] }],
     ["a,b\r\n1,2", { header: ["a", "b"], rows: [{ line: 2, cells: ["1", "2"] }] }],
     ['a,b\n"x,y","line1\nline2"\n', { header: ["a", "b"], rows: [{ line: 2, cells: ["x,y", "line1\nline2"] }] }],
     ['a\n"he said ""hi"""', { header: ["a"], rows: [{ line: 2, cells: ['he said "hi"'] }] }],
@@ -84,11 +88,34 @@ test("parseCsv exact characterisation before large-cell allocation optimisation"
     ['a\n"x"y', 2, "unexpected character after closing quote"],
     ["", 1, "header row required"],
     ["a,a", 1, 'duplicate header "a"'],
-    ["a,b\n1", 2, "expected 2 columns, found 1"]
+    ["a,b\n1", 2, "expected 2 columns, found 1"],
+    ["a,b\n1,2,", 2, "expected 2 columns, found 3"],
+    ["a,b\n1,2\n\n", 3, "expected 2 columns, found 1"],
+    ['a\n"x"\r', 2, "bare CR line ending"],
+    ['a\n"x\r\ny"\nz"', 4, "quote inside unquoted field"],
+    ['a,a\n"open', 2, "unterminated quoted field"],
+    ['a,b\n1\n1,2\n1,2\n"open', 5, "unterminated quoted field"]
   ]) assert.throws(() => F.parseCsv(text), e => e.code === "invalid_content" && e.extra.line === line && e.extra.detail === detail, JSON.stringify(text));
 });
 
-test("spreadsheet-safe export only prefixes risky cells; canonical text untouched", () => {
-  const src = "a,b\n=1+1,ok\n@x,\"-2\"\n";
-  assert.equal(F.spreadsheetSafeCsv(src), "a,b\r\n'=1+1,ok\r\n'@x,'-2\r\n");
+test("CSV measurements preserve syntax, header, columns, then schema error precedence", () => {
+  for (const [text, format, line, detail] of [
+    [csv(["r1,x,,m,no,u,", "r2,x"]), "csv", 3, "expected 7 columns, found 2"],
+    [csv(["r1,x,,m,no,u,", '"open']), "csv", 3, "unterminated quoted field"],
+    [csv(["r1,x,,m,1,u,", "r2,x,,m,2,u,", "r1,x,,m,3,u,"]), "schema", 4, "duplicate id"],
+    [csv(["r1,x,,m,1,u,", "r1,x,,m,2,u,", '"open']), "csv", 4, "unterminated quoted field"]
+  ]) assert.throws(() => F.checkFile("csv", text, M, "fixture.csv"), e =>
+    e.status === 422 && e.code === "invalid_content" && e.extra.file === "fixture.csv" &&
+    e.extra.format === format && e.extra.line === line && e.extra.detail === detail);
+});
+
+test("spreadsheetSafeCsv exact output characterisation", () => {
+  for (const [text, expected] of [
+    ["a,b\n=1+1,ok\n@x,\"-2\"\n", "a,b\r\n'=1+1,ok\r\n'@x,'-2\r\n"],
+    ["a\n=x\n+x\n-x\n@x\n\tx\n\"\rx\"\n", "a\r\n'=x\r\n'+x\r\n'-x\r\n'@x\r\n'\tx\r\n\"'\rx\"\r\n"],
+    ['a,b\n"a""b","x,y"\n"x\ny","x\r\ny"\n,\n', 'a,b\r\n"a""b","x,y"\r\n"x\ny","x\r\ny"\r\n,\r\n'],
+    ["a\n", "a\r\n"],
+    ['"=header"', "'=header\r\n"],
+    ["a\n\n", "a\r\n\r\n"]
+  ]) assert.equal(new TextDecoder().decode(typeof F.spreadsheetSafeCsv(text) === "string" ? new TextEncoder().encode(F.spreadsheetSafeCsv(text)) : F.spreadsheetSafeCsv(text)), expected, JSON.stringify(text));
 });
