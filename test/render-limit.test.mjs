@@ -329,13 +329,26 @@ test("Chrome: exact owner/viewer notes, small views, offline copies, and synthet
   const browser = await puppeteer.launch({ executablePath: process.env.CHROME_PATH ?? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", headless: true, args: ["--no-sandbox"] });
   const captures = process.env.AGENT_LIBRARY_RENDER_CAPTURES === "1";
   const out = "tmp/design-captures/s2b2-ui3"; if (captures) mkdirSync(out, { recursive: true });
+  const onlineGaps = {};
+  async function measureLayout(page, view, width) {
+    await page.setViewport({ width, height: 900 });
+    const layout = await page.evaluate(() => {
+      const tabs = document.querySelector('.tabs');
+      const first = [...document.querySelectorAll('main .state, main pre.raw, main iframe.htmlview, main p.muted.small')]
+        .find(e => e.getBoundingClientRect().height && e.getBoundingClientRect().top >= tabs.getBoundingClientRect().bottom);
+      const rect = e => { const r = e.getBoundingClientRect(); return [r.x, r.y + scrollY, r.width, r.height]; };
+      return { gap: first.getBoundingClientRect().top - tabs.getBoundingClientRect().bottom, elements: [...document.querySelectorAll('main, main *')].map(e => [e.tagName, e.className?.baseVal ?? e.className, ...rect(e)]) };
+    });
+    console.log('render-limit layout ' + JSON.stringify({ view, width, ...layout }));
+    return layout.gap;
+  }
   try {
     for (const [who, role] of [[owner, "owner"], [viewer, "viewer"]]) {
       const page = await browser.newPage(); const [name, value] = who.cookie.split("="); await page.setCookie({ name, value, url: APP });
       await page.emulateMediaFeatures([{ name: "prefers-color-scheme", value: "dark" }]);
       const requests = []; page.on("request", r => { if (r.url().includes("/render")) requests.push(r.url()); });
       const errors = []; page.on("pageerror", e => errors.push(e.message));
-      for (const width of captures ? [1280, 390] : [1280]) {
+      for (const width of [1280, 390]) {
         await page.setViewport({ width, height: 900 });
         for (const key of ["largeMarkdown", "largeHtml", "smallMarkdown", "smallHtml"]) {
           requests.length = 0;
@@ -360,6 +373,7 @@ test("Chrome: exact owner/viewer notes, small views, offline copies, and synthet
             }
             if (html) { assert.deepEqual(requests, []); assert.equal(await page.$eval("iframe.htmlview", e => e.getAttribute("src")), null); }
             else await page.waitForFunction(() => document.querySelector(".preview h1")?.textContent === "early-render-marker");
+            if (role === "owner" && html) onlineGaps[width] = await measureLayout(page, "online-too-large-html", width);
             if (captures && role === "owner" && html && width === 1280) await page.screenshot({ path: `${out}/1-button-owner-1280.png` });
             if (html || role === "viewer") {
               // Start at the tab row, walk with real Tab keys, then activate the supported next step.
@@ -473,9 +487,17 @@ test("Chrome: exact owner/viewer notes, small views, offline copies, and synthet
             assert.equal(await page.$(".state button"), null);
             assert.deepEqual(await page.$eval(".state", e => [e.getAttribute("role"), e.getAttribute("aria-live"), e.classList.contains("error")]), ["tabpanel", null, false]);
           }
-          if (captures && key === "largeHtml") for (const width of [1280, 390]) {
-            await page.setViewport({ width, height: 900 });
-            await page.screenshot({ path: `${out}/4-offline-html-${width}.png` });
+          for (const width of [1280, 390]) {
+            const gap = await measureLayout(page, key === "largeHtml" ? "offline-too-large-html" : "offline-markdown", width);
+            if (key === "largeHtml") {
+              assert.ok(gap >= 8, `${width}px offline too-large box has at least 8px below the tabs`);
+              assert.ok(Math.abs(gap - onlineGaps[width]) <= 1, `${width}px offline gap matches the online gap within 1px`);
+            }
+            if (captures && key === "largeHtml") await page.screenshot({ path: `${out}/4-offline-html-${width}.png` });
+          }
+          if (key === "largeHtml") {
+            await page.evaluate(() => [...document.querySelectorAll('[role="tab"]')].find(e => e.textContent === "Source").click());
+            for (const width of [1280, 390]) await measureLayout(page, "offline-too-large-html-source", width);
           }
         }
         for (const key of ["smallMarkdown", "smallHtml"]) {
@@ -484,7 +506,12 @@ test("Chrome: exact owner/viewer notes, small views, offline copies, and synthet
           const selector = key === "smallHtml" ? "iframe.htmlview" : ".preview";
           if (key === "smallHtml") {
             assert.equal(await page.$eval(selector, e => e.previousElementSibling.textContent), "Images and videos in pages need a connection.");
-            if (captures) { await page.setViewport({ width: 1280, height: 900 }); await page.screenshot({ path: `${out}/4-offline-html-small-1280.png` }); }
+            for (const width of [1280, 390]) {
+              await measureLayout(page, "offline-small-html", width);
+              if (captures && width === 1280) await page.screenshot({ path: `${out}/4-offline-html-small-1280.png` });
+            }
+            await page.evaluate(() => [...document.querySelectorAll('[role="tab"]')].find(e => e.textContent === "Source").click());
+            for (const width of [1280, 390]) await measureLayout(page, "offline-small-html-source", width);
           }
           assert.deepEqual(await page.$eval(selector, e => [e.tagName, e.getAttribute("role"), e.parentElement.className]), [key === "smallHtml" ? "IFRAME" : "DIV", "tabpanel", ""]);
         }

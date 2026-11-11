@@ -345,6 +345,7 @@ code{font-family:ui-monospace,Menlo,monospace;font-size:.92em;overflow-wrap:anyw
 .doc-meta{margin:6px 0 0;color:var(--muted);font-size:13.5px;overflow-wrap:anywhere}
 .titlebar + .doc-meta{margin-top:-2px}
 main > .tabs,main > nav.tabs{margin:16px 0 12px}
+.offline-page-limit{margin-top:12px}
 .preview{font-size:16.5px;line-height:1.7;padding:20px 28px 24px}
 .preview > *{max-width:var(--read)}
 .preview h1,.preview h2,.preview h3,.preview h4{text-transform:none;letter-spacing:-.01em;color:var(--fg);font-weight:700;line-height:1.3;margin:1.4em 0 .5em}

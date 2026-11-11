@@ -3896,7 +3896,8 @@ async function viewOfflineItem(pid, aid, tab) {
     var fr = it.renderTooLarge
       ? stateBox("", "doc", "Page too large to show here", pageLimitNotice("Open Source"))
       : h("iframe", { class: "htmlview", title: "Rendered page (saved copy)", sandbox: "allow-popups allow-popups-to-escape-sandbox", referrerpolicy: "no-referrer" });
-    if (!it.renderTooLarge) fr.srcdoc = it.page || "";
+    if (it.renderTooLarge) fr.classList.add("offline-page-limit");
+    else fr.srcdoc = it.page || "";
     var rawH = h("pre", { class: "raw", text: it.body || "", hidden: true });
     var tabsH = tabList("Saved page views");
     [["page", "Page", fr], ["raw", "Source", rawH]].forEach(function (t) {
