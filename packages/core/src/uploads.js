@@ -7,7 +7,7 @@ import { FILE_BYTES_CEILING, explainLimit, fileTooLarge, guardSql, projectLimitG
 import { BINARY_TYPES, IMAGE_TYPES, VIDEO_TYPES, appConnectEnabled, assertWritable, audit, idemLookup, loadArtifact, mdBody, provenance, publishRevision, requireAppConnect, textCreateMetadata } from "./service.js";
 import { TEXT_MAX_BYTES } from "./text-limits.js";
 import { HttpError, int, nowIso, nowMs, randomId, sha256Hex, str } from "./util.js";
-import { deferSearchIndexing, extractSearchTermsFlat, releaseUploadTerms, reserveUploadTerms, searchDocCap } from "./search/tokens.js";
+import { deferSearchIndexing, extractUploadTerms, releaseUploadTerms, reserveUploadTerms, searchDocCap } from "./search/tokens.js";
 
 var db2 = /* @__PURE__ */ __name((ctx) => ctx.env.DB, "db");
 const TEXT_UPLOAD_KINDS = { "text/markdown": "markdown", "text/html": "html", "application/json": "json", "text/csv": "csv" };
@@ -483,11 +483,9 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
         searchCap = searchDocCap(ctx.env, check.size);
         searchUnits = text.length;
         if (searchCap > 0) {
+          // The ticket owns the terms: when the run settles, detaches or is discarded, they are released and dropped.
           searchTicket = reserveUploadTerms(ctx.env, text, check.size);
-          if (searchTicket) {
-            try { searchFlat = extractSearchTermsFlat(text, searchCap); }
-            catch { releaseUploadTerms(ctx.env, searchTicket, null, "error"); searchTicket = null; }
-          }
+          if (searchTicket) searchFlat = extractUploadTerms(ctx.env, searchTicket, text);
         }
       } catch (e) {
         // Only document validation errors are terminal. R2/D1 failures retain their retryable sealed state.

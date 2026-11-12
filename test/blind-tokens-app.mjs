@@ -6,10 +6,11 @@ import { createHash, createHmac } from "node:crypto";
 import { loadWorker } from "./load-worker.mjs";
 import * as W from "./blind-tokens-world.mjs";
 // workerd's FixedLengthStream and crypto.DigestStream, as the upload tests define them (Node stand-ins).
-import "./upload-world.mjs";
+import { d1BindArray } from "./upload-world.mjs";
 
 export const lib = await loadWorker({
-  "search/tokens.js": ["searchAdmissionState", "drainSearchIndexing", "searchFlatHeld"],
+  "search/tokens.js": ["searchAdmissionState", "drainSearchIndexing", "searchFlatHeld", "withDeferredWork", "discardDeferredWork", "deferSearchIndexing", "skipSearchJobs"],
+  "backup.js": ["prepareBackupJobs"],
   "service.js": ["publishRevision", "deferIndexing"],
 });
 
@@ -51,6 +52,9 @@ function blobStore() {
 export async function app(vars = {}) {
   const world = W.mkWorld();
   const BLOBS = blobStore();
+  // D1's bind conversion (slice 3b's d1BindArray: a byte list binds as a BLOB, as D1 does; node:sqlite cannot bind arrays).
+  const prepare = world.DB.prepare;
+  world.DB.prepare = (q) => { const st = prepare(q); const bind = st.bind; return { ...st, bind: (...p) => bind(...p.map(d1BindArray)) }; };
   const env = { DB: world.DB, BLOBS, LOCAL_DEV_LOGIN: PASS, RATE_READS_PER_MIN: "100000", RATE_WRITES_PER_MIN: "100000", RATE_AUTHFAIL_PER_MIN: "100000", ...vars };
   const waits = [];
   let waitUntil = (p) => { waits.push(p); };

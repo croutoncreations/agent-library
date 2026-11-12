@@ -399,12 +399,18 @@ test("12: the response resolves before deferred_start for a 10 MiB worst-case sa
   const seen = [];
   a.world.before = async (c) => { if (isRunCall(c)) seen.push("run_call"); };
   const { events } = await captureLogs(async () => {
+    // Every log line as written (captureLogs' collector is wrapped): read at the moment the fetch promise resolves.
+    const lines = [], collect = console.log;
+    console.log = (...x) => { lines.push(String(x[0])); return collect(...x); };
     const r = await a.fetch(`/api/projects/p12big/artifacts/${md.body.artifact_id}`, { method: "PUT",
       headers: { cookie: a.cookie, "x-csrf-token": a.csrf, "content-type": "application/json", "idempotency-key": "key-big-save-0001" },
       body: JSON.stringify({ expected_revision: 1, body: big }) });
     // The moment the fetch promise resolved: record what the run had done by then, in the same observation.
     seen.push(`response:${r.status}`);
-    seen.push(`phases:${(globalThis.__phaseLog ?? []).length}`);
+    // The run has not started: no deferred_start (SEARCH_PHASE_LOG = "1") and no extraction (extract_done) yet.
+    seen.push(`started:${lines.some((l) => /"phase":"(deferred_start|extract_done|hmac_done)"/.test(l))}`);
+    seen.push(`handler_done:${lines.some((l) => /"phase":"handler_done"/.test(l))}`);
+    console.log = collect;
     await r.text();
     await a.settle();
   });
@@ -412,6 +418,7 @@ test("12: the response resolves before deferred_start for a 10 MiB worst-case sa
   const at = seen.findIndex((x) => x.startsWith("response:"));
   assert.equal(seen[at], "response:200");
   assert.deepEqual(seen.slice(0, at), [], "no run D1 call before the response resolved");
+  assert.deepEqual(seen.slice(at + 1, at + 3), ["started:false", "handler_done:true"], "at the response: handed over, not started, nothing extracted");
   const phases = events.filter((e) => e.event === "search_phase").map((e) => e.phase);
   assert.deepEqual(phases.slice(0, 2), ["handler_done", "deferred_start"]);
   assert.ok(seen.slice(at + 1).includes("run_call"), "the run ran after");
@@ -1070,4 +1077,137 @@ test("13l calls: a 100 × 10 KB import adds no D1 call before its response; the 
   idle();
   const skipped = events.filter((e) => e.event === "search_index_skipped").map((e) => e.reasons);
   console.log(JSON.stringify({ event: "test_measure", test: "13l calls", requestCalls: atResponse, runCalls: calls.run, responseMs, indexed: indexed.length, skipped }));
+});
+
+test("4a8-1: an upload finish whose publication is paused past the horizon while another request detaches its run answers 200; the document is missing, nothing held", async () => {
+  const a = await app();
+  await a.project("phz");
+  const b0 = baseline();
+  const realNow = Date.now;
+  let release, held = false;
+  const paused = new Promise((r) => { release = r; });
+  const text = Array.from({ length: 20000 }, (_, i) => "horizonword" + i.toString(36)).join(" ");
+  const f = await textUpload(a, "phz", text, { finish: false });
+  a.world.before = async (c) => { if (!held && c.kind === "batch" && c.qs.some((q) => /INSERT INTO revisions/.test(q))) { held = true; await paused; } };
+  let fin, events;
+  try {
+    ({ result: fin, events } = await captureLogs(async () => {
+      const p = a.req("POST", `/api/projects/phz/uploads/${f.begin.upload_id}/finish`, {});
+      await until(() => held, { what: "the publish batch" });
+      assert.equal(lib.searchFlatHeld(), b0.flat + 1, "the ticket's terms are held during publication");
+      // Past the 120 s horizon, another request's admission detaches the (unstarted) upload run.
+      Date.now = () => realNow() + 121000;
+      a.world.before = null;
+      const other = await a.req("POST", "/api/projects/phz/artifacts", { title: "Synthetic", body: "other request" });
+      assert.equal(other.status, 201);
+      assert.equal(lib.searchAdmissionState().detached, 1, "the upload run was detached");
+      assert.equal(lib.searchFlatHeld(), b0.flat, "its packed terms dropped at detach");
+      release();
+      const x = await p;
+      await a.settle();
+      return x;
+    }));
+  } finally { Date.now = realNow; a.world.before = null; }
+  assert.equal(fin.status, 200, JSON.stringify(fin.body));
+  assert.ok(events.some((e) => e.event === "search_run_detached"));
+  assert.equal(docRow(a, fin.body.artifact_id), undefined, "the upload's document has no row");
+  assert.ok(missing(a).includes(fin.body.artifact_id), "it is missing");
+  assertBaseline(b0, "after horizon");
+  assertExact(a);
+});
+
+// --- Review 4a8-2/3: backup jobs are prepared before the commit; restore ids in stored form --------------------------
+test("4a8-2: backup.js does no text work after the commit: no utf8Length import, and no TextEncoder call between the batch and the response", async () => {
+  const src = readFileSync(join(ROOT, "packages/core/src/backup.js"), "utf8");
+  assert.ok(!/\butf8Length\b/.test(src), "utf8Length is not used by backup.js");
+  const a = await app();
+  await a.project("pk2");
+  const ws = wsOfPrincipal(a);
+  const docs = Array.from({ length: 20 }, (_, i) => `scan check ${i} ` + "z".repeat(2000));
+  let armed = false, encodes = 0;
+  const Real = TextEncoder.prototype.encode, RealInto = TextEncoder.prototype.encodeInto;
+  // Each document text is over 2,000 units; the response's own small JSON body (encoded by Response) is not text work.
+  const isText = (v) => typeof v === "string" && v.length >= 2000;
+  TextEncoder.prototype.encode = function (...x) { if (armed && isText(x[0])) encodes++; return Real.apply(this, x); };
+  TextEncoder.prototype.encodeInto = function (...x) { if (armed && isText(x[0])) encodes++; return RealInto.apply(this, x); };
+  // Armed from the publishing batch's return until the response resolves.
+  a.world.after = async (c) => { if (c.kind === "batch" && c.qs.some((q) => /INSERT INTO revisions/.test(q))) armed = true; };
+  let r;
+  try { r = await a.req("POST", `/api/workspaces/${ws}/import`, synthBackup({ docs })); }
+  finally { armed = false; TextEncoder.prototype.encode = Real; TextEncoder.prototype.encodeInto = RealInto; a.world.after = null; }
+  assert.equal(r.status, 201, JSON.stringify(r.body));
+  assert.equal(encodes, 0, "no text encoded after the commit");
+  await captureLogs(() => a.settle());
+  idle();
+});
+
+/** A restore backup whose documents carry odd ids (numbers, byte lists) beside ordinary ones. */
+function oddIdBackup(entries) {
+  const at = "2026-01-01T00:00:00.000Z";
+  const artifacts = [], revisions = [];
+  for (const { id, rev, text } of entries) {
+    artifacts.push({ id, kind: "markdown", title: "Synthetic", folder: "", tags: "[]", head_rev: 1, head_revision_id: rev, meta_version: 1, trashed_at: null, created_at: at, updated_at: at });
+    revisions.push({ id: rev, artifact_id: id, rev_no: 1, author_id: "hum_src", body: text, blob_key: null, size: Buffer.byteLength(text), sha256: sha(text), mime: "text/markdown", restored_from: null, created_at: at });
+  }
+  return { schema: "agent-library-backup/1", exported_at: at, project: { id: "podd_src", title: "Synthetic", created_at: at }, artifacts, revisions, comments: [], meta_versions: [], blobs: {} };
+}
+
+test("4a8-3: one numeric-id document in a restore no longer costs the others their jobs; it is indexed under its stored form \"7.0\"", async () => {
+  const a = await app();
+  const entries = [{ id: 7, rev: 8, text: "numeric document words" }, { id: "doc_a", rev: "rev_a", text: "ordinary alpha" }, { id: "doc_b", rev: "rev_b", text: "ordinary beta" }];
+  const { result: r, events } = await captureLogs(async () => { const x = await a.req("POST", "/api/restore", oddIdBackup(entries)); await a.settle(); return x; });
+  assert.equal(r.status, 201, JSON.stringify(r.body));
+  assert.deepEqual(r.body, { restored_project: "podd_src", artifacts: 3, revisions: 3, blobs: 0, grants: 0 }, "response unchanged");
+  assert.equal(headOf(a, "7.0"), "8.0", "D1 stores the numbers as text");
+  assertIndexed(a, "podd_src", "7.0", "numeric document words", "numeric");
+  assertIndexed(a, "podd_src", "doc_a", "ordinary alpha", "a");
+  assertIndexed(a, "podd_src", "doc_b", "ordinary beta", "b");
+  assert.ok(!events.some((e) => e.event === "search_index_failed"));
+  idle();
+});
+
+test("4a8-3: a byte-list document id is skipped alone ({refused: 1}); numeric and ordinary documents of the same restore are indexed", async () => {
+  const a = await app();
+  const entries = [{ id: 7, rev: 8, text: "numeric words" }, { id: [100, 111, 99], rev: "rev_bytes", text: "byte list words" },
+    { id: "doc_a", rev: "rev_a", text: "ordinary alpha" }, { id: "doc_b", rev: "rev_b", text: "ordinary beta" }];
+  const { result: r, events } = await captureLogs(async () => { const x = await a.req("POST", "/api/restore", oddIdBackup(entries)); await a.settle(); return x; });
+  assert.equal(r.status, 201, JSON.stringify(r.body));
+  assert.deepEqual(r.body, { restored_project: "podd_src", artifacts: 4, revisions: 4, blobs: 0, grants: 0 });
+  assertIndexed(a, "podd_src", "7.0", "numeric words", "numeric");
+  assertIndexed(a, "podd_src", "doc_a", "ordinary alpha", "a");
+  assertIndexed(a, "podd_src", "doc_b", "ordinary beta", "b");
+  assert.equal(W.one(a.world, "SELECT COUNT(*) AS n FROM search_token_docs WHERE typeof(artifact_id) <> 'text' OR artifact_id NOT IN ('7.0','doc_a','doc_b')").n, 0, "no row for the byte-list document");
+  assert.deepEqual(events.filter((e) => e.event === "search_index_skipped").map((e) => e.reasons), [{ refused: 1 }]);
+  idle();
+});
+
+test("4a8-3: prepareBackupJobs maps ids through the stored forms, counts non-text ids as refused, and never uses String(id)", async () => {
+  const backup = oddIdBackup([{ id: 7, rev: 8, text: "a" }, { id: [1, 2], rev: "r2", text: "b" }, { id: "lone\ud800", rev: "r3", text: "c" }]);
+  const tb = new Map(backup.revisions.map((r) => [r, Buffer.byteLength(r.body)]));
+  const stored = new Map([[7, "7.0"], [8, "8.0"], ["lone\ud800", "lone\ufffd"], ["r2", "r2"], ["r3", "r3"]]);
+  stored.set(backup.artifacts[1].id, "\u0000blob:1,2");
+  const { jobs, refused } = lib.prepareBackupJobs(backup, tb, { project: "p", artifact: (id) => stored.get(id) ?? null, revision: (id) => stored.get(id) ?? null });
+  assert.deepEqual(jobs.map((j) => [j.artifactId, j.revisionId, j.textBytes]), [["7.0", "8.0", 1], ["lone\ufffd", "r3", 1]]);
+  assert.equal(refused, 1);
+  // A missing stored form (null) is refused too, never String(id).
+  const none = lib.prepareBackupJobs(backup, tb, { project: "p", artifact: () => null, revision: () => null });
+  assert.deepEqual([none.jobs.length, none.refused], [0, 3]);
+  // The refused count reaches the request's skip line once.
+  const env = lib.withDeferredWork({});
+  const { events } = await captureLogs(() => { lib.skipSearchJobs(env, "refused", refused); lib.discardDeferredWork(env); });
+  assert.deepEqual(events.filter((e) => e.event === "search_index_skipped").map((e) => e.reasons), [{ refused: 1 }]);
+});
+
+test("4a8-3: a lone-surrogate text document id does not restore (existing behaviour, not pinned); nothing is deferred", async () => {
+  const a = await app();
+  const { result: r, events } = await captureLogs(async () => {
+    const x = await a.req("POST", "/api/restore", oddIdBackup([{ id: "lone\ud800x", rev: "rev_l", text: "lone words" }, { id: "doc_a", rev: "rev_a", text: "ordinary" }]));
+    await a.settle();
+    return x;
+  });
+  assert.ok(r.status < 200 || r.status >= 300, `not a success: ${r.status}`);
+  assert.equal(W.one(a.world, "SELECT COUNT(*) AS n FROM revisions").n, 0, "nothing published");
+  assert.equal(a.waits.length, 0, "no run");
+  assert.ok(!events.some((e) => /^search_/.test(e.event)), "no search line");
+  idle();
 });

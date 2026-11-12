@@ -677,6 +677,7 @@ export class SearchRun {
     this.nonce = randomId("sw", 9);
     this.phases = new Set();
     this.phaseLog = false;   // set from the env that admits or starts the run (searchPhaseLog)
+    this.tickets = new Set();   // held upload tickets (reserveUploadTerms); ended with the run (endTickets)
     this.skipped = {};
     this.completed = 0;
     this.unchanged = 0;
@@ -724,6 +725,7 @@ export class SearchRun {
     if (this.detached || this.settled) return;
     this.detached = true;
     this.holder.detached = true;
+    endTickets(this);
     clearHolder(this.holder);
     isolate.active.delete(this);
     isolate.activeBytes -= this.envelope + this.payload;
@@ -735,6 +737,7 @@ export class SearchRun {
   /** Settle once: nulls every holder field and releases the reservation (or frees its detached entry). */
   settle() {
     if (this.settled) return;
+    endTickets(this);
     clearHolder(this.holder);
     if (this.detached) isolate.detached.delete(this);
     else {
@@ -1342,18 +1345,32 @@ function requestRun(q, n) {
 }
 
 // --- Upload finish: the payload reservation is taken before extraction ----------------------------------------------
-/** Ticket → { run, amount, units, state: "held" | "consumed" | "released" }. Tickets are opaque frozen objects. */
+/**
+ * Held ticket → { key, run, amount, units, cap, flat, state: "held" }. Tickets are opaque frozen objects; only held
+ * tickets are in the map (consumed, released and run-ended tickets are deleted, so any later use is refused).
+ */
 const UPLOAD_TICKETS = new WeakMap();
-function releaseTicket(t) {
+/** End a held ticket: release its reservation (unless `consumed`), drop its packed terms unless consumed. */
+function endTicket(t, how) {
   if (t.state !== "held") return;
-  t.state = "released";
+  t.state = how;
+  UPLOAD_TICKETS.delete(t.key);
+  t.run.tickets.delete(t.key);
+  if (how === "consumed") { t.flat = null; return; }
   t.run.release(t.amount);   // a no-op once the run detached or settled (its payload is gone with it)
+  dropUnadmittedFlat(t.flat);
+  t.flat = null;
+}
+const releaseTicket = (t) => endTicket(t, "released");
+/** Run end (settle, detach; discard settles): every still-held ticket is released and its packed terms dropped. */
+function endTickets(run) {
+  for (const key of [...run.tickets]) { const t = UPLOAD_TICKETS.get(key); if (t) endTicket(t, "released"); else run.tickets.delete(key); }
 }
 /**
  * Upload finish, inside its slot and before extraction: reserve in this request's run the payload an upload job of
  * `text` (the decoded upload; its .length is the job's textUnits) and `textBytes` (the stored size) will be charged:
- * min(12,000,000, 3 × units) + 96 B × docCap. The same limits as admission (the run's 26 MiB and documents and code
- * units, the isolate's 32 MiB). Returns an opaque ticket for the job's `ticket`, or null with nothing reserved: off
+ * min(12,000,000, 3 × units) + 96 B × docCap, within the run's 26 MiB and the isolate's 32 MiB. It checks the run's
+ * document and code-unit counts at reservation but does not reserve them: admission re-checks them. Returns an opaque ticket for the job's `ticket`, or null with nothing reserved: off
  * (docCap 0), no deferred-work queue, the run already started, or no room (counted as one `admission` skip). Never throws.
  */
 export function reserveUploadTerms(env, text, textBytes) {
@@ -1373,7 +1390,8 @@ export function reserveUploadTerms(env, text, textBytes) {
       return null;
     }
     const ticket = Object.freeze({});
-    UPLOAD_TICKETS.set(ticket, { run, amount, units, state: "held" });
+    UPLOAD_TICKETS.set(ticket, { key: ticket, run, amount, units, cap, flat: null, state: "held" });
+    run.tickets.add(ticket);
     return ticket;
   } catch {
     if (q) q.skipped.error = (q.skipped.error ?? 0) + 1;
@@ -1387,14 +1405,43 @@ export function reserveUploadTerms(env, text, textBytes) {
  */
 export function releaseUploadTerms(env, ticket, handle, reason) {
   try {
+    const q = env?.[DEFERRED];
     const t = ticket ? UPLOAD_TICKETS.get(ticket) : null;
+    // Only the request whose run holds the ticket may release it (another env's call is a no-op).
+    if (t && t.run !== q?.run) return;
     if (t) releaseTicket(t);
     if (handle) dropUnadmittedFlat(handle);
-    const q = env?.[DEFERRED];
     if (reason && q) q.skipped[reason] = (q.skipped[reason] ?? 0) + 1;
   } catch { /* never fails the finish */ }
 }
+/**
+ * Upload finish, after reserveUploadTerms: extract `text`'s terms under the ticket (the cap it was reserved for) and
+ * record the handle as the ticket's own, so the run's end drops them with the reservation. Null when the ticket is not
+ * held by this env's run, already has terms, or `text` is not the reserved one; an extraction failure releases the
+ * ticket and counts one `error` skip. Never throws.
+ */
+export function extractUploadTerms(env, ticket, text) {
+  const q = env?.[DEFERRED];
+  const t = ticket ? UPLOAD_TICKETS.get(ticket) : null;
+  if (!t || t.run !== q?.run || t.flat !== null || typeof text !== "string" || text.length !== t.units) return null;
+  try {
+    t.flat = extractSearchTermsFlat(text, t.cap);
+    return t.flat;
+  } catch {
+    try { releaseTicket(t); q.skipped.error = (q.skipped.error ?? 0) + 1; } catch { /* never throws */ }
+    return null;
+  }
+}
 
+/** Count `n` documents a publishing path could not describe as jobs (reason, e.g. "refused") in the request's skip line. */
+export function skipSearchJobs(env, reason, n) {
+  try {
+    const q = env?.[DEFERRED];
+    if (!q || !Number.isSafeInteger(n) || n <= 0) return;
+    if (q.started || q.discarded) q.skipped.late = (q.skipped.late ?? 0) + n;
+    else q.skipped[reason] = (q.skipped[reason] ?? 0) + n;
+  } catch { /* never throws */ }
+}
 /** Log the request's skipped jobs when it has no run (a run logs its own, once, when it ends). */
 function logRequestSkips(q) {
   const n = skipCount(q.skipped);
@@ -1487,7 +1534,7 @@ export function admitSearchJobs(env, run, jobs) {
     for (const j of all) {
       if (j.ticket === null) continue;
       const t = UPLOAD_TICKETS.get(j.ticket);
-      if (t.state !== "held" || t.run !== run || tickets.has(j.ticket) || t.units !== j.units || t.amount !== searchJobCharge(j, { upload: true }))
+      if (!t || t.state !== "held" || t.run !== run || t.flat !== j.flat || tickets.has(j.ticket) || t.units !== j.units || t.amount !== searchJobCharge(j, { upload: true }))
         throw new HttpError(500, "search_job_invalid", "A search job is invalid: ticket");
       tickets.add(j.ticket);
     }
@@ -1525,7 +1572,7 @@ export function admitSearchJobs(env, run, jobs) {
       job.flat = null;
       continue;
     }
-    if (ticket) ticket.state = "consumed";
+    if (ticket) endTicket(ticket, "consumed");
     job.charge = charge;
     run.textUnits += job.units;
     if (job.flat !== null) FLAT_ADMITTED.add(job.flat);

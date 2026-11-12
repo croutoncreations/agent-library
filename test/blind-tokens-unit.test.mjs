@@ -17,7 +17,7 @@ const lib = await loadWorker({
     "indexSearchJobs", "SEARCH_BATCH_TOKENS_MAX", "SEARCH_BATCH_STATEMENTS_MAX", "SEARCH_RUN_LIMITS",
     "openSearchRun", "admitSearchJobs", "runSearchIndexing", "searchAdmissionState", "withDeferredWork", "deferSearchIndexing", "startDeferredWork",
     "discardDeferredWork", "drainSearchIndexing", "SEARCH_CALL_ENVELOPE_BYTES", "SEARCH_RUN_BASE_BYTES", "SEARCH_ACTIVE_MAX_BYTES", "SEARCH_RUN_MAX_BYTES",
-    "SEARCH_DETACHED_MAX", "SEARCH_DETACH_AFTER_MS", "reserveUploadTerms", "releaseUploadTerms"],
+    "SEARCH_DETACHED_MAX", "SEARCH_DETACH_AFTER_MS", "reserveUploadTerms", "releaseUploadTerms", "extractUploadTerms"],
   "search/unicode61.js": ["u61FoldToken"],
   "limits.js": ["LIMIT_KEYS", "workspaceLimits"],
   "adapters.js": ["withAdapters", "resolveAdapters"],
@@ -1835,7 +1835,7 @@ test("upload ticket: reserves the upload charge before extraction; admitting its
   assert.ok(ticket && Object.isFrozen(ticket) && Object.keys(ticket).length === 0, "opaque frozen ticket");
   const s1 = adm.searchAdmissionState();
   assert.equal(s1.activeBytes, ENV + BASE + uploadCharge(text), "reserved before any job exists");
-  const flat = adm.extractSearchTermsFlat(text, 20000);
+  const flat = adm.extractUploadTerms(req, ticket, text);
   adm.deferSearchIndexing(req, [uploadJob("up1", flat, text, ticket)]);
   assert.equal(adm.searchAdmissionState().activeBytes, s1.activeBytes, "transfer: unchanged at admission");
   // The finish's finally: the ticket is consumed, the handle admitted: nothing is released or dropped.
@@ -1877,7 +1877,7 @@ test("upload ticket: forged, copied, consumed, released or another run's ticket 
   await logs(() => adm.deferSearchIndexing(req, [uploadJob("t2", flat2, "other text entirely", mine)]));
   assert.equal(adm.searchFlatHeld(), held0);
   // Consumed: admitted once, then refused.
-  const flat3 = adm.extractSearchTermsFlat(text, 20000);
+  const flat3 = adm.extractUploadTerms(req, mine, text);
   adm.deferSearchIndexing(req, [uploadJob("t1", flat3, text, mine)]);
   const flat4 = adm.extractSearchTermsFlat(text, 20000);
   const { events } = await logs(() => adm.deferSearchIndexing(req, [uploadJob("t2", flat4, text, mine)]));
@@ -1931,4 +1931,96 @@ test("upload ticket: null with nothing reserved when it does not fit, when off, 
   assert.equal(adm.searchAdmissionState().activeBytes, s.activeBytes, "release after detach changes nothing");
   await logs(async () => { adm.discardDeferredWork(r3); adm.discardDeferredWork(r4); });
   assertIdle();
+});
+
+// --- Review 4a8: a held ticket owns its packed terms; run end releases and drops them --------------------------------
+/** Several hundred KiB of packed terms: 20,000 distinct 20-unit words. */
+const bigUpload = () => words(20000, "uploadtermpadding").join(" ");
+
+test("review 4a8-1: detach at the horizon releases a held ticket AND drops its packed terms; the later defer is refused quietly, release is a no-op", async () => {
+  const world = world1(["hz1"]);
+  const held0 = adm.searchFlatHeld();
+  const req = adm.withDeferredWork(aenv(world));
+  const text = bigUpload();
+  const ticket = adm.reserveUploadTerms(req, text, Buffer.byteLength(text));
+  assert.ok(ticket);
+  const flat = adm.extractUploadTerms(req, ticket, text);
+  assert.ok(flat && flat.byteLength > 300 * 1024, `packed ${flat?.byteLength}`);
+  assert.equal(adm.searchFlatHeld(), held0 + 1);
+  // Publication "stalls" past the horizon; another request's admission detaches the unstarted run.
+  advance(adm.SEARCH_DETACH_AFTER_MS + 1);
+  const other = adm.withDeferredWork(aenv(world));
+  await logs(() => adm.deferSearchIndexing(other, [job("hz1", "other words")]));
+  await logs(() => adm.discardDeferredWork(other));
+  const s = adm.searchAdmissionState();
+  assert.equal(s.detached, 1);
+  assert.equal(s.activeBytes, 0, "only the detached envelope remains (counted in the detached set)");
+  assert.equal(adm.searchFlatHeld(), held0, "the arrays are gone, not merely uncharged");
+  // The upload resumes: its defer is refused quietly, its finally release changes nothing.
+  const { events } = await logs(() => adm.deferSearchIndexing(req, [uploadJob("hz1", flat, text, ticket)]));
+  assert.ok(!events.some((e) => e.event === "search_phase"));
+  adm.releaseUploadTerms(req, ticket, flat);
+  assert.equal(adm.searchFlatHeld(), held0);
+  assert.equal(adm.searchAdmissionState().activeBytes, 0);
+  await logs(() => adm.discardDeferredWork(req));
+  await adm.drainSearchIndexing();
+});
+
+test("review 4a8-1: settle and discard release every held ticket of the run and drop its storage", async () => {
+  const world = world1(["sd1"]);
+  const held0 = adm.searchFlatHeld();
+  const text = bigUpload();
+  // discard
+  const r1 = adm.withDeferredWork(aenv(world));
+  const t1 = adm.reserveUploadTerms(r1, text, Buffer.byteLength(text));
+  const f1 = adm.extractUploadTerms(r1, t1, text);
+  assert.equal(adm.searchFlatHeld(), held0 + 1);
+  await logs(() => adm.discardDeferredWork(r1));
+  assertIdle();
+  assert.equal(adm.searchFlatHeld(), held0, "discard dropped the storage");
+  const { events: e1 } = await logs(() => adm.deferSearchIndexing(r1, [uploadJob("sd1", f1, text, t1)]));
+  assert.deepEqual(e1.filter((e) => e.event === "search_index_failed").map((e) => e.code), [], "late after discard: counted, no error");
+  // settle (a run that started with another job while the ticket was still held)
+  const r2 = adm.withDeferredWork(aenv(world));
+  const t2 = adm.reserveUploadTerms(r2, text, Buffer.byteLength(text));
+  const f2 = adm.extractUploadTerms(r2, t2, text);
+  adm.deferSearchIndexing(r2, [job("sd1", "plain words")]);
+  const waits = [];
+  await logs(async () => { adm.startDeferredWork(r2, { waitUntil: (p) => waits.push(p) }); await Promise.all(waits); });
+  assertIdle();
+  assert.equal(adm.searchFlatHeld(), held0, "settle dropped the held ticket's storage");
+  adm.releaseUploadTerms(r2, t2, f2);
+  assertIdle();
+  assert.equal(adm.searchFlatHeld(), held0);
+});
+
+test("review 4a8-1: a ticket's job must carry the ticket's own handle; a ticket released through another request's env is a no-op", async () => {
+  const world = world1(["mm1", "mm2"]);
+  const held0 = adm.searchFlatHeld();
+  const text = "mismatch words";
+  const req = adm.withDeferredWork(aenv(world));
+  const ticket = adm.reserveUploadTerms(req, text, Buffer.byteLength(text));
+  const own = adm.extractUploadTerms(req, ticket, text);
+  const stranger = adm.extractSearchTermsFlat(text, 20000);
+  const before = adm.searchAdmissionState().activeBytes;
+  const { events } = await logs(() => adm.deferSearchIndexing(req, [uploadJob("mm1", stranger, text, ticket)]));
+  assert.ok(events.some((e) => e.code === "search_job_invalid"), "mismatched handle refused");
+  assert.equal(adm.searchAdmissionState().activeBytes, before);
+  // Another request's env: release does nothing (the ticket stays held, its storage alive).
+  const other = adm.withDeferredWork(aenv(world));
+  adm.releaseUploadTerms(other, ticket, own);
+  assert.equal(adm.searchAdmissionState().activeBytes, before, "not released through a foreign env");
+  assert.equal(adm.searchFlatHeld(), held0 + 1, "own storage alive");
+  // A second extraction under the same ticket is refused (null), and extraction through a foreign env too.
+  assert.equal(adm.extractUploadTerms(req, ticket, text), null);
+  const t2 = adm.reserveUploadTerms(req, text, Buffer.byteLength(text));
+  assert.equal(adm.extractUploadTerms(other, t2, text), null);
+  // The own handle is admitted.
+  adm.deferSearchIndexing(req, [uploadJob("mm2", own, text, ticket)]);
+  adm.releaseUploadTerms(req, t2, null);
+  const waits = [];
+  await logs(async () => { adm.startDeferredWork(req, { waitUntil: (p) => waits.push(p) }); await Promise.all(waits); });
+  assert.equal(W.docRow(world, "mm2").revision_id, "rev_mm2");
+  assertIdle();
+  assert.equal(adm.searchFlatHeld(), held0);
 });
