@@ -13,6 +13,7 @@ const sha = (b) => createHash("sha256").update(b).digest("hex");
 const MiB = 1024 * 1024;
 const pngLike = (n) => { const b = randomBytes(n); PNG.copy(b, 0, 0, Math.min(PNG.length, n)); return b; };
 const status = (s, code) => (e) => e?.status === s && e?.code === code;
+const silentLogs = async (fn) => { const real = console.error; console.error = () => {}; try { return await fn(); } finally { console.error = real; } };
 
 /** A World (encryption on unless off) with BLOBS and batch spies; begin/put/finish through the production code. */
 function setup({ encryption = true, vars = {} } = {}) {
@@ -286,25 +287,144 @@ test("design test 26: a finish whose publish committed, retried concurrently whi
   assert.equal(s.w.row(id).state, "published");
 });
 
-test("design test 26: when the batch itself hits a fence but this request's answer is already stored, runBatch returns it and finish does not end the upload", async () => {
+test("design test 26: the batch hits a fence after a racing finish committed this publication: runBatch returns the stored answer, the upload is published, the bytes read back, one revision", async () => {
   const s = setup();
   const bytes = pngLike(3000);
   const id = await s.begin(bytes);
   assert.equal((await s.w.put(id, bytes)).status, 200);
   const k = "finish-replay-2";
-  // Just before this finish's batch: a racing finish under the same idempotency key stored its answer, then the key
-  // was shredded. The batch hits the key fence; runBatch finds the stored answer and returns it in place of the refusal.
+  const u = s.w.row(id);
+  const revId = u.final_key.slice(u.final_key.lastIndexOf("/") + 1);
+  const ok = { artifact_id: u.artifact_id, revision: 1, revision_id: revId, sha256: sha(bytes), size: bytes.length };
+  // Just before this finish's publishing batch: a racing finish under the same idempotency key commits the same
+  // publication (revision row with the upload's columns, head moved, upload published, answer stored), and then the
+  // key is shredded. This batch's revision INSERT matches nothing and its key fence fails.
   s.w.hooks.beforeBatch = async () => {
-    const digest = sha(id);
+    const t = new Date().toISOString();
+    s.w.sql.prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, body_key, blob_key, blob_key_id, blob_header, size, sha256, mime, restored_from, created_at, via_kind, via_id, via_label, client_info, change_note)
+      VALUES (?, ?, ?, 1, 'hum_synthetic', NULL, NULL, ?, ?, ?, ?, ?, 'image/png', NULL, ?, 'browser', NULL, NULL, NULL, NULL)`).run(revId, u.artifact_id, P, u.final_key, u.enc_key_id, u.enc_header, bytes.length, sha(bytes), t);
+    s.w.sql.prepare("UPDATE artifacts SET head_rev = 1, head_revision_id = ?, updated_at = ? WHERE id = ?").run(revId, t, u.artifact_id);
+    s.w.sql.prepare("UPDATE uploads SET state = 'published', final_revision_id = ?, result = ?, finalize_token = NULL, finalize_until = NULL WHERE id = ?").run(revId, JSON.stringify({ status: 200, body: ok }), id);
     s.w.sql.prepare("INSERT INTO idempotency (principal_id, project_id, op, key, digest, status, response, created_at) VALUES ('hum_synthetic', ?, ?, ?, ?, 200, ?, ?)")
-      .run(P, "upload.finish:" + id, k, digest, JSON.stringify({ artifact_id: s.w.row(id).artifact_id, revision: 1, revision_id: "rev_racer", sha256: sha(bytes), size: bytes.length }), new Date().toISOString());
+      .run(P, "upload.finish:" + id, k, sha(id), JSON.stringify(ok), t);
     await lib.shredWorkspaceKeys(s.env, WS);
   };
   const r = await s.finish(id, k);
   assert.equal(r.status, 200);
   assert.equal(r.body.idempotent_replay, true);
-  assert.equal(r.body.revision_id, "rev_racer");
-  assert.notEqual(s.w.row(id).state, "failed", "a stored answer is never turned into a failed upload");
+  assert.equal(r.body.revision_id, revId);
+  assert.equal(s.w.row(id).state, "published");
+  assert.equal(s.w.sql.prepare("SELECT COUNT(*) AS n FROM revisions WHERE artifact_id = ?").get(u.artifact_id).n, 1, "exactly one revision");
+  assert.ok(s.w.blobs.has(u.final_key), "the published object was not reclaimed");
+  // The key is shredded now, so a read answers 410; the stored object is still the published one under its header.
+  await assert.rejects(s.download(u.artifact_id), status(410, "key_shredded"));
+});
+
+test("design test 26: the same race without a shred: the retry replays and the bytes read back", async () => {
+  const s = setup();
+  const bytes = pngLike(3000);
+  const id = await s.begin(bytes);
+  assert.equal((await s.w.put(id, bytes)).status, 200);
+  const first = await s.finish(id, "finish-replay-3");
+  const again = await s.finish(id, "finish-replay-3");
+  assert.equal(again.body.idempotent_replay, true);
+  assert.equal(again.body.revision_id, first.body.revision_id);
+  assert.ok((await s.download(first.body.artifact_id)).bytes.equals(bytes));
+  assert.equal(s.w.sql.prepare("SELECT COUNT(*) AS n FROM revisions WHERE artifact_id = ?").get(first.body.artifact_id).n, 1);
+});
+
+// ---- Review fixes for part 2 ----
+
+test("review fix: an al-enc marker removed between finish's head and its ranged get is refused: 500 publish_failed, failed", async () => {
+  const s = setup();
+  const bytes = pngLike(2000);
+  const id = await s.begin(bytes);
+  assert.equal((await s.w.put(id, bytes)).status, 200);
+  const key = s.w.row(id).final_key, keyId = s.w.row(id).enc_key_id;
+  s.w.r2.onGet = async (k) => { if (k === key) s.w.meta.get(k).customMetadata = { "al-key": keyId }; };
+  await assert.rejects(s.finish(id), status(500, "publish_failed"));
+  assert.equal(s.w.row(id).state, "failed");
+});
+
+test("review fix: inspectUploadedBlob with headBytes 0 on an encrypted row answers corrupt (no raw codec error)", async () => {
+  const s = setup();
+  const bytes = pngLike(2000);
+  const id = await s.begin(bytes);
+  assert.equal((await s.w.put(id, bytes)).status, 200);
+  const u = s.w.row(id);
+  const r = await silentLogs(() => lib.inspectUploadedBlob(s.env, { key: u.final_key, projectId: P, artifactId: u.artifact_id, workspaceId: WS, size: bytes.length, sha256: sha(bytes), keyId: u.enc_key_id, header: u.enc_header, receivedSize: u.received_size, receivedSha256: u.received_sha256 }, 0));
+  assert.deepEqual(r, { ok: false, reason: "corrupt" });
+});
+
+test("review fix: a key id that names no key of the workspace ends the upload failed with 500 publish_failed; a missing master key leaves it retryable", async () => {
+  const s = setup();
+  const bytes = pngLike(2000);
+  const id = await s.begin(bytes);
+  assert.equal((await s.w.put(id, bytes)).status, 200);
+  const key = s.w.row(id).final_key;
+  s.w.sql.prepare("UPDATE uploads SET enc_key_id = 'wk_unknown' WHERE id = ?").run(id);
+  s.w.meta.get(key).customMetadata["al-key"] = "wk_unknown";
+  const r = await silentLogs(() => s.finish(id).catch((e) => e));
+  assert.ok(status(500, "publish_failed")(r), String(r));
+  assert.equal(s.w.row(id).state, "failed");
+
+  const t = setup();
+  const id2 = await t.begin(bytes);
+  assert.equal((await t.w.put(id2, bytes)).status, 200);
+  const secret = t.w.env.CONTENT_MASTER_KEY_V1;
+  delete t.w.env.CONTENT_MASTER_KEY_V1;
+  const e = await silentLogs(() => t.finish(id2, "retry-key").catch((x) => x));
+  assert.equal(e.code, "master_key_missing", String(e));
+  assert.equal(t.w.row(id2).state, "sealed", "still retryable");
+  t.w.env.CONTENT_MASTER_KEY_V1 = secret;
+  assert.equal((await t.finish(id2, "retry-key-2")).status, 200);
+});
+
+test("review fix: two simultaneous encrypted PUTs of one upload: exactly one is accepted, and the recorded header decrypts the stored object", async () => {
+  const s = setup();
+  const bytes = pngLike(150_000);
+  const id = await s.begin(bytes);
+  const results = await Promise.allSettled([s.w.put(id, bytes), s.w.put(id, bytes)]);
+  assert.equal(results.filter((r) => r.status === "fulfilled").length, 1, JSON.stringify(results.map((r) => r.status)));
+  assert.ok(results.some((r) => r.status === "rejected" && r.reason.code === "upload_not_writable"));
+  const u = s.w.row(id);
+  assert.ok(Buffer.from(s.w.blobs.get(u.final_key).subarray(0, CHUNKED_HEADER_BYTES)).equals(Buffer.from(u.enc_header, "base64url")));
+  const f = await s.finish(id);
+  assert.ok((await s.download(f.body.artifact_id)).bytes.equals(bytes));
+});
+
+test("review fix: a PUT whose storage write succeeded but whose received update failed, then a retry PUT: the recorded header is the final object's, and finish succeeds", async () => {
+  const s = setup();
+  const bytes = pngLike(100_000);
+  const id = await s.begin(bytes);
+  let failed = false;
+  s.w.hooks.beforeRun = async (q) => { if (!failed && /SET state = 'received'/.test(q)) { failed = true; throw new Error("synthetic D1 failure"); } };
+  await assert.rejects(s.w.put(id, bytes), /synthetic D1 failure/);
+  assert.equal(s.w.row(id).state, "pending");
+  const firstHeader = Buffer.from(s.w.blobs.get(s.w.row(id).final_key).subarray(0, CHUNKED_HEADER_BYTES));
+  assert.equal((await s.w.put(id, bytes)).status, 200);
+  const u = s.w.row(id);
+  const stored = Buffer.from(s.w.blobs.get(u.final_key).subarray(0, CHUNKED_HEADER_BYTES));
+  assert.ok(!stored.equals(firstHeader), "the retry rewrote the object (a new salt)");
+  assert.ok(stored.equals(Buffer.from(u.enc_header, "base64url")), "the row records the final object's header");
+  const f = await s.finish(id);
+  assert.equal(f.status, 200);
+  assert.ok((await s.download(f.body.artifact_id)).bytes.equals(bytes));
+});
+
+test("review fix: when the post-put consistency check fires, the object just written is deleted and the upload returns to pending", async () => {
+  const s = setup();
+  const bytes = pngLike(5000);
+  const id = await s.begin(bytes);
+  const key = s.w.row(id).final_key;
+  const put = s.w.env.BLOBS.put;
+  s.w.env.BLOBS.put = async (k, b, o) => { const r = await put(k, b, o); return { ...r, size: r.size + 1 }; };
+  const e = await silentLogs(() => s.w.put(id, bytes).catch((x) => x));
+  assert.ok(status(500, "publish_failed")(e), String(e));
+  assert.equal(s.w.blobs.has(key), false, "this attempt's own write was deleted");
+  assert.equal(s.w.row(id).state, "pending");
+  s.w.env.BLOBS.put = put;
+  assert.equal((await s.w.put(id, bytes)).status, 200);
 });
 
 test("text uploads are untouched: the raw input stays plaintext with R2's sha256 check, even with encryption on", async () => {

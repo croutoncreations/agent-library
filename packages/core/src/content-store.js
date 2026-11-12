@@ -371,8 +371,13 @@ export async function writeUploadBlob(env, { key, body, size, sha256, contentTyp
     if (tap.state.tooShort) throw blobWriteError("too_short", e);
     throw e;
   }
-  if (!head.out.header || tap.state.sha256 !== sha256 || tap.state.count !== size || put?.size !== chunkedStoredLength(size))
+  if (!head.out.header || tap.state.sha256 !== sha256 || tap.state.count !== size || put?.size !== chunkedStoredLength(size)) {
+    // Defence in depth: the object is this attempt's own, never published write. Delete it before answering, so an
+    // upload that goes back to pending leaves nothing behind (a failed delete is left to upload cleanup).
+    console.error(JSON.stringify({ event: "upload_blob_write_inconsistent" }));
+    await env.BLOBS.delete(key).catch(() => {});
     throw new HttpError(500, "publish_failed", "The stored object is inconsistent with what was written");
+  }
   return { size: tap.state.count, sha256: tap.state.sha256, keyId, header: b64url(head.out.header) };
 }
 
@@ -452,12 +457,14 @@ export async function inspectUploadedBlob(env, { key, projectId, artifactId, wor
   }
   // size >= 1 here (finish refuses a 0-byte binary first); one ranged get of chunk 0, authenticated.
   if (size < 1) return corrupt("empty");
+  // An encrypted object needs at least one plaintext byte checked (chunk 0 must authenticate); no caller asks for 0.
+  if (!(headBytes >= 1)) return corrupt("no_head_bytes");
   const end = Math.min(headBytes, size) - 1;
   const plan = planChunkedRange(size, 0, end);
   const object = await getBlob(env, key, { offset: plan.storedStart, length: plan.storedEnd - plan.storedStart + 1 });
   if (!object) return { ok: false, reason: "missing" };
   // The ranged get carries the object's metadata too (probe item d): an object replaced since the head is refused.
-  if (object.customMetadata?.["al-key"] !== ref.keyId || object.size !== chunkedStoredLength(size)) { await object.body?.cancel().catch(() => {}); return corrupt("metadata"); }
+  if (object.customMetadata?.["al-enc"] !== "1" || object.customMetadata?.["al-key"] !== ref.keyId || object.size !== chunkedStoredLength(size)) { await object.body?.cancel().catch(() => {}); return corrupt("metadata"); }
   try {
     const plain = decryptChunkedRange({ header: setup.header, dataKey: setup.dataKey, objectKey: key, start: 0, end, fetchStored: () => object.body });
     const head = new Uint8Array(end + 1);

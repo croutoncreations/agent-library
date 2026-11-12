@@ -438,6 +438,14 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
         keyId: held.enc_key_id ?? null, header: held.enc_header ?? null, receivedSize: held.received_size, receivedSha256: held.received_sha256 }, kind ? 0 : 16);
     } catch (e) {
       if (e instanceof HttpError && e.code === "key_shredded") return await fail(e.status, e.code, e.message, "failed");
+      // The recorded key id names no key of this workspace, or its row is malformed: retrying this upload cannot heal
+      // that, so it ends failed (publish_failed). Configuration and provider errors (encryption_misconfigured,
+      // encryption_not_configured, master_key_*, key_unwrap_failed, key_provider_invalid) can heal: the upload stays
+      // sealed and retryable.
+      if (e instanceof HttpError && (e.code === "key_not_found" || e.code === "key_row_invalid" || e.code === "invalid_key_id")) {
+        console.error(JSON.stringify({ event: "upload_finish_key_error", code: e.code, projectId, artifactId: u.artifact_id }));
+        return await fail(500, "publish_failed", "Stored object failed verification", "failed");
+      }
       throw e;
     }
     if (!check.ok && check.reason === "missing") return await fail(409, "missing_bytes", "Uploaded bytes missing", "failed");
