@@ -119,7 +119,7 @@ is no longer found by cleanup and remains until the project is purged.
 | Request body: app API | 11 MiB (11,534,336 bytes) for document/data create and save; 2 MiB for every other route (including backup import/restore) | request | fixed | `413 too_large`; message names the request-size limit |
 | Request body: legacy MCP (`/mcp` with a grant token) | 2 MiB | request | fixed | `413` JSON-RPC `-32600` |
 | Request body: OAuth MCP | 1 MiB; 3 MiB for connections with file access | request | fixed | `413` JSON-RPC `-32600` |
-| Request body: `/v1` API and publisher snapshots | 11 MiB for `/v1` file create and save; the `/v1` upload PUT takes raw bytes up to the declared size (10 MiB for text); 6.5 MB (6,500,000 bytes) for other `/v1` routes and publisher snapshots | request | fixed | `413 too_large`; message names the request-size limit |
+| Request body: `/v1` API and publisher snapshots | 11 MiB for `/v1` file create and save; the `/v1` upload PUT takes raw bytes up to the declared size (10 MiB for text); 6.5 MB (6,500,000 bytes) for other `/v1` routes and publisher snapshots | request | fixed | `413 too_large`; message names the request-size limit (the upload PUT's own errors are in the Upload body row) |
 | Request body: publisher generation parts | 256 KiB | request | fixed | `413` |
 
 App API, `/v1` and legacy MCP bodies are counted in UTF-8 bytes as they arrive and never buffered past the cap. `Content-Length` is checked before buffering. The 10 MiB storage limit depends on the transport: JSON escaping can push a smaller document above the 11 MiB request cap, producing `413`. MCP caps are unchanged; not every transport can write a 10 MiB document inline.
