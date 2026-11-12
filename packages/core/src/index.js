@@ -368,9 +368,11 @@ function createWorker(adapterConfig = {}) {
   // Fail closed: CONTENT_ENCRYPTION_REQUIRED=1 but the key provider is not configured or its configuration is
   // malformed. Only applies when that var is set. The response names no secret; the log line has the reason and, for
   // an error, only its code (HttpError) or constructor name, never its message.
+  // An invalid CONTENT_ENCRYPTION_REQUIRED value is refused the same way (reason required_value_invalid, never the value).
   const encryptionMissing = (env) => {
-    if (!encryptionRequired(env)) return false;
     const log = (detail) => console.error(JSON.stringify({ event: "encryption_misconfigured", ...detail }));
+    try { if (!encryptionRequired(env)) return false; }
+    catch { log({ reason: "required_value_invalid" }); return true; }
     try {
       if (encryptionConfigured(withAdapters(env, A))) return false;
       log({ reason: "not_configured" });

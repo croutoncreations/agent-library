@@ -409,9 +409,28 @@ test("the unwrap memo is bound to the wrapped value: a row whose wrapped value c
   assert.equal((await lib.workspaceDataKey(r, WS_A)).key, a.key, "the original row still hits the memo");
 });
 
-test("encryptionRequired reads CONTENT_ENCRYPTION_REQUIRED; only \"1\" means required", () => {
-  for (const [v, want] of [[undefined, false], ["", false], ["0", false], ["1", true], [1, true]]) {
+test("encryptionRequired reads CONTENT_ENCRYPTION_REQUIRED: unset, \"\", \"0\"/0 off; \"1\"/1 on; anything else is a configuration error", async () => {
+  for (const [v, want] of [[undefined, false], [null, false], ["", false], ["0", false], [0, false], ["1", true], [1, true]]) {
     assert.equal(lib.encryptionRequired({ CONTENT_ENCRYPTION_REQUIRED: v }), want, String(v));
+  }
+  const { DB } = mkDB();
+  const misconfigured = (e) => e.status === 500 && e.code === "encryption_misconfigured" && e.message === "Content encryption is required but not configured";
+  const call = (env) => lib.createWorker().fetch(new Request("https://app.example.test/api/me"), { APP_HOST: "app.example.test", DB, ...env }, { waitUntil() {} });
+  const secret = masterSecret();
+  for (const v of ["true", "yes", true, "2", " 1"]) {
+    for (const keys of [{}, { CONTENT_MASTER_KEY_VERSION: "1", CONTENT_MASTER_KEY_V1: secret }]) {
+      const label = `${JSON.stringify(v)} ${keys.CONTENT_MASTER_KEY_VERSION ? "configured" : "unconfigured"}`;
+      const env = { CONTENT_ENCRYPTION_REQUIRED: v, ...keys };
+      assert.throws(() => lib.encryptionRequired(env), misconfigured, label);
+      await assert.rejects(lib.encryptionEnabled(request({ DB, ...env })), misconfigured, label);
+      let res;
+      const logs = await captureErrors(async () => { res = await call(env); });
+      assert.equal(res.status, 500, label);
+      assert.deepEqual(await res.json(), { error: { code: "encryption_misconfigured", message: "Content encryption is required but not configured" } }, label);
+      const lines = logs.filter((l) => l.includes('"event":"encryption_misconfigured"'));
+      assert.deepEqual(lines.map((l) => JSON.parse(l)), [{ event: "encryption_misconfigured", reason: "required_value_invalid" }], label);
+      assert.ok(!lines[0].includes(secret), label);
+    }
   }
 });
 

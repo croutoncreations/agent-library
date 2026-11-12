@@ -34,7 +34,8 @@ stored exactly as described under [Today](#today).
   client; the server log names the secret, never its value.
 - **Fail closed.** The var `CONTENT_ENCRYPTION_REQUIRED="1"` makes encryption required: while the master key settings
   are missing or malformed, `createWorker` refuses every request with a 500 `encryption_misconfigured` ("Content
-  encryption is required but not configured"). Unset, nothing changes. `encryptionEnabled(env)` is the one
+  encryption is required but not configured"). Unset, `""` or `"0"`, nothing changes; any other value (`"true"`, a
+  TOML boolean, `" 1"`) is refused the same way (logged as `required_value_invalid`), never read as "off". `encryptionEnabled(env)` is the one
   decision for writing: true when configured; false only when not configured, not required and `workspace_keys` has
   no real key row (`master_version > 0`, shredded or not; a shred's tombstone does not count); otherwise the same 500, so losing the configuration after keys exist never turns into plaintext.
   `workspaceDataKey` also refuses unless the configuration is present and well-formed, even for a workspace that

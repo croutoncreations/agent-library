@@ -51,25 +51,35 @@ export function encryptionConfigured(env) {
   return v;
 }
 
-/** Does this installation require content encryption? Worker var CONTENT_ENCRYPTION_REQUIRED = "1". */
-export function encryptionRequired(env) {
-  return String(env?.CONTENT_ENCRYPTION_REQUIRED ?? "") === "1";
-}
-
 /** The message of every encryption_misconfigured refusal (also createWorker's). Names no secret. */
 export const ENCRYPTION_MISCONFIGURED_MESSAGE = "Content encryption is required but not configured";
+
+/**
+ * Does this installation require content encryption? Worker var CONTENT_ENCRYPTION_REQUIRED: unset, "", "0" or 0 is
+ * not required; "1" or 1 is required. Any other value ("true", a TOML boolean, " 1") is never read as "off": it throws
+ * 500 encryption_misconfigured. The caller logs it (never the value).
+ */
+export function encryptionRequired(env) {
+  const v = env?.CONTENT_ENCRYPTION_REQUIRED;
+  if (v === undefined || v === null || v === "" || v === "0" || v === 0) return false;
+  if (v === "1" || v === 1) return true;
+  throw new HttpError(500, "encryption_misconfigured", ENCRYPTION_MISCONFIGURED_MESSAGE);
+}
 
 /**
  * Should new content be encrypted? The one decision later slices use for writing (never encryptionConfigured() alone).
  * true when configured (no query). false only when not configured, not required and `workspace_keys` has no real key
  * row (master_version > 0, shredded or not; a shred's tombstone has master_version 0 and does not count), probed on
- * every such call, never cached: another request may create the first key at any time. Otherwise 500 encryption_misconfigured: required but not configured, or encryption was
- * in use (rows exist) and its configuration is gone, which must never turn into writing plaintext. A malformed
- * configuration throws its own error.
+ * every such call, never cached: another request may create the first key at any time. Otherwise 500
+ * encryption_misconfigured: CONTENT_ENCRYPTION_REQUIRED has an invalid value (checked first), required but not
+ * configured, or encryption was in use (real key rows exist) and its configuration is gone, which must never turn into
+ * writing plaintext. A malformed configuration throws its own error.
  */
 export async function encryptionEnabled(env) {
+  let required;
+  try { required = encryptionRequired(env); }
+  catch (e) { logKeyEvent("encryption_misconfigured", { reason: "required_value_invalid" }); throw e; }
   if (encryptionConfigured(env)) return true;
-  const required = encryptionRequired(env);
   const inUse = !required && !!(await env.DB.prepare("SELECT 1 AS x FROM workspace_keys WHERE master_version > 0 LIMIT 1").first("x"));
   if (required || inUse) {
     logKeyEvent("encryption_misconfigured", { reason: required ? "required_not_configured" : "key_rows_exist_not_configured" });
