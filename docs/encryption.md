@@ -36,7 +36,7 @@ stored exactly as described under [Today](#today).
   are missing or malformed, `createWorker` refuses every request with a 500 `encryption_misconfigured` ("Content
   encryption is required but not configured"). Unset, nothing changes. `encryptionEnabled(env)` is the one
   decision for writing: true when configured; false only when not configured, not required and `workspace_keys` has
-  no row at all; otherwise the same 500, so losing the configuration after keys exist never turns into plaintext.
+  no real key row (`master_version > 0`, shredded or not; a shred's tombstone does not count); otherwise the same 500, so losing the configuration after keys exist never turns into plaintext.
   `workspaceDataKey` also refuses unless the configuration is present and well-formed, even for a workspace that
   already has a key.
 - **Table** `workspace_keys` (migration `0029_workspace_keys.sql`): `workspace_id`, `key_id` (`wk_…`, primary key),

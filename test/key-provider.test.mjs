@@ -437,10 +437,29 @@ test("encryptionEnabled: true when configured (no query); false only when not co
   const removed = { ...base, CONTENT_MASTER_KEY_VERSION: undefined };
   await assert.rejects(lib.encryptionEnabled(request(removed)), misconfigured, "version var removed while rows exist");
   await assert.rejects(lib.encryptionEnabled(request({ ...base, CONTENT_MASTER_KEY_VERSION: "" })), misconfigured, "version var blanked");
-  // Even when the only rows are shredded ones (a tombstone).
+  // A tombstone is not a key: an installation that never encrypted and only shredded (purged) workspaces stays off.
   sql.prepare("DELETE FROM workspace_keys").run();
   await lib.shredWorkspaceKeys(request(removed), WS_B);
-  await assert.rejects(lib.encryptionEnabled(request(removed)), misconfigured, "only a tombstone");
+  assert.equal(await lib.encryptionEnabled(request(removed)), false, "only a tombstone");
+});
+
+test("tombstones do not count as 'encryption was in use'; a real key row counts even after it was shredded", async () => {
+  const { sql, DB } = mkDB();
+  const off = request({ DB });
+  await lib.shredWorkspaceKeys(off, WS_A);
+  await lib.shredWorkspaceKeys(off, WS_B);
+  assert.equal(rows(sql, WS_A)[0].master_version, 0, "a tombstone");
+  assert.equal(await lib.encryptionEnabled(request({ DB })), false, "unconfigured, not required, only tombstones");
+  assert.equal(await lib.encryptionEnabled(off), false);
+  // The tombstone still stops the workspace getting a key once encryption is configured.
+  const base = configuredBase(DB);
+  await assert.rejects(lib.workspaceDataKey(request(base), WS_A), (e) => e.code === "key_shredded");
+  // A real key, later shredded, still means encryption was in use.
+  const ws = "wsp_synthetic_real";
+  await lib.workspaceDataKey(request(base), ws);
+  await lib.shredWorkspaceKeys(request(base), ws);
+  assert.equal(activeRows(sql, ws).length, 0);
+  await assert.rejects(lib.encryptionEnabled(request({ DB })), (e) => e.status === 500 && e.code === "encryption_misconfigured");
 });
 
 test("workspaceDataKey refuses to hand out a key for encrypting when the configuration is missing or malformed, even with a row", async () => {
