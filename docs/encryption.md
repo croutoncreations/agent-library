@@ -28,33 +28,94 @@ stored exactly as described under [Today](#today).
 
 - **Master keys.** Worker secrets `CONTENT_MASTER_KEY_V<n>` (n a positive integer), each the base64 or base64url
   encoding of exactly 32 random bytes; the var `CONTENT_MASTER_KEY_VERSION` names the current n. Encryption is
-  configured when that var is set and its secret decodes to 32 bytes. Unset means not configured; a malformed version
-  or secret is an error (`master_key_version_invalid`, `master_key_invalid`, `master_key_missing`), never "off".
-  Errors name the secret, never its value.
+  configured when that var is set (a string of digits or a number) and its secret decodes to 32 bytes. Unset or `""`
+  means not configured; a malformed version or secret is an error (`master_key_version_invalid`,
+  `master_key_invalid`, `master_key_missing`), never "off". Error messages name no secret, since they can reach a
+  client; the server log names the secret, never its value.
+- **Fail closed.** The var `CONTENT_ENCRYPTION_REQUIRED="1"` makes encryption required: while the master key settings
+  are missing or malformed, `createWorker` refuses every request with a 500 `encryption_misconfigured` ("Content
+  encryption is required but not configured"). Unset, nothing changes. `encryptionEnabled(env)` is the one
+  decision for writing: true when configured; false only when not configured, not required and `workspace_keys` has
+  no row at all; otherwise the same 500, so losing the configuration after keys exist never turns into plaintext.
+  `workspaceDataKey` also refuses unless the configuration is present and well-formed, even for a workspace that
+  already has a key.
 - **Table** `workspace_keys` (migration `0029_workspace_keys.sql`): `workspace_id`, `key_id` (`wk_…`, primary key),
   `master_version`, `wrapped`, `created_at` and `shredded_at` (epoch milliseconds). A partial unique index allows one
-  unshredded key per workspace.
+  unshredded key per workspace; a plain index on `workspace_id` serves the other lookups by workspace.
 - **Data keys.** 32 bytes from `crypto.getRandomValues`, wrapped with AES-256-GCM under the current master key with a
   fresh random 96-bit IV. The additional data binds the wrapped key to its row: `al-dek/1`, workspace id, key id and
   master version, each as a 4-byte big-endian length followed by its UTF-8 bytes. `wrapped` is base64url of
   IV ‖ ciphertext ‖ tag. A wrapped value copied to another workspace, key id or master version does not unwrap.
 - **In memory** a data key is only a non-extractable HKDF `CryptoKey` (usages `["deriveKey"]`), unwrapped directly to
-  HKDF. The raw bytes exist only while a key is created and are zeroed afterwards. Content keys are derived from it,
-  never the data key itself.
-- **First use** (`workspaceDataKey(env, workspaceId)` in `packages/core/src/crypto/keys.js`): `INSERT OR IGNORE`, then
-  re-select the active row, so concurrent first use yields one key for every caller. A workspace with any shredded
-  key row gets no new key (`key_shredded`).
+  HKDF. The raw bytes exist only while a key is created and are zeroed afterwards. When content encryption is wired
+  in, each object's key will be derived from it ([Object format](#object-format-version-1)); the data key itself will
+  never encrypt content.
+- **First use** (`workspaceDataKey(env, workspaceId)` in `packages/core/src/crypto/keys.js`): an `INSERT` that does
+  nothing when it loses to a concurrent first use (`ON CONFLICT … DO NOTHING` on the one-active-key index), then
+  re-select the active row, so concurrent first use yields one key for every caller. Any other insert failure is
+  `key_create_failed`. A workspace with any shredded key row gets no new key (`key_shredded`).
 - **Decryption lookup** (`dataKeyById(env, workspaceId, keyId)`): refuses an unknown key id, a shredded key and a key
   of another workspace than the caller expects.
+- **Shredding** (`shredWorkspaceKeys(env, workspaceId)`, not called by anything yet): marks every key row of the
+  workspace shredded and overwrites its wrapped key with the empty string; a workspace that never had a key gets a
+  shredded tombstone row, so it can never get one later. Idempotent. A shredded row (or one whose wrapped key is
+  empty) never reaches the key provider. See [Limits](#limits).
 - **Rotation.** New keys are wrapped under the current version; an older row unwraps as long as its
-  `CONTENT_MASTER_KEY_V<n>` is still set. If it is not, the error names the missing secret. Rewrapping old rows is
+  `CONTENT_MASTER_KEY_V<n>` is still set. If it is not, the request fails with `master_key_missing` and the server
+  log names the missing secret. Rewrapping old rows is
   not built yet.
 - **One unwrap per request.** `createWorker` gives each request its own memo (`withDataKeyMemo`, like
-  `withRequestMemo`); nothing is cached across requests.
+  `withRequestMemo`); nothing is cached across requests. The memo holds unwrapped keys by everything the wrap
+  authenticates (workspace id, key id, master version, wrapped value), so a row that changes during a request is
+  unwrapped afresh. Which key is active, and whether it is shredded, is read from the database on every call.
 - **Seam.** The `keyProvider` adapter (`packages/core/src/adapters.js`) wraps and unwraps a data key for
   `{ workspaceId, keyId, masterVersion }`; the default (`crypto/worker-secret-keys.js`) uses the Worker secrets above
-  and a hosted installation may replace it with an external KMS. Row storage, first use and the memo stay in core.
+  and a hosted installation may replace it with an external KMS. A supplied provider replaces the default whole and
+  must define `configured`, `currentVersion`, `wrap` and `unwrap`. Core checks what it returns: `configured` a
+  boolean, synchronously; `currentVersion` a positive integer; `wrap` a non-empty string; `unwrap` a
+  non-extractable HKDF key whose only usage is `deriveKey`. Row storage, first use and the memo stay in core.
   Workspace ids are the usual ones (`projectWorkspaceId`, including legacy `wsp_` + owner).
+
+### Limits
+
+- **Shredding is recorded in the database.** It does not protect against someone who can write to the database: they
+  can put back a key row they saved earlier. Nor does it reach database restore points, D1 Time Travel (about 30
+  days) or exported backups, which still hold the wrapped key. Content is beyond recovery only once those have aged
+  out, or once the master key version that wrapped its key has been retired and its secret deleted.
+- **Each write is authenticated, not that it is the latest.** Someone who can write to object storage can put back an
+  older complete write of the same storage key, and it decrypts.
+- **Master key usage.** Data keys are wrapped with random 96-bit IVs, so one master key should wrap at most 2^32 data
+  keys. Usage is about one per workspace. Rotation means adding `CONTENT_MASTER_KEY_V<n+1>` and raising
+  `CONTENT_MASTER_KEY_VERSION`.
+
+### Rules for code that uses this
+
+For the slices that wire this into reads and writes:
+
+- The workspace id comes from the server-side project, never from the stored object.
+- Whether to **decrypt** is decided by the stored object (its metadata or header), never by the current
+  configuration. Whether to **encrypt** is decided by `encryptionEnabled(env)`, never by `encryptionConfigured()`
+  alone.
+- A key shredded during a request may still be held by that request. A write must be made conditional on the key
+  still being active, or writes must be blocked while a workspace is shredded.
+- A decrypt stream that errors is a failed read, even though earlier chunks were delivered: nothing may act on
+  partial plaintext.
+- Range reads authenticate only the chunks they touch.
+- **Uploads.** Once bodies are encrypted, R2's own SHA-256 check sees ciphertext. The plaintext hash must be computed
+  in front of the encryptor, and a mismatch must fail before the final chunk is released (the encryptor releases the
+  final chunk only after the input ends, so no valid object is stored). The stored length passed to storage is
+  `chunkedStoredLength(size)`.
+- Before decrypting, check that the storage key lies under the prefix the request is authorized for (the project's
+  and document's own prefix), so a database row pointed at another object in the same workspace is refused.
+- The header used for a range read must be pinned to the write the database refers to (stored with the revision, or
+  read with the same conditional ETag as the range), and its plaintext length must equal the size the database
+  records.
+- Content type is served from the database, never from object metadata.
+- Range callbacks (`fetchStored`) should return storage's stream, not a buffer of the whole range.
+- An encrypted object cannot be copied byte for byte to another storage key (backup import, moves): decrypt and
+  re-encrypt.
+- **HTTP.** Declare the plaintext length. On a decrypt error, abort the response so the client sees a failed body.
+  Never send validators or cache headers that imply a complete object.
 
 ## Text versions and inline compatibility
 
@@ -111,7 +172,8 @@ Plan when per-workspace encryption is built: add a nullable `key_version` to `re
 plaintext, read both), encrypt in the Worker before insert, and replace the SQL-side uses above. Search is the hard
 part: options are a title-only index, a bounded decrypt-and-scan within one project, or an index of keyed HMAC
 tokens. Old plaintext remains in D1 Time Travel and backups until they age out; any announcement should say so.
-Deleting a workspace's data key then makes all of its content unreadable (crypto-shredding).
+Shredding a workspace's data key then makes its content unreadable (crypto-shredding), within the
+[limits](#limits) above.
 
 ## Object format (version 1)
 
@@ -172,3 +234,14 @@ Limits:
   is shorter or longer than declared, withholding the final chunk, so a mis-sized upload is never a valid object.
 - Version 1 fixes the chunk size; a different size needs a new exponent or version, which this parser refuses.
 - The test-only fixed-salt function exists only for the known-answer test and is not exported.
+- The storage object key must be well-formed Unicode (no lone surrogates, which would encode to the same bytes as
+  U+FFFD) and at most 1,015 UTF-8 bytes, so the HKDF info stays within 1,024 bytes.
+- The data key must be a non-extractable HKDF key whose only usage is `deriveKey`.
+
+Two decisions, both of which would change the stored bytes, so they must be revisited before real content is first
+written, not after:
+
+- **The header carries no key id.** The key id travels in the object's metadata; a wrong one only makes
+  authentication fail.
+- **The workspace id is not in the HKDF info.** The data key is already per workspace, so it would add nothing: a
+  wrong workspace's key fails either way.

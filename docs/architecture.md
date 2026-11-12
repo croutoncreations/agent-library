@@ -107,7 +107,7 @@ The modules were recovered mechanically from the previous byte-pinned bundle (Ph
 | `lifecycle`: `workspaceCreated`, `workspaceDeleted`, `inviteCreated` | None | Billing customer, invitation email | None |
 | `routes`: `{ method?, path, handler }` | None | Billing, sign-up, legal pages | None |
 | `mailer.send` | Logs only | Not used (invitation email is sent by `lifecycle.inviteCreated`, SendGrid) | Logs only |
-| `keyProvider`: `configured`, `currentVersion`, `wrap`, `unwrap` (workspace data keys; [encryption.md](encryption.md#workspace-keys)) | Worker secrets `CONTENT_MASTER_KEY_V<n>` (`packages/core/src/crypto/worker-secret-keys.js`) | Same, later an external KMS | Worker secrets; not configured when `CONTENT_MASTER_KEY_VERSION` is unset. Nothing is encrypted yet |
+| `keyProvider`: `configured`, `currentVersion`, `wrap`, `unwrap` (workspace data keys; [encryption.md](encryption.md#workspace-keys)) | Worker secrets `CONTENT_MASTER_KEY_V<n>` (`packages/core/src/crypto/worker-secret-keys.js`) | Same, later an external KMS | Worker secrets; not configured when `CONTENT_MASTER_KEY_VERSION` is unset. A supplied provider replaces the default whole (all four methods). Nothing is encrypted yet |
 
 Not yet adapters (deferred from the plan's interface list): an external `AuditSink`/metrics (phase 5; audits stay in D1), UI slots such as settings tabs (phase 3/4, with the hosted billing UI) and a `workspaceSuspended` hook (core has no suspend operation yet). Core doesn't call `mailer` yet; hosted mail is sent from lifecycle hooks. The plan's `createWorker(config, adapters)` became `createWorker(adapters)`: configuration stays in Worker vars.
 
