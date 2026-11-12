@@ -53,7 +53,12 @@ async function runBatch(ctx, stmts, i) {
   } catch (e) {
     if (isTextWriteFenceError(e)) throw e;
     const refusal = fenceRefusal(e);
-    if (refusal) throw refusal;
+    if (refusal) {
+      // A retry racing its own first attempt: if that attempt already stored a response, the request succeeded.
+      const prior = await idemLookup(ctx, i);
+      if (prior) return prior;
+      throw refusal;
+    }
     if (/UNIQUE|PRIMARY KEY|constraint/i.test(String(e?.message ?? e))) {
       const prior = await idemLookup(ctx, i);
       if (prior) return prior;

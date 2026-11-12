@@ -12,7 +12,8 @@ import { ROOT } from "./helpers.mjs";
 const lib = await loadWorker({
   "content-store.js": ["keyFence", "plaintextFence", "fenceRefusal", "commitTextWrites", "isTextWriteFenceError"],
   "crypto/keys.js": ["shredWorkspaceKeys", "NO_REAL_KEY_SQL"],
-  "service.js": ["runBatch"]
+  "service.js": ["runBatch"],
+  "util.js": ["HttpError"]
 });
 
 const MIGRATIONS = readdirSync(join(ROOT, "migrations")).filter((f) => f.endsWith(".sql")).sort();
@@ -220,3 +221,128 @@ test("commitTextWrites answers a fence refusal as its HttpError and at once remo
   assert.deepEqual([...objects], ["text/proj-a/a/published"]);
   assert.deepEqual(sql.prepare("SELECT key FROM content_writes").all().map((r) => r.key), ["text/proj-a/a/published"]);
 });
+
+// A retry with the same idempotency key that runs while the first attempt commits: its own lookup missed, its guarded
+// statements and its guarded idempotency INSERT change no row (the head moved), so no UNIQUE error fires, and then a
+// fence refuses. The request did succeed, so the stored response wins over the refusal.
+const synthCtx = (env) => ({ env, requestId: "req_s", principal: { id: "hum_a", kind: "human", label: "Synthetic" } });
+const storeIdem = (sql, key, digest, response) => sql.prepare(`INSERT INTO idempotency (principal_id, project_id, op, key, digest, status, response, created_at)
+  VALUES ('hum_a', 'proj-a', 'synthetic', ?, ?, 201, ?, ?)`).run(key, digest, JSON.stringify(response), new Date().toISOString());
+/** The retry's batch: a head-guarded statement and a guarded idempotency INSERT, both changing 0 rows, then `fence`. */
+const lostRaceBatch = (DB, key, fence) => [
+  DB.prepare("INSERT INTO content_writes (key, project_id, created_at) SELECT 'text/lost-race', 'proj-a', 1 WHERE EXISTS (SELECT 1 FROM artifacts WHERE id = 'a' AND head_rev = 99)"),
+  DB.prepare(`INSERT INTO idempotency (principal_id, project_id, op, key, digest, status, response, created_at)
+    SELECT 'hum_a', 'proj-a', 'synthetic', ?, 'd', 201, '{}', ? WHERE EXISTS (SELECT 1 FROM revisions WHERE id = 'r_lost_race')`).bind(key, new Date().toISOString()),
+  fence
+];
+const refusingFences = (env) => [["key_shredded", lib.keyFence(env, { keyId: "wk_gone", workspaceId: "wsp_a" })], ["encryption_started", lib.plaintextFence(env)]];
+
+test("runBatch: a stored response with the same key and digest wins over the refusal of the retry's fence", async () => {
+  const { sql, DB, env } = mkDB();
+  addKey(sql, "wsp_a", "wk_a"); // makes the plaintext fence refuse
+  const stored = { artifact_id: "art_synthetic", revision: 1 };
+  for (const [code, fence] of refusingFences(env)) {
+    const key = "race-" + code;
+    storeIdem(sql, key, "d", stored);
+    const out = await lib.runBatch(synthCtx(env), lostRaceBatch(DB, key, fence), { projectId: "proj-a", op: "synthetic", key, digest: "d" });
+    assert.deepEqual(out, { status: 201, body: { ...stored, idempotent_replay: true } }, code);
+  }
+  assert.equal(sql.prepare("SELECT COUNT(*) AS n FROM content_writes").get().n, 0);
+});
+
+test("runBatch: without a stored response the retry's fence refusal is answered as before", async () => {
+  const { sql, DB, env } = mkDB();
+  addKey(sql, "wsp_a", "wk_a");
+  for (const [code, fence] of refusingFences(env)) {
+    const key = "none-" + code;
+    const err = await lib.runBatch(synthCtx(env), lostRaceBatch(DB, key, fence), { projectId: "proj-a", op: "synthetic", key, digest: "d" }).then(() => null, (e) => e);
+    assert.equal(err?.code, code);
+  }
+  assert.equal(sql.prepare("SELECT COUNT(*) AS n FROM idempotency").get().n, 0);
+});
+
+test("runBatch: a stored response under the same key with a different digest answers what idemLookup answers (422)", async () => {
+  const { sql, DB, env } = mkDB();
+  addKey(sql, "wsp_a", "wk_a");
+  for (const [code, fence] of refusingFences(env)) {
+    const key = "reused-" + code;
+    storeIdem(sql, key, "other-digest", { artifact_id: "art_other" });
+    const err = await lib.runBatch(synthCtx(env), lostRaceBatch(DB, key, fence), { projectId: "proj-a", op: "synthetic", key, digest: "d" }).then(() => null, (e) => e);
+    assert.deepEqual([err?.status, err?.code], [422, "idempotency_key_reused"], code);
+  }
+});
+
+/** An artifact 'a' with revision r1 (body_key `revisionKey`) and, optionally, comment c1 (body_key `commentKey`). */
+function seedPublished(sql, { revisionKey, commentKey } = {}) {
+  const at = new Date().toISOString();
+  sql.prepare("INSERT INTO artifacts (id, project_id, kind, title, head_rev, created_at, updated_at) VALUES ('a', 'proj-a', 'markdown', 'Synthetic', 1, ?, ?)").run(at, at);
+  if (revisionKey) sql.prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, size, sha256, mime, created_at, body_key)
+    VALUES ('r1', 'a', 'proj-a', 1, 'hum_a', 1, 'x', 'text/markdown', ?, ?)`).run(at, revisionKey);
+  if (commentKey) sql.prepare(`INSERT INTO comments (id, project_id, artifact_id, rev_no, author_id, body, created_at, body_key)
+    VALUES ('c1', 'proj-a', 'a', 1, 'hum_a', '', ?, ?)`).run(at, commentKey);
+}
+/** Objects in a fake bucket, each with a fresh text-write intent. */
+function stageObjects(sql, env, keys) {
+  const objects = new Set(keys);
+  env.BLOBS = { async delete(ks) { for (const k of [ks].flat()) objects.delete(k); } };
+  for (const key of keys) sql.prepare("INSERT INTO content_writes (key, project_id, created_at) VALUES (?, 'proj-a', ?)").run(key, Date.now());
+  return objects;
+}
+const intentKeys = (sql) => sql.prepare("SELECT key FROM content_writes ORDER BY key").all().map((r) => r.key);
+
+test("commitTextWrites: when runBatch returns the stored replay, the retry's staged text goes at once and referenced text stays", async () => {
+  const { sql, DB, env } = mkDB();
+  addKey(sql, "wsp_a", "wk_a");
+  const first = "text/proj-a/a/r1", retry = "text/proj-a/a/r_retry";
+  seedPublished(sql, { revisionKey: first });
+  const stored = { artifact_id: "a", revision: 1, revision_id: "r1" };
+  for (const [code, fence] of refusingFences(env)) {
+    const key = "replay-" + code;
+    storeIdem(sql, key, "d", stored);
+    sql.prepare("DELETE FROM content_writes").run();
+    // The first attempt's key is passed too (with a live intent, so the deadline fence passes): the cleanup must keep
+    // it because a revision refers to it.
+    const objects = stageObjects(sql, env, [retry, first]);
+    const out = await lib.commitTextWrites(env, [retry, first], (guarded) => lib.runBatch(synthCtx(env), guarded(lostRaceBatch(DB, key, fence)), { projectId: "proj-a", op: "synthetic", key, digest: "d" }));
+    assert.deepEqual(out, { status: 201, body: { ...stored, idempotent_replay: true } }, code);
+    assert.deepEqual([...objects], [first], code);
+    assert.deepEqual(intentKeys(sql), [first], code);
+    assert.equal(sql.prepare("SELECT body_key FROM revisions WHERE id = 'r1'").get().body_key, first);
+  }
+});
+
+// A commit callback may throw a refusal-coded HttpError that no fence statement raised. The cleanup is still safe because
+// it deletes only keys no revision or comment refers to, not because the batch is known to have rolled back.
+test("commitTextWrites: a key_shredded thrown by the callback before any batch removes the staged unreferenced text", async () => {
+  const { sql, env } = mkDB();
+  const staged = "text/proj-a/a/staged";
+  const objects = stageObjects(sql, env, [staged]);
+  const err = await lib.commitTextWrites(env, [staged], async () => { throw new lib.HttpError(410, "key_shredded", "synthetic"); }).then(() => null, (e) => e);
+  assert.deepEqual([err?.status, err?.code], [410, "key_shredded"]);
+  assert.deepEqual([...objects], []);
+  assert.deepEqual(intentKeys(sql), []);
+});
+
+for (const holder of ["revision", "comment"]) {
+  test(`commitTextWrites: a key_shredded thrown after the callback's batch committed keeps the text a ${holder} refers to`, async () => {
+    const { sql, DB, env } = mkDB();
+    const published = "text/proj-a/a/published", spare = "text/proj-a/a/spare";
+    seedPublished(sql, {});
+    const objects = stageObjects(sql, env, [published, spare]);
+    const at = new Date().toISOString();
+    const publish = holder === "revision"
+      ? DB.prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, size, sha256, mime, created_at, body_key)
+          VALUES ('r1', 'a', 'proj-a', 1, 'hum_a', 1, 'x', 'text/markdown', ?, ?)`).bind(at, published)
+      : DB.prepare(`INSERT INTO comments (id, project_id, artifact_id, rev_no, author_id, body, created_at, body_key)
+          VALUES ('c1', 'proj-a', 'a', 1, 'hum_a', '', ?, ?)`).bind(at, published);
+    const err = await lib.commitTextWrites(env, [published, spare], async (guarded) => {
+      await DB.batch(guarded([publish]));
+      throw new lib.HttpError(410, "key_shredded", "synthetic");
+    }).then(() => null, (e) => e);
+    assert.deepEqual([err?.status, err?.code], [410, "key_shredded"]);
+    assert.deepEqual([...objects], [published]);
+    assert.deepEqual(intentKeys(sql), [published]);
+    const table = holder === "revision" ? "revisions" : "comments";
+    assert.equal(sql.prepare(`SELECT body_key FROM ${table}`).get().body_key, published);
+  });
+}
