@@ -1,4 +1,5 @@
 import { HttpError } from "./util.js";
+import { ACTIVE_KEY_SQL, KEY_SHREDDED_MESSAGE, NO_REAL_KEY_SQL } from "./crypto/keys.js";
 
 // ContentStore: the one place the Worker reads or writes stored file bytes (R2 `BLOBS`).
 //
@@ -169,6 +170,44 @@ export const TEXT_WRITE_STALE_MS = 60 * 60 * 1000;
 // Depends on D1's SQLite constraint text; tested against local D1, not just a simulated error.
 export function isTextWriteFenceError(error) {
   return /NOT NULL constraint failed: content_writes\.(?:project_id|created_at)\b/.test(String(error?.message ?? error));
+}
+
+// Publication fences (docs/encryption.md#rules-for-code-that-uses-this). Each is an INSERT into the always-empty
+// content_fences table that puts NULL into a NOT NULL column when its condition no longer holds, so the statement
+// fails and D1 rolls back the whole batch. The failing column names the condition; fenceRefusal maps it.
+
+/**
+ * Fence for a write under a workspace key: fails (content_fences.key_active) unless the key row `keyId` of
+ * `workspaceId` is still active. Place the fence LAST in the batch, after every statement whose result the caller
+ * reads; one statement that fails rolls back the whole batch wherever it sits.
+ */
+export function keyFence(env, { keyId, workspaceId } = {}) {
+  if (typeof keyId !== "string" || !keyId || typeof workspaceId !== "string" || !workspaceId)
+    throw new HttpError(500, "fence_invalid", "A key fence needs a key id and a workspace id");
+  return env.DB.prepare(`INSERT INTO content_fences (key_active, no_real_key) SELECT NULL, 0
+    WHERE NOT EXISTS (SELECT 1 FROM workspace_keys WHERE key_id = ? AND workspace_id = ? AND ${ACTIVE_KEY_SQL})`).bind(keyId, workspaceId);
+}
+
+/**
+ * Fence for a plaintext write: fails (content_fences.no_real_key) once any real key row exists. Place the fence LAST
+ * in the batch, after every statement whose result the caller reads; one statement that fails rolls back the whole
+ * batch wherever it sits.
+ */
+export function plaintextFence(env) {
+  return env.DB.prepare(`INSERT INTO content_fences (key_active, no_real_key) SELECT 0, NULL WHERE NOT ${NO_REAL_KEY_SQL}`);
+}
+
+/**
+ * The HttpError a fence refusal answers (410 key_shredded, 409 encryption_started), or null for any other error.
+ * Depends on D1's SQLite constraint text; tested against local D1. Place fences LAST in the batch, after every statement
+ * whose result the caller reads; one statement that fails rolls back the whole batch wherever it sits.
+ */
+export function fenceRefusal(error) {
+  const m = /NOT NULL constraint failed: content_fences\.(key_active|no_real_key)\b/.exec(String(error?.message ?? ""));
+  if (!m) return null;
+  return m[1] === "key_active"
+    ? new HttpError(410, "key_shredded", KEY_SHREDDED_MESSAGE)
+    : new HttpError(409, "encryption_started", "Encryption was turned on while this was being saved; try again");
 }
 
 /** Atomic publication fence and best-effort disposal of objects known not to have published. */

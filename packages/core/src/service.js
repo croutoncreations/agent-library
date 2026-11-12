@@ -1,5 +1,5 @@
 import { TEXT_MAX_BYTES } from "./text-limits.js";
-import { commitTextWrites, getText, isTextWriteFenceError, mapContent, stageTextWrite, textWriteComplete } from "./content-store.js";
+import { commitTextWrites, fenceRefusal, getText, isTextWriteFenceError, mapContent, stageTextWrite, textWriteComplete } from "./content-store.js";
 import { authorizeProject, authzSql, contentWriteSql, credentialGate, protectSql, requireHuman } from "./auth.js";
 import { chQuery, cleanupChanges, listChanges } from "./changes/service.js";
 import { MEASUREMENTS, MIME, checkFile, isCalendarDate, measurementRecords } from "./formats.js";
@@ -51,7 +51,7 @@ async function runBatch(ctx, stmts, i) {
   try {
     return await db(ctx).batch(stmts);
   } catch (e) {
-    if (isTextWriteFenceError(e)) throw e;
+    if (isTextWriteFenceError(e) || fenceRefusal(e)) throw e;
     if (/UNIQUE|PRIMARY KEY|constraint/i.test(String(e?.message ?? e))) {
       const prior = await idemLookup(ctx, i);
       if (prior) return prior;
