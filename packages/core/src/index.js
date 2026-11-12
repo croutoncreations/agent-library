@@ -397,7 +397,8 @@ function createWorker(adapterConfig = {}) {
         try { startDeferredWork(e, ctx); } catch { /* never changes the response; the run is discarded below */ }
         return res;
       } finally {
-        discardDeferredWork(e);
+        // Never replaces the handler's own result or rejection (it does not throw; guarded anyway).
+        try { discardDeferredWork(e); } catch { /* ignored */ }
       }
     }
   };

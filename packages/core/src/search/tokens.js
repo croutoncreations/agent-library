@@ -92,6 +92,11 @@ export function utf8Length(s) {
   }
   return n;
 }
+/**
+ * SEARCH_PHASE_LOG: the per-run search_phase lines are written only when it is exactly "1". Any other value, unset or
+ * empty, is off (never an error). The anomaly phases (deadline, detached) are always written.
+ */
+export const searchPhaseLog = (env) => env?.SEARCH_PHASE_LOG === "1";
 /** Per-document cap: min(SEARCH_TERMS_MAX, 256 + floor(bytes / 8)). */
 export const searchDocCap = (env, textBytes) => Math.min(searchTermsMax(env), 256 + Math.floor(textBytes / 8));
 /** The target's own truncation when extraction stopped at `cap`: off, cap (the var) or size (the text's size). */
@@ -580,11 +585,17 @@ export async function deleteSearchDocs(env, docs, { eligible, values }) {
 // --- Logs -------------------------------------------------------------------------------------------------------
 const logEvent = (event, detail) => console.log(JSON.stringify({ event, ...detail }));
 const logError = (event, detail) => console.error(JSON.stringify({ event, ...detail }));
-/** search_phase, at most once per run and phase; never content. */
+/** Phases logged whatever SEARCH_PHASE_LOG says: they are anomalies, not progress. */
+const ANOMALY_PHASES = new Set(["deadline", "detached"]);
+/**
+ * search_phase, at most once per run and phase; never content. Progress phases only when the run's env has
+ * SEARCH_PHASE_LOG = "1" (run.phaseLog). A log line that throws is ignored: logging never changes what a run does.
+ */
 function phase(run, name) {
   if (run.phases.has(name)) return;
   run.phases.add(name);
-  logEvent("search_phase", { phase: name, run: run.id, ms: Date.now() - run.admittedAt });
+  if (!run.phaseLog && !ANOMALY_PHASES.has(name)) return;
+  try { logEvent("search_phase", { phase: name, run: run.id, ms: Date.now() - run.admittedAt }); } catch { /* ignored */ }
 }
 
 // --- Runs ---------------------------------------------------------------------------------------------------------
@@ -665,6 +676,7 @@ export class SearchRun {
     this.detached = false; this.settled = false;
     this.nonce = randomId("sw", 9);
     this.phases = new Set();
+    this.phaseLog = false;   // set from the env that admits or starts the run (searchPhaseLog)
     this.skipped = {};
     this.completed = 0;
     this.unchanged = 0;
@@ -1340,38 +1352,51 @@ export function startDeferredWork(env, ctx) {
   q.started = true;
   const run = q.run;
   q.run = null;
-  if (!run || !run.holder.jobs?.length) {
-    if (run) { for (const [k, n] of Object.entries(run.skipped)) q.skipped[k] = (q.skipped[k] ?? 0) + n; run.settle(); }
-    logRequestSkips(q);
-    return;
+  // From here until ctx.waitUntil(p) has returned, any throw (a throwing waitUntil getter, a log line, …) drops and
+  // settles the run: it never stays registered without a runner, and nothing escapes to the wrapper.
+  try {
+    if (!run || !run.holder.jobs?.length) {
+      if (run) { for (const [k, n] of Object.entries(run.skipped)) q.skipped[k] = (q.skipped[k] ?? 0) + n; run.settle(); }
+      logRequestSkips(q);
+      return;
+    }
+    for (const [k, n] of Object.entries(q.skipped)) run.skip(k, n);
+    q.skipped = {};
+    // Read once: a getter is not trusted twice. Without a usable waitUntil the run is never started.
+    const waitUntil = ctx?.waitUntil;
+    if (typeof waitUntil !== "function") { dropRun(q, run, "unstarted"); return; }
+    phase(run, "handler_done");
+    // The run has not done anything yet (it begins with scheduler.wait(0)): if anything below throws, it is settled
+    // now, and runSearchIndexing returns quietly when it finds it settled after its first yield.
+    const p = track(run, runSearchIndexing(env, run));
+    waitUntil.call(ctx, p);
+  } catch {
+    if (run) dropRun(q, run, "unstarted");
   }
-  for (const [k, n] of Object.entries(q.skipped)) run.skip(k, n);
-  q.skipped = {};
-  // Without a usable ctx.waitUntil the run is never started: it is settled and its jobs counted as skipped.
-  if (typeof ctx?.waitUntil !== "function") { dropRun(q, run, "unstarted"); return; }
-  phase(run, "handler_done");
-  const p = track(run, runSearchIndexing(env, run));
-  // The run has not done anything yet (it begins with scheduler.wait(0)): if waitUntil throws, it is settled now, and
-  // runSearchIndexing returns quietly when it finds it settled after its first yield.
-  try { ctx.waitUntil(p); } catch { dropRun(q, run, "unstarted"); }
 }
 /** Settle a run that never started: count its jobs as skipped for `reason` and log the request's skips. */
 function dropRun(q, run, reason) {
-  for (const [k, n] of Object.entries(run.skipped)) q.skipped[k] = (q.skipped[k] ?? 0) + n;
-  const n = run.holder.jobs?.length ?? 0;
-  if (n) q.skipped[reason] = (q.skipped[reason] ?? 0) + n;
-  run.settle();
-  logRequestSkips(q);
+  try {
+    for (const [k, n] of Object.entries(run.skipped)) q.skipped[k] = (q.skipped[k] ?? 0) + n;
+    const n = run.holder.jobs?.length ?? 0;
+    if (n) q.skipped[reason] = (q.skipped[reason] ?? 0) + n;
+  } finally {
+    // Settling never depends on the tally or the log line succeeding.
+    run.settle();
+  }
+  try { logRequestSkips(q); } catch { /* a log line never fails the request */ }
 }
 /** In the fetch wrapper's `finally`: a run that was not started is dropped (holder nulled, reservation released). */
 export function discardDeferredWork(env) {
-  const q = env?.[DEFERRED];
-  if (!q || q.started || q.discarded) return;
-  q.discarded = true;
-  const run = q.run;
-  q.run = null;
-  if (run) dropRun(q, run, "discarded");
-  else logRequestSkips(q);
+  try {
+    const q = env?.[DEFERRED];
+    if (!q || q.started || q.discarded) return;
+    q.discarded = true;
+    const run = q.run;
+    q.run = null;
+    if (run) dropRun(q, run, "discarded");
+    else logRequestSkips(q);
+  } catch { /* never throws into the fetch wrapper's finally */ }
 }
 /** Resolves when every run started in this isolate so far has settled (tests and local tools). */
 export async function drainSearchIndexing() {
@@ -1385,6 +1410,7 @@ export function admitSearchJobs(env, run, jobs) {
   // Only a run that has not started may take jobs: once started, the writer iterates holder.jobs.
   if (!run || run.startedAt || run.settled || run.detached || run.running)
     throw new HttpError(500, "search_run_invalid", "Search jobs can only be added to a run that has not started");
+  run.phaseLog = searchPhaseLog(env);
   // Every descriptor is checked before anything is reserved, so a bad one changes no counter. A flat handle is used by
   // one job only: one already held by an admitted job (of any live run) or given twice in this call is refused. A
   // refused call drops the storage of every handle it read that no admitted job holds.

@@ -710,7 +710,7 @@ test("test 10 and 27: a stuck isolate refuses admission and logs search_admissio
 
 test("test 10: deferral: jobs wait for startDeferredWork, run under one waitUntil promise that never rejects; discard drops an unstarted run", async () => {
   const world = world1(["df1", "df2"]);
-  const env = aenv(world);
+  const env = aenv(world, { SEARCH_PHASE_LOG: "1" });
   const req = adm.withDeferredWork(env);
   assert.equal(adm.deferSearchIndexing(req, [job("df1", "alpha")]), undefined);
   assert.equal(world.calls, 0, "nothing runs before the response");
@@ -1746,5 +1746,78 @@ test("review R6-1: a job with neither text nor flat that is not off is an error,
   const { events } = await logs(() => adm.runSearchIndexing(env, r));
   assert.equal(W.docRow(world, "nn")?.revision_id ?? "", "", "no complete row");
   assert.ok(events.some((e) => e.event === "search_index_failed" && e.code === "search_terms_invalid"), JSON.stringify(events));
+  assertIdle();
+});
+
+// --- Starting deferred work cannot orphan a run; phase lines are opt-in (SEARCH_PHASE_LOG) ---------------------------
+/** A request with one admitted job; returns the request env and the run's holder (to check it is cleared). */
+function deferredRequest(world, vars = {}) {
+  const req = adm.withDeferredWork(aenv(world, vars));
+  adm.deferSearchIndexing(req, [job("sd1", "alpha beta")]);
+  const s = adm.searchAdmissionState();
+  assert.equal(s.active, 1, "admitted");
+  return req;
+}
+const skipLines = (events) => events.filter((e) => e.event === "search_index_skipped");
+
+test("review R7-1: a ctx whose waitUntil is a throwing getter: the run is dropped and settled, nothing escapes, one skip line", async () => {
+  const world = world1(["sd1"]);
+  const req = deferredRequest(world);
+  const ctx = { get waitUntil() { throw new Error("synthetic getter failure"); } };
+  const { events } = await logs(() => { adm.startDeferredWork(req, ctx); adm.discardDeferredWork(req); });
+  assert.equal(adm.searchAdmissionState().active, 0, "settled synchronously");
+  await adm.drainSearchIndexing();
+  assertIdle();
+  assert.deepEqual(skipLines(events).map((e) => e.reasons), [{ unstarted: 1 }]);
+  assert.equal(W.docRow(world, "sd1"), undefined);
+});
+
+test("review R7-1: a console.log that throws during handler_done cannot fail the hand-over (with SEARCH_PHASE_LOG=1)", async () => {
+  const world = world1(["sd1"]);
+  const req = deferredRequest(world, { SEARCH_PHASE_LOG: "1" });
+  const waits = [];
+  const realLog = console.log;
+  console.log = (line) => { if (String(line).includes("handler_done")) throw new Error("synthetic log failure"); };
+  try {
+    assert.doesNotThrow(() => adm.startDeferredWork(req, { waitUntil: (p) => waits.push(p) }));
+    adm.discardDeferredWork(req);
+  } finally { console.log = realLog; }
+  await Promise.all(waits);
+  await adm.drainSearchIndexing();
+  // Either the run was handed over and completed, or it was dropped and settled: never left registered.
+  assertIdle();
+});
+
+test("review R7-1: discardDeferredWork never throws (a run whose settle throws is still released)", async () => {
+  const world = world1(["sd1"]);
+  const req = deferredRequest(world);
+  const realError = console.error, realLog = console.log;
+  console.log = () => { throw new Error("synthetic log failure"); };
+  console.error = () => { throw new Error("synthetic log failure"); };
+  try { assert.doesNotThrow(() => adm.discardDeferredWork(req)); } finally { console.log = realLog; console.error = realError; }
+  assertIdle();
+});
+
+test("review R7-2: search_phase lines are written only with SEARCH_PHASE_LOG exactly \"1\"; deadline and detached always", async () => {
+  for (const [vars, want] of [[{}, false], [{ SEARCH_PHASE_LOG: "1" }, true], [{ SEARCH_PHASE_LOG: "true" }, false], [{ SEARCH_PHASE_LOG: "" }, false], [{ SEARCH_PHASE_LOG: 1 }, false]]) {
+    const world = world1(["ph"]);
+    const req = adm.withDeferredWork(aenv(world, vars));
+    adm.deferSearchIndexing(req, [job("ph", "alpha")]);
+    const waits = [];
+    const { events } = await logs(async () => { adm.startDeferredWork(req, { waitUntil: (p) => waits.push(p) }); await Promise.all(waits); });
+    const phases = events.filter((e) => e.event === "search_phase").map((e) => e.phase);
+    assert.deepEqual(phases, want ? ["handler_done", "deferred_start", "extract_done", "hmac_done", "deferred_end"] : [], JSON.stringify(vars));
+    assert.equal(W.docRow(world, "ph").revision_id, "rev_ph");
+    assertIdle();
+  }
+  // deadline is logged without the var.
+  const world = world1(["dl2"]);
+  const env = aenv(world);
+  let seen = 0;
+  world.after = ({ kind, qs }) => { if (kind === "batch" && qs.some((q) => /INTO search_tokens/.test(q)) && ++seen === 1) advance(21000); };
+  const { done } = start(env, [job("dl2", words(25000, "dz").join(" "))]);
+  const { events } = await done;
+  world.after = null;
+  assert.deepEqual(events.filter((e) => e.event === "search_phase").map((e) => e.phase), ["deadline"]);
   assertIdle();
 });

@@ -218,23 +218,33 @@ test("12: with SEARCH_TERMS_MAX = 0 a save writes a complete off row with no tok
   idle();
 });
 
-test("12: the response resolves before deferred_start for a 10 MiB worst-case save", async () => {
-  const a = await app();
+test("12: the response resolves before deferred_start for a 10 MiB worst-case save (one ordered observation)", async () => {
+  const a = await app({ SEARCH_PHASE_LOG: "1" });
   await a.project("p12big");
   const md = await a.req("POST", "/api/projects/p12big/artifacts", { title: "Synthetic", body: "seed" });
   await a.settle();
   const big = Array.from({ length: 1300000 }, (_, i) => "w" + i.toString(36)).join(" ").slice(0, 10 * 1048576 - 64);
-  const order = [];
+  // Every D1 call of the run touches a search table or the plan read; mark when the first one happens.
+  const isRunCall = (c) => (c.qs ?? [c.q]).some((q) => /search_token|search_term_counters|workspace_search_keys|\) AS cw,/.test(q));
+  const seen = [];
+  a.world.before = async (c) => { if (isRunCall(c)) seen.push("run_call"); };
   const { events } = await captureLogs(async () => {
-    const p = a.req("PUT", `/api/projects/p12big/artifacts/${md.body.artifact_id}`, { expected_revision: 1, body: big });
-    const r = await p;
-    order.push(["response", r.status]);
+    const r = await a.fetch(`/api/projects/p12big/artifacts/${md.body.artifact_id}`, { method: "PUT",
+      headers: { cookie: a.cookie, "x-csrf-token": a.csrf, "content-type": "application/json", "idempotency-key": "key-big-save-0001" },
+      body: JSON.stringify({ expected_revision: 1, body: big }) });
+    // The moment the fetch promise resolved: record what the run had done by then, in the same observation.
+    seen.push(`response:${r.status}`);
+    seen.push(`phases:${(globalThis.__phaseLog ?? []).length}`);
+    await r.text();
     await a.settle();
   });
-  const start = events.findIndex((e) => e.event === "search_phase" && e.phase === "deferred_start");
-  assert.equal(order[0][1], 200);
-  assert.ok(start >= 0, "the run started");
-  assert.ok(events.findIndex((e) => e.event === "search_phase" && e.phase === "handler_done") < start);
+  a.world.before = null;
+  const at = seen.findIndex((x) => x.startsWith("response:"));
+  assert.equal(seen[at], "response:200");
+  assert.deepEqual(seen.slice(0, at), [], "no run D1 call before the response resolved");
+  const phases = events.filter((e) => e.event === "search_phase").map((e) => e.phase);
+  assert.deepEqual(phases.slice(0, 2), ["handler_done", "deferred_start"]);
+  assert.ok(seen.slice(at + 1).includes("run_call"), "the run ran after");
   const row = docRow(a, md.body.artifact_id);
   assert.equal(row.revision_id, headOf(a, md.body.artifact_id));
   assertExact(a);
@@ -353,20 +363,23 @@ test("16: 20 concurrent creates in a new workspace leave one key row; each docum
 });
 
 // --- 17: fences after the response -------------------------------------------------------------------------------------
-test("17: a key shred between commit and deferred work: the save is 201, the document stays missing, the log carries key_shredded", async () => {
+/** The run's first token write batch (it leases or creates the document row). */
+const isWrite = (c) => c.kind === "batch" && c.qs.some((q) => /^\s*(UPDATE|INSERT INTO) search_token_docs\b/.test(q));
+
+test("17a: a key shred while the run's first token write is in flight: the key fence refuses it (key_shredded), nothing written", async () => {
   const master = Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64");
   const a = await app({ CONTENT_MASTER_KEY_VERSION: "1", CONTENT_MASTER_KEY_V1: master });
   const p = await a.project("p17");
-  const first = await a.req("POST", "/api/projects/p17/artifacts", { title: "Synthetic", body: "seed" });
+  const first = await a.req("POST", "/api/projects/p17/artifacts", { title: "Synthetic", body: "seed words" });
   assert.equal(first.status, 201);
   await a.settle();
-  // Shred after the commit, before the deferred run: the run is held at its first D1 call.
+  const before = { tokens: tokensOf(a, first.body.artifact_id), row: docRow(a, first.body.artifact_id), counters: W.counters(a.world) };
   let release, held = false;
   const paused = new Promise((r) => { release = r; });
-  a.world.before = async (c) => { if (!held && isPlan(c)) { held = true; await paused; } };
+  a.world.before = async (c) => { if (!held && isWrite(c)) { held = true; await paused; } };
   const { result: s, events } = await captureLogs(async () => {
     const s0 = await a.req("PUT", `/api/projects/p17/artifacts/${first.body.artifact_id}`, { expected_revision: 1, body: "after shred" });
-    await until(() => held, { what: "the run's plan read" });
+    await until(() => held, { what: "the run's first write batch" });
     W.run(a.world, "UPDATE workspace_keys SET shredded_at = 1, wrapped = '' WHERE workspace_id = ?", p.workspace_id);
     release();
     a.world.before = null;
@@ -374,33 +387,98 @@ test("17: a key shred between commit and deferred work: the save is 201, the doc
     return s0;
   });
   assert.equal(s.status, 200);
-  assert.notEqual(docRow(a, first.body.artifact_id)?.revision_id, headOf(a, first.body.artifact_id), "not complete at the new head");
-  assert.ok(events.some((e) => e.event === "search_index_failed" && e.code === "key_shredded"), JSON.stringify(events.filter((e) => /search/.test(e.event))));
+  const failed = events.filter((e) => e.event === "search_index_failed");
+  assert.deepEqual(failed.map((e) => e.code), ["key_shredded"], JSON.stringify(failed));
+  assert.deepEqual(tokensOf(a, first.body.artifact_id), before.tokens, "prior tokens unchanged");
+  assert.deepEqual(docRow(a, first.body.artifact_id), before.row, "nothing written");
+  assert.deepEqual(W.counters(a.world), before.counters);
   assertExact(a);
   idle();
 });
 
-test("17: encryption turned on between commit and deferred work: the save is 200, the document stays missing, encryption_started", async () => {
+test("17b: encryption turned on while the run's first token write is in flight: the plaintext fence refuses it (encryption_started)", async () => {
   const a = await app();
   const p = await a.project("p17b");
-  const first = await a.req("POST", "/api/projects/p17b/artifacts", { title: "Synthetic", body: "seed" });
+  const first = await a.req("POST", "/api/projects/p17b/artifacts", { title: "Synthetic", body: "seed words" });
   await a.settle();
+  const before = { tokens: tokensOf(a, first.body.artifact_id), row: docRow(a, first.body.artifact_id), counters: W.counters(a.world) };
   let release, held = false;
   const paused = new Promise((r) => { release = r; });
-  a.world.before = async (c) => { if (!held && isPlan(c)) { held = true; await paused; } };
+  a.world.before = async (c) => { if (!held && isWrite(c)) { held = true; await paused; } };
   const { result: s, events } = await captureLogs(async () => {
     const s0 = await a.req("PUT", `/api/projects/p17b/artifacts/${first.body.artifact_id}`, { expected_revision: 1, body: "after encryption on" });
-    await until(() => held, { what: "the run's plan read" });
-    W.run(a.world, `INSERT INTO workspace_keys (workspace_id, key_id, master_version, wrapped, created_at) VALUES (?, 'wk_synthetic', 1, 'synthetic-wrapped', 1)`, p.workspace_id);
+    await until(() => held, { what: "the run's first write batch" });
+    W.run(a.world, "INSERT INTO workspace_keys (workspace_id, key_id, master_version, wrapped, created_at) VALUES (?, 'wk_synthetic', 1, 'synthetic-wrapped', 1)", p.workspace_id);
     release();
     a.world.before = null;
     await a.settle();
     return s0;
   });
   assert.equal(s.status, 200);
-  assert.notEqual(docRow(a, first.body.artifact_id)?.revision_id, headOf(a, first.body.artifact_id));
-  assert.ok(events.some((e) => e.event === "search_index_failed" && (e.code === "encryption_started" || e.code === "encryption_misconfigured")), JSON.stringify(events.filter((e) => /search/.test(e.event))));
+  const failed = events.filter((e) => e.event === "search_index_failed");
+  assert.deepEqual(failed.map((e) => e.code), ["encryption_started"], JSON.stringify(failed));
+  assert.deepEqual(tokensOf(a, first.body.artifact_id), before.tokens, "prior tokens unchanged");
+  assert.deepEqual(docRow(a, first.body.artifact_id), before.row);
+  assert.deepEqual(W.counters(a.world), before.counters);
+  assertExact(a);
   idle();
+});
+
+test("wiring: a publication refused by a fence creates no job and no run", async () => {
+  const a = await app({ SEARCH_PHASE_LOG: "1" });
+  await a.project("pfence");
+  await a.req("POST", "/api/projects/pfence/artifacts", { title: "Synthetic", body: "seed" });
+  await a.settle();
+  // The text-write fence (first statement of the publishing batch) refuses when the staged write is gone: expire it
+  // just before the batch runs. The publication is refused (503 text_write_expired) and must create no job.
+  const w0 = a.waits.length, c0 = a.world.calls;
+  a.world.before = async (c) => { if (c.kind === "batch" && c.qs.some((q) => /INSERT INTO revisions/.test(q))) W.run(a.world, "UPDATE content_writes SET created_at = 0"); };
+  const { result: r, events } = await captureLogs(() => a.req("POST", "/api/projects/pfence/artifacts", { title: "Synthetic", body: "refused words" }));
+  a.world.before = null;
+  assert.equal(r.status, 503, JSON.stringify(r.body));
+  assert.equal(r.body.error.code, "text_write_expired");
+  assert.equal(a.waits.length, w0, "no run handed to waitUntil");
+  assert.ok(!events.some((e) => e.event === "search_phase" || e.event === "search_index_skipped"), "no job, no run");
+  assert.ok(!a.world.log.slice(-(a.world.calls - c0)).some((c) => (c.qs ?? [c.q]).some((q) => /search_token_docs|workspace_search_keys/.test(q))));
+  idle();
+});
+
+test("wiring: a project deleted between the commit and the run's first token batch gets no tokens; counters exact", async () => {
+  const a = await app();
+  await a.project("pdel");
+  const keep = await a.req("POST", "/api/projects/pdel/artifacts", { title: "Synthetic", body: "kept words" });
+  await a.settle();
+  const before = W.counters(a.world);
+  let release, held = false;
+  const paused = new Promise((r) => { release = r; });
+  a.world.before = async (c) => { if (!held && isWrite(c)) { held = true; await paused; } };
+  const r = await a.req("POST", "/api/projects/pdel/artifacts", { title: "Synthetic", body: "never indexed words" });
+  assert.equal(r.status, 201);
+  await until(() => held, { what: "the run's first write batch" });
+  const del = await a.req("DELETE", "/api/projects/pdel", { confirm_title: "Synthetic" });
+  assert.ok(del.status < 300, JSON.stringify(del.body));
+  release();
+  a.world.before = null;
+  await captureLogs(() => a.settle());
+  assert.equal(docRow(a, r.body.artifact_id), undefined, "no row for the new document");
+  assert.equal(W.one(a.world, "SELECT COUNT(*) AS n FROM search_tokens s JOIN search_token_docs d ON d.doc_id = s.doc_id WHERE d.artifact_id = ?", r.body.artifact_id).n, 0);
+  assert.deepEqual(W.counters(a.world), before);
+  void keep;
+  assertExact(a);
+  idle();
+});
+
+test("R7-2: a plain save logs no search_phase line without SEARCH_PHASE_LOG, and the five with it", async () => {
+  for (const [vars, want] of [[{}, []], [{ SEARCH_PHASE_LOG: "1" }, ["handler_done", "deferred_start", "extract_done", "hmac_done", "deferred_end"]]]) {
+    const a = await app(vars);
+    await a.project("pphase");
+    const md = await a.req("POST", "/api/projects/pphase/artifacts", { title: "Synthetic", body: "alpha" });
+    await a.settle();
+    const { events } = await captureLogs(async () => { await a.req("PUT", `/api/projects/pphase/artifacts/${md.body.artifact_id}`, { expected_revision: 1, body: "beta" }); await a.settle(); });
+    assert.deepEqual(events.filter((e) => e.event === "search_phase").map((e) => e.phase), want, JSON.stringify(vars));
+    assertIndexed(a, "pphase", md.body.artifact_id, "beta");
+    idle();
+  }
 });
 
 // --- 18: best effort -----------------------------------------------------------------------------------------------------
@@ -626,5 +704,30 @@ test("9: deferIndexing never throws: onSearchJob or the deferral throwing logs o
   const got = [];
   lib.deferIndexing(ctx, "art_y", "p_y", "rev_y", secret, 22, (j) => got.push(j));
   assert.deepEqual(got, [{ artifactId: "art_y", projectId: "p_y", revisionId: "rev_y", text: secret, textBytes: 22 }]);
+  idle();
+});
+
+test("R7-1: coreWorker.fetch rejecting while discardDeferredWork itself throws: the handler's own error surfaces; nothing left registered", async () => {
+  const a = await app();
+  await a.project("p9d");
+  let committed = false;
+  a.world.after = async (c) => { if (c.kind === "batch" && c.qs.some((q) => /INSERT INTO revisions/.test(q))) committed = true; };
+  const realSet = Headers.prototype.set, realLog = console.log, realError = console.error;
+  const handlerError = new TypeError("synthetic failure after the commit");
+  Headers.prototype.set = function (...args) { if (committed && args[0] === "x-content-type-options") throw handlerError; return realSet.apply(this, args); };
+  // Every search log line throws from the commit on: the discard's skip line fails inside the wrapper's finally.
+  const failSearch = (real) => (...x) => { if (committed && /"event":"search_/.test(String(x[0]))) throw new Error("synthetic log failure"); return real(...x); };
+  console.log = failSearch(realLog);
+  console.error = failSearch(realError);
+  let rejected = null;
+  try {
+    await a.fetch("/api/projects/p9d/artifacts", { method: "POST", headers: { cookie: a.cookie, "x-csrf-token": a.csrf, "content-type": "application/json", "idempotency-key": "key-reject-0002" }, body: JSON.stringify({ title: "Synthetic", body: "alpha" }) }, { waitUntil() {} });
+  } catch (e) { rejected = e; }
+  finally {
+    committed = false;
+    Headers.prototype.set = realSet; console.log = realLog; console.error = realError;
+    a.world.after = null;
+  }
+  assert.equal(rejected, handlerError, "the handler's own error");
   idle();
 });
