@@ -397,10 +397,12 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
   try {
     const held = await current();
     const finalKey = held?.final_key;
-    // An upload begun by an earlier Worker holds the unencoded form, which differs only for a restored document's id.
-    const prefix = [blobPrefix(projectId, u.artifact_id), `blobs/${projectId}/${u.artifact_id}/`]
-      .find((p) => typeof finalKey === "string" && finalKey.startsWith(p) && /^rev_[A-Za-z0-9_-]+$/.test(finalKey.slice(p.length)));
-    if (held?.finalize_token !== token || !prefix)
+    // The encoded prefix only. The unencoded form of one id can be another's encoded prefix (a document literally named
+    // "a%2Fb" vs "a/b"), so accepting it would let one document's key pass for the other. For every id the app creates
+    // the two are the same string; an upload begun by the previous Worker on a restored document whose id needs
+    // encoding is refused here and must be started again.
+    const prefix = blobPrefix(projectId, u.artifact_id);
+    if (held?.finalize_token !== token || typeof finalKey !== "string" || !finalKey.startsWith(prefix) || !/^rev_[A-Za-z0-9_-]+$/.test(finalKey.slice(prefix.length)))
       throw new HttpError(500, "publish_failed", "Upload finalization state is inconsistent");
     const kind = Object.hasOwn(TEXT_UPLOAD_KINDS, u.mime) ? TEXT_UPLOAD_KINDS[u.mime] : null;
     const revId = kind ? randomId("rev") : finalKey.slice(prefix.length);

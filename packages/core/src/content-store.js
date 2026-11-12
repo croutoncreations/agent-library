@@ -411,13 +411,23 @@ export async function writeBlobBytes(env, { key, bytes, contentType, workspaceId
 }
 
 /**
+ * A string as the database stores it: each lone surrogate becomes U+FFFD. Probed on local workerd D1: the id
+ * "x\ud800" is stored as hex 78EFBFBD, and a second id "x\udc00" then fails UNIQUE on the primary key (node:sqlite
+ * stores it the same way). Two such ids are one stored value, so they collide as the database's keys collide.
+ */
+export function storedText(v) {
+  return String(v).replace(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, "\ufffd");
+}
+
+/**
  * The storage-key prefix of one document's file objects. Each segment is URI-encoded, as textKey does, so no
  * document's prefix is a prefix of another's ("a" and "a/b", or "a/b" and a literal "a%2Fb"). Ids the app creates
- * ([A-Za-z0-9_-], every project id) are unchanged by encoding; only a document id kept by restore can differ. A lone
- * surrogate becomes U+FFFD first, so encoding never throws.
+ * ([A-Za-z0-9_-], every project id) are unchanged by encoding; only a document id kept by restore can differ. Each
+ * segment is the id as stored (storedText: a lone surrogate is stored as U+FFFD), so encoding never throws and two
+ * ids that collide in the database share a prefix, never two different documents.
  */
 export function blobPrefix(projectId, artifactId) {
-  const seg = (v) => encodeURIComponent(String(v).replace(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, "\ufffd"));
+  const seg = (v) => encodeURIComponent(storedText(v));
   return `blobs/${seg(projectId)}/${seg(artifactId)}/`;
 }
 

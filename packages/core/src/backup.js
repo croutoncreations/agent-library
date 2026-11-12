@@ -1,6 +1,6 @@
 import { TEXT_MAX_BYTES } from "./text-limits.js";
 import { personalWorkspaceId } from "./tenancy.js";
-import { blobKeyFits, blobPrefix, blobRef, commitTextWrites, deleteBlobs, dropUnreferencedBlobs, fenceRefusal, getText, isTextWriteFenceError, keyFence, mapContent, plaintextFence, readBlobBytes, stageTextWrites, textKey, textWriteComplete, writeBlobBytes } from "./content-store.js";
+import { blobKeyFits, blobPrefix, blobRef, commitTextWrites, deleteBlobs, dropUnreferencedBlobs, fenceRefusal, getText, isTextWriteFenceError, keyFence, mapContent, plaintextFence, readBlobBytes, stageTextWrites, storedText, textKey, textWriteComplete, writeBlobBytes } from "./content-store.js";
 import { textSearchBridge } from "./search/service.js";
 import { limitsFor, requireHuman } from "./auth.js";
 import { BINARY_TYPES, LIMITS, tplDate } from "./service.js";
@@ -114,6 +114,9 @@ async function validateBackup(backup) {
 //    (storedDocumentIds), so a number and a string match exactly when the database would store them the same.
 // strict (import only) adds import's own rules: finite numbers and no byte lists, restored_from an integer, trashed
 // and comment bodies scalars, and references by plain equality (import requires string ids).
+// What D1's bind accepts as a BLOB: a list of numbers each >= 0 and < 256 (workerd's D1 shim; probed: [65.1] binds
+// as 0x41, [255.9] as 0xFF, [-0] as 0x00; [-1], [256], [NaN], [Infinity], ["1"], [null], [true], [[1]] throw).
+// The stored bytes are Uint8Array.from(list) (fractions truncated), so byte lists compare by those bytes.
 const isByteList = (v) => Array.isArray(v) && v.every((b) => typeof b === "number" && b >= 0 && b < 256);
 const scalar = (v) => v === null || v === void 0 || typeof v === "string" || typeof v === "boolean" || typeof v === "number";
 function checkBindable(backup, { strict = false, docKey = (v) => v } = {}) {
@@ -150,21 +153,24 @@ function checkBindable(backup, { strict = false, docKey = (v) => v } = {}) {
  * Restore: the form each document id and reference will be stored in. artifacts.id and every artifact_id are TEXT
  * columns, so the database keeps a string as it is and turns a number or boolean into its own text form (D1 binds
  * every JS number as REAL, so 7 is stored "7.0" and never equals "7"); a byte list stays a BLOB, equal only to the
- * same bytes. The foreign keys compare those stored forms. The database is asked for the numbers and booleans (one
- * batch, only when there are any). Returns Map(value -> stored text, or a tagged key for a BLOB).
+ * same bytes; a string is stored with each lone surrogate as U+FFFD (storedText, shared with blobPrefix). The foreign
+ * keys compare those stored forms. The database is asked for the numbers and booleans, in batches of at most 100
+ * statements and only when there are any; each distinct value comes from a row restore's own batch inserts, so the
+ * lookup issues at most one statement per such row. Returns Map(value -> stored text, or a tagged key for a BLOB).
  */
 async function storedDocumentIds(DB, backup) {
   const values = new Set([...backup.artifacts.map((a) => a?.id), ...[...backup.revisions, ...backup.meta_versions ?? [], ...backup.comments].map((x) => x?.artifact_id)]);
   const stored = new Map();
   const ask = [];
   for (const v of values) {
-    if (typeof v === "string") stored.set(v, v);
-    else if (isByteList(v)) stored.set(v, "\u0000blob:" + v.join(","));
+    if (typeof v === "string") stored.set(v, storedText(v));
+    else if (isByteList(v)) stored.set(v, "\u0000blob:" + Uint8Array.from(v).join(","));
     else if (v != null && scalar(v)) ask.push(v);
   }
-  if (ask.length) {
-    const res = await DB.batch(ask.map((v) => DB.prepare("SELECT CAST(? AS TEXT) AS t").bind(v)));
-    ask.forEach((v, i) => stored.set(v, res[i].results[0]?.t ?? null));
+  for (let i = 0; i < ask.length; i += 100) {
+    const chunk = ask.slice(i, i + 100);
+    const res = await DB.batch(chunk.map((v) => DB.prepare("SELECT CAST(? AS TEXT) AS t").bind(v)));
+    chunk.forEach((v, j) => stored.set(v, res[j].results[0]?.t ?? null));
   }
   return stored;
 }

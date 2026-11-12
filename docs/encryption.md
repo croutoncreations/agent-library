@@ -208,6 +208,12 @@ before encryption was configured with encrypted ones after.
   The 48-byte header is stored in the database (base64url). The object carries R2 metadata `al-enc: "1"` and
   `al-key: <key id>` and the content type `application/octet-stream`; the content type a client sees always comes
   from the database. Both places must agree: one set without the other is refused as `500 blob_corrupt`.
+- **Storage keys.** A file's storage key is `blobs/<project>/<document>/<name>`, with the project and document
+  parts URI-encoded (a lone surrogate first becomes U+FFFD, as the database stores it), and every read checks that
+  encoded prefix. Ids the app creates are unchanged by encoding; only a document id kept by restore can differ. No
+  encrypted object was written before this rule (no environment had a key), so no key needs migrating. An upload
+  begun before the upgrade on a restored document whose id needs encoding fails at finish
+  (`500 publish_failed`) and must be started again.
 - **The header lives in the database.** Every write of the same storage key has a fresh salt, and every chunk
   authenticates the full header, so the database header pins a read to the exact write that was published. A later
   write of the same key does not decrypt under it.
@@ -279,6 +285,10 @@ before encryption was configured with encrypted ones after.
   5. The decision on late writes (below) is made.
   6. The operator knows the two floors: never run an older Worker, and never restore the database to a point before
      encrypted content was written.
+  7. Staging first: a key is configured on staging, and the checks above pass there, before production. Production is
+     configured only on the owner's explicit go-ahead.
+  8. The cost of the plaintext-write condition (the "no real key exists" query over `workspace_keys`, served by the
+     `workspace_keys_real` index) is measured on staging, where every plaintext write and publication runs it.
 - **Late writes.** An R2 put the Worker stopped waiting for can still commit later. Before publication, finish
   catches it (chunk 0 does not authenticate under the recorded header: `500 publish_failed`, upload failed). After
   publication it would make that version read as `blob_corrupt` (unavailable, never wrong content). Closing this is a
