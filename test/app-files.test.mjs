@@ -664,9 +664,10 @@ test("PUT replace: etag and rev:N forms; stale 412 with current_*; early and lat
   assert.equal(byTag.status, 200, "the first etag names the current bytes again"); assert.equal(byTag.json.file.revision, 5);
   ok(await put(c.tok, "r.md", v3, { match: "rev:5" }), 200);
   const revs = revCount(c.P.publisher_id), cnt = counters(c.P.publisher_id);
-  // Early unchanged: a matching X-Content-SHA256 answers before any byte is read, even at a cap.
+  // Early unchanged: a matching X-Content-SHA256 answers before any byte is kept, even at a cap. The body is drained
+  // (read and discarded); one that never arrives is given up at the (here shortened) idle deadline and answered anyway.
   setCounters(c.P.publisher_id, cnt[0], 100000, cnt[2]);
-  const x = partialPut(c.tok, "r.md", { length: v3.length, send: 0, headers: { "If-Match": "rev:6", "X-Content-SHA256": sha(v3) } });
+  const x = partialPut(c.tok, "r.md", { length: v3.length, send: 0, headers: { "If-Match": "rev:6", "X-Content-SHA256": sha(v3), "x-test-receive-deadline-ms": "1000" } });
   const early = await Promise.race([x.response, new Promise((r) => setTimeout(() => r(null), 4000))]);
   x.socket.destroy();
   assert.ok(early && /^HTTP\/1\.1 200/.test(early), `early unchanged answered without the body: ${early?.slice(0, 200)}`);
@@ -854,25 +855,115 @@ test("PUT size: 1 MiB accepted, 1 MiB + 1 refused (N14) declared and chunked; un
   assert.equal(sql(`SELECT COUNT(*) AS n FROM artifacts WHERE publisher_id = '${c.P.publisher_id}' AND export_name = 'under.md' AND trashed_at IS NULL`)[0].n <= 1, true);
   const under = sql(`SELECT r.size FROM artifacts a JOIN revisions r ON r.id = a.head_revision_id WHERE a.publisher_id = '${c.P.publisher_id}' AND a.export_name = 'under.md'`);
   if (under.length) assert.equal(under[0].size, 10, "only the declared bytes were taken");
-  // At a cap, a slow body is refused before it is read; no audit is written.
+  // At a cap, a slow body is refused before any byte is kept or a slot taken (the drain gives up at the shortened idle
+  // deadline); no audit is written.
   setCounters(c.P.publisher_id, 10000, 5, 5);
   const audits = auditCount(c.P.publisher_id);
-  const slow = partialPut(c.tok, "capped.md", { length: 1000, send: 0 });
+  const slow = partialPut(c.tok, "capped.md", { length: 1000, send: 0, headers: { "x-test-receive-deadline-ms": "1000" } });
   const capAns = await Promise.race([slow.response, new Promise((r) => setTimeout(() => r(""), 4000))]);
   slow.socket.destroy();
   assert.match(capAns, /^HTTP\/1\.1 413/); assert.match(capAns, /"max_files":10000/);
   assert.equal(auditCount(c.P.publisher_id), audits);
   setCounters(c.P.publisher_id, 1, 1, 1048576);
-  // Workspace storage full: 402 before the body is read.
+  // Workspace storage full: 402 before any byte is kept.
   const pid = ok(await owner.req("POST", "/api/workspaces", { name: uniq("Tiny") }), 201).id;
   sql(`UPDATE workspaces SET plan = 'tiny' WHERE id = '${pid}'`);
   const tp = ok(await owner.req("POST", "/api/projects", { title: uniq("Tiny project"), workspace_id: pid }), 201).id;
   const t = await connect(tp);
-  const full = partialPut(t.tok, "big.md", { length: 70000, send: 0 });
+  const full = partialPut(t.tok, "big.md", { length: 70000, send: 0, headers: { "x-test-receive-deadline-ms": "1000" } });
   const fullAns = await Promise.race([full.response, new Promise((r) => setTimeout(() => r(""), 4000))]);
   full.socket.destroy();
   assert.match(fullAns, /^HTTP\/1\.1 402/); assert.match(fullAns, /limit_reached/);
   assert.equal((await put(t.tok, "small.md", "x".repeat(1000), { create: true })).status, 201);
+});
+
+// Early answers drain the body (A-drain): once authorization has passed, an answer given before the body was received
+// first reads and discards the rest (at most 16 MiB, within the receive deadlines), so a client still sending sees the
+// answer, not a closed connection. The defect showed in about 1 of 5 requests, so each case runs 30 times in a row.
+/** Run `send` 30 times; no fetch may fail (a closed connection), and every answer must pass `check`. */
+async function thirty(label, send, check) {
+  const failures = [];
+  for (let i = 0; i < 30; i++) {
+    let r;
+    try { r = await send(i); } catch (e) { failures.push(`${i}: ${e.cause?.code ?? e.message}`); continue; }
+    check(r, i);
+  }
+  console.log(JSON.stringify({ loop: label, failed_fetches: failures.length }));
+  assert.deepEqual(failures, [], `${label}: requests that saw a closed connection instead of the answer`);
+}
+const MiB = "a".repeat(1048576);
+
+test("early answers drain the body: over-cap declared and chunked 413 N14, stale 412, N6, early unchanged, cap 413; 30 times each, every answer arrives", async () => {
+  const c = await connect("files-own");
+  await thirty("declared 1 MiB + 1", (i) => put(c.tok, `over${i}.md`, MiB + "a", { create: true }), (r) => err(r, 413, "file_too_large", N.N14));
+  await thirty("chunked 3 MiB", async (i) => {
+    const body = new ReadableStream({ start(ctl) { for (let k = 0; k < 3; k++) ctl.enqueue(Buffer.from(MiB)); ctl.close(); } });
+    const r = await fetch(`${h.api}/app/files/chunk${i}.md`, { method: "PUT", duplex: "half", body,
+      headers: { authorization: `Bearer ${c.tok}`, "content-type": "text/markdown", "if-none-match": "*", "idempotency-key": uniq("chunk-key") } });
+    return { status: r.status, json: await r.json(), text: "" };
+  }, (r) => err(r, 413, "file_too_large", N.N14));
+  ok(await put(c.tok, "s.md", "v1", { create: true }), 201);
+  const v2 = ok(await put(c.tok, "s.md", "v2", { match: "rev:1" }));
+  await thirty("stale If-Match", () => put(c.tok, "s.md", MiB, { match: "rev:1" }), (r) => {
+    err(r, 412, "precondition_failed", N.N5); assert.equal(r.json.error.current_revision, 2); assert.equal(r.json.error.current_etag, v2.file.etag);
+  });
+  await thirty("create over a file", () => put(c.tok, "s.md", MiB, { create: true }), (r) => err(r, 412, "precondition_failed", N.N6));
+  ok(await put(c.tok, "big.md", MiB, { create: true }), 201);
+  const revs = revCount(c.P.publisher_id), cnt = counters(c.P.publisher_id);
+  await thirty("early unchanged", () => put(c.tok, "big.md", MiB, { match: "rev:1", headers: { "x-content-sha256": sha(MiB) } }), (r) => {
+    assert.equal(r.status, 200, r.text); assert.equal(r.json.unchanged, true); assert.equal(r.json.file.revision, 1);
+    assert.equal(r.headers.get("x-test-slots-in-use"), "0");
+  });
+  assert.equal(revCount(c.P.publisher_id), revs); assert.deepEqual(counters(c.P.publisher_id), cnt);
+  // While an early-unchanged body is still arriving it is being drained, and the drain holds no slot.
+  const x = partialPut(c.tok, "big.md", { length: 1048576, send: 524288, headers: { "If-Match": "rev:1", "X-Content-SHA256": sha(MiB) } });
+  try {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 1000) { assert.equal(await slotsInUse(c.tok), 0, "the drain takes no slot"); await new Promise((r) => setTimeout(r, 100)); }
+    x.socket.write(Buffer.alloc(524288, 0x61));
+    const ans = await Promise.race([x.response, new Promise((r) => setTimeout(() => r("(no answer in 4 s)"), 4000))]);
+    assert.match(ans, /^HTTP\/1\.1 200 /, ans.slice(0, 200)); assert.match(ans, /"unchanged":true/);
+  } finally { x.socket.destroy(); }
+  setCounters(c.P.publisher_id, 10000, cnt[1], cnt[2]);
+  try {
+    await thirty("at the files cap", (i) => put(c.tok, `capped${i}.md`, MiB, { create: true }), (r) => { err(r, 413, "quota_exceeded"); assert.equal(r.json.error.max_files, 10000); });
+  } finally { setCounters(c.P.publisher_id, ...cnt); }
+  assert.equal(revCount(c.P.publisher_id), revs);
+});
+
+test("early answers drain the body: a full isolate answers 503 with Retry-After to a 1 MiB PUT, 30 times, every answer arrives", async () => {
+  const w = await slotWorld();
+  // Four slow uploads hold the isolate's four slots; a byte every 500 ms keeps each within its idle deadline.
+  const open = w.holders.map((hc, i) => partialPut(hc.tok, `hold${i}.md`, { length: 100000, send: 3 }));
+  const trickle = setInterval(() => { for (const o of open) o.socket.write("a"); }, 500);
+  try {
+    await untilSlots(w.fifth.tok, 4);
+    await thirty("isolate full", (i) => put(w.fifth.tok, `busy${i}.md`, MiB, { create: true }), (r) => {
+      err(r, 503, "app_files_busy", N.N12); assert.equal(r.headers.get("retry-after"), "1");
+    });
+  } finally { clearInterval(trickle); for (const o of open) o.socket.destroy(); }
+  await untilSlots(w.fifth.tok, 0, 8000);
+});
+
+test("early answers drain the body only after authorization: an unauthenticated PUT answers 401 at once; an authorized refusal waits for the body", async () => {
+  const c = await connect("files-own");
+  ok(await put(c.tok, "held.md", "v1", { create: true }), 201);
+  // No valid token: route() answers before put() runs, so nothing waits for (drains) the body.
+  const t0 = Date.now();
+  const anon = partialPut("not-a-token", "held.md", { length: 1048576, send: 1000 });
+  const a = await Promise.race([anon.response, new Promise((r) => setTimeout(() => r("(no answer in 3 s)"), 3000))]);
+  const anonMs = Date.now() - t0;
+  anon.socket.destroy();
+  assert.match(a, /^HTTP\/1\.1 401 /, a.slice(0, 200));
+  assert.ok(anonMs < 1000, `401 took ${anonMs} ms: the body must not be drained for an unauthenticated caller`);
+  // Authorized, refused (N6) while the body is still arriving: the answer comes once the drain stops at the idle deadline.
+  const t1 = Date.now();
+  const auth = partialPut(c.tok, "held.md", { length: 1048576, send: 1000, headers: { "x-test-receive-deadline-ms": "1500" } });
+  const b = await Promise.race([auth.response, new Promise((r) => setTimeout(() => r("(no answer in 5 s)"), 5000))]);
+  const authMs = Date.now() - t1;
+  auth.socket.destroy();
+  assert.match(b, /^HTTP\/1\.1 412 /, b.slice(0, 200));
+  assert.ok(authMs >= 1400, `412 came after ${authMs} ms: an authorized early answer drains until the (shortened) idle deadline`);
 });
 
 // Design test 16 (one local isolate) with A1 and A7. The admission table itself (overrun, reclaim, the 6-body bound,

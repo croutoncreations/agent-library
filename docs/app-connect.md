@@ -92,6 +92,8 @@ App Files lets an app keep ordinary text files by path, one request per file, li
 
 **One request body is at most 1 MiB (1,048,576 bytes).** Larger single files for apps are planned; the three-step upload flow does not accept an app's token today. Until then, an app's larger exports go through the staged export route (`/v1/publisher/generations`), or must be split into files of at most 1 MiB. A body must arrive within 15 seconds in total, with no gap longer than 5 seconds; that is about 70 KB/s for a full 1 MiB. Clients on weak links should send smaller files, or retry with the same `Idempotency-Key`.
 
+When the API refuses a `PUT` (or answers "unchanged") before it has taken the body, it first reads and discards the rest of the body, up to 16 MiB and within the same time limits as an upload, so the answer reaches a client that is still sending. A larger or slower body is cut off, and the client may see a closed connection instead of the answer. This takes no upload slot and keeps none of the body; a request without a valid token is answered without reading its body.
+
 ### Paths
 
 - 1–8 segments separated by `/`, each 1–64 characters of letters, digits, `.`, `_` and `-`, not starting with `.`; at most 200 characters; ending in one of the extensions above. ASCII only, no `%` escapes, no `\`, no empty segments. The path must be exactly what was sent (no `.` or `..` segments).
@@ -102,7 +104,7 @@ App Files lets an app keep ordinary text files by path, one request per file, li
 ### Preconditions, idempotency and replay
 
 - `PUT` needs either `If-None-Match: *` (create; refused if a file exists) or `If-Match` (replace). `DELETE` needs `If-Match`. `If-Match` is either the file's `ETag` (`"<sha256>"`) or a revision, written `rev:N` or `"rev:N"`. A revision is judged by number: if the content went A → B → A, `rev:1` is stale although the bytes match again.
-- `X-Content-SHA256` (64 lowercase hex characters) is optional. When it equals the current version's hash on a replace, the answer is `200 unchanged` at once, without reading the body and even when the app is at a limit. When the body does not match it, the answer is `422 integrity_mismatch`.
+- `X-Content-SHA256` (64 lowercase hex characters) is optional. When it equals the current version's hash on a replace, the answer is `200 unchanged` without keeping the body, taking a slot or writing anything, even when the app is at a limit. When the body does not match it, the answer is `422 integrity_mismatch`.
 - Every `PUT` and `DELETE` needs an `Idempotency-Key`. A retry with the same key and the same request replays the first answer (with `idempotent_replay: true`), even if the file or the limits changed since, and even when the retry races the first request. The same key with a different request is `422 idempotency_key_reused`. When a stored answer exists for the key, a busy server may answer `503` or `429` instead of the refusal; retry later with the same key and the stored answer is replayed.
 
 ### Delete

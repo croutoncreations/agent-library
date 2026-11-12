@@ -120,3 +120,73 @@ test("path conflicts: exact and ancestor names are bound lowercased (at most 8 v
   const deep = W.conflictCheck("pub_x", "1/2/3/4/5/6/7/8.md");
   assert.equal(deep.params.length, 1 + 8 + 1 + 2);
 });
+
+// The App Files drain (early answers, and an undeclared body past 1 MiB): read and discard, at most DRAIN_BYTES from the
+// body's first byte, within the receive deadlines; cancel past either bound; keep nothing.
+const D = await loadWorker({ "api/app-files.js": ["drainBody", "APP_FILES_RECEIVE_MS", "APP_FILES_IDLE_MS"], "util.js": ["DRAIN_BYTES"] });
+/** A synthetic body: `count` chunks of `size` bytes, each after `gapMs`; records reads, cancels and WeakRefs to the chunks. */
+function body({ size = 65536, count = Infinity, gapMs = 0 } = {}) {
+  const s = { pulled: 0, cancelled: false, refs: [] };
+  s.reader = new ReadableStream({
+    async pull(ctl) {
+      if (s.pulled >= count) { ctl.close(); return; }
+      if (gapMs) await new Promise((r) => setTimeout(r, gapMs));
+      if (s.cancelled) return;
+      const c = new Uint8Array(size); s.refs.push(new WeakRef(c)); s.pulled++; ctl.enqueue(c);
+    },
+    cancel() { s.cancelled = true; }
+  }, { highWaterMark: 0 }).getReader();
+  return s;
+}
+const LONG = { receiveMs: 15e3, idleMs: 5e3 };
+
+test("drain: the constants are the shared ones (util DRAIN_BYTES 16 MiB; the receive's 15 s total and 5 s idle)", () => {
+  assert.equal(D.DRAIN_BYTES, 16 * 1024 * 1024);
+  assert.equal(D.APP_FILES_RECEIVE_MS, 15e3); assert.equal(D.APP_FILES_IDLE_MS, 5e3);
+});
+
+test("drain: a body within 16 MiB is read to its end and not cancelled", async () => {
+  const b = body({ count: 256 }); // exactly 16 MiB
+  assert.equal(await D.drainBody(b.reader, 0, LONG), "done");
+  assert.equal(b.pulled, 256); assert.equal(b.cancelled, false);
+});
+
+test("drain: stops after 16 MiB in total (counting bytes already received) and cancels", async () => {
+  const b = body();
+  assert.equal(await D.drainBody(b.reader, 0, LONG), "bytes");
+  assert.equal(b.cancelled, true); assert.equal(b.pulled, 257, "16 MiB plus the chunk that passed it, no more");
+  const c = body();
+  assert.equal(await D.drainBody(c.reader, 15 * 1024 * 1024, LONG), "bytes");
+  assert.equal(c.pulled, 17, "1 MiB more after 15 MiB already received");
+});
+
+test("drain: cancels on the idle limit and on the total limit", async () => {
+  const idle = body({ count: 3, gapMs: 400 });
+  let t = Date.now();
+  assert.equal(await D.drainBody(idle.reader, 0, { receiveMs: 5000, idleMs: 150 }), "time");
+  assert.ok(Date.now() - t < 400, "gave up at the idle limit"); assert.equal(idle.cancelled, true);
+  const slow = body({ gapMs: 50 });
+  t = Date.now();
+  assert.equal(await D.drainBody(slow.reader, 0, { receiveMs: 300, idleMs: 200 }), "time");
+  const took = Date.now() - t;
+  assert.ok(took >= 280 && took < 450, `gave up at the total limit (${took} ms)`); assert.equal(slow.cancelled, true);
+  // The total limit counts from the given start (receiveBody passes its own start time).
+  const late = body({ gapMs: 50 });
+  t = Date.now();
+  assert.equal(await D.drainBody(late.reader, 0, { receiveMs: 300, idleMs: 200 }, Date.now() - 200), "time");
+  assert.ok(Date.now() - t < 200, "only the remaining 100 ms of the total limit");
+});
+
+test("drain: keeps no chunk (every chunk read is collectable afterwards)", async () => {
+  const { setFlagsFromString } = await import("node:v8");
+  const { runInNewContext } = await import("node:vm");
+  setFlagsFromString("--expose-gc");
+  const gc = runInNewContext("gc");
+  const b = body({ size: 1024 * 1024 });
+  assert.equal(await D.drainBody(b.reader, 0, LONG), "bytes");
+  await new Promise((r) => setTimeout(r, 0));
+  gc(); gc();
+  const alive = b.refs.filter((r) => r.deref() !== undefined).length;
+  assert.equal(b.refs.length, 17);
+  assert.ok(alive <= 1, `${alive} of ${b.refs.length} chunks still reachable after the drain`);
+});

@@ -10,7 +10,7 @@ import { nowIso } from "../util.js";
 import { appOrigin, artifactWebUrl, previewWebUrl } from "../links.js";
 import { clientLiveSql } from "../oauth/server.js";
 import { serveContent } from "../uploads.js";
-import { HttpError, b64url, idemKey, int, json, randomId, sha256Hex } from "../util.js";
+import { DRAIN_BYTES, HttpError, b64url, idemKey, int, json, randomId, sha256Hex } from "../util.js";
 import { assertStillAuthorized, pubCtx, testHooksOn, testPause } from "./publisher.js";
 
 /**
@@ -121,6 +121,7 @@ async function withSlot(execCtx, ws, creator, reclaimMs, work) {
  * slot is released by withSlot. Returns { bytes, sha256 }.
  */
 async function receiveBody(req, limit, declared, { receiveMs, idleMs }) {
+  const start = Date.now();
   const reader = req.body?.getReader();
   const chunks = [];
   let n = 0, timedOut = false;
@@ -137,7 +138,12 @@ async function receiveBody(req, limit, declared, { receiveMs, idleMs }) {
       if (timedOut) break;
       if (r.done) break;
       n += r.value.byteLength;
-      if (n > limit) { await reader.cancel().catch(() => {}); chunks.length = 0; throw tooLarge(); }
+      if (n > limit) {
+        // Keep nothing more, drop what was kept, and drain the rest (same deadlines, counted from this body's start).
+        chunks.length = 0; clearTimeout(total); clearTimeout(idle);
+        await drainBody(reader, n, { receiveMs, idleMs }, start);
+        throw tooLarge();
+      }
       chunks.push(r.value);
       clearTimeout(idle); idle = setTimeout(cancel, idleMs);
     }
@@ -149,6 +155,28 @@ async function receiveBody(req, limit, declared, { receiveMs, idleMs }) {
   for (const c of chunks) { bytes.set(c, o); o += c.byteLength; }
   chunks.length = 0;
   return { bytes, sha256: await sha256Hex(bytes) };
+}
+/**
+ * Read and discard the rest of a body so an early answer reaches a client that is still sending: at most DRAIN_BYTES
+ * counted from the body's first byte (`seen` already received), within the receive's total (from `start`) and idle
+ * deadlines. Past either bound the body is cancelled (the client may then see a closed connection). Nothing is kept.
+ * Returns "done" (read to its end), "bytes" or "time".
+ */
+export async function drainBody(reader, seen, { receiveMs, idleMs }, start = Date.now()) {
+  let n = seen, why = null;
+  const stop = (w) => { why ??= w; reader.cancel().catch(() => {}); };
+  const total = setTimeout(() => stop("time"), Math.max(0, start + receiveMs - Date.now()));
+  let idle = setTimeout(() => stop("time"), idleMs);
+  try {
+    for (;;) {
+      const { done, value } = await reader.read().catch(() => ({ done: true, value: undefined }));
+      if (why) return why;
+      if (done) return "done";
+      n += value.byteLength;
+      if (n > DRAIN_BYTES) { stop("bytes"); return why; }
+      clearTimeout(idle); idle = setTimeout(() => stop("time"), idleMs);
+    }
+  } finally { clearTimeout(total); clearTimeout(idle); }
 }
 const ROOT = "/v1/app/files";
 const SEGMENT = /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}$/;
@@ -359,10 +387,23 @@ function answer(res, path, kind, size) {
   return json(body, res.status, { etag: body.file.etag });
 }
 
+/**
+ * PUT. Once step 1 (authorization) has passed, every answer and error given while the body was never received first
+ * drains it (drainBody, no slot, nothing kept): this wrapper is the one place, so no early return can skip it. A body
+ * that receiveBody started is never drained here (receiveBody drains its own over-limit case; a stalled one is a 408).
+ */
 async function put(req, env, execCtx, p, requestId, wsId, rest) {
-  // 1. Authorization (route() already checked the token and the rate limit).
+  // 1. Authorization (route() already checked the token and the rate limit). A refusal here is not drained.
   await assertStillAuthorized(env, p);
   const h = appHooks(env, req);
+  const drain = async () => { if (req.body && !req.body.locked) await drainBody(req.body.getReader(), 0, h); };
+  let res;
+  try { res = await putAuthorized(req, env, execCtx, p, requestId, wsId, rest, h); }
+  catch (e) { await drain(); throw e; }
+  await drain();
+  return res;
+}
+async function putAuthorized(req, env, execCtx, p, requestId, wsId, rest, h) {
   // 2. Parse: nothing below reads the body.
   const { path, kind } = parseAppPath(rest);
   contentKind(req, kind);
@@ -448,12 +489,10 @@ async function put(req, env, execCtx, p, requestId, wsId, rest) {
   const c4 = await guard(rowChecks);
   if (c4.res) return c4.res;
   const row = c4.v;
-  // Early unchanged: the declared hash already equals the head's; nothing is read, reserved or written.
-  if (row && claimed === row.sha256) {
-    await req.body?.cancel().catch(() => {});
-    return unchanged(row);
-  }
-  // 5. Caps and workspace storage, from the declared size, before any byte is read.
+  // Early unchanged: the declared hash already equals the head's; nothing is kept, reserved or written (put() drains
+  // the body).
+  if (row && claimed === row.sha256) return unchanged(row);
+  // 5. Caps and workspace storage, from the declared size, before any byte is kept or a slot taken.
   const c5 = await guard(() => caps(row ? 0 : 1, declared ?? APP_FILE_MAX_BYTES));
   if (c5.res) return c5.res;
   // 6-10 under one slot.
