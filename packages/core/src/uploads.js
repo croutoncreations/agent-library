@@ -384,6 +384,7 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
     text = null;
     if (hasTextFinishSlot && textFinishSlot?.token === token) textFinishSlot = null;
   };
+  // Every outcome is awaited before returning (`return await`): the finally must not release the lease before it is recorded.
   try {
     const held = await current();
     const finalKey = held?.final_key;
@@ -401,7 +402,7 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
       return true;
     };
     const fail = async (status, code, message, state, extra) => {
-      if (!await end(status, code, message, state, extra)) return lost();
+      if (!await end(status, code, message, state, extra)) return await lost();
       await dropUnpublished(ctx.env, uploadId, finalKey).catch((e) => { if (!kind) throw e; });
       await purgeStaging(ctx.env, u);
       throw new HttpError(status, code, message, extra);
@@ -412,18 +413,18 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
       releaseTextFinishSlot();
       const row = await current();
       if (row && (row.state === "failed" || row.state === "conflict")) await dropUnpublished(ctx.env, uploadId, finalKey);
-      return lost();
+      return await lost();
     };
     // No write and no whole-object read: the upload's PUT already stored the bytes at final_key, and R2 checked their
     // length and the declared SHA-256 on the way in. Confirm what R2 recorded (fail closed without a checksum), then
     // check the type signature on the first bytes (BINARY_TYPES checks need at most 13).
     const stored = await headBlob(ctx.env, finalKey);
-    if (!stored) return fail(409, "missing_bytes", "Uploaded bytes missing", "failed");
+    if (!stored) return await fail(409, "missing_bytes", "Uploaded bytes missing", "failed");
     const size = stored.size;
     const sha2 = blobSha256Hex(stored);
-    if (sha2 === null) return fail(500, "publish_failed", "Stored object has no SHA-256 checksum", "failed");
+    if (sha2 === null) return await fail(500, "publish_failed", "Stored object has no SHA-256 checksum", "failed");
     if (size !== u.expected_size || sha2 !== u.expected_sha256)
-      return fail(422, "integrity_mismatch", "Byte length or SHA-256 does not match declaration", "failed", { received_size: size, received_sha256: sha2 });
+      return await fail(422, "integrity_mismatch", "Byte length or SHA-256 does not match declaration", "failed", { received_size: size, received_sha256: sha2 });
     if (kind) {
       if (kind === "json" || kind === "csv") requireAppConnect(ctx);
       const a = await loadArtifact(ctx, projectId, u.artifact_id, { allowUnpublished: u.base_rev === 0 });
@@ -434,26 +435,26 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
       hasTextFinishSlot = true;
       try {
         text = await getUploadedText(ctx.env, finalKey, kind);
-        if (textFinishSlot?.token !== token || textFinishSlot.until <= nowMs()) return lostAfterWrite();
-        if (text === null) return fail(409, "missing_bytes", "Uploaded bytes missing", "failed");
+        if (textFinishSlot?.token !== token || textFinishSlot.until <= nowMs()) return await lostAfterWrite();
+        if (text === null) return await fail(409, "missing_bytes", "Uploaded bytes missing", "failed");
         if (kind === "markdown" || kind === "html") mdBody(text, kind);
         else checkFile(kind, text, a.schema_id);
       } catch (e) {
         // Only document validation errors are terminal. R2/D1 failures retain their retryable sealed state.
-        if (e instanceof HttpError && (e.code === "invalid_content" || e.code === "too_large" || e.code === "invalid_input")) return fail(e.status, e.code, e.message, "failed", e.extra);
+        if (e instanceof HttpError && (e.code === "invalid_content" || e.code === "too_large" || e.code === "invalid_input")) return await fail(e.status, e.code, e.message, "failed", e.extra);
         throw e;
       }
     } else {
       // Binary finish must never read the whole object or perform a second write.
       const head = await getBlobHead(ctx.env, finalKey, 16);
-      if (!head) return fail(409, "missing_bytes", "Uploaded bytes missing", "failed");
+      if (!head) return await fail(409, "missing_bytes", "Uploaded bytes missing", "failed");
       // An upload begun before own-property checking may carry an inherited name: it is never a valid type.
-      if (!Object.hasOwn(BINARY_TYPES, u.mime) || !BINARY_TYPES[u.mime](head)) return fail(415, "signature_mismatch", `Bytes are not a valid ${u.mime}`, "failed");
+      if (!Object.hasOwn(BINARY_TYPES, u.mime) || !BINARY_TYPES[u.mime](head)) return await fail(415, "signature_mismatch", `Bytes are not a valid ${u.mime}`, "failed");
     }
     // Still the finisher? Renew the lease for the publication.
     const renewedUntil = nowMs() + FINALIZE_LEASE_MS;
     const renew = await db2(ctx).prepare(`UPDATE uploads SET finalize_until = ? WHERE id = ? AND state = 'sealed' AND finalize_token = ?${kind ? " AND finalize_until > ?" : ""}`).bind(renewedUntil, uploadId, token, ...kind ? [nowMs()] : []).run();
-    if (!renew.meta.changes) return lostAfterWrite();
+    if (!renew.meta.changes) return await lostAfterWrite();
     if (hasTextFinishSlot && textFinishSlot?.token === token) textFinishSlot.until = renewedUntil;
     const ok2 = { artifact_id: u.artifact_id, revision: u.base_rev + 1, revision_id: revId, sha256: sha2, size };
     const gate = "EXISTS (SELECT 1 FROM revisions WHERE id = ?)";
@@ -479,9 +480,9 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
     } catch (e) {
       // The fenced insert also fails when the lease was lost; only the current finisher may record a conflict.
       const row = await current();
-      if (!row || row.state !== "sealed" || row.finalize_token !== token) return lostAfterWrite();
+      if (!row || row.state !== "sealed" || row.finalize_token !== token) return await lostAfterWrite();
       if (e instanceof HttpError && (e.status === 409 || e.code === "protected_source")) {
-        if (!await end(e.status, e.code, e.message, "conflict", e.extra)) return lost();
+        if (!await end(e.status, e.code, e.message, "conflict", e.extra)) return await lost();
         await dropUnpublished(ctx.env, uploadId, finalKey);
         await purgeStaging(ctx.env, u);
         throw new HttpError(e.status, e.code, e.message, e.extra);
