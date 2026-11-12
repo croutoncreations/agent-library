@@ -28,6 +28,12 @@ test("uploadFinish: every fail/lost/lostAfterWrite outcome is awaited before its
   const body = src.slice(start, end < 0 ? void 0 : end);
   assert.match(body, /return await fail\(/, "guard sees the real body");
   assert.deepEqual(body.match(/return (?:fail|lost|lostAfterWrite)\(/g), null, "un-awaited return of fail/lost/lostAfterWrite in uploadFinish");
+  // Whatever the statement form (return, bare call, extra spaces): every call of a helper that records, reads or cleans
+  // up an outcome is awaited where it is made.
+  const calls = [...body.matchAll(/\b(?:fail|lost|lostAfterWrite|end|dropUnpublished|purgeStaging)\s*\(/g)];
+  assert.ok(calls.length >= 20, `guard found the helper calls (${calls.length})`);
+  const bare = calls.filter((m) => !/\bawait\s+$/.test(body.slice(Math.max(0, m.index - 12), m.index))).map((m) => body.slice(Math.max(0, m.index - 30), m.index + 20));
+  assert.deepEqual(bare, [], "helper call in uploadFinish that is not awaited where it is made");
 });
 
 // begin -> PUT -> finish against the BLOBS spy, as a human (no CSRF needed with the linkCtx path).

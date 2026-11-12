@@ -50,8 +50,10 @@ The final R2 key is fixed at upload begin (an upload begun by an older Worker ge
 Publication checks its ownership
 inside the revision-insertion statement. Cleanup cannot fail an upload with a live
 lease, and terminal final objects are purged only when no registered write remains.
-A finisher releases its lease only after its outcome (published, failed or conflict) has been recorded, so a
-failed finish replays its error instead of leaving the upload `sealed` with no lease (`409 finish_in_progress`).
+The statement that records an outcome (published, failed or conflict) also clears the lease. The finisher's final
+lease release runs only after that write has settled, and on its own releases the lease only after an unexpected
+error (the upload stays `sealed` and retryable). A failed finish therefore replays its error rather than answering
+`409 finish_in_progress`.
 
 ## Interrupted writes
 
