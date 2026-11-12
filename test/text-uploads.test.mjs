@@ -196,7 +196,7 @@ test("text finish memory slot refuses a second full read, leaves retryable state
   first.r2.onGet = async () => { first.r2.onGet = null; entered(); await gate; };
   const slow = lib.uploadFinish(first.ctx, P, a.upload_id, "slot-first"); await ready;
   try {
-    await assert.rejects(lib.uploadFinish(second.ctx, P, b.upload_id, "slot-second"), e => e.status === 503 && e.code === "text_finish_busy" && e.message === "Another text upload is being finalized on this server; retry upload_finish shortly with the same idempotency key" && e.extra.retry_after_seconds === 1);
+    await assert.rejects(lib.uploadFinish(second.ctx, P, b.upload_id, "slot-second"), e => e.status === 503 && e.code === "text_finish_busy" && e.message === "Another text upload is being finalized on this server; retry the finish request shortly with the same idempotency key" && e.extra.retry_after_seconds === 1);
     assert.equal(second.r2.gets.length, 0); assert.equal(second.row(b.upload_id).state, "sealed"); assert.equal(second.row(b.upload_id).result, null); assert.equal(second.row(b.upload_id).finalize_token, null);
     const binary = world(), u = binary.upload(); assert.equal((await lib.uploadFinish(binary.ctx, P, u.id, "binary-during-text")).status, 200);
   } finally { release(); await slow; }

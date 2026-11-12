@@ -18,7 +18,7 @@ function block(w, hook) {
   w.r2[hook] = async () => { w.r2[hook] = null; entered(); await gate; };
   return { release, ready };
 }
-const busy = e => e.status === 503 && e.code === "text_finish_busy" && e.message === "Another text upload is being finalized on this server; retry upload_finish shortly with the same idempotency key" && e.extra.retry_after_seconds === 1;
+const busy = e => e.status === 503 && e.code === "text_finish_busy" && e.message === "Another text upload is being finalized on this server; retry the finish request shortly with the same idempotency key" && e.extra.retry_after_seconds === 1;
 
 test("text finish slot expires with its lease; a late holder neither publishes nor releases its successor", async t => {
   t.mock.timers.enable({ apis: ["Date"], now: Date.now() });

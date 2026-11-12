@@ -237,7 +237,7 @@ async function uploadPut(req, env, requestId, uploadId, linkCtx, { projectId, ra
     } catch (e) {
       const m = String(e?.message ?? e);
       // A digest rejection is a real answer even if a timer fired meanwhile: report it (and end the upload) as 422.
-      if (!abandoned && /SHA-256 checksum you specified did not match|10037/.test(m)) throw new HttpError(422, "integrity_mismatch", "The body's SHA-256 does not match the declared sha256; this upload has ended, start a new one with upload_begin");
+      if (!abandoned && /SHA-256 checksum you specified did not match|10037/.test(m)) throw new HttpError(422, "integrity_mismatch", "The body's SHA-256 does not match the declared sha256; this upload has ended, start a new upload");
       if (timedOut) throw expired();
       if (/too many bytes/i.test(m)) throw new HttpError(413, "too_large", "Body exceeds declared size");
       if (/did not see all expected bytes/i.test(m)) throw new HttpError(400, "incomplete_body", "Body ended before the declared size; PUT the whole file again");
@@ -429,7 +429,7 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
       const a = await loadArtifact(ctx, projectId, u.artifact_id, { allowUnpublished: u.base_rev === 0 });
       assertWritable(ctx, a, "content");
       if (a.kind !== kind) throw new HttpError(400, "invalid_input", "mime must match the existing document kind");
-      if (textFinishSlot && textFinishSlot.until > nowMs()) throw new HttpError(503, "text_finish_busy", "Another text upload is being finalized on this server; retry upload_finish shortly with the same idempotency key", { retry_after_seconds: 1 });
+      if (textFinishSlot && textFinishSlot.until > nowMs()) throw new HttpError(503, "text_finish_busy", "Another text upload is being finalized on this server; retry the finish request shortly with the same idempotency key", { retry_after_seconds: 1 });
       textFinishSlot = { token, until: held.finalize_until };
       hasTextFinishSlot = true;
       try {
