@@ -40,7 +40,9 @@ stored exactly as described under [Today](#today).
   `required_value_invalid`), never read as "off". `encryptionEnabled(env)` is the one decision for writing: true when
   configured; false only when not configured, not required and `workspace_keys` has no real key row
   (`master_version > 0`, shredded or not; a shred's tombstone does not count); otherwise the same 500, so losing the
-  configuration after keys exist never turns into plaintext.
+  configuration after keys exist never turns into plaintext. **Every installation that turns encryption on must also
+  set `CONTENT_ENCRYPTION_REQUIRED="1"`**, which lives in the Worker's configuration and not in the database; with it
+  set, a missing configuration refuses requests whatever the database says ([Limits](#limits)).
   `workspaceDataKey` also refuses unless the configuration is present and well-formed, even for a workspace that
   already has a key.
 - **Table** `workspace_keys` (migration `0029_workspace_keys.sql`): `workspace_id`, `key_id` (`wk_…`, primary key),
@@ -88,6 +90,12 @@ stored exactly as described under [Today](#today).
   out, or once the master key version that wrapped its key has been retired and its secret deleted.
 - **Each write is authenticated, not that it is the latest.** Someone who can write to object storage can put back an
   older complete write of the same storage key, and it decrypts.
+- **`encryptionEnabled` trusts the database.** It decides "encryption was in use" from rows in the database, so
+  someone who can write to the database (deleting key rows or setting their `master_version` to 0) could make an
+  installation whose master-key settings are later removed fall back to plaintext. Therefore **every installation
+  that turns encryption on must also set `CONTENT_ENCRYPTION_REQUIRED="1"`**, which lives in the Worker's
+  configuration and not in the database; with it set, a missing configuration refuses requests whatever the database
+  says.
 - **Master key usage.** Data keys are wrapped with random 96-bit IVs, so one master key should wrap at most 2^32 data
   keys. Usage is about one per workspace. Rotation means adding `CONTENT_MASTER_KEY_V<n+1>` and raising
   `CONTENT_MASTER_KEY_VERSION`.
@@ -100,15 +108,18 @@ For the slices that wire this into reads and writes:
 - Whether to **decrypt** is decided by the stored object (its metadata or header), never by the current
   configuration. Whether to **encrypt** is decided by `encryptionEnabled(env)`, never by `encryptionConfigured()`
   alone.
-- A key shredded during a request may still be held by that request. A write must be made conditional on the key
-  still being active, or writes must be blocked while a workspace is shredded. The condition is that the key's row
-  (`WHERE key_id = ?`) still satisfies `ACTIVE_KEY_SQL`, exported from `keys.js` (`shredded_at IS NULL AND
-  wrapped <> ''`); use that export, never a hand-written copy.
+- **A write under a key.** A key shredded during a request may still be held by that request. The statement or
+  `batch` that publishes the write must itself carry the condition that the key row `WHERE key_id = ? AND
+  workspace_id = ?` still satisfies `ACTIVE_KEY_SQL` (exported from `keys.js`; never a hand-written copy). A separate
+  check before the publishing statement is not enough.
 - Ask `encryptionEnabled` again immediately before each write decision; never carry its answer across awaits that
   could span a configuration or rollout change.
-- A plaintext write must be fenced against encryption having started in the meantime: the publishing statement must
-  be conditional (no real key row exists, the same test `encryptionEnabled` makes), just as a write under a key is
-  conditional on the key still being active.
+- **A plaintext write.** The statement or `batch` that publishes it must itself carry `NO_REAL_KEY_SQL` (exported
+  from `keys.js`; the same test `encryptionEnabled` makes), for the same reason: encryption may start in the meantime.
+- If either condition refuses, nothing is published, and the object already staged in storage is removed by the
+  existing staging cleanup (the text-write intent sweep, upload cleanup). The caller gets an error and may retry.
+- Worker versions from before these conditions existed do not honour them, so encryption may be configured only
+  after a Worker that fences its writes is fully deployed.
 - Only the operator purge of a deleted workspace (a later slice) may call `shredWorkspaceKeys`. It is safe on an
   installation without encryption: its tombstone does not make `encryptionEnabled` refuse.
 - A project's content is under the key of the workspace it belonged to when it was written. Nothing moves projects
