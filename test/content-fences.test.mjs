@@ -91,19 +91,54 @@ test("plaintextFence passes with no real key row and refuses once one exists, sh
   assert.equal(fenceRows(sql), 0);
 });
 
+const STARTED_MESSAGE = "Encryption was turned on while this was being saved; send it again";
+
 test("fenceRefusal maps only the two fence messages", () => {
   const shredded = lib.fenceRefusal(new Error(KEY_ACTIVE_MESSAGE));
   assert.deepEqual([shredded.status, shredded.code, shredded.message], [410, "key_shredded", "This workspace's content key has been shredded"]);
   const started = lib.fenceRefusal(new Error(`D1_ERROR: ${NO_REAL_KEY_MESSAGE}: SQLITE_CONSTRAINT`));
-  assert.deepEqual([started.status, started.code, started.message], [409, "encryption_started", "Encryption was turned on while this was being saved; try again"]);
+  assert.deepEqual([started.status, started.code, started.message], [409, "encryption_started", STARTED_MESSAGE]);
   for (const other of [
     new Error(TEXT_DEADLINE_MESSAGE),
     new Error("UNIQUE constraint failed: idempotency.principal_id, idempotency.project_id, idempotency.op, idempotency.key"),
     new Error("NOT NULL constraint failed: artifacts.title"),
     new Error("no such table: content_fences"),
     new Error("NOT NULL constraint failed: content_fences.key_activex"),
-    null, undefined, 42, {}
+    new Error("CHECK constraint failed: key_active IS NULL AND no_real_key IS NULL"),
+    null, undefined, 42, {}, ""
   ]) assert.equal(lib.fenceRefusal(other), null, String(other?.message ?? other));
+});
+
+test("fenceRefusal returns an already mapped refusal unchanged and so is safe to call twice", () => {
+  const shredded = lib.fenceRefusal(new Error(KEY_ACTIVE_MESSAGE));
+  const started = lib.fenceRefusal(new Error(NO_REAL_KEY_MESSAGE));
+  assert.equal(lib.fenceRefusal(shredded), shredded);
+  assert.equal(lib.fenceRefusal(started), started);
+  assert.equal(lib.fenceRefusal(lib.fenceRefusal(shredded)), shredded);
+  // An HttpError with another code is not a refusal, even if its message happens to quote one.
+  const other = Object.assign(new Error(KEY_ACTIVE_MESSAGE), { status: 409, code: "conflict" });
+  assert.equal(lib.fenceRefusal(other).code, "key_shredded");
+});
+
+test("fenceRefusal reads a bare string and a cause chain of at most three levels", () => {
+  assert.equal(lib.fenceRefusal(KEY_ACTIVE_MESSAGE).code, "key_shredded");
+  assert.equal(lib.fenceRefusal(`D1_ERROR: ${NO_REAL_KEY_MESSAGE}`).code, "encryption_started");
+  const d1Error = new Error(`D1_ERROR: ${KEY_ACTIVE_MESSAGE}: SQLITE_CONSTRAINT`);
+  assert.equal(lib.fenceRefusal(new Error("publication failed", { cause: d1Error })).status, 410);
+  assert.equal(lib.fenceRefusal(new Error("outer", { cause: new Error("middle", { cause: d1Error }) })).status, 410);
+  assert.equal(lib.fenceRefusal(new Error("outer", { cause: NO_REAL_KEY_MESSAGE })).status, 409);
+  assert.equal(lib.fenceRefusal({ message: "wrapper", cause: { cause: NO_REAL_KEY_MESSAGE } }).status, 409);
+  assert.equal(lib.fenceRefusal(new Error("1", { cause: new Error("2", { cause: new Error("3", { cause: d1Error }) }) })), null);
+  assert.equal(lib.fenceRefusal(new Error("publication failed", { cause: new Error("network timeout") })), null);
+});
+
+test("content_fences refuses every row: NULLs by NOT NULL with the column name, anything else by its CHECK", () => {
+  const { sql } = mkDB();
+  assert.throws(() => sql.prepare("INSERT INTO content_fences (key_active, no_real_key) VALUES (1, 1)").run(), /CHECK constraint failed/);
+  assert.throws(() => sql.prepare("INSERT INTO content_fences (key_active, no_real_key) VALUES (0, 0)").run(), /CHECK constraint failed/);
+  assert.throws(() => sql.prepare("INSERT INTO content_fences (key_active, no_real_key) VALUES (NULL, 0)").run(), { message: KEY_ACTIVE_MESSAGE });
+  assert.throws(() => sql.prepare("INSERT INTO content_fences (key_active, no_real_key) VALUES (0, NULL)").run(), { message: NO_REAL_KEY_MESSAGE });
+  assert.equal(fenceRows(sql), 0);
 });
 
 test("a refusing fence placed last rolls back the whole batch; a passing one leaves earlier results in place", async () => {
@@ -120,35 +155,68 @@ test("a refusing fence placed last rolls back the whole batch; a passing one lea
   assert.equal(fenceRows(sql), 0);
 });
 
-test("runBatch rethrows both fence refusals unchanged, still maps UNIQUE to 409 conflict and rethrows the text deadline", async () => {
+test("runBatch answers both fence refusals as their HttpError, still maps UNIQUE to 409 conflict and rethrows the text deadline", async () => {
   const { sql, DB, env } = mkDB();
   addKey(sql, "wsp_a", "wk_a");
   const ctx = { env, requestId: "req_s", principal: { id: "hum_a", kind: "human", label: "Synthetic" } };
   const idem = { projectId: "proj-a", op: "synthetic", key: "k1", digest: "d" };
   const insert = (key) => DB.prepare("INSERT INTO content_writes (key, project_id, created_at) VALUES (?, 'proj-a', 1)").bind(key);
-  const raw = async (stmts) => { try { await DB.batch(stmts); } catch (e) { return e; } };
-  for (const fence of [lib.keyFence(env, { keyId: "wk_gone", workspaceId: "wsp_a" }), lib.plaintextFence(env), DB.prepare("INSERT INTO content_writes (key, project_id, created_at) VALUES (NULL, NULL, NULL)")]) {
-    const expected = await raw([fence]);
-    const got = await lib.runBatch(ctx, [insert("text/x"), fence], idem).then(() => null, (e) => e);
-    assert.ok(got instanceof Error);
-    assert.equal(got.message, expected.message);
-    assert.equal(got.status, undefined, "raw error, not mapped to an HttpError");
-  }
+  const outcome = (p) => p.then(() => null, (e) => e);
+  const shredded = await outcome(lib.runBatch(ctx, [insert("text/x"), lib.keyFence(env, { keyId: "wk_gone", workspaceId: "wsp_a" })], idem));
+  assert.deepEqual([shredded.status, shredded.code], [410, "key_shredded"]);
+  const started = await outcome(lib.runBatch(ctx, [insert("text/x"), lib.plaintextFence(env)], idem));
+  assert.deepEqual([started.status, started.code, started.message], [409, "encryption_started", STARTED_MESSAGE]);
+  const deadline = await outcome(lib.runBatch(ctx, [insert("text/x"), DB.prepare("INSERT INTO content_writes (key, project_id, created_at) VALUES (NULL, NULL, NULL)")], idem));
+  assert.equal(deadline.message, TEXT_DEADLINE_MESSAGE);
+  assert.equal(deadline.status, undefined, "the text deadline stays raw for commitTextWrites");
   assert.equal(sql.prepare("SELECT COUNT(*) AS n FROM content_writes").get().n, 0);
   await lib.runBatch(ctx, [insert("text/dup")], idem);
   await assert.rejects(lib.runBatch(ctx, [insert("text/dup")], idem), (e) => e.status === 409 && e.code === "conflict");
 });
 
-test("commitTextWrites surfaces a key-fence refusal unchanged and leaves the text-write intent for the sweep", async () => {
+test("a replay whose idempotency row already committed returns the stored response, not the refusal of a later fence", async () => {
   const { sql, DB, env } = mkDB();
-  env.BLOBS = { async delete() { throw new Error("must not delete a refused write's object here"); } };
-  sql.prepare("INSERT INTO content_writes (key, project_id, created_at) VALUES ('text/proj-a/a/r', 'proj-a', ?)").run(Date.now());
-  const err = await lib.commitTextWrites(env, ["text/proj-a/a/r"], (guarded) => DB.batch(guarded([
+  const ctx = { env, requestId: "req_s", principal: { id: "hum_a", kind: "human", label: "Synthetic" } };
+  const idem = { projectId: "proj-a", op: "synthetic", key: "replay-1", digest: "d" };
+  const stored = { artifact_id: "art_synthetic" };
+  const idemRow = () => DB.prepare(`INSERT INTO idempotency (principal_id, project_id, op, key, digest, status, response, created_at)
+    VALUES ('hum_a', 'proj-a', 'synthetic', 'replay-1', 'd', 201, ?, ?)`).bind(JSON.stringify(stored), new Date().toISOString());
+  const insert = (key) => DB.prepare("INSERT INTO content_writes (key, project_id, created_at) VALUES (?, 'proj-a', 1)").bind(key);
+  await lib.runBatch(ctx, [idemRow(), insert("text/first"), lib.plaintextFence(env)], idem);
+  addKey(sql, "wsp_a", "wk_a"); // the plaintext fence now refuses
+  await assert.rejects(DB.batch([lib.plaintextFence(env)]), { message: NO_REAL_KEY_MESSAGE });
+  const replay = await lib.runBatch(ctx, [idemRow(), insert("text/second"), lib.plaintextFence(env)], idem);
+  assert.deepEqual(replay, { status: 201, body: { ...stored, idempotent_replay: true } });
+  assert.deepEqual(sql.prepare("SELECT key FROM content_writes ORDER BY key").all().map((r) => r.key), ["text/first"]);
+});
+
+test("commitTextWrites answers a fence refusal as its HttpError and at once removes only the unreferenced staged text", async () => {
+  const { sql, DB, env } = mkDB();
+  const objects = new Set(["text/proj-a/a/staged", "text/proj-a/a/published"]);
+  env.BLOBS = { async delete(keys) { for (const k of [keys].flat()) objects.delete(k); } };
+  const at = new Date().toISOString();
+  sql.prepare("INSERT INTO artifacts (id, project_id, kind, title, created_at, updated_at) VALUES ('a', 'proj-a', 'markdown', 'Synthetic', ?, ?)").run(at, at);
+  sql.prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, size, sha256, mime, created_at, body_key)
+    VALUES ('r1', 'a', 'proj-a', 1, 'hum_a', 1, 'x', 'text/markdown', ?, 'text/proj-a/a/published')`).run(at);
+  for (const key of objects) sql.prepare("INSERT INTO content_writes (key, project_id, created_at) VALUES (?, 'proj-a', ?)").run(key, Date.now());
+  const keys = ["text/proj-a/a/staged", "text/proj-a/a/published"];
+  const err = await lib.commitTextWrites(env, keys, (guarded) => DB.batch(guarded([
     DB.prepare("INSERT INTO content_writes (key, project_id, created_at) VALUES ('text/should-rollback', 'proj-a', 1)"),
     lib.keyFence(env, { keyId: "wk_missing", workspaceId: "wsp_a" })
   ]))).then(() => null, (e) => e);
-  assert.equal(err?.message, KEY_ACTIVE_MESSAGE);
-  assert.equal(lib.isTextWriteFenceError(err), false);
-  assert.equal(lib.fenceRefusal(err).code, "key_shredded");
-  assert.deepEqual(sql.prepare("SELECT key FROM content_writes").all().map((r) => r.key), ["text/proj-a/a/r"]);
+  assert.deepEqual([err?.status, err?.code], [410, "key_shredded"]);
+  // Cleanup ran for the refused write; the object and intent a revision refers to were kept.
+  assert.deepEqual([...objects], ["text/proj-a/a/published"]);
+  assert.deepEqual(sql.prepare("SELECT key FROM content_writes").all().map((r) => r.key), ["text/proj-a/a/published"]);
+  assert.equal(sql.prepare("SELECT body_key FROM revisions").get().body_key, "text/proj-a/a/published");
+
+  // The same through runBatch (already mapped there) and for a plaintext refusal.
+  objects.add("text/proj-a/a/staged2");
+  sql.prepare("INSERT INTO content_writes (key, project_id, created_at) VALUES ('text/proj-a/a/staged2', 'proj-a', ?)").run(Date.now());
+  addKey(sql, "wsp_a", "wk_a");
+  const ctx = { env, requestId: "req_s", principal: { id: "hum_a", kind: "human", label: "Synthetic" } };
+  const err2 = await lib.commitTextWrites(env, ["text/proj-a/a/staged2"], (guarded) => lib.runBatch(ctx, guarded([lib.plaintextFence(env)]), { projectId: "proj-a", op: "synthetic", key: "k2", digest: "d" })).then(() => null, (e) => e);
+  assert.deepEqual([err2?.status, err2?.code], [409, "encryption_started"]);
+  assert.deepEqual([...objects], ["text/proj-a/a/published"]);
+  assert.deepEqual(sql.prepare("SELECT key FROM content_writes").all().map((r) => r.key), ["text/proj-a/a/published"]);
 });

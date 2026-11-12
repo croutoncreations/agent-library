@@ -175,6 +175,7 @@ export function isTextWriteFenceError(error) {
 // Publication fences (docs/encryption.md#rules-for-code-that-uses-this). Each is an INSERT into the always-empty
 // content_fences table that puts NULL into a NOT NULL column when its condition no longer holds, so the statement
 // fails and D1 rolls back the whole batch. The failing column names the condition; fenceRefusal maps it.
+// Never add a conflict clause (OR IGNORE, OR REPLACE, ON CONFLICT) to a fence: it would turn a refusal into a pass.
 
 /**
  * Fence for a write under a workspace key: fails (content_fences.key_active) unless the key row `keyId` of
@@ -199,15 +200,24 @@ export function plaintextFence(env) {
 
 /**
  * The HttpError a fence refusal answers (410 key_shredded, 409 encryption_started), or null for any other error.
+ * An HttpError with one of those codes is returned unchanged, so mapping twice is safe. Otherwise the message of
+ * `error`, its `cause` and that cause's `cause` (three levels at most; a bare string counts as a message) is matched.
+ * runBatch and commitTextWrites already map refusals; call this only for a batch you run yourself.
  * Depends on D1's SQLite constraint text; tested against local D1. Place fences LAST in the batch, after every statement
  * whose result the caller reads; one statement that fails rolls back the whole batch wherever it sits.
  */
 export function fenceRefusal(error) {
-  const m = /NOT NULL constraint failed: content_fences\.(key_active|no_real_key)\b/.exec(String(error?.message ?? ""));
-  if (!m) return null;
-  return m[1] === "key_active"
-    ? new HttpError(410, "key_shredded", KEY_SHREDDED_MESSAGE)
-    : new HttpError(409, "encryption_started", "Encryption was turned on while this was being saved; try again");
+  if (error instanceof HttpError && (error.code === "key_shredded" || error.code === "encryption_started")) return error;
+  let current = error;
+  for (let depth = 0; depth < 3 && current != null; depth++) {
+    const message = typeof current === "string" ? current : String(current.message ?? "");
+    const m = /NOT NULL constraint failed: content_fences\.(key_active|no_real_key)\b/.exec(message);
+    if (m) return m[1] === "key_active"
+      ? new HttpError(410, "key_shredded", KEY_SHREDDED_MESSAGE)
+      : new HttpError(409, "encryption_started", "Encryption was turned on while this was being saved; send it again");
+    current = typeof current === "object" || typeof current === "function" ? current.cause : undefined;
+  }
+  return null;
 }
 
 /** Atomic publication fence and best-effort disposal of objects known not to have published. */
@@ -229,6 +239,9 @@ export async function commitTextWrites(env, keys, commit) {
     settled = true;
     return keys.length && Array.isArray(result) ? result.slice(1) : result;
   } catch (error) {
+    // A recognised refusal means the batch rolled back, like the text deadline below: clean up at once.
+    const refusal = fenceRefusal(error);
+    if (refusal) { settled = true; throw refusal; }
     if (!isTextWriteFenceError(error)) throw error;
     settled = true;
     throw new HttpError(503, "text_write_expired", "Text write expired before publication; retry with the same idempotency key");

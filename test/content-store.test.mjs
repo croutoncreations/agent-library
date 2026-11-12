@@ -49,6 +49,14 @@ test("content_fences appears in no source file other than content-store.js", () 
   assert.deepEqual(users, ["packages/core/src/content-store.js"]);
 });
 
+// A conflict clause would turn a fence refusal into a pass (INSERT OR IGNORE skips the NOT NULL failure).
+test("the fence statements in content-store.js carry no conflict clause", () => {
+  const text = readFileSync(join(ROOT, "packages", "core", "src", "content-store.js"), "utf8");
+  const fences = [...text.matchAll(/\bprepare\(\s*(["'`])([\s\S]*?)\1/g)].map((m) => m[2]).filter((q) => q.includes("content_fences"));
+  assert.equal(fences.length, 2);
+  for (const q of fences) assert.doesNotMatch(q, /\bOR\s+(?:IGNORE|REPLACE|ABORT|FAIL|ROLLBACK)\b|\bON\s+CONFLICT\b/i, q);
+});
+
 // Legacy fallback SELECTs still fetch inline bodies, but SQL must not match against them. The temporary FTS
 // bridge and publisher generation copies remain plaintext until later slices (docs/encryption.md).
 test("SQL never matches revision or comment body columns", () => {

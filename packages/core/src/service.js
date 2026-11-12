@@ -51,7 +51,9 @@ async function runBatch(ctx, stmts, i) {
   try {
     return await db(ctx).batch(stmts);
   } catch (e) {
-    if (isTextWriteFenceError(e) || fenceRefusal(e)) throw e;
+    if (isTextWriteFenceError(e)) throw e;
+    const refusal = fenceRefusal(e);
+    if (refusal) throw refusal;
     if (/UNIQUE|PRIMARY KEY|constraint/i.test(String(e?.message ?? e))) {
       const prior = await idemLookup(ctx, i);
       if (prior) return prior;
