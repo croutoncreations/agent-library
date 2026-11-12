@@ -1,6 +1,6 @@
 import { TEXT_MAX_BYTES } from "./text-limits.js";
 import { personalWorkspaceId } from "./tenancy.js";
-import { blobRef, commitTextWrites, deleteBlob, putBlob, getText, readBlobBytes, mapContent, stageTextWrites, textKey, textWriteComplete } from "./content-store.js";
+import { blobKeyFits, blobRef, commitTextWrites, deleteBlobs, dropUnreferencedBlobs, fenceRefusal, getText, isTextWriteFenceError, keyFence, mapContent, plaintextFence, readBlobBytes, stageTextWrites, textKey, textWriteComplete, writeBlobBytes } from "./content-store.js";
 import { textSearchBridge } from "./search/service.js";
 import { limitsFor, requireHuman } from "./auth.js";
 import { BINARY_TYPES, LIMITS, tplDate } from "./service.js";
@@ -99,6 +99,90 @@ async function validateBackup(backup) {
   }
   return { pid, decoded };
 }
+// Pre-write checks shared by import and restore: every value either binds into a statement after the first object
+// is written must be bindable (null, string, finite number or boolean), and every row must name a document of the
+// backup. Restore gains only these (and the key-length check): no backup that restores today is refused, because a
+// value that cannot bind, or a row for an unknown document, made today's restore batch fail anyway.
+const bindable = (v) => v === null || v === void 0 || typeof v === "string" || typeof v === "boolean" || typeof v === "number" && Number.isFinite(v);
+function checkBindable(backup) {
+  const bad = (m) => { throw new HttpError(400, "bad_backup", m); };
+  const fields = (row, names, what) => { for (const n of names) if (!bindable(row?.[n])) bad(`Invalid ${what} field ${n}`); };
+  const intOrNull = (v, what) => { if (v != null && !Number.isSafeInteger(v)) bad(`Invalid ${what} restored_from`); };
+  if (typeof backup.project !== "object" || backup.project === null) bad("Missing project");
+  fields(backup.project, ["title", "created_at"], "project");
+  const ids = new Set();
+  for (const a of backup.artifacts) {
+    fields(a, ["id", "kind", "title", "folder", "tags", "head_rev", "head_revision_id", "meta_version", "trashed_at", "created_at", "updated_at"], "document");
+    ids.add(a.id);
+  }
+  for (const r of backup.revisions) {
+    fields(r, ["id", "artifact_id", "rev_no", "author_id", "size", "sha256", "mime", "created_at", "via_kind", "via_id", "via_label", "client_info", "change_note"], "version");
+    intOrNull(r.restored_from, "version");
+    if (!ids.has(r.artifact_id)) bad("Revision for an unknown document");
+  }
+  for (const v of backup.meta_versions ?? []) {
+    fields(v, ["id", "artifact_id", "version", "title", "folder", "tags", "trashed", "author_id", "via_kind", "via_id", "via_label", "client_info", "change_note", "created_at", "template_description"], "details version");
+    intOrNull(v.restored_from, "details version");
+    if (!ids.has(v.artifact_id)) bad("Details version for an unknown document");
+  }
+  for (const c of backup.comments) {
+    fields(c, ["id", "artifact_id", "rev_no", "author_id", "body", "created_at"], "comment");
+    if (!ids.has(c.artifact_id)) bad("Comment on an unknown document");
+  }
+}
+/** Every storage key an attempt will write must fit the encrypted format's object-key limit (checked before any put). */
+function checkKeysFit(keys) {
+  for (const k of keys) if (!blobKeyFits(k)) throw new HttpError(400, "bad_backup", "A file key is too long");
+}
+const CONSTRAINT = /FOREIGN KEY|UNIQUE|PRIMARY KEY|NOT NULL constraint|CHECK constraint/;
+/**
+ * Write a backup's file objects, then publish them in ONE batch with the fences last (docs/encryption.md), and clean
+ * up by phase and source of a failure, never by a later exception's text:
+ *  - failure before the batch is sent (an object write, a statement build, a fence): delete every object written;
+ *  - the batch call itself rejected with a fence refusal, the text deadline or a constraint error (D1 rolled it
+ *    back), or the caller reports it resolved without publishing: delete only the written keys no revision refers to;
+ *  - anything else may have committed (a lost acknowledgement): delete nothing, log backup_cleanup_skipped.
+ * objects: [[key, bytes, contentType]] with explicit workspaceId; build(descriptors) returns the statements (the revision
+ * INSERTs bind descriptors.get(key).keyId/header). Returns { res } or { error, batchError, cleanup(published) }.
+ */
+async function publishBackup(env, { objects, workspaceId, textKeys, build }) {
+  const written = [], descriptors = new Map();
+  let sent = false, batchError = null;
+  const log = (reason, count) => console.error(JSON.stringify({ event: "backup_cleanup_skipped", count, reason }));
+  // Outcome 2: settled as not published. dropUnreferencedBlobs never throws (it logs and deletes nothing on failure).
+  const dropSettled = () => dropUnreferencedBlobs(env, written);
+  try {
+    for (const [key, bytes, contentType] of objects) {
+      descriptors.set(key, await writeBlobBytes(env, { key, bytes, contentType, workspaceId }));
+      written.push(key);
+    }
+    const pairs = new Set(), fences = [];
+    let plain = false;
+    for (const d of descriptors.values()) {
+      if (d.keyId === null) plain = true;
+      else if (!pairs.has(d.keyId)) { pairs.add(d.keyId); fences.push(keyFence(env, { keyId: d.keyId, workspaceId })); }
+    }
+    if (plain) fences.push(plaintextFence(env));
+    const all = [...build(descriptors), ...fences];
+    const res = await commitTextWrites(env, textKeys, (guarded) => {
+      // Addendum: build the guarded statements, THEN mark the batch as sent, then send it.
+      const guardedStmts = guarded(all);
+      sent = true;
+      return env.DB.batch(guardedStmts).catch((e) => { batchError = e; throw e; });
+    });
+    return { res, settledNotPublished: dropSettled };
+  } catch (error) {
+    if (!sent) {
+      try { await deleteBlobs(env, written); } catch { log("delete_failed", written.length); }
+    } else if (batchError && (fenceRefusal(batchError) || isTextWriteFenceError(batchError) || CONSTRAINT.test(String(batchError?.message ?? batchError)))) {
+      await dropSettled();
+    } else if (written.length) {
+      log("outcome_unknown", written.length);
+    }
+    return { error, batchError };
+  }
+}
+
 async function restoreBackup(ctx, backup) {
   requireHuman(ctx);
   const DB = ctx.env.DB;
@@ -111,45 +195,62 @@ async function restoreBackup(ctx, backup) {
   const existing = await DB.prepare("SELECT COUNT(*) AS n FROM projects").first("n");
   if (existing) throw new HttpError(409, "store_not_empty", "Restore targets an empty isolated store only");
   const { pid, decoded } = await validateBackup(backup);
-  // IDs stay stable, but each attempt owns fresh immutable objects, even after a lost acknowledgement.
+  checkBindable(backup);
+  // IDs stay stable, but each attempt owns fresh immutable objects, even after a lost acknowledgement: text keys carry
+  // the attempt segment, file keys end in _<attempt> (not stripped: stripping could make x and x_restore_… collide).
   const attempt = randomId("restore");
+  const restoreKey = (k) => `${k}_${attempt}`;
   // Validate every resulting key, including the attempt segment, before writing any bytes or intents.
   for (const r of backup.revisions) if (r.blob_key === null) textKey(pid, r.artifact_id, r.id, attempt);
   for (const c of backup.comments) textKey(pid, c.artifact_id, c.id, attempt);
-  for (const [k, bytes] of decoded) await putBlob(ctx.env, k, bytes);
+  checkKeysFit([...decoded.keys()].map(restoreKey));
+  // The restored project is the principal's personal workspace's, so its files go under that workspace's key.
+  const workspaceId = personalWorkspaceId(ctx.principal.id);
   const authors = new Set([...backup.revisions, ...backup.comments, ...backup.meta_versions ?? []].map((x) => x.author_id));
-  const stmts = [];
+  const head = [];
   for (const a of authors) if (a !== ctx.principal.id)
-    stmts.push(DB.prepare("INSERT OR IGNORE INTO principals (id, kind, issuer, subject, label, created_at) VALUES (?, 'agent', 'restored', ?, ?, ?)").bind(a, a, "restored " + a, nowIso()));
-  stmts.push(DB.prepare("INSERT INTO projects (id, owner_id, title, created_at, workspace_id) VALUES (?, ?, ?, ?, ?)").bind(pid, ctx.principal.id, backup.project.title, backup.project.created_at, personalWorkspaceId(ctx.principal.id)));
+    head.push(DB.prepare("INSERT OR IGNORE INTO principals (id, kind, issuer, subject, label, created_at) VALUES (?, 'agent', 'restored', ?, ?, ?)").bind(a, a, "restored " + a, nowIso()));
+  head.push(DB.prepare("INSERT INTO projects (id, owner_id, title, created_at, workspace_id) VALUES (?, ?, ?, ?, ?)").bind(pid, ctx.principal.id, backup.project.title, backup.project.created_at, workspaceId));
   for (const a of backup.artifacts)
-    stmts.push(DB.prepare(`INSERT INTO artifacts (id, project_id, kind, title, folder, tags, head_rev, head_revision_id, meta_version, trashed_at, created_at, updated_at, is_template, template_description, source_artifact_id, source_revision, source_role, template_date)
+    head.push(DB.prepare(`INSERT INTO artifacts (id, project_id, kind, title, folder, tags, head_rev, head_revision_id, meta_version, trashed_at, created_at, updated_at, is_template, template_description, source_artifact_id, source_revision, source_role, template_date)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(a.id, pid, a.kind, a.title, a.folder, a.tags, a.head_rev, a.head_revision_id, a.meta_version, a.trashed_at, a.created_at, a.updated_at, a.is_template ?? 0, a.template_description ?? "", a.source_artifact_id ?? null, a.source_revision ?? null, a.source_role ?? null, a.template_date ?? null));
-  const textKeys = [], textWrites = [];
-  const bridges = [];
+  // Split revision loop, part 1: text keys, text writes and bridges before stageTextWrites. Only the revision INSERTs
+  // wait for the file writes (they bind each object's key id and header).
+  const textKeys = [], textWrites = [], bridges = [], bodyKeys = new Map();
   for (const r of backup.revisions) {
-    const bodyKey = r.blob_key ? null : textKey(pid, r.artifact_id, r.id, attempt);
-    if (bodyKey) textWrites.push({ projectId: pid, artifactId: r.artifact_id, revisionId: r.id, text: r.body, attempt });
-    if (bodyKey) { textKeys.push(bodyKey); bridges.push(textSearchBridge(ctx.env, r.artifact_id, r.id, r.body), textWriteComplete(ctx.env, bodyKey)); }
-    stmts.push(DB.prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, body_key, blob_key, size, sha256, mime, restored_from, created_at, via_kind, via_id, via_label, client_info, change_note)
-      VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(r.id, r.artifact_id, pid, r.rev_no, r.author_id, bodyKey, r.blob_key, r.size, r.sha256, r.mime, r.restored_from, r.created_at, r.via_kind ?? null, r.via_id ?? null, r.via_label ?? null, r.client_info ?? null, r.change_note ?? null));
+    if (r.blob_key) continue;
+    const bodyKey = textKey(pid, r.artifact_id, r.id, attempt);
+    bodyKeys.set(r.id, bodyKey);
+    textWrites.push({ projectId: pid, artifactId: r.artifact_id, revisionId: r.id, text: r.body, attempt });
+    textKeys.push(bodyKey); bridges.push(textSearchBridge(ctx.env, r.artifact_id, r.id, r.body), textWriteComplete(ctx.env, bodyKey));
   }
+  const tail = [];
   for (const v of backup.meta_versions ?? [])
-    stmts.push(DB.prepare(`INSERT INTO meta_versions (id, artifact_id, project_id, version, title, folder, tags, trashed, author_id, via_kind, via_id, via_label, client_info, change_note, restored_from, created_at, template_description)
+    tail.push(DB.prepare(`INSERT INTO meta_versions (id, artifact_id, project_id, version, title, folder, tags, trashed, author_id, via_kind, via_id, via_label, client_info, change_note, restored_from, created_at, template_description)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(v.id, v.artifact_id, pid, v.version, v.title, v.folder, v.tags, v.trashed ? 1 : 0, v.author_id, v.via_kind ?? null, v.via_id ?? null, v.via_label ?? null, v.client_info ?? null, v.change_note ?? null, v.restored_from ?? null, v.created_at, v.template_description ?? ""));
   for (const c of backup.comments) {
     const bodyKey = textKey(pid, c.artifact_id, c.id, attempt);
     textWrites.push({ projectId: pid, artifactId: c.artifact_id, revisionId: c.id, text: c.body, attempt });
     textKeys.push(bodyKey); bridges.push(textWriteComplete(ctx.env, bodyKey));
-    stmts.push(DB.prepare("INSERT INTO comments (id, project_id, artifact_id, rev_no, author_id, body, body_key, created_at) VALUES (?, ?, ?, ?, ?, '', ?, ?)").bind(c.id, pid, c.artifact_id, c.rev_no, c.author_id, bodyKey, c.created_at));
+    tail.push(DB.prepare("INSERT INTO comments (id, project_id, artifact_id, rev_no, author_id, body, body_key, created_at) VALUES (?, ?, ?, ?, ?, '', ?, ?)").bind(c.id, pid, c.artifact_id, c.rev_no, c.author_id, bodyKey, c.created_at));
   }
-  stmts.push(DB.prepare("INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id) VALUES (?, ?, ?, 'backup.restore', ?, 'ok', ?)").bind(nowIso(), ctx.principal.id, pid, pid, ctx.requestId));
+  tail.push(DB.prepare("INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id) VALUES (?, ?, ?, 'backup.restore', ?, 'ok', ?)").bind(nowIso(), ctx.principal.id, pid, pid, ctx.requestId));
   await stageTextWrites(ctx.env, textWrites);
-  try {
-    await commitTextWrites(ctx.env, textKeys, (guarded) => DB.batch(guarded([...stmts, ...bridges])));
-  } catch (error) {
+  const mimeOf = new Map(backup.revisions.filter((r) => r.blob_key).map((r) => [r.blob_key, r.mime]));
+  const out = await publishBackup(ctx.env, {
+    objects: [...decoded].map(([k, bytes]) => [restoreKey(k), bytes, mimeOf.get(k)]), workspaceId, textKeys,
+    // Split revision loop, part 2: the revision INSERTs, binding each object's descriptor (never the backup's fields).
+    build: (descriptors) => [...head, ...backup.revisions.map((r) => {
+      const d = r.blob_key ? descriptors.get(restoreKey(r.blob_key)) : null;
+      return DB.prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, body_key, blob_key, blob_key_id, blob_header, size, sha256, mime, restored_from, created_at, via_kind, via_id, via_label, client_info, change_note)
+      VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(r.id, r.artifact_id, pid, r.rev_no, r.author_id, bodyKeys.get(r.id) ?? null, r.blob_key ? restoreKey(r.blob_key) : null, d?.keyId ?? null, d?.header ?? null, r.size, r.sha256, r.mime, r.restored_from ?? null, r.created_at, r.via_kind ?? null, r.via_id ?? null, r.via_label ?? null, r.client_info ?? null, r.change_note ?? null);
+    }), ...tail, ...bridges],
+  });
+  if (out.error) {
+    // A lost race, or a commit whose acknowledgement was lost: either way the store now holds a project. In the second
+    // case the restore may in fact have succeeded (docs/self-hosting.md: reload before retrying).
     if (await DB.prepare("SELECT COUNT(*) AS n FROM projects").first("n")) throw new HttpError(409, "store_not_empty", "Restore targets an empty isolated store only");
-    throw error;
+    throw out.error;
   }
   return { restored_project: pid, artifacts: backup.artifacts.length, revisions: backup.revisions.length, blobs: decoded.size, grants: 0 };
 }
@@ -218,6 +319,10 @@ function checkImportRows(env, backup, decoded, limits) {
     if (!Number.isInteger(v.version) || v.version < 1 || typeof v.created_at !== "string") bad("Bad details version");
     str(v.title ?? "", "title", 200); str(v.folder ?? "", "folder", 200);
     if (v.via_kind != null && !VIA_KINDS.has(v.via_kind)) bad("Bad details provenance");
+    // Import's content rules for details versions, as for versions and documents (restore keeps only checkBindable).
+    str(v.via_label ?? "", "via_label", 200); str(v.client_info ?? "", "client_info", 500); str(v.change_note ?? "", "change_note", 280);
+    let vtags; try { vtags = JSON.parse(v.tags ?? "[]"); } catch { bad("tags must be a JSON list"); }
+    if (!Array.isArray(vtags) || vtags.some((x) => typeof x !== "string" || x.length > 50) || vtags.length > 20) bad("tags must be a list of short strings");
   }
 }
 
@@ -234,6 +339,7 @@ async function importBackup(ctx, workspaceId, input, idemKeyValue, digest = "") 
   };
   if (idemKeyValue) { const prior = await replay(); if (prior) return prior; }
   const { pid: oldPid, decoded } = await validateBackup(backup);
+  checkBindable(backup);
   checkImportRows(ctx.env, backup, decoded, await workspaceLimits(ctx.env, workspaceId));
   const DB = ctx.env.DB, me = ctx.principal.id, at = nowIso();
   const title = input?.title !== void 0 ? str(input.title, "title", 200, { min: 1 }) : str(String(backup.project?.title ?? "Imported project"), "title", 200, { min: 1 });
@@ -250,6 +356,7 @@ async function importBackup(ctx, workspaceId, input, idemKeyValue, digest = "") 
     return `blobs/${pid}/${artId.get(m[2])}/${m[3]}`;
   };
   const keyMap = new Map([...decoded.keys()].map((k) => [k, newKey(k)]));
+  checkKeysFit(keyMap.values());
   // Every check is done; re-check the role right before writing bytes (also checked inside the project INSERT).
   if (!await DB.prepare(`SELECT ${workspaceRoleSql("?", "admin")} AS ok`).bind(me, workspaceId).first("ok")) throw new HttpError(403, "forbidden", "Needs the admin role in an active workspace");
   // Workspace limits (Phase 4): one more project, and every version's bytes, checked in the project INSERT (the rest
@@ -269,16 +376,21 @@ async function importBackup(ctx, workspaceId, input, idemKeyValue, digest = "") 
     stmts.push(DB.prepare(`INSERT INTO artifacts (id, project_id, kind, title, folder, tags, head_rev, head_revision_id, meta_version, trashed_at, created_at, updated_at, is_template, template_description, source_artifact_id, source_revision, source_role, template_date)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(artId.get(a.id), pid, a.kind, a.title, a.folder ?? "", a.tags ?? "[]", a.head_rev, revId.get(a.head_revision_id) ?? null, a.meta_version, a.trashed_at ?? null, a.created_at, a.updated_at, a.is_template ?? 0, a.template_description ?? "", src ? artId.get(a.source_artifact_id) : null, src ? a.source_revision : null, src ? a.source_role : null, a.template_date ?? null));
   }
+  // Split revision loop, part 1: text keys, text writes and bridges are computed before stageTextWrites (moving the
+  // whole loop after the file writes would leave text intents unstaged). Only the revision INSERTs are built later.
   const textKeys = [], textWrites = [];
-  const bridges = [];
+  const bridges = [], bodyKeys = new Map();
   for (const r of backup.revisions) {
+    if (r.blob_key) continue;
     const aid = artId.get(r.artifact_id), rid = revId.get(r.id);
-    const bodyKey = r.blob_key ? null : textKey(pid, aid, rid);
-    if (bodyKey) textWrites.push({ projectId: pid, artifactId: aid, revisionId: rid, text: r.body });
-    if (bodyKey) { textKeys.push(bodyKey); bridges.push(textSearchBridge(ctx.env, aid, rid, r.body), textWriteComplete(ctx.env, bodyKey)); }
-    stmts.push(DB.prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, body_key, blob_key, size, sha256, mime, restored_from, created_at, via_kind, via_id, via_label, client_info, change_note)
-      VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(rid, aid, pid, r.rev_no, me, bodyKey, r.blob_key === null ? null : keyMap.get(r.blob_key), r.size, r.sha256, r.mime, r.restored_from ?? null, r.created_at, r.via_kind ?? null, null, r.via_label ? `${r.via_label} (imported)` : "imported", r.client_info ?? null, r.change_note ?? null));
+    const bodyKey = textKey(pid, aid, rid);
+    bodyKeys.set(r.id, bodyKey);
+    textWrites.push({ projectId: pid, artifactId: aid, revisionId: rid, text: r.body });
+    textKeys.push(bodyKey); bridges.push(textSearchBridge(ctx.env, aid, rid, r.body), textWriteComplete(ctx.env, bodyKey));
   }
+  const revisionStmt = (r, d) => DB.prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, body_key, blob_key, blob_key_id, blob_header, size, sha256, mime, restored_from, created_at, via_kind, via_id, via_label, client_info, change_note)
+      VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(revId.get(r.id), artId.get(r.artifact_id), pid, r.rev_no, me, bodyKeys.get(r.id) ?? null, r.blob_key === null ? null : keyMap.get(r.blob_key), d?.keyId ?? null, d?.header ?? null, r.size, r.sha256, r.mime, r.restored_from ?? null, r.created_at, r.via_kind ?? null, null, r.via_label ? `${r.via_label} (imported)` : "imported", r.client_info ?? null, r.change_note ?? null);
+  const head = stmts.splice(0);
   for (const v of backup.meta_versions ?? [])
     stmts.push(DB.prepare(`INSERT INTO meta_versions (id, artifact_id, project_id, version, title, folder, tags, trashed, author_id, via_kind, via_id, via_label, client_info, change_note, restored_from, created_at, template_description)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(randomId("mv"), artId.get(v.artifact_id), pid, v.version, v.title ?? "", v.folder ?? "", v.tags ?? "[]", v.trashed ? 1 : 0, me, v.via_kind ?? null, null, v.via_label ?? null, v.client_info ?? null, v.change_note ?? null, v.restored_from ?? null, v.created_at, v.template_description ?? ""));
@@ -293,27 +405,28 @@ async function importBackup(ctx, workspaceId, input, idemKeyValue, digest = "") 
   stmts.push(DB.prepare(`INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id, workspace_id) SELECT ?, ?, ?, 'backup.import', ?, 'ok', ?, ? WHERE ${exists}`).bind(at, me, pid, pid, ctx.requestId, workspaceId, pid));
   if (idemKeyValue) stmts.push(DB.prepare(`INSERT INTO idempotency (principal_id, project_id, op, key, digest, status, response, created_at) SELECT ?, ?, 'backup.import', ?, ?, 201, ?, ? WHERE ${exists}`)
     .bind(me, workspaceId, idemKeyValue, digest, JSON.stringify(result), at, pid));
-  // Statements are fully built (any bind error happens above, before bytes exist). Now write the bytes.
   await stageTextWrites(ctx.env, textWrites);
-  const written = [];
-  const dropBlobs = async () => { for (const k of written) await deleteBlob(ctx.env, k).catch(() => {}); };
-  try { for (const [k, bytes] of decoded) { await putBlob(ctx.env, keyMap.get(k), bytes); written.push(keyMap.get(k)); } }
-  catch (e) { await dropBlobs(); throw e; }
-  let res;
-  try { res = await commitTextWrites(ctx.env, textKeys, (guarded) => DB.batch(guarded([...stmts, ...bridges]))); }
-  catch (e) {
-    await dropBlobs();
+  // The file bytes go under the authorized target workspace's key (never anything named in the backup).
+  const mimeOf = new Map(backup.revisions.filter((r) => r.blob_key).map((r) => [r.blob_key, r.mime]));
+  const out = await publishBackup(ctx.env, {
+    objects: [...decoded].map(([k, bytes]) => [keyMap.get(k), bytes, mimeOf.get(k)]), workspaceId, textKeys,
+    // res[0] stays the project INSERT: head[0] is it, and the fences go last.
+    build: (descriptors) => [...head, ...backup.revisions.map((r) => revisionStmt(r, r.blob_key === null ? null : descriptors.get(keyMap.get(r.blob_key)))), ...stmts, ...bridges],
+  });
+  if (out.error) {
+    const m = String(out.batchError?.message ?? out.batchError ?? "");
     // The admin check lost a race (no project row): the dependent rows fail their foreign key and nothing is written.
-    if (/FOREIGN KEY/i.test(String(e?.message ?? e))) {
+    if (/FOREIGN KEY/i.test(m)) {
       await explainLimit(ctx.env, workspaceId, { projects: 1, storage_bytes: addBytes }, lg.limits);
       throw new HttpError(403, "forbidden", "Needs the admin role in an active workspace");
     }
-    if (/UNIQUE|PRIMARY KEY/i.test(String(e?.message ?? e)) && idemKeyValue) { const prior = await replay(); if (prior) return prior; }
-    throw e;
+    if (/UNIQUE|PRIMARY KEY/i.test(m) && idemKeyValue) { const prior = await replay(); if (prior) return prior; }
+    throw out.error;
   }
-  // Empty backup and a lost race: no dependent row failed, but no project was created either.
-  if (!res[0].meta.changes) {
-    await dropBlobs();
+  // Empty backup and a lost race: no dependent row failed, but no project was created either (settled: no revision
+  // row can exist without the project, so nothing this attempt wrote is referenced).
+  if (!out.res[0].meta.changes) {
+    await out.settledNotPublished();
     await explainLimit(ctx.env, workspaceId, { projects: 1, storage_bytes: addBytes }, lg.limits);
     throw new HttpError(403, "forbidden", "Needs the admin role in an active workspace");
   }

@@ -57,6 +57,12 @@ test("the raw R2 readers (getBlob, getBlobHead, getBlobBytes, headBlob, blobSha2
     .map(rel);
   assert.deepEqual(importers, []);
 });
+test("backup.js writes and cleans up files only through writeBlobBytes and the phase-based cleanup: no putBlob, deleteBlob or raw reader", () => {
+  const src = readFileSync(join(ROOT, "packages", "core", "src", "backup.js"), "utf8");
+  const imported = [...src.matchAll(/import\s*\{([^}]*)\}\s*from\s*["'][^"']*content-store\.js["']/g)].flatMap((m) => m[1].split(",").map((x) => x.trim()));
+  for (const name of ["putBlob", "deleteBlob", "getBlob", "getBlobBytes", "getBlobHead", "headBlob", "blobSha256Hex", "putBlobStream"]) assert.ok(!imported.includes(name), name);
+  assert.ok(imported.includes("writeBlobBytes") && imported.includes("dropUnreferencedBlobs") && imported.includes("deleteBlobs"));
+});
 test("ACTIVE_KEY_SQL and NO_REAL_KEY_SQL are imported only by content-store.js (crypto/keys.js defines them)", () => {
   const importers = jsFiles(join(ROOT, "packages"))
     .filter((f) => !rel(f).startsWith("packages/core/src/crypto/"))

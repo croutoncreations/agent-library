@@ -217,3 +217,46 @@ describe("official MCP SDK client over OAuth with encryption on (design test 23)
     assert.ok(Buffer.from(img.data, "base64").equals(png));
   });
 });
+
+describe("backup round trip across installations (design test 18, Real)", () => {
+  // Installation A has no encryption; B has synthetic key settings. They run one after the other on the same port.
+  const PID = "enc-backup-src";
+  let exported, bytes, sourceBlobKey;
+  test("export from A (plaintext) carries no encryption columns; import into B encrypts under B's key and downloads identically; A is unchanged", async () => {
+    const a = await startAppConnectServer({ port: PORT, vars: { PROJECT_BINARY_BYTES: "0" } });
+    try {
+      const owner = await a.owner();
+      assert.equal((await owner.req("POST", "/api/projects", { id: PID, title: "Backup source" })).status, 201);
+      bytes = Buffer.concat([makePng(6, 6), randomBytes(70_000)]);
+      const b = await owner.req("POST", `/api/projects/${PID}/uploads`, { title: "Round trip.png", mime: "image/png", size: bytes.length, sha256: sha256(bytes) });
+      assert.equal(b.status, 201, JSON.stringify(b.body));
+      assert.equal((await owner.req("PUT", b.body.put_url, undefined, { raw: bytes, idem: false })).status, 200);
+      const f = await owner.req("POST", `/api/projects/${PID}/uploads/${b.body.upload_id}/finish`, {});
+      assert.equal(f.status, 200, JSON.stringify(f.body));
+      const e = await owner.req("GET", `/api/projects/${PID}/backup`);
+      assert.equal(e.status, 200);
+      exported = e.body;
+      assert.ok(exported.revisions.every((r) => !("blob_key_id" in r) && !("blob_header" in r)), "no encryption columns in a backup");
+      sourceBlobKey = exported.revisions.find((r) => r.blob_key).blob_key;
+      assert.ok(Buffer.from(exported.blobs[sourceBlobKey].data, "base64").equals(bytes), "blobs are plaintext");
+      const again = await owner.req("GET", `/api/projects/${PID}/artifacts/${f.body.artifact_id}/content`, undefined, { binary: true });
+      assert.ok(again.body.equals(bytes), "A unchanged");
+    } finally { await a.stop(); }
+    const b = await startAppConnectServer({ port: PORT, vars: {
+      CONTENT_MASTER_KEY_VERSION: "1", CONTENT_MASTER_KEY_V1: randomBytes(32).toString("base64"), CONTENT_ENCRYPTION_REQUIRED: "1", PROJECT_BINARY_BYTES: "0" } });
+    try {
+      const owner = await b.owner();
+      const me = await owner.req("GET", "/api/me");
+      const wid = `wsp_${me.body.principal.id}`; // the owner's personal workspace (migration 0017's trigger)
+      const imp = await owner.req("POST", `/api/workspaces/${wid}/import`, exported);
+      assert.equal(imp.status, 201, JSON.stringify(imp.body));
+      const sql = async (q) => JSON.parse((await promisify(execFile)("wrangler", ["d1", "--config", LOCAL_CONFIG, "execute", "DB", "--local", "--persist-to", b.dir, "--json", "--command", q], { cwd: ROOT, env: { ...process.env, CI: "1", NO_COLOR: "1" } })).stdout)[0].results;
+      const [row] = await sql(`SELECT r.artifact_id, r.blob_key_id, k.workspace_id FROM revisions r JOIN workspace_keys k ON k.key_id = r.blob_key_id WHERE r.project_id = '${imp.body.project_id}'`);
+      assert.ok(row, "the imported version is encrypted under a key of B");
+      assert.equal(row.workspace_id, wid);
+      const d = await owner.req("GET", `/api/projects/${imp.body.project_id}/artifacts/${row.artifact_id}/content`, undefined, { binary: true });
+      assert.equal(d.status, 200);
+      assert.ok(d.body.equals(bytes), "identical download");
+    } finally { await b.stop(); }
+  });
+});
