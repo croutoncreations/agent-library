@@ -387,6 +387,8 @@ test("key and plaintext fences fail with the exact constraint text on real local
       const statements = readFileSync(join(ROOT, "migrations", f), "utf8").replace(/^--.*$/gm, "").split(";").map(s => s.trim()).filter(Boolean);
       for (const s of statements) await DB.prepare(s).run();
     }
+    // runBatch looks up a stored idempotent response on a refusal: the real idempotency table from 0001_init.sql.
+    await DB.prepare(/CREATE TABLE idempotency \([^;]*\)/.exec(readFileSync(join(ROOT, "migrations", "0001_init.sql"), "utf8"))[0]).run();
     await DB.prepare("CREATE TABLE fence_probe (id TEXT PRIMARY KEY)").run();
     const env = { DB };
     const probe = (id) => DB.prepare("INSERT INTO fence_probe (id) VALUES (?)").bind(id);
