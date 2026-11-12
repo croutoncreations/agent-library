@@ -103,15 +103,17 @@ const capReason = (env, cap) => cap === 0 ? "off" : cap === searchTermsMax(env) 
  * Self-contained: the regular-expression statics are reset before it returns, so it never keeps `word` reachable.
  */
 export function u61FoldTokenBounded(word, max = SEARCH_TERM_UNITS_MAX) {
-  try {
-    if (isAscii(word)) return word.length <= max ? word.toLowerCase() : null;
-    let out = "";
-    for (const ch of word) {
-      out += u61FoldToken(ch);
-      if (out.length > max) return null;
-    }
-    return out;
-  } finally { forgetLastMatch(); }
+  try { return foldBounded(word, max); } finally { forgetLastMatch(); }
+}
+/** u61FoldTokenBounded without its reset: the scanner calls this per piece and resets once in its own finally. */
+function foldBounded(word, max) {
+  if (isAscii(word)) return word.length <= max ? word.toLowerCase() : null;
+  let out = "";
+  for (const ch of word) {
+    out += u61FoldToken(ch);
+    if (out.length > max) return null;
+  }
+  return out;
 }
 /** True if every unit is below 0x80 (a loop, so no regular expression keeps the word reachable). */
 function isAscii(word) {
@@ -119,7 +121,7 @@ function isAscii(word) {
   return true;
 }
 /** Calls add(term) for each distinct folded term, in text order, up to `cap`. Returns true if a further one was cut. */
-function scanTerms(text, cap, add, fold = u61FoldTokenBounded) {
+function scanTerms(text, cap, add, fold = foldBounded) {
   if (cap <= 0 || !text) return false;
   try { return scanTermsIn(text, cap, add, fold); } finally { forgetLastMatch(); }
 }
@@ -162,6 +164,17 @@ const WORD_HEAD = new RegExp(`${TOKEN_CLASSES.first}${TOKEN_CLASSES.rest}{0,${SE
 /** A continuation piece of the same word: sticky, so it matches only exactly where the previous piece ended. */
 const WORD_MORE = new RegExp(`${TOKEN_CLASSES.rest}{1,${SEARCH_SCAN_PIECE_UNITS}}`, "yu");
 /**
+ * True if a matched piece holds the full SEARCH_SCAN_PIECE_UNITS code points, so the word may go on. A piece of fewer
+ * units has fewer code points; a piece of P..2P units is counted (it holds no lone surrogate, so every high surrogate
+ * starts a pair). A shorter piece ended because the rest class failed or the text ended: no continuation to try.
+ */
+function pieceIsFull(piece) {
+  if (piece.length < SEARCH_SCAN_PIECE_UNITS) return false;
+  let points = piece.length;
+  for (let i = 0; i < piece.length; i++) if ((piece.charCodeAt(i) & 0xfc00) === 0xd800) points--;
+  return points >= SEARCH_SCAN_PIECE_UNITS;
+}
+/**
  * Calls onWord(start, end, term) for each word in text order, where [start, end) is exactly a U61_TOKEN_WELLFORMED
  * match: the greedy run `first rest*` is the head piece followed by continuation pieces while the rest class goes on,
  * and with the "u" flag no piece ends inside a surrogate pair. onWord returning false stops the scan.
@@ -171,6 +184,9 @@ const WORD_MORE = new RegExp(`${TOKEN_CLASSES.rest}{1,${SEARCH_SCAN_PIECE_UNITS}
  * pieces and joining equals folding the whole word. The word is never concatenated: the term grows to at most
  * SEARCH_TERM_UNITS_MAX units, and once it would pass that the word is dead and its remaining pieces are only matched
  * and skipped. Memory per word: one piece plus 200 units. Without fold, term is null.
+ *
+ * Memory per word is a small fixed bound: at most the head match and one continuation match at a time (each at most
+ * SEARCH_SCAN_PIECE_UNITS code points) plus the term of at most 200 units, whatever the word's length.
  *
  * Every match sets lastIndex itself first: the patterns are shared by every scan in the isolate (and a scan may run
  * inside another's onWord), so their position is never trusted. The caller resets the RegExp statics afterwards.
@@ -184,16 +200,14 @@ function scanWordsIn(text, fold, onWord) {
     const start = head.index;
     let end = WORD_HEAD.lastIndex;
     let term = fold ? fold(head[0], SEARCH_TERM_UNITS_MAX) : null;
-    for (;;) {
+    let full = pieceIsFull(head[0]);
+    while (full) {
       WORD_MORE.lastIndex = end;
-      if (term === null) {
-        if (!WORD_MORE.test(text)) break;
-        end = WORD_MORE.lastIndex;
-        continue;
-      }
       const more = WORD_MORE.exec(text);
       if (!more) break;
       end = WORD_MORE.lastIndex;
+      full = pieceIsFull(more[0]);
+      if (term === null) continue;   // a dead word's pieces are only consumed
       const folded = fold(more[0], SEARCH_TERM_UNITS_MAX - term.length);
       term = folded === null ? null : term + folded;
     }
@@ -208,18 +222,22 @@ export function scanSearchWords(text, onWord) {
 function scanTermsIn(text, cap, add, fold) {
   const seen = new Set();
   let truncated = false;
-  scanWordsIn(text, fold, (_start, _end, t) => {
-    if (!t || seen.has(t)) return true;
-    if (seen.size >= cap) { truncated = true; return false; }
-    seen.add(t);
-    add(t);
-    return true;
-  });
+  try {
+    scanWordsIn(text, fold, (_start, _end, t) => {
+      if (!t || seen.has(t)) return true;
+      if (seen.size >= cap) { truncated = true; return false; }
+      seen.add(t);
+      add(t);
+      return true;
+    });
+  } finally {
+    seen.clear();   // the scan's working set is released here, not left to whatever still references this frame
+  }
   return truncated;
 }
 /** Distinct index terms of a text, at most `cap` (tests and small callers; runs use the packed forms). */
 export function extractSearchTerms(text, cap) {
-  return extractSearchTermsWith(text, cap, u61FoldTokenBounded);
+  return extractSearchTermsWith(text, cap, foldBounded);
 }
 /** extractSearchTerms with the piece fold given (fold(piece, max), as u61FoldTokenBounded; tests count through it). */
 export function extractSearchTermsWith(text, cap, fold) {
@@ -243,8 +261,12 @@ function extractSearchTermsUnits(text, cap) {
     for (let i = 0; i < t.length; i++) units[used++] = t.charCodeAt(i);
     offsets.push(used);
   });
-  return { units: units.slice(0, used), offsets: Uint32Array.from(offsets), count: offsets.length - 1, truncated };
+  const result = { units: units.slice(0, used), offsets: Uint32Array.from(offsets), count: offsets.length - 1, truncated };
+  offsets.length = 0;   // the growable list is released with the result built
+  return result;
 }
+/** Flat containers made by extractSearchTermsFlat: searchJob accepts a flat job only if it is one of these. */
+const OWN_FLAT = new WeakSet();
 /**
  * Terms packed as UTF-8 bytes and offsets (upload finish: extracted before its response, then the text is dropped).
  * bytes.byteLength <= min(12,000,000, 3 × text.length).
@@ -263,7 +285,16 @@ export function extractSearchTermsFlat(text, cap) {
     used += enc.encodeInto(t, bytes.subarray(used)).written;
     offsets.push(used);
   });
-  return { bytes: bytes.slice(0, used), offsets: Uint32Array.from(offsets), count: offsets.length - 1, truncated };
+  // Our own result: plain typed arrays over fresh, fixed, non-shared buffers that they cover whole (slice and from
+  // allocate exactly), non-extensible (V8 refuses Object.freeze on a non-empty typed array: its elements stay
+  // writable, but no property can be added), in a frozen container recorded in OWN_FLAT.
+  const out = { bytes: bytes.slice(0, used), offsets: Uint32Array.from(offsets), count: offsets.length - 1, truncated };
+  offsets.length = 0;   // the growable list is released with the result built
+  Object.preventExtensions(out.bytes);
+  Object.preventExtensions(out.offsets);
+  const flat = Object.freeze(out);
+  OWN_FLAT.add(flat);
+  return flat;
 }
 /** Bytes a packed term list holds. */
 const packedBytes = (p) => (p.units ? p.units.byteLength : p.bytes.byteLength) + p.offsets.byteLength;
@@ -710,6 +741,7 @@ async function step(run, work) {
  */
 export function searchJob(env, input) {
   const invalid = (why) => new HttpError(500, "search_job_invalid", "A search job is invalid: " + why);
+  // Each descriptor property is read exactly once, here.
   const { artifactId, projectId, revisionId, text = null, flat = null, textBytes, textUnits } = input ?? {};
   if (typeof artifactId !== "string" || typeof projectId !== "string" || typeof revisionId !== "string") throw invalid("ids");
   const count = (n) => Number.isSafeInteger(n) && n >= 0;
@@ -721,11 +753,11 @@ export function searchJob(env, input) {
   const cap = searchDocCap(env, textBytes);
   const units = text !== null ? text.length : textUnits;
   if (flat !== null) {
-    // The flat terms must be what their charge covers: at most `cap` terms, consistent offsets, within 3 × units.
+    // Only extractSearchTermsFlat's own frozen result: its fields are data properties that cannot change, and its
+    // arrays cover their own buffers whole, so the job retains exactly what extraction made.
+    if (!OWN_FLAT.has(flat)) throw invalid("flat container");
     const { bytes, offsets, count: n } = flat;
-    // Each array must own its whole backing buffer, so the job retains exactly what it is charged for.
-    const owned = (a) => a.byteOffset === 0 && a.byteLength === a.buffer.byteLength;
-    if (!(bytes instanceof Uint8Array) || !(offsets instanceof Uint32Array) || !owned(bytes) || !owned(offsets)) throw invalid("flat arrays");
+    // The caller's size context must agree: at most `cap` terms, consistent offsets, within 3 × units.
     if (!count(n) || offsets.length !== n + 1
       || offsets[0] !== 0 || offsets[n] !== bytes.byteLength || bytes.byteLength > Math.min(12000000, 3 * units)) throw invalid("flat");
     for (let i = 0; i < n; i++) if (offsets[i + 1] < offsets[i]) throw invalid("flat offsets");
@@ -734,9 +766,9 @@ export function searchJob(env, input) {
   // SEARCH_TERMS_MAX = 0: no extraction; the text is never kept (the row is written complete as `off`).
   const off = cap === 0;
   return {
-    // A fresh container with only the known fields: nothing else the caller attached is carried into the job.
+    // The extractor's own frozen container (nothing the caller attached to the descriptor is carried into the job).
     meta: { artifactId, projectId, revisionId }, text: off ? null : text,
-    flat: off || flat === null ? null : { bytes: flat.bytes, offsets: flat.offsets, count: flat.count, truncated: flat.truncated === true }, terms: null, tokens: null, removes: null, adds: null,
+    flat: off ? null : flat, terms: null, tokens: null, removes: null, adds: null,
     cap, units: off ? 0 : units, charge: 0, reason: "", digest: "",
     kind: null, row: null, scope: null, done: false, replanned: false,
   };
