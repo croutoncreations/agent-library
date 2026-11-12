@@ -118,6 +118,7 @@ async function readTextCapped(req, maxBytes) {
     if (done) break;
     n += value.byteLength;
     if (n > maxBytes) {
+      parts.length = 0; // nothing read so far is kept while the rest is discarded
       await drainOrCancel(reader, n);
       return null;
     }

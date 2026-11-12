@@ -4,6 +4,7 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import net from "node:net";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { startAppConnectServer } from "./fixtures/app-connect-harness.mjs";
@@ -283,6 +284,74 @@ test("over-cap MCP bodies: legacy, file-enabled OAuth and documents-only OAuth a
     const j = await r.json();
     assert.deepEqual([j.error.code, j.error.message], [-32600, message], `${what} streamed=${streamed}`);
   }
+});
+
+// A client that writes the request head and the whole body before it reads anything (the socket stays paused until the
+// last byte is written). If the server answers and closes without reading the body, the unread bytes make it reset the
+// connection and the 413 is lost; so this needs the server to read and discard the rest of an over-cap body first.
+function writeAllThenRead(base, token, body, chunked) {
+  const u = new URL(base);
+  return new Promise((resolve, reject) => {
+    const sock = net.connect({ host: u.hostname, port: Number(u.port) });
+    sock.pause();
+    const got = [];
+    sock.on("error", reject);
+    // A server that stops reading without closing must fail here, not hang until the runner gives up.
+    sock.setTimeout(30_000, () => sock.destroy(new Error("no complete response within 30 s")));
+    sock.on("data", (d) => got.push(d));
+    sock.on("end", () => resolve(Buffer.concat(got)));
+    sock.on("connect", () => {
+      sock.write(`POST /mcp HTTP/1.1\r\nhost: ${u.host}\r\nauthorization: Bearer ${token}\r\ncontent-type: application/json\r\naccept: application/json, text/event-stream\r\nconnection: close\r\n`
+        + (chunked ? "transfer-encoding: chunked\r\n\r\n" : `content-length: ${body.length}\r\n\r\n`));
+      if (chunked) {
+        for (let o = 0; o < body.length; o += 65536) { const c = body.subarray(o, o + 65536); sock.write(c.length.toString(16) + "\r\n"); sock.write(c); sock.write("\r\n"); }
+        sock.write("0\r\n\r\n", () => sock.resume());
+      } else sock.write(body, () => sock.resume());
+    });
+  });
+}
+function parseHttpResponse(raw) {
+  const at = raw.indexOf("\r\n\r\n");
+  assert.ok(at > 0, "a complete response head");
+  const [statusLine, ...lines] = raw.subarray(0, at).toString("latin1").split("\r\n");
+  const headers = Object.fromEntries(lines.map((l) => [l.slice(0, l.indexOf(":")).toLowerCase(), l.slice(l.indexOf(":") + 1).trim()]));
+  let rest = raw.subarray(at + 4);
+  if (/chunked/i.test(headers["transfer-encoding"] ?? "")) {
+    const parts = [];
+    for (;;) {
+      const eol = rest.indexOf("\r\n");
+      const n = parseInt(rest.subarray(0, eol).toString("latin1"), 16);
+      if (!n) break;
+      parts.push(rest.subarray(eol + 2, eol + 2 + n));
+      rest = rest.subarray(eol + 2 + n + 2);
+    }
+    rest = Buffer.concat(parts);
+  } else if (headers["content-length"] !== undefined) rest = rest.subarray(0, Number(headers["content-length"]));
+  return { statusLine, body: rest.toString("utf8") };
+}
+
+test("over-cap OAuth MCP bodies written in full before the client reads: the 413 and its advice arrive (file-enabled and documents-only, Content-Length and chunked)", async () => {
+  const docsOnly = await h.connectMcpAgent({ [P]: "write" }, { clientName: "Synthetic documents only writer" });
+  sql("UPDATE oauth_connections SET file_access = 0 WHERE client_name = 'Synthetic documents only writer'");
+  const body = (n) => Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "save_markdown", arguments: { body: "x".repeat(n) } } }));
+  // The legacy server already drains (readTextCapped): it shows the client itself is sound.
+  const cases = [
+    ["legacy", h.appUi, legacyToken, 2 * 1024 * 1024, OVER_LEGACY],
+    ["oauth files", h.issuer, oauthToken, 3 * 1024 * 1024, OVER_FILES],
+    ["oauth documents only", h.issuer, docsOnly.access_token, 1024 * 1024, OVER_DOCS],
+  ];
+  const got = [], want = [];
+  for (const [what, base, token, cap, message] of cases) for (const chunked of [false, true]) {
+    const label = `${what} chunked=${chunked}`;
+    want.push([label, "HTTP/1.1 413", "2.0", null, -32600, message]);
+    try {
+      // Twice the cap (well under the 16 MiB drain limit), so a server that stops reading leaves megabytes unread.
+      const r = parseHttpResponse(await writeAllThenRead(base, token, body(2 * cap), chunked));
+      const j = JSON.parse(r.body);
+      got.push([label, r.statusLine.slice(0, 12), j.jsonrpc, j.id, j.error?.code, j.error?.message]);
+    } catch (e) { got.push([label, `no response: ${e.code && e.code !== "ERR_ASSERTION" ? e.code : e.message}`]); }
+  }
+  assert.deepEqual(got, want);
 });
 
 // Rows written, including unpublished placeholders (head_rev = 0): "nothing written" is asserted from the database.
