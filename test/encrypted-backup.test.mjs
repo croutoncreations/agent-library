@@ -6,7 +6,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash, randomBytes } from "node:crypto";
-import { P, PNG, lib, world, keyVars } from "./upload-world.mjs";
+import { P, PNG, lib, world, keyVars, d1BindArray } from "./upload-world.mjs";
 import { CHUNKED_HEADER_BYTES, chunkedStoredLength } from "../packages/core/src/crypto/chunked.js";
 
 const OWNER = "hum_synthetic", WS = "wsp_hum_synthetic";
@@ -516,3 +516,258 @@ test("review fix (part 3): after a pre-send file-write failure, staged text obje
   assert.equal(s.w.sql.prepare("SELECT COUNT(*) AS n FROM content_writes").get().n, 0, "intents removed by the sweep");
   for (const k of intents) assert.equal(s.w.blobs.has(k), false, "text object reclaimed");
 });
+
+// ---- Review Lows for part 4: restore stores exactly what the restore at b2d81c8 stored ----
+
+const commentBodies = (s, pid) => Promise.all(s.w.sql.prepare("SELECT id, body_key FROM comments WHERE project_id = ? ORDER BY id").all(pid).map(async (c) => [c.id, Buffer.from(s.w.blobs.get(c.body_key)).toString("utf8")]));
+
+for (const encryption of [false, true]) {
+  test(`review Lows (part 4): a comment body that is not a string is stored as its string form, as before (encryption ${encryption ? "on" : "off"}); import still refuses it`, async () => {
+    const s = setup({ encryption, project: false });
+    const bk = makeBackup();
+    const base = bk.comments[0];
+    bk.comments = [{ ...base, id: "cmt_obj", body: { odd: true } }, { ...base, id: "cmt_num", body: 5 }, { ...base, id: "cmt_list", body: [1, 2] }, { ...base, id: "cmt_bool", body: false }];
+    await lib.restoreBackup(s.ctx, bk);
+    // b2d81c8 wrote each comment with putText(new TextEncoder().encode(c.body)): the value's string form.
+    assert.deepEqual(await commentBodies(s, "src-proj"), [["cmt_bool", "false"], ["cmt_list", "1,2"], ["cmt_num", "5"], ["cmt_obj", "[object Object]"]]);
+    const t = setup({ encryption });
+    await assert.rejects(lib.importBackup(t.ctx, WS, { backup: structuredClone(bk) }, "cbody"), status(400, "bad_backup"));
+  });
+
+  test(`review Lows (part 4): document references match as the database stores ids: a number and a string match exactly when their stored text is equal (encryption ${encryption ? "on" : "off"})`, async () => {
+    // A TEXT column stores a bound number as its REAL text form (D1 binds every number as REAL; node:sqlite binds a
+    // JS number as REAL too): 7 is stored "7.0". So the reference 7 matched a document "7.0" before (the foreign key
+    // compares stored values) and never matched "7" (the old batch failed on the foreign key, after writing files).
+    const s = setup({ encryption, project: false });
+    const bytes = pngOf(5000);
+    const bk = makeBackup({ files: [bytes] });
+    bk.artifacts[0].id = "7.0";
+    Object.assign(bk.revisions[0], { artifact_id: 7, blob_key: "blobs/src-proj/seven/rev_f1" });
+    bk.blobs = { "blobs/src-proj/seven/rev_f1": bk.blobs["blobs/src-proj/art_file/rev_f1"] };
+    bk.meta_versions.push({ id: "mv7", artifact_id: 7, version: 1, title: "t", folder: "", tags: "[]", trashed: 0, author_id: OWNER, created_at: at() });
+    bk.comments[0].artifact_id = 8;
+    bk.artifacts[1].id = 8; // the text document's id is a number (stored "8.0"); its version names it as "8.0"
+    bk.revisions[1].artifact_id = "8.0";
+    await lib.restoreBackup(s.ctx, bk);
+    assert.deepEqual(s.w.sql.prepare("SELECT id, typeof(id) AS t FROM artifacts WHERE project_id = 'src-proj' ORDER BY id").all().map((r) => ({ ...r })), [{ id: "7.0", t: "text" }, { id: "8.0", t: "text" }]);
+    assert.equal(s.w.sql.prepare("SELECT COUNT(*) AS n FROM revisions WHERE artifact_id = '7.0'").get().n, 1);
+    assert.equal(s.w.sql.prepare("SELECT COUNT(*) AS n FROM meta_versions WHERE artifact_id = '7.0'").get().n, 1);
+    assert.equal(s.w.sql.prepare("SELECT COUNT(*) AS n FROM comments WHERE artifact_id = '8.0'").get().n, 1);
+    assert.ok((await download(s, "src-proj", "7.0")).equals(bytes), "the file reads under its document's stored id");
+    assert.equal((await lib.getArtifact(s.ctx, "src-proj", "8.0")).body, "# synthetic text\n");
+    // 7 against "7" (and "8" against 8) never matched: refused before any write, where the old batch failed.
+    for (const mutate of [(b) => { b.artifacts[0].id = "7"; for (const r of b.revisions.filter((r) => r.blob_key)) r.artifact_id = 7; }, (b) => { b.artifacts[1].id = 8; b.revisions.find((r) => !r.blob_key).artifact_id = "8"; b.comments[0].artifact_id = 8; }]) {
+      const t = setup({ encryption, project: false });
+      const bad = makeBackup();
+      mutate(bad);
+      const puts = [];
+      const put = t.w.env.BLOBS.put;
+      t.w.env.BLOBS.put = (k, b, o) => { puts.push(k); return put(k, b, o); };
+      await assert.rejects(lib.restoreBackup(t.ctx, bad), (e) => e.status === 400 && e.message === "Revision for an unknown document");
+      assert.deepEqual(puts, []);
+    }
+    // Import keeps comparing ids exactly.
+    const u = setup({ encryption });
+    await assert.rejects(lib.importBackup(u.ctx, WS, { backup: structuredClone(bk) }, "numid"), status(400, "bad_backup"));
+  });
+
+  test(`review Lows (part 4): a list of byte values binds as a BLOB, as D1 bound it before; restore keeps it, import refuses it (encryption ${encryption ? "on" : "off"})`, async () => {
+    const s = setup({ encryption, project: false });
+    const bk = makeBackup();
+    bk.revisions[0].via_label = [104, 105];
+    await lib.restoreBackup(s.ctx, bk);
+    const row = s.w.sql.prepare("SELECT typeof(via_label) AS t, hex(via_label) AS h FROM revisions WHERE id = 'rev_f1'").get();
+    assert.deepEqual({ ...row }, { t: "blob", h: "6869" });
+    const t = setup({ encryption });
+    await assert.rejects(lib.importBackup(t.ctx, WS, { backup: structuredClone(bk) }, "bytes"), status(400, "bad_backup"));
+  });
+
+  test(`review Lows (part 4): document ids holding "/" or "%" restore with their files under URI-encoded prefixes that read back, and no document's prefix holds another's keys (encryption ${encryption ? "on" : "off"})`, async () => {
+    const s = setup({ encryption, project: false });
+    const ids = ["a", "a/b", "a%2Fb", "50%"];
+    const files = new Map(ids.map((id) => [id, pngOf(3000 + id.length)]));
+    const bk = makeBackup({ files: [] });
+    bk.artifacts = bk.artifacts.filter((a) => a.id !== "art_file");
+    bk.blobs = {};
+    ids.forEach((id, i) => {
+      const bytes = files.get(id), key = `blobs/src-proj/seg${i}/rev_${i}`;
+      bk.artifacts.push({ ...bk.artifacts[0], id, kind: "binary", title: `F${i}.png`, head_rev: 1, head_revision_id: `rev_${i}` });
+      bk.revisions.push({ id: `rev_${i}`, artifact_id: id, rev_no: 1, author_id: OWNER, body: null, blob_key: key, size: bytes.length, sha256: sha(bytes), mime: "image/png", restored_from: null, created_at: at(), via_kind: "browser", via_id: null, via_label: null, client_info: null, change_note: null });
+      bk.blobs[key] = { sha256: sha(bytes), data: bytes.toString("base64") };
+    });
+    await lib.restoreBackup(s.ctx, bk);
+    const rows = fileRows(s, "src-proj");
+    assert.equal(rows.length, ids.length);
+    const prefix = (id) => `blobs/src-proj/${encodeURIComponent(id)}/`;
+    for (const r of rows) {
+      assert.ok(r.blob_key.startsWith(prefix(r.artifact_id)), `${r.artifact_id}: ${r.blob_key}`);
+      for (const other of ids) if (other !== r.artifact_id) assert.ok(!r.blob_key.startsWith(prefix(other)), `${r.blob_key} not under ${other}`);
+      const full = s.w.sql.prepare("SELECT blob_key, size, blob_key_id, blob_header FROM revisions WHERE id = ?").get(r.id);
+      assert.ok(Buffer.from(await lib.readBlobBytes(s.env, await lib.blobRef(s.env, full, { projectId: "src-proj", artifactId: r.artifact_id }))).equals(files.get(r.artifact_id)), r.artifact_id);
+      assert.ok((await download(s, "src-proj", r.artifact_id)).equals(files.get(r.artifact_id)), `download ${r.artifact_id}`);
+      // Another document's id never passes this object's prefix check.
+      if (encryption) for (const other of ids) if (other !== r.artifact_id)
+        await assert.rejects(silent(async () => { const x = await lib.blobRef(s.env, full, { projectId: "src-proj", artifactId: other }); return lib.readBlobBytes(s.env, x); }).then((o) => { if (o.error) throw o.error; }), status(500, "blob_corrupt"));
+    }
+    // Export reads every file back.
+    const exported = await lib.exportBackup(s.ctx, "src-proj");
+    for (const r of exported.revisions.filter((r) => r.blob_key)) assert.ok(Buffer.from(exported.blobs[r.blob_key].data, "base64").equals(files.get(r.artifact_id)));
+  });
+}
+
+// ---- Review Lows for the restore-compatibility commit ----
+
+const putsOf = (s) => { const puts = []; const put = s.w.env.BLOBS.put; s.w.env.BLOBS.put = (k, b, o) => { puts.push(k); return put(k, b, o); }; return puts; };
+
+test("review Lows (restore compatibility): the World's D1 double binds lists exactly as local D1 did when probed", () => {
+  // Probe on local workerd D1 (miniflare), `SELECT typeof(?), hex(?)`: these bound as BLOBs ...
+  for (const [list, hex] of [[[65.1], "41"], [[65.9], "41"], [[255.9], "ff"], [[0.5], "00"], [[-0], "00"], [[1e-300], "00"], [[], ""], [[104, 105], "6869"]])
+    assert.equal(Buffer.from(d1BindArray(list)).toString("hex"), hex, JSON.stringify(list));
+  // ... and these threw D1_TYPE_ERROR at bind.
+  for (const list of [[-1], [-0.5], [256], [NaN], [Infinity], ["1"], [null], [true], [[1]]])
+    assert.throws(() => d1BindArray(list), /D1_TYPE_ERROR/, String(list));
+  for (const v of ["s", 7, null, true]) assert.equal(d1BindArray(v), v);
+  const w = world();
+  assert.throws(() => w.env.DB.prepare("SELECT ?").bind([256]), /D1_TYPE_ERROR/);
+});
+
+for (const encryption of [false, true]) {
+  test(`review Lows (restore compatibility): byte-list ids match by the bytes they store (encryption ${encryption ? "on" : "off"})`, async () => {
+    // [65.1], [65] and [65.9] all store the BLOB 0x41, so the old foreign key matched them.
+    const s = setup({ encryption, project: false });
+    const bk = makeBackup();
+    bk.artifacts[1].id = [65.1];
+    bk.revisions.find((r) => !r.blob_key).artifact_id = [65];
+    bk.comments[0].artifact_id = [65.9];
+    await lib.restoreBackup(s.ctx, bk);
+    assert.equal(s.w.sql.prepare("SELECT COUNT(*) AS n FROM artifacts WHERE id = X'41'").get().n, 1);
+    assert.equal(s.w.sql.prepare("SELECT COUNT(*) AS n FROM revisions WHERE artifact_id = X'41'").get().n, 1);
+    assert.equal(s.w.sql.prepare("SELECT COUNT(*) AS n FROM comments WHERE artifact_id = X'41'").get().n, 1);
+    // Lists that store different bytes do not match: refused before any write, where the old batch failed.
+    const t = setup({ encryption, project: false });
+    const bad = makeBackup();
+    bad.artifacts[1].id = [65];
+    bad.revisions.find((r) => !r.blob_key).artifact_id = [66.5];
+    const puts = putsOf(t);
+    await assert.rejects(lib.restoreBackup(t.ctx, bad), (e) => e.status === 400 && e.message === "Revision for an unknown document");
+    assert.deepEqual(puts, []);
+    // A list D1 cannot bind is refused before any write, like any other unbindable value.
+    for (const list of [[-1], [256], [65.1, "x"]]) {
+      const u = setup({ encryption, project: false });
+      const b = makeBackup();
+      b.revisions[0].via_label = list;
+      const p = putsOf(u);
+      await assert.rejects(lib.restoreBackup(u.ctx, b), (e) => e.status === 400 && e.message === "Invalid version field via_label", String(list));
+      assert.deepEqual(p, []);
+    }
+  });
+
+  test(`review Lows (restore compatibility): more than 100 distinct numeric ids restore, looked up in batches of at most 100 (encryption ${encryption ? "on" : "off"})`, async () => {
+    const s = setup({ encryption, project: false });
+    const bk = makeBackup();
+    const t = at();
+    for (let i = 1; i <= 130; i++) {
+      bk.artifacts.push({ ...bk.artifacts[1], id: i, title: `N${i}`, head_rev: 0, head_revision_id: null });
+      bk.meta_versions.push({ id: `mvn${i}`, artifact_id: i, version: 1, title: `N${i}`, folder: "", tags: "[]", trashed: 0, author_id: OWNER, created_at: t });
+    }
+    await lib.restoreBackup(s.ctx, bk);
+    assert.equal(s.w.sql.prepare("SELECT COUNT(*) AS n FROM meta_versions WHERE project_id = 'src-proj'").get().n, 130);
+    assert.equal(s.w.sql.prepare("SELECT COUNT(*) AS n FROM meta_versions m JOIN artifacts a ON a.id = m.artifact_id AND a.project_id = m.project_id WHERE m.project_id = 'src-proj'").get().n, 130);
+    const lookups = s.batches.filter((b) => b.every((q) => /CAST\(\? AS TEXT\)/.test(q)));
+    assert.deepEqual(lookups.map((b) => b.length), [100, 30]);
+  });
+
+  test(`review Lows (restore compatibility): ids with a lone surrogate match references in their stored form (encryption ${encryption ? "on" : "off"})`, async () => {
+    // Both the database and blobPrefix store a lone surrogate as U+FFFD, so "x\ud800", "x\udc00" and "x\ufffd" are one
+    // stored id. (A text version or comment naming a lone surrogate itself failed at textKey before and still does.)
+    const s = setup({ encryption, project: false });
+    const bk = makeBackup();
+    bk.artifacts[1].id = "x\ud800";
+    bk.revisions.find((r) => !r.blob_key).artifact_id = "x\ufffd";
+    bk.comments[0].artifact_id = "x\ufffd";
+    await lib.restoreBackup(s.ctx, bk);
+    assert.equal((await lib.getArtifact(s.ctx, "src-proj", "x\ufffd")).body, "# synthetic text\n");
+    assert.equal(s.w.sql.prepare("SELECT COUNT(*) AS n FROM comments WHERE artifact_id = ?").get("x\ufffd").n, 1);
+    // A file document named with one lone surrogate, its file version and details version naming it with another.
+    const f = setup({ encryption, project: false });
+    const fb = makeBackup({ files: [pngOf(4000)] });
+    fb.artifacts[0].id = "x\ud800";
+    fb.revisions[0].artifact_id = "x\udc00";
+    fb.meta_versions.push({ id: "mvs", artifact_id: "x\udc00", version: 1, title: "t", folder: "", tags: "[]", trashed: 0, author_id: OWNER, created_at: at() });
+    await lib.restoreBackup(f.ctx, fb);
+    assert.ok((await download(f, "src-proj", "x\ufffd")).equals(Buffer.from(fb.blobs[fb.revisions[0].blob_key].data, "base64")));
+    assert.ok(fileRows(f, "src-proj")[0].blob_key.startsWith(`blobs/src-proj/${encodeURIComponent("x\ufffd")}/`));
+    assert.equal(f.w.sql.prepare("SELECT COUNT(*) AS n FROM meta_versions WHERE artifact_id = ?").get("x\ufffd").n, 1);
+    // A reference that differs in its stored form is still refused before any write.
+    const r = setup({ encryption, project: false });
+    const rb = makeBackup();
+    rb.artifacts[1].id = "x\ud800";
+    rb.revisions.find((x) => !x.blob_key).artifact_id = "x\ufffd\ufffd";
+    rb.comments[0].artifact_id = "x\ufffd";
+    const puts = putsOf(r);
+    await assert.rejects(lib.restoreBackup(r.ctx, rb), (e) => e.status === 400 && e.message === "Revision for an unknown document");
+    assert.deepEqual(puts, []);
+  });
+
+  test(`review Lows (restore compatibility): two documents "x\\ud800" and "x\\udc00" still collide on the primary key as before, leaving no project and no file object (encryption ${encryption ? "on" : "off"})`, async () => {
+    const s = setup({ encryption, project: false });
+    const bk = makeBackup({ files: [pngOf(3000)], text: null });
+    const second = pngOf(3500), key = "blobs/src-proj/second/rev_s1";
+    bk.artifacts[0].id = "x\ud800";
+    bk.revisions[0].artifact_id = "x\ud800";
+    bk.artifacts.push({ ...bk.artifacts[0], id: "x\udc00", head_revision_id: "rev_s1" });
+    bk.revisions.push({ ...bk.revisions[0], id: "rev_s1", artifact_id: "x\udc00", blob_key: key, size: second.length, sha256: sha(second) });
+    bk.blobs[key] = { sha256: sha(second), data: second.toString("base64") };
+    const { error } = await silent(() => lib.restoreBackup(s.ctx, bk));
+    assert.match(String(error?.message), /UNIQUE constraint failed: artifacts\.id/);
+    assert.equal(s.w.sql.prepare("SELECT COUNT(*) AS n FROM projects").get().n, 0);
+    assert.deepEqual(objectsUnder(s, "src-proj"), []);
+  });
+
+  test(`review Lows (restore compatibility): upload finish accepts the encoded prefix only (encryption ${encryption ? "on" : "off"})`, async () => {
+    // Restored documents "a/b" and "a%2Fb": the unencoded prefix of "a%2Fb" is the encoded prefix of "a/b".
+    const s = setup({ encryption, project: false });
+    const bk = makeBackup({ text: null, files: [] });
+    const v0 = pngOf(3000), t0 = at();
+    bk.artifacts = ["a/b", "a%2Fb"].map((id, i) => ({ ...bk.artifacts[0], id, head_rev: 1, head_revision_id: `rev_0${i}` }));
+    bk.revisions = ["a/b", "a%2Fb"].map((id, i) => ({ id: `rev_0${i}`, artifact_id: id, rev_no: 1, author_id: OWNER, body: null, blob_key: `blobs/src-proj/seg${i}/rev_0${i}`, size: v0.length, sha256: sha(v0), mime: "image/png", restored_from: null, created_at: t0, via_kind: "browser", via_id: null, via_label: null, client_info: null, change_note: null }));
+    bk.blobs = Object.fromEntries(bk.revisions.map((r) => [r.blob_key, { sha256: sha(v0), data: v0.toString("base64") }]));
+    await lib.restoreBackup(s.ctx, bk);
+    const pid = "src-proj";
+    const begin = async (art, bytes, k) => {
+      const b = await lib.uploadBegin(s.ctx, pid, { mime: "image/png", size: bytes.length, sha256: sha(bytes), artifact_id: art, expected_revision: s.w.sql.prepare("SELECT head_rev FROM artifacts WHERE id = ?").get(art).head_rev }, k);
+      assert.equal(b.status, 201, JSON.stringify(b.body));
+      return b.body.upload_id;
+    };
+    const finalKey = (id) => s.w.sql.prepare("SELECT final_key FROM uploads WHERE id = ?").get(id).final_key;
+    // A normal upload on "a/b" begins, PUTs and finishes under the encoded prefix.
+    const v1 = pngOf(5000);
+    const u1 = await begin("a/b", v1, "b1");
+    assert.ok(finalKey(u1).startsWith(`blobs/${pid}/a%2Fb/rev_`));
+    assert.equal((await s.w.put(u1, v1)).status, 200);
+    const f1 = await lib.uploadFinish(s.ctx, pid, u1, "f1");
+    assert.equal(f1.status, 200, JSON.stringify(f1.body));
+    assert.ok((await download(s, pid, "a/b")).equals(v1));
+    // An upload on "a%2Fb" whose final_key is under "a/b"'s encoded prefix (a database edit) is refused; nothing is
+    // published and a/b's object is untouched.
+    const v2 = pngOf(5000);
+    const u2 = await begin("a%2Fb", v2, "b2");
+    assert.ok(finalKey(u2).startsWith(`blobs/${pid}/a%252Fb/rev_`));
+    assert.equal((await s.w.put(u2, v2)).status, 200);
+    s.w.sql.prepare("UPDATE uploads SET final_key = ? WHERE id = ?").run(finalKey(u1), u2);
+    await assert.rejects(lib.uploadFinish(s.ctx, pid, u2, "f2"), (e) => e.status === 500 && e.code === "publish_failed" && e.message === "Upload finalization state is inconsistent");
+    assert.equal(s.w.sql.prepare("SELECT head_rev FROM artifacts WHERE id = ?").get("a%2Fb").head_rev, 1);
+    assert.equal(s.w.sql.prepare("SELECT COUNT(*) AS n FROM revisions WHERE artifact_id = ?").get("a%2Fb").n, 1);
+    assert.ok((await download(s, pid, "a/b")).equals(v1));
+    // The refused upload is still sealed (the inconsistency is not one finish ends); end it so the next can begin.
+    assert.equal(s.w.sql.prepare("SELECT state FROM uploads WHERE id = ?").get(u2).state, "sealed");
+    s.w.sql.prepare("UPDATE uploads SET state = 'failed' WHERE id = ?").run(u2);
+    // An upload row holding the unencoded form for "a/b" (as the previous Worker wrote it) is refused at finish.
+    const v3 = pngOf(5000);
+    const u3 = await begin("a/b", v3, "b3");
+    s.w.sql.prepare("UPDATE uploads SET final_key = ? WHERE id = ?").run(`blobs/${pid}/a/b/rev_rawform`, u3);
+    assert.equal((await s.w.put(u3, v3)).status, 200);
+    await assert.rejects(lib.uploadFinish(s.ctx, pid, u3, "f3"), (e) => e.status === 500 && e.code === "publish_failed");
+    assert.equal(s.w.sql.prepare("SELECT head_rev FROM artifacts WHERE id = ?").get("a/b").head_rev, 2);
+  });
+}

@@ -40,6 +40,17 @@ export const PNG = Buffer.from("89504e470d0a1a0a0000000d494844520000000100000001
 export const SHA = createHash("sha256").update(PNG).digest("hex");
 export const P = "prj_synthetic";
 
+/**
+ * D1's bind for a list, as workerd's D1 shim does it (probed on local D1): a list whose every element is a number
+ * >= 0 and < 256 binds as a BLOB of Uint8Array.from(list) (fractions truncated); any other list throws D1_TYPE_ERROR at
+ * bind. Other values pass through unchanged. Pinned by test/encrypted-backup.test.mjs ("the World's D1 double binds lists").
+ */
+export function d1BindArray(v) {
+  if (!Array.isArray(v)) return v;
+  if (v.every((b) => typeof b === "number" && b >= 0 && b < 256)) return Uint8Array.from(v);
+  throw new Error(`D1_TYPE_ERROR: Type 'object' not supported for value '${v}'`);
+}
+
 /** encryption: add synthetic key vars (keyVars) to env. */
 export function world({ encryption = false } = {}) {
   const sql = new DatabaseSync(":memory:");
@@ -55,7 +66,7 @@ export function world({ encryption = false } = {}) {
   });
   const DB = {
     withSession() { return DB; },
-    prepare(q) { return { bind: (...p) => stmt(q, p), ...stmt(q, []) }; },
+    prepare(q) { return { bind: (...p) => stmt(q, p.map(d1BindArray)), ...stmt(q, []) }; },
     async batch(ss) {
       if (hooks.beforeBatch) { const h = hooks.beforeBatch; hooks.beforeBatch = null; await h(); }
       sql.exec("BEGIN");

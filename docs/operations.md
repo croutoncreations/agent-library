@@ -30,6 +30,8 @@ Limits:
 
 Restoring has no UI yet. Send the backup JSON to `POST /api/restore` from a signed-in owner session (with the CSRF header); `test/a12-durability.test.mjs` shows a full round trip. Restore only into an **empty** library, such as a fresh installation. It refuses a library that already has content, checks every hash and creates no agent access. Reconnect your agents afterwards.
 
+Restore stores a backup's values as given. A hand-edited backup can therefore put values the app never writes into your own installation (for example binary values in text fields, or document ids the UI cannot address); restore refuses only what could never be stored. Import, by contrast, checks every value against the app's own rules.
+
 If a restore answers `store_not_empty` (409) after you started it on an empty store, it may have completed despite the error. Reload the app and check your projects before retrying.
 
 With encryption configured, restore and import re-encrypt every file under the target workspace's key; restored file keys carry a per-attempt suffix. A failure whose outcome is unknown (for example a lost connection after the database committed) deletes nothing and logs `backup_cleanup_skipped`; such unreferenced objects are not reclaimed by this release (see [encryption.md](encryption.md#files)).

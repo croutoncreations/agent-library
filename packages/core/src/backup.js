@@ -1,6 +1,6 @@
 import { TEXT_MAX_BYTES } from "./text-limits.js";
 import { personalWorkspaceId } from "./tenancy.js";
-import { blobKeyFits, blobRef, commitTextWrites, deleteBlobs, dropUnreferencedBlobs, fenceRefusal, getText, isTextWriteFenceError, keyFence, mapContent, plaintextFence, readBlobBytes, stageTextWrites, textKey, textWriteComplete, writeBlobBytes } from "./content-store.js";
+import { blobKeyFits, blobPrefix, blobRef, commitTextWrites, deleteBlobs, dropUnreferencedBlobs, fenceRefusal, getText, isTextWriteFenceError, keyFence, mapContent, plaintextFence, readBlobBytes, stageTextWrites, storedText, textKey, textWriteComplete, writeBlobBytes } from "./content-store.js";
 import { textSearchBridge } from "./search/service.js";
 import { limitsFor, requireHuman } from "./auth.js";
 import { BINARY_TYPES, LIMITS, tplDate } from "./service.js";
@@ -99,16 +99,29 @@ async function validateBackup(backup) {
   }
   return { pid, decoded };
 }
-// Pre-write checks shared by import and restore: every value either binds into a statement after the first object
-// is written must be bindable (null, string, finite number or boolean), and every row must name a document of the
-// backup. Restore gains only these (and the key-length check): no backup that restores today is refused, because a
-// value that cannot bind, or a row for an unknown document, made today's restore batch fail anyway.
-// The check is on the value as it WILL be bound, after the coercions the statements apply (meta_versions.trashed is
-// bound as `trashed ? 1 : 0`, so any value binds). strict (import only) adds import's own rules: restored_from an
-// integer and trashed a scalar. Restore must refuse nothing it accepted before (design Addendum 2).
-const bindable = (v) => v === null || v === void 0 || typeof v === "string" || typeof v === "boolean" || typeof v === "number" && Number.isFinite(v);
-function checkBindable(backup, { strict = false } = {}) {
+// Pre-write checks shared by import and restore: every value that binds into a statement after the first object
+// is written must be bindable, and every row must name a document of the backup. Restore gains only these (and the
+// key-length check), and they accept exactly what today's restore could store (design Addendum 2: restore must refuse
+// nothing it accepted before):
+//  - bindable is what D1's bind accepts: null, a string, any number (a JSON 1e999 is Infinity, which D1 binds as
+//    NULL), a boolean, or a list of byte values (bound as a BLOB); anything else (an object, a list of other values)
+//    made today's restore fail when its statement was built, before the batch. undefined passes here because the
+//    statements that bind a field raw fail on it as they did before, and the others bind `?? null`.
+//  - each check is on the value as it WILL be used: meta_versions.trashed is bound as `trashed ? 1 : 0` and a
+//    comment's body is only ever encoded to text (TextEncoder makes any value its string form), so restore checks
+//    neither.
+//  - document references match as the database's foreign keys match them: docKey maps a value to its stored form
+//    (storedDocumentIds), so a number and a string match exactly when the database would store them the same.
+// strict (import only) adds import's own rules: finite numbers and no byte lists, restored_from an integer, trashed
+// and comment bodies scalars, and references by plain equality (import requires string ids).
+// What D1's bind accepts as a BLOB: a list of numbers each >= 0 and < 256 (workerd's D1 shim; probed: [65.1] binds
+// as 0x41, [255.9] as 0xFF, [-0] as 0x00; [-1], [256], [NaN], [Infinity], ["1"], [null], [true], [[1]] throw).
+// The stored bytes are Uint8Array.from(list) (fractions truncated), so byte lists compare by those bytes.
+const isByteList = (v) => Array.isArray(v) && v.every((b) => typeof b === "number" && b >= 0 && b < 256);
+const scalar = (v) => v === null || v === void 0 || typeof v === "string" || typeof v === "boolean" || typeof v === "number";
+function checkBindable(backup, { strict = false, docKey = (v) => v } = {}) {
   const bad = (m) => { throw new HttpError(400, "bad_backup", m); };
+  const bindable = (v) => strict ? scalar(v) && (typeof v !== "number" || Number.isFinite(v)) : scalar(v) || isByteList(v);
   const fields = (row, names, what) => { for (const n of names) if (!bindable(row?.[n])) bad(`Invalid ${what} field ${n}`); };
   const intOrNull = (v, what) => {
     if (!bindable(v)) bad(`Invalid ${what} field restored_from`);
@@ -119,22 +132,47 @@ function checkBindable(backup, { strict = false } = {}) {
   const ids = new Set();
   for (const a of backup.artifacts) {
     fields(a, ["id", "kind", "title", "folder", "tags", "head_rev", "head_revision_id", "meta_version", "trashed_at", "created_at", "updated_at"], "document");
-    ids.add(a.id);
+    ids.add(docKey(a.id));
   }
   for (const r of backup.revisions) {
     fields(r, ["id", "artifact_id", "rev_no", "author_id", "size", "sha256", "mime", "created_at", "via_kind", "via_id", "via_label", "client_info", "change_note"], "version");
     intOrNull(r.restored_from, "version");
-    if (!ids.has(r.artifact_id)) bad("Revision for an unknown document");
+    if (!ids.has(docKey(r.artifact_id))) bad("Revision for an unknown document");
   }
   for (const v of backup.meta_versions ?? []) {
     fields(v, ["id", "artifact_id", "version", "title", "folder", "tags", ...strict ? ["trashed"] : [], "author_id", "via_kind", "via_id", "via_label", "client_info", "change_note", "created_at", "template_description"], "details version");
     intOrNull(v.restored_from, "details version");
-    if (!ids.has(v.artifact_id)) bad("Details version for an unknown document");
+    if (!ids.has(docKey(v.artifact_id))) bad("Details version for an unknown document");
   }
   for (const c of backup.comments) {
-    fields(c, ["id", "artifact_id", "rev_no", "author_id", "body", "created_at"], "comment");
-    if (!ids.has(c.artifact_id)) bad("Comment on an unknown document");
+    fields(c, ["id", "artifact_id", "rev_no", "author_id", ...strict ? ["body"] : [], "created_at"], "comment");
+    if (!ids.has(docKey(c.artifact_id))) bad("Comment on an unknown document");
   }
+}
+/**
+ * Restore: the form each document id and reference will be stored in. artifacts.id and every artifact_id are TEXT
+ * columns, so the database keeps a string as it is and turns a number or boolean into its own text form (D1 binds
+ * every JS number as REAL, so 7 is stored "7.0" and never equals "7"); a byte list stays a BLOB, equal only to the
+ * same bytes; a string is stored with each lone surrogate as U+FFFD (storedText, shared with blobPrefix). The foreign
+ * keys compare those stored forms. The database is asked for the numbers and booleans, in batches of at most 100
+ * statements and only when there are any; each distinct value comes from a row restore's own batch inserts, so the
+ * lookup issues at most one statement per such row. Returns Map(value -> stored text, or a tagged key for a BLOB).
+ */
+async function storedDocumentIds(DB, backup) {
+  const values = new Set([...backup.artifacts.map((a) => a?.id), ...[...backup.revisions, ...backup.meta_versions ?? [], ...backup.comments].map((x) => x?.artifact_id)]);
+  const stored = new Map();
+  const ask = [];
+  for (const v of values) {
+    if (typeof v === "string") stored.set(v, storedText(v));
+    else if (isByteList(v)) stored.set(v, "\u0000blob:" + Uint8Array.from(v).join(","));
+    else if (v != null && scalar(v)) ask.push(v);
+  }
+  for (let i = 0; i < ask.length; i += 100) {
+    const chunk = ask.slice(i, i + 100);
+    const res = await DB.batch(chunk.map((v) => DB.prepare("SELECT CAST(? AS TEXT) AS t").bind(v)));
+    chunk.forEach((v, j) => stored.set(v, res[j].results[0]?.t ?? null));
+  }
+  return stored;
 }
 /** Every storage key an attempt will write must fit the encrypted format's object-key limit (checked before any put). */
 function checkKeysFit(keys) {
@@ -204,20 +242,24 @@ async function restoreBackup(ctx, backup) {
   const existing = await DB.prepare("SELECT COUNT(*) AS n FROM projects").first("n");
   if (existing) throw new HttpError(409, "store_not_empty", "Restore targets an empty isolated store only");
   const { pid, decoded } = await validateBackup(backup);
-  checkBindable(backup);
+  const storedIds = await storedDocumentIds(DB, backup);
+  checkBindable(backup, { docKey: (v) => storedIds.has(v) ? storedIds.get(v) : v });
   // IDs stay stable, but each attempt owns fresh immutable objects, even after a lost acknowledgement: text keys carry
   // the attempt segment, file keys end in _<attempt> (not stripped: stripping could make x and x_restore_… collide).
   const attempt = randomId("restore");
   // Each file object is written under the revision's OWN document (blobs/<project>/<document>/…), which every read
-  // checks before decrypting. Export never pairs a revision with another document's key, but restore accepted such a
-  // hand-made pair before (its plaintext read did not check the prefix), so it must keep restoring it: the common
-  // case keeps today's name (`<key>_<attempt>`); a key naming another document is copied to a fresh name in the
-  // revision's own document, once per (source key, document).
+  // checks before decrypting (blobPrefix: the document id as stored, URI-encoded). Export never pairs a revision with
+  // another document's key, but restore accepted such a hand-made pair before (its plaintext read did not check the
+  // prefix), and accepted any document id, so it must keep restoring both: when the key's document segment is the
+  // revision's stored document id (always a [A-Za-z0-9_-] segment, which encoding leaves unchanged) the key keeps
+  // today's name (`<key>_<attempt>`); otherwise the object is copied to a fresh name under the revision's own
+  // document's prefix, once per (source key, document).
   const targets = new Map();
   const restoreKey = (r) => {
-    const m = /^blobs\/[A-Za-z0-9_-]+\/([A-Za-z0-9_-]+)\/[A-Za-z0-9_-]+$/.exec(r.blob_key);
-    const pair = r.artifact_id + "\n" + r.blob_key;
-    if (!targets.has(pair)) targets.set(pair, m && m[1] === r.artifact_id ? `${r.blob_key}_${attempt}` : `blobs/${pid}/${r.artifact_id}/${randomId("rx")}_${attempt}`);
+    // The id as the document's row will hold it (a byte list's segment is its text form; it never matches a key).
+    const doc = typeof storedIds.get(r.artifact_id) === "string" && !storedIds.get(r.artifact_id).startsWith("\u0000") ? storedIds.get(r.artifact_id) : String(r.artifact_id);
+    const pair = doc + "\n" + r.blob_key;
+    if (!targets.has(pair)) targets.set(pair, r.blob_key.startsWith(blobPrefix(pid, doc)) ? `${r.blob_key}_${attempt}` : `${blobPrefix(pid, doc)}${randomId("rx")}_${attempt}`);
     return targets.get(pair);
   };
   const fileRevisions = backup.revisions.filter((r) => r.blob_key);
@@ -381,7 +423,7 @@ async function importBackup(ctx, workspaceId, input, idemKeyValue, digest = "") 
   const keyMap = new Map([...decoded.keys()].map((k) => [k, newKey(k)]));
   // A file version's key must lie in its own document (reads check that prefix before decrypting). Export never
   // produces another pairing; a hand-made backup that does is refused before anything is written.
-  for (const r of backup.revisions) if (r.blob_key !== null && !keyMap.get(r.blob_key).startsWith(`blobs/${pid}/${artId.get(r.artifact_id)}/`))
+  for (const r of backup.revisions) if (r.blob_key !== null && !keyMap.get(r.blob_key).startsWith(blobPrefix(pid, artId.get(r.artifact_id))))
     throw new HttpError(400, "bad_backup", "A file key does not match its document");
   checkKeysFit(keyMap.values());
   // Every check is done; re-check the role right before writing bytes (also checked inside the project INSERT).

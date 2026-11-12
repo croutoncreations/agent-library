@@ -533,7 +533,12 @@ test("Chrome: exact owner/viewer notes, small views, offline copies, and synthet
                   assert.match(await linked.$eval(".vh-body", e => e.textContent), /identical/);
                   assert.equal(await linked.$(".vh-body pre.raw"), null);
                   await linked.close();
+                  // Showing Preview reloads it, and the reload rebuilds the note with a new link. Wait for that link:
+                  // the one from before the reload is removed from the page, and a click aimed at it fails.
+                  const staleLink = await page.$(".preview-note a");
                   await page.evaluate(() => [...document.querySelectorAll('[role="tab"]')].find(e => e.textContent === "Preview").click());
+                  await page.waitForFunction(stale => { const a = document.querySelector(".preview-note a"); return a && a !== stale; }, {}, staleLink);
+                  assert.equal(await staleLink.evaluate(e => e.isConnected), false, "the reload replaced the link");
                   await page.waitForSelector(".preview-note a", { visible: true });
                   await page.evaluate(() => { window.renderLimitDocument = true; });
                   if (width === 390) {
