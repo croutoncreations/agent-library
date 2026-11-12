@@ -18,7 +18,7 @@ Response:
 {"results":[{"project_id":"planning","project_title":"Planning","artifact_id":"art_example","title":"Annual subscriptions","kind":"markdown","matched_field":"title","snippet":"Renew annually in January.","indexed_body":true,"revision":3,"sha256":"<revision hash>","updated_at":"2026-10-27T12:00:00.000Z","web_url":"https://library.example.com/p/planning/a/art_example?v=3","preview_url":"https://library.example.com/p/planning/a/art_example/preview?v=3"}],"has_more":false,"next_cursor":null}
 ```
 
-Each excerpt is plain source text, at most 500 characters; HTML source is displayed as text, never executed. Binary matches use titles only and `indexed_body:false`. JSON/CSV follow the existing App Connect feature flag; OAuth connections approved without file access cannot search binaries. Title-only matches still show a short body excerpt or their title. UI highlighting uses text nodes; it is decorative and may differ from FTS accent folding.
+Each excerpt is plain source text, at most 500 characters; HTML source is displayed as text, never executed. Binary matches use titles only and `indexed_body:false`. JSON/CSV follow the existing App Connect feature flag; OAuth connections approved without file access cannot search binaries. Title-only matches still show a short body excerpt or their title. Excerpts are built from the first 16,384 characters of the indexed text: when the matching words occur only later in the document, the excerpt is the start of the text (or the title when that prefix holds no complete word). Ranking and which documents are returned are unaffected. UI highlighting uses text nodes; it is decorative and may differ from FTS accent folding.
 
 ## Lexical semantics and ranking
 
