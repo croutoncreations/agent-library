@@ -12,8 +12,8 @@ import { ROOT } from "./helpers.mjs";
 import * as W from "./blind-tokens-world.mjs";
 
 const lib = await loadWorker({
-  "search/tokens.js": ["extractSearchTerms", "extractSearchTermsFlat", "u61FoldTokenBounded", "searchDocCap", "searchTermsMax", "searchScopeBounds",
-    "searchSweepWritesMax", "utf8Length", "searchTokensFor", "searchTokenDigest", "deriveSearchKey", "searchKeyInfo", "decodeSearchSecret", "searchTokenKey",
+  "search/tokens.js": ["extractSearchTerms", "extractSearchTermsFlat", "searchFlatTerms", "searchFlatHeld", "searchTermInputs", "u61FoldTokenBounded", "searchDocCap", "searchTermsMax", "searchScopeBounds",
+    "searchSweepWritesMax", "utf8Length", "searchTokensFor", "searchTokenDigest", "decodeSearchSecret", "searchTokenKey",
     "indexSearchJobs", "SEARCH_BATCH_TOKENS_MAX", "SEARCH_BATCH_STATEMENTS_MAX", "SEARCH_RUN_LIMITS",
     "openSearchRun", "admitSearchJobs", "runSearchIndexing", "searchAdmissionState", "withDeferredWork", "deferSearchIndexing", "startDeferredWork",
     "discardDeferredWork", "drainSearchIndexing", "SEARCH_CALL_ENVELOPE_BYTES", "SEARCH_RUN_BASE_BYTES", "SEARCH_ACTIVE_MAX_BYTES", "SEARCH_RUN_MAX_BYTES",
@@ -130,9 +130,7 @@ test("test 6: the run's scanned-units budget (10 Mi code units) refuses the job 
 test("test 7: extractSearchTermsFlat decodes to the same terms as extractSearchTerms", () => {
   const text = "Zürich straße 日本語 alpha beta alpha 😀 " + words(500).join(" ");
   const flat = lib.extractSearchTermsFlat(text, 300), plain = lib.extractSearchTerms(text, 300);
-  const dec = new TextDecoder(), got = [];
-  for (let i = 0; i < flat.count; i++) got.push(dec.decode(flat.bytes.subarray(flat.offsets[i], flat.offsets[i + 1])));
-  assert.deepEqual(got, plain.terms);
+  assert.deepEqual(lib.searchFlatTerms(flat), plain.terms);
   assert.equal(flat.truncated, plain.truncated);
 });
 
@@ -147,7 +145,7 @@ test("test 7: heap: a 10 MiB text extracted flat and dropped is released (child 
     const flat = lib.extractSearchTermsFlat(text, 20000);
     text = null;
     global.gc(); global.gc(); const after = process.memoryUsage().heapUsed;
-    console.log("FLAT " + JSON.stringify({ fell: withText - after, bytes: flat.bytes.byteLength, count: flat.count }));
+    console.log("FLAT " + JSON.stringify({ fell: withText - after, bytes: flat.byteLength, count: flat.count }));
   `], { cwd: ROOT, encoding: "utf8", timeout: 120000 });
   assert.equal(child.status, 0, child.stderr);
   const r = JSON.parse(child.stdout.split("FLAT ")[1]);
@@ -169,8 +167,9 @@ test("test 7: heap kept by the first (cold) and a later (warm) capped scan, repo
       const flat = lib.extractSearchTermsFlat(text, 20000);
       text = null;
       // kept = heap after gc − heap with the text + the text (ASCII: a one-byte string of 2 Mi bytes), less the result.
-      global.gc(); const kept = process.memoryUsage().heapUsed - withText + 2 * 1048576 - (flat.bytes.byteLength + flat.offsets.byteLength);
-      console.log("KEPT " + JSON.stringify({ kept, result: flat.bytes.byteLength + flat.offsets.byteLength }));
+      const result = flat.byteLength + 4 * (flat.count + 1);   // the private bytes and offsets the handle stands for
+      global.gc(); const kept = process.memoryUsage().heapUsed - withText + 2 * 1048576 - result;
+      console.log("KEPT " + JSON.stringify({ kept, result }));
     `], { cwd: ROOT, encoding: "utf8", timeout: 120000 });
     assert.equal(child.status, 0, child.stderr);
     return JSON.parse(child.stdout.split("KEPT ")[1]);
@@ -203,7 +202,16 @@ test("test 8: tokens are sorted lower-case hex HMACs (createHmac), the digest an
   await assert.rejects(lib.searchTokenKey(env, "wsp_a"), (e) => e.code === "search_key_invalid");
 });
 
+/** The search-key derivation lives in crypto/ (only search/tokens.js imports workspaceSearchKey). Loaded with its own env helpers. */
+let keyLibP = null;
+const keyLib = () => (keyLibP ??= loadWorker({
+  "crypto/search-key.js": ["deriveSearchKey", "searchKeyInfo", "workspaceSearchKey"],
+  "search/tokens.js": ["searchTokensFor", "searchTokenKey"],
+  "adapters.js": ["withAdapters", "resolveAdapters"],
+  "crypto/keys.js": ["withDataKeyMemo"],
+}));
 test("test 8: derivation: HKDF-SHA-256 of the data key with info al-search/1 ‖ 0x00 ‖ workspaceId", async () => {
+  const lib = await keyLib();
   const raw = crypto.getRandomValues(new Uint8Array(32));
   const dataKey = await crypto.subtle.importKey("raw", raw, "HKDF", false, ["deriveKey"]);
   const key = await lib.deriveSearchKey(dataKey, "wsp_derive");
@@ -214,6 +222,34 @@ test("test 8: derivation: HKDF-SHA-256 of the data key with info al-search/1 ‖
   assert.deepEqual(await lib.searchTokensFor(key, ["word"]), expectedTokens(expected, ["word"]));
   // Another workspace derives an unrelated key from the same data key.
   assert.notDeepEqual(await lib.searchTokensFor(await lib.deriveSearchKey(dataKey, "wsp_other"), ["word"]), expectedTokens(expected, ["word"]));
+});
+
+test("test 8: workspaceSearchKey (crypto/) gives a non-extractable, sign-only key, memoized per data key, and refuses like the data key", async () => {
+  const lib = await keyLib();
+  const envOf = (world, vars = {}) => lib.withAdapters({ DB: world.DB, ...vars }, lib.resolveAdapters({}));
+  const world = W.mkWorld();
+  W.seedWorkspace(world);
+  const master = Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64");
+  const env = envOf(world, { CONTENT_MASTER_KEY_VERSION: "1", CONTENT_MASTER_KEY_V1: master });
+  const got = await lib.workspaceSearchKey(env, "wsp_a");
+  assert.deepEqual(Object.keys(got).sort(), ["key", "keyId"], "only the key id and the derived key: never the data key");
+  assert.equal(got.key.extractable, false);
+  assert.deepEqual(got.key.usages, ["sign"]);
+  assert.deepEqual(got.key.algorithm, { name: "HMAC", hash: { name: "SHA-256" }, length: 256 });
+  await assert.rejects(crypto.subtle.exportKey("raw", got.key));
+  // Within one request (its data-key memo, as createWorker attaches) the derived key is derived once.
+  const request = lib.withDataKeyMemo(env);
+  const inRequest = await lib.workspaceSearchKey(request, "wsp_a");
+  assert.equal((await lib.workspaceSearchKey(request, "wsp_a")).key, inRequest.key, "memoized per data-key object (one request)");
+  // The same tokens as the tokens module's own key (the bytes of the derivation did not change).
+  const viaTokens = await lib.searchTokenKey(env, "wsp_a");
+  assert.deepEqual([viaTokens.keyId, viaTokens.encrypted], [got.keyId, true]);
+  assert.deepEqual(await lib.searchTokensFor(viaTokens.key, ["word"]), await lib.searchTokensFor(got.key, ["word"]));
+  // Refusals are workspaceDataKey's own.
+  await assert.rejects(lib.workspaceSearchKey(envOf(world), "wsp_a"), (e) => e.status === 500 && e.code === "encryption_not_configured");
+  W.run(world, "UPDATE workspace_keys SET shredded_at = 1, wrapped = '' WHERE workspace_id = 'wsp_a'");
+  await assert.rejects(lib.workspaceSearchKey(envOf(world, { CONTENT_MASTER_KEY_VERSION: "1", CONTENT_MASTER_KEY_V1: master }), "wsp_a"),
+    (e) => e.status === 410 && e.code === "key_shredded");
 });
 
 test("test 8: encryption on: the run derives from the workspace data key and fences on it", async () => {
@@ -1203,7 +1239,7 @@ test("review A6 (test 28): a stable group builds every member's diff before pack
 // --- Review fixes, round 2 -------------------------------------------------------------------------------------------
 /** The round-2 exports, loaded on first use (so the older tests still load against code that lacks them). */
 let r2lib = null;
-const r2 = async () => (r2lib ??= await loadWorker({ "search/tokens.js": ["extractSearchTermsWith", "U61_TOKEN_WELLFORMED", "u61FoldTokenBounded", "extractSearchTerms", "extractSearchTermsFlat"] }));
+const r2 = async () => (r2lib ??= await loadWorker({ "search/tokens.js": ["extractSearchTermsWith", "U61_TOKEN_WELLFORMED", "u61FoldTokenBounded", "extractSearchTerms", "extractSearchTermsFlat", "searchFlatTerms"] }));
 test("review R2-1: lone surrogates split words lazily: 300,000 short words with cap 10 give 10 terms after bounded work", async () => {
   const lib = await r2();
   const parts = [];
@@ -1220,9 +1256,8 @@ test("review R2-1: lone surrogates split words lazily: 300,000 short words with 
   assert.deepEqual(r.terms, parts.slice(0, 10));
   // Packed and flat give the same terms on the malformed fixtures.
   for (const t of [text, "ab\uD800cd", "x\uDC00y z", "\uD800", "a\uD800" + "b".repeat(300) + " c\uDBFF\uDFFFd"]) {
-    const plain = lib.extractSearchTerms(t, 50), flat = lib.extractSearchTermsFlat(t, 50), dec = new TextDecoder(), got = [];
-    for (let i = 0; i < flat.count; i++) got.push(dec.decode(flat.bytes.subarray(flat.offsets[i], flat.offsets[i + 1])));
-    assert.deepEqual(got, plain.terms, JSON.stringify(t.slice(0, 20)));
+    const plain = lib.extractSearchTerms(t, 50), flat = lib.extractSearchTermsFlat(t, 50);
+    assert.deepEqual(lib.searchFlatTerms(flat), plain.terms, JSON.stringify(t.slice(0, 20)));
   }
 });
 
@@ -1266,60 +1301,66 @@ test("review R2-1: the token pattern never matches across a lone surrogate and n
     for (const m of t.matchAll(lib.U61_TOKEN_WELLFORMED)) assert.ok(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(m[0]), JSON.stringify(m[0]));
 });
 
-/** A hand-built flat container for `terms`: arrays that own their buffers and are consistent, but not the extractor's. */
-function handFlat(terms) {
-  const enc = new TextEncoder(), parts = terms.map((t) => enc.encode(t));
-  const bytes = new Uint8Array(parts.reduce((n, p) => n + p.length, 0)), offsets = new Uint32Array(parts.length + 1);
-  let at = 0;
-  parts.forEach((p, i) => { bytes.set(p, at); at += p.length; offsets[i + 1] = at; });
-  return { bytes, offsets, count: parts.length, truncated: false };
-}
-test("review R4-1: a flat job is only extractSearchTermsFlat's own result: hand-built, getter and copied containers are refused", () => {
-  const world = world1([]);
+// --- Flat terms are held privately: the caller gets an opaque frozen handle ----------------------------------------
+test("review R5-2: extractSearchTermsFlat returns a frozen handle of exactly { count, truncated, byteLength }, reaching no storage", () => {
+  const text = "Zürich straße 日本語 alpha beta 😀 " + words(300).join(" ");
+  const h = lib.extractSearchTermsFlat(text, 100);
+  assert.ok(Object.isFrozen(h), "the handle is frozen");
+  assert.deepEqual(Object.keys(h).sort(), ["byteLength", "count", "truncated"]);
+  assert.deepEqual(Reflect.ownKeys(h).sort(), ["byteLength", "count", "truncated"], "no symbol keys either");
+  assert.equal(Object.getPrototypeOf(h), Object.prototype);
+  assert.deepEqual([typeof h.count, typeof h.truncated, typeof h.byteLength], ["number", "boolean", "number"]);
+  for (const k of Reflect.ownKeys(h)) {
+    const d = Object.getOwnPropertyDescriptor(h, k);
+    assert.ok("value" in d && !d.writable && !d.configurable, `${String(k)} is a fixed data property`);
+    assert.ok(!ArrayBuffer.isView(d.value) && !(d.value instanceof ArrayBuffer), `${String(k)} reaches no array or buffer`);
+  }
+  const terms = lib.searchFlatTerms(h);
+  assert.equal(terms.length, h.count);
+  assert.deepEqual(terms, lib.extractSearchTerms(text, 100).terms);
+  assert.equal(h.byteLength, terms.reduce((n, t) => n + Buffer.byteLength(t), 0));
+  terms[0] = "changed";
+  assert.notEqual(lib.searchFlatTerms(h)[0], "changed", "searchFlatTerms returns copies");
+  const empty = lib.extractSearchTermsFlat("", 10);
+  assert.deepEqual([Object.isFrozen(empty), empty.count, empty.byteLength, lib.searchFlatTerms(empty)], [true, 0, 0, []]);
+});
+
+test("review R5-2: only a live handle from extractSearchTermsFlat is accepted: forged, copied and spent handles are refused", async () => {
+  const world = world1(["fh"]);
   const env = aenv(world);
   const real = lib.extractSearchTermsFlat("alpha beta", 10);
-  const small = handFlat(["alpha", "beta"]), large = new Uint8Array(4 * MiB);
-  let reads = 0;
-  const getter = { get bytes() { return reads++ === 0 ? small.bytes : large; }, offsets: small.offsets, count: 2, truncated: false };
-  const frozenCopy = Object.freeze({ ...real });
-  for (const [why, flat] of [["hand-built", small], ["getter", getter], ["spread copy", { ...real }], ["frozen copy", frozenCopy],
-    ["view of a real result's arrays", { bytes: real.bytes.subarray(0), offsets: real.offsets, count: real.count, truncated: real.truncated }]]) {
+  const descriptor = (flat) => ({ artifactId: "fh", projectId: "proj_a", revisionId: "rev_fh", flat, textBytes: 10, textUnits: 10 });
+  const refused = (why, flat) => {
     const r = adm.openSearchRun();
     const before = adm.searchAdmissionState();
-    assert.throws(() => adm.admitSearchJobs(env, r, [{ artifactId: "fc", projectId: "proj_a", revisionId: "rev_fc", flat, textBytes: 10, textUnits: 10 }]),
+    assert.throws(() => adm.admitSearchJobs(env, r, [descriptor(flat)]),
       (e) => e.code === "search_job_invalid" && /flat container/.test(e.message), why);
     assert.deepEqual(adm.searchAdmissionState(), before, why);
     assert.equal(r.holder.jobs.length, 0, why);
     r.settle();
     assertRecovered();
-  }
+  };
+  const legacy = { bytes: new TextEncoder().encode("alphabeta"), offsets: Uint32Array.from([0, 5, 9]), count: 2, truncated: false };
+  for (const [why, flat] of [["forged handle", { count: 2, truncated: false, byteLength: 9 }], ["spread copy", { ...real }],
+    ["frozen copy", Object.freeze({ ...real })], ["arrays (the old form)", legacy], ["object inheriting from a handle", Object.create(real)]]) refused(why, flat);
+  assert.throws(() => lib.searchFlatTerms({ ...real }), (e) => e.code === "search_job_invalid");
+  // A real handle indexes exactly, and is spent: once its job is done, the storage is gone and it is refused.
+  const held = lib.searchFlatHeld();
+  const { result } = await logs(() => indexJobs(env, [descriptor(real)]));
+  assert.equal(result.completed, 1);
+  assert.deepEqual(W.tokensOf(world, "fh"), expectedTokens(secretOf(world, "wsp_a"), ["alpha", "beta"]));
+  assertExact(world);
+  assert.equal(lib.searchFlatHeld(), held - 1, "the private storage is dropped when the job finishes");
+  assert.throws(() => lib.searchFlatTerms(real), (e) => e.code === "search_job_invalid");
+  refused("second use after the job settled", real);
+  assertIdle();
 });
 
-test("review R4-1: extractSearchTermsFlat's result is frozen, its arrays non-extensible and each covers its own whole fixed buffer", () => {
-  const real = lib.extractSearchTermsFlat("Zürich straße 日本語 alpha beta 😀 " + words(300).join(" "), 100);
-  assert.ok(Object.isFrozen(real), "the container is frozen");
-  for (const [name, a, T] of [["bytes", real.bytes, Uint8Array], ["offsets", real.offsets, Uint32Array]]) {
-    assert.equal(Object.getPrototypeOf(a), T.prototype, `${name} is a plain ${T.name}`);
-    assert.equal(Object.isExtensible(a), false, `${name} is not extensible`);
-    assert.equal(a.byteOffset, 0, `${name} starts its buffer`);
-    assert.equal(a.byteLength, a.buffer.byteLength, `${name} covers its whole buffer`);
-    assert.equal(a.buffer.resizable, false, `${name}'s buffer is fixed`);
-    assert.ok(!(a.buffer instanceof SharedArrayBuffer), `${name}'s buffer is not shared`);
-    assert.throws(() => { "use strict"; a.extra = 1; }, TypeError, `no property can be added to ${name}`);
-    assert.equal(a.extra, undefined);
-  }
-  const before = [real.bytes, real.offsets, real.count, real.truncated];
-  for (const k of ["bytes", "offsets", "count", "truncated"]) assert.throws(() => { "use strict"; real[k] = null; }, TypeError, k);
-  assert.throws(() => { "use strict"; real.extra = 1; }, TypeError);
-  assert.deepEqual([real.bytes, real.offsets, real.count, real.truncated], before);
-  const empty = lib.extractSearchTermsFlat("", 10);
-  assert.ok(Object.isFrozen(empty) && empty.count === 0 && empty.offsets.length === 1);
-});
-
-test("review R4-1: a real flat result is admitted and indexes exactly; the descriptor and its sidecar are not kept", async () => {
+test("review R5-2: a real handle is admitted and indexes exactly; the descriptor's sidecar is not kept; a refused run drops the storage", async () => {
   const world = world1(["fo"]);
   const env = aenv(world);
   const flat = lib.extractSearchTermsFlat("alpha beta alpha", 10);
+  const held = lib.searchFlatHeld();
   const sidecarRef = new WeakRef(new Uint8Array(8 * MiB));
   const block = gate();
   world.before = () => block.wait;
@@ -1327,7 +1368,7 @@ test("review R4-1: a real flat result is admitted and indexes exactly; the descr
   // descriptor (or read anything else from it) the sidecar would survive the gc below.
   const { run, done } = start(env, [{ artifactId: "fo", projectId: "proj_a", revisionId: "rev_fo", flat, textBytes: 16, textUnits: 16, sidecar: sidecarRef.deref() }]);
   const j = run.holder.jobs[0];
-  assert.equal(j.flat, flat, "the job keeps the extractor's own frozen container");
+  assert.equal(j.flat, flat, "the job keeps the handle");
   await settleGc();
   assert.equal(sidecarRef.deref(), undefined, "the descriptor's sidecar is not reachable from the admitted job");
   block.open();
@@ -1336,6 +1377,32 @@ test("review R4-1: a real flat result is admitted and indexes exactly; the descr
   assert.deepEqual(W.tokensOf(world, "fo"), expectedTokens(secretOf(world, "wsp_a"), ["alpha", "beta"]));
   assertExact(world);
   assertIdle();
+  assert.equal(lib.searchFlatHeld(), held - 1);
+  // A run that is dropped before it starts (clearHolder) drops its handles' storage too.
+  const h2 = lib.extractSearchTermsFlat("gamma", 10);
+  const r = adm.openSearchRun();
+  adm.admitSearchJobs(env, r, [{ artifactId: "fo", projectId: "proj_a", revisionId: "rev_fo2", flat: h2, textBytes: 5, textUnits: 5 }]);
+  assert.equal(lib.searchFlatHeld(), held);
+  r.settle();
+  assert.equal(lib.searchFlatHeld(), held - 1, "settling an unstarted run drops the storage");
+  assert.throws(() => lib.searchFlatTerms(h2), (e) => e.code === "search_job_invalid");
+  assertIdle();
+});
+
+test("review R5-2: searchTermInputs checks every interval before allocating (both packed forms)", () => {
+  const bad = (why, p, from, to) => assert.throws(() => lib.searchTermInputs(p, from, to), (e) => e.status === 500 && e.code === "search_terms_invalid", why);
+  const bytes = new Uint8Array(4096), units = new Uint16Array(1024);
+  bad("offsets alternating 0 and the length (flat)", { bytes, offsets: Uint32Array.from([0, 4096, 0, 4096]), count: 3 }, 0, 3);
+  bad("a flat term over 600 bytes", { bytes, offsets: Uint32Array.from([0, 601]), count: 1 }, 0, 1);
+  bad("past the end (flat)", { bytes, offsets: Uint32Array.from([4000, 4100]), count: 1 }, 0, 1);
+  bad("backwards (flat)", { bytes, offsets: Uint32Array.from([10, 5]), count: 1 }, 0, 1);
+  bad("a units term over 200 units", { units, offsets: Uint32Array.from([0, 201]), count: 1 }, 0, 1);
+  bad("past the end (units)", { units, offsets: Uint32Array.from([1000, 1030]), count: 1 }, 0, 1);
+  bad("missing offset", { bytes, offsets: Uint32Array.from([0]), count: 1 }, 0, 1);
+  bad("non-integer offset (plain array)", { bytes, offsets: [0, 1.5], count: 1 }, 0, 1);
+  // Valid: exactly 600 bytes and exactly 200 units are allowed.
+  assert.equal(lib.searchTermInputs({ bytes, offsets: Uint32Array.from([0, 600, 600]), count: 2 }, 0, 2).length, 2);
+  assert.deepEqual(lib.searchTermInputs({ units: Uint16Array.from("ab", (c) => c.charCodeAt(0)), offsets: Uint32Array.from([0, 2]), count: 1 }, 0, 1).map((b) => [...b]), [[97, 98]]);
 });
 
 test("review R2-3: when ctx.waitUntil throws, the run settles at once and one skip line is logged", async () => {
@@ -1509,20 +1576,34 @@ test("pieces: seeded random strings have the same word boundaries piecewise as w
     lib.scanSearchWords(t, (s, e) => { got.push([s, e]); return true; });
     assert.deepEqual(got, unboundedWords(lib, t), JSON.stringify(t));
   }
-  // Long words of about [P−3, 2P+3] code points (no separators), with a separator, lone surrogate or dropped mark
-  // placed near each piece cut, so continuation pieces and the cut itself are compared at random.
+  // Long words that reach the piece cuts. wordChars keeps only alphabet entries that are, as a whole, one token (the
+  // unbounded pattern anchored at both ends): U+0332 and U+05B8 are separators in the tables, so "\u0332" and
+  // "\u05e9\u05b8" are not word characters; they stay among the breakers. Each iteration places at most one breaker
+  // (a separator, a lone surrogate or a dropped mark) within 3 code points of the cut at P or at 2P, and sizes the word
+  // so that some compared span always holds at least P code points (and, without a breaker or with one at 2P, at
+  // least 2P − 3), so continuation pieces and the cuts themselves are compared at random.
   const P = lib.SEARCH_SCAN_PIECE_UNITS;
-  const wordChars = alphabet.filter((c) => !/^[ .\n\u3002]$/.test(c) && !/^[\uD800-\uDFFF]$/.test(c));
-  const breakers = [" ", "\u3002", "\uD800", "\uDC00", "\u0301", "\u0332"];
+  const whole = new RegExp(`^(?:${lib.U61_TOKEN_WELLFORMED.source})$`, lib.U61_TOKEN_WELLFORMED.flags.replace("g", ""));
+  const wordChars = alphabet.filter((c) => whole.test(c));
+  assert.ok(!wordChars.includes("\u0332") && !wordChars.includes("\u05e9\u05b8") && wordChars.includes("\u03a9"), JSON.stringify(wordChars));
+  const breakers = [" ", "\u3002", "\uD800", "\uDC00", "\u0301", "\u0332", "\u05e9\u05b8"];
+  const points = (x) => [...x].length;
+  let reached2P = 0;
   for (let i = 0; i < 300; i++) {
+    const cut = [0, P, 2 * P][rnd(3)];   // 0: no breaker
+    const n = cut === P ? 2 * P + 4 + rnd(4) : cut === 2 * P ? 2 * P + rnd(4) : P + rnd(P + 4);
     const cps = [];
-    for (let k = 0, n = P - 3 + rnd(P + 7); k < n; k++) cps.push(wordChars[rnd(wordChars.length)]);
-    for (const cut of [P, 2 * P]) if (cut - 3 < cps.length && rnd(3) > 0) cps[Math.min(cps.length - 1, cut - 3 + rnd(7))] = breakers[rnd(breakers.length)];
+    for (let k = 0; k < n; k++) cps.push(wordChars[rnd(wordChars.length)]);
+    if (cut) cps[Math.min(n - 1, cut - 3 + rnd(7))] = breakers[rnd(breakers.length)];
     const t = (rnd(2) ? "" : breakers[rnd(breakers.length)]) + cps.join("") + (rnd(2) ? "" : " tail");
     const got = [];
     lib.scanSearchWords(t, (s, e) => { got.push([s, e]); return true; });
     assert.deepEqual(got, unboundedWords(lib, t), `long word ${i} (${t.length} units)`);
+    const longest = Math.max(...got.map(([s, e]) => points(t.slice(s, e))));
+    assert.ok(longest >= P, `long word ${i}: the longest span holds ${longest} code points, short of the cut at ${P}`);
+    if (longest >= 2 * P) reached2P++;
   }
+  assert.ok(reached2P >= 30, `${reached2P} long words reached the second cut (2P)`);
 });
 
 test("pieces: a callback that throws mid-scan leaves no state behind: the next scan is correct", async () => {

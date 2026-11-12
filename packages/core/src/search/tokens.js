@@ -12,7 +12,8 @@
 // holds large data. Every D1 call goes through runEnv(), which checks the deadline, the call budget and detachment before
 // and after the call, so a late result is never stored.
 import { fenceRefusal, keyFence, plaintextFence } from "../content-store.js";
-import { encryptionEnabled, workspaceDataKey } from "../crypto/keys.js";
+import { encryptionEnabled } from "../crypto/keys.js";
+import { workspaceSearchKey } from "../crypto/search-key.js";
 import { workspaceLimits } from "../limits.js";
 import { HttpError, randomId } from "../util.js";
 import { U61_TOKEN, u61FoldToken } from "./unicode61.js";
@@ -265,11 +266,33 @@ function extractSearchTermsUnits(text, cap) {
   offsets.length = 0;   // the growable list is released with the result built
   return result;
 }
-/** Flat containers made by extractSearchTermsFlat: searchJob accepts a flat job only if it is one of these. */
-const OWN_FLAT = new WeakSet();
 /**
- * Terms packed as UTF-8 bytes and offsets (upload finish: extracted before its response, then the text is dropped).
- * bytes.byteLength <= min(12,000,000, 3 × text.length).
+ * Private storage of flat terms, keyed by the opaque handle extractSearchTermsFlat returned: { bytes, offsets }. The
+ * arrays never leave this module, so no caller can rewrite, detach, share or decorate them. searchJob accepts a flat
+ * job only for a handle present here; the entry is deleted when its job takes the terms, finishes or is dropped
+ * (dropFlat), so the storage does not outlive the run because the caller still holds the handle.
+ */
+const FLAT_STORE = new WeakMap();
+/** Entries put in FLAT_STORE and not yet dropped (an entry whose handle is collected without a job is not counted down). */
+let flatHeld = 0;
+/** Deletes a handle's private storage (no-op for an unknown or already dropped handle). */
+function dropFlat(handle) {
+  if (handle && FLAT_STORE.delete(handle)) flatHeld--;
+}
+/** Test-only: the number of flat storages created and not yet dropped. */
+export const searchFlatHeld = () => flatHeld;
+/** Test-only: the terms behind a live handle, decoded into new strings (the arrays are never exposed). */
+export function searchFlatTerms(handle) {
+  const store = FLAT_STORE.get(handle);
+  if (!store) throw new HttpError(500, "search_job_invalid", "A search job is invalid: flat container");
+  const dec = new TextDecoder(), out = [];
+  for (let i = 0; i + 1 < store.offsets.length; i++) out.push(dec.decode(store.bytes.subarray(store.offsets[i], store.offsets[i + 1])));
+  return out;
+}
+/**
+ * Terms packed as UTF-8 bytes and offsets (upload finish: extracted before its response, then the text is dropped),
+ * held privately. Returns an opaque frozen handle { count, truncated, byteLength } (plain data); pass it unchanged, once,
+ * as a job's `flat`. byteLength <= min(12,000,000, 3 × text.length).
  */
 export function extractSearchTermsFlat(text, cap) {
   const max = Math.min(12000000, 3 * text.length), enc = new TextEncoder();
@@ -285,21 +308,31 @@ export function extractSearchTermsFlat(text, cap) {
     used += enc.encodeInto(t, bytes.subarray(used)).written;
     offsets.push(used);
   });
-  // Our own result: plain typed arrays over fresh, fixed, non-shared buffers that they cover whole (slice and from
-  // allocate exactly), non-extensible (V8 refuses Object.freeze on a non-empty typed array: its elements stay
-  // writable, but no property can be added), in a frozen container recorded in OWN_FLAT.
-  const out = { bytes: bytes.slice(0, used), offsets: Uint32Array.from(offsets), count: offsets.length - 1, truncated };
+  // Exact copies (slice and from allocate fresh buffers they cover whole), kept only in FLAT_STORE.
+  const store = { bytes: bytes.slice(0, used), offsets: Uint32Array.from(offsets) };
   offsets.length = 0;   // the growable list is released with the result built
-  Object.preventExtensions(out.bytes);
-  Object.preventExtensions(out.offsets);
-  const flat = Object.freeze(out);
-  OWN_FLAT.add(flat);
-  return flat;
+  const handle = Object.freeze({ count: store.offsets.length - 1, truncated, byteLength: store.bytes.byteLength });
+  FLAT_STORE.set(handle, store);
+  flatHeld++;
+  return handle;
 }
 /** Bytes a packed term list holds. */
 const packedBytes = (p) => (p.units ? p.units.byteLength : p.bytes.byteLength) + p.offsets.byteLength;
-/** UTF-8 inputs for terms [from, to) of a packed list (one HMAC chunk's input buffers). */
+/** Most storage one folded term (at most 200 UTF-16 units) can occupy: 200 units, or 600 UTF-8 bytes. */
+const TERM_UNITS_SPAN = SEARCH_TERM_UNITS_MAX, TERM_BYTES_SPAN = 3 * SEARCH_TERM_UNITS_MAX;
+/**
+ * UTF-8 inputs for terms [from, to) of a packed list (one HMAC chunk's input buffers). Every interval is checked before
+ * anything is allocated: integers with 0 <= a <= b <= the storage's length and b − a within one term's maximum, else
+ * 500 search_terms_invalid. Unreachable through the public surface (the storage is private); an assertion against
+ * our own bugs, so one chunk can never copy more than 1,000 terms' worth.
+ */
 function termInputs(p, from, to) {
+  const store = p.units ?? p.bytes, span = p.units ? TERM_UNITS_SPAN : TERM_BYTES_SPAN;
+  for (let i = from; i < to; i++) {
+    const a = p.offsets[i], b = p.offsets[i + 1];
+    if (!Number.isInteger(a) || !Number.isInteger(b) || a < 0 || b < a || b > store.length || b - a > span)
+      throw new HttpError(500, "search_terms_invalid", "Packed search terms are invalid");
+  }
   const enc = new TextEncoder(), out = [];
   for (let i = from; i < to; i++) {
     const a = p.offsets[i], b = p.offsets[i + 1];
@@ -307,9 +340,10 @@ function termInputs(p, from, to) {
   }
   return out;
 }
+/** termInputs, for its bounds test. */
+export const searchTermInputs = termInputs;
 
 // --- Keys and tokens ----------------------------------------------------------------------------------------------
-const SEARCH_INFO = "al-search/1";
 const HEX32 = /^[0-9a-f]{32}$/;
 const hex16 = (buf) => {
   const b = new Uint8Array(buf, 0, 16);
@@ -317,21 +351,6 @@ const hex16 = (buf) => {
   for (const x of b) s += (x < 16 ? "0" : "") + x.toString(16);
   return s;
 };
-/** Derived search keys, per data-key object (data keys are memoized per request, so this is per request too). */
-const derivedKeys = new WeakMap();
-/** "al-search/1" ‖ 0x00 ‖ UTF-8(workspaceId). */
-export function searchKeyInfo(workspaceId) {
-  const prefix = new TextEncoder().encode(SEARCH_INFO), id = new TextEncoder().encode(workspaceId);
-  const info = new Uint8Array(prefix.length + 1 + id.length);
-  info.set(prefix, 0);
-  info.set(id, prefix.length + 1);
-  return info;
-}
-/** HMAC-SHA-256 key for sign only, derived from a workspace data key (HKDF-SHA-256, empty salt, searchKeyInfo). */
-export function deriveSearchKey(dataKey, workspaceId) {
-  return crypto.subtle.deriveKey({ name: "HKDF", hash: "SHA-256", salt: new Uint8Array(0), info: searchKeyInfo(workspaceId) },
-    dataKey, { name: "HMAC", hash: "SHA-256", length: 256 }, false, ["sign"]);
-}
 const b64urlDecode = (s) => Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0));
 const b64urlEncode = (b) => btoa(String.fromCharCode(...b)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 /** The plaintext-mode secret, decoded; exactly 32 bytes or 500 search_key_invalid. */
@@ -342,15 +361,14 @@ export function decodeSearchSecret(secret) {
   return raw;
 }
 /**
- * The workspace's search key: { keyId, key, encrypted }. Encryption on: derived from the active data key (key_id is the
- * data key's). Off: the workspace_search_keys row, created on first use in one batch (insert-or-keep, then read).
+ * The workspace's search key: { keyId, key, encrypted }. Encryption on: crypto/search-key.js derives it (key_id is the
+ * active workspace key's). Off: the workspace_search_keys row, created on first use in one batch (insert-or-keep, then
+ * read).
  */
 export async function searchTokenKey(env, workspaceId) {
   if (await encryptionEnabled(env)) {
-    const dk = await workspaceDataKey(env, workspaceId);
-    let p = derivedKeys.get(dk.key);
-    if (!p) { p = deriveSearchKey(dk.key, workspaceId); derivedKeys.set(dk.key, p); }
-    return { keyId: dk.keyId, key: await p, encrypted: true };
+    const { keyId, key } = await workspaceSearchKey(env, workspaceId);
+    return { keyId, key, encrypted: true };
   }
   const fresh = crypto.getRandomValues(new Uint8Array(32));
   let read;
@@ -579,7 +597,8 @@ const nextTurn = () => {
 };
 /** Every large field of a holder and its jobs set to null. */
 function clearHolder(holder) {
-  for (const job of holder.jobs ?? []) { job.text = null; job.flat = null; job.terms = null; job.tokens = null; job.removes = null; job.adds = null; }
+  // Each job's flat handle is dropped from FLAT_STORE here too: settle() and detach() both come through this.
+  for (const job of holder.jobs ?? []) { dropFlat(job.flat); job.text = null; job.flat = null; job.terms = null; job.tokens = null; job.removes = null; job.adds = null; }
   holder.jobs = null; holder.plan = null; holder.set = null; holder.pending = null;
 }
 
@@ -753,12 +772,13 @@ export function searchJob(env, input) {
   const cap = searchDocCap(env, textBytes);
   const units = text !== null ? text.length : textUnits;
   if (flat !== null) {
-    // Only extractSearchTermsFlat's own frozen result: its fields are data properties that cannot change, and its
-    // arrays cover their own buffers whole, so the job retains exactly what extraction made.
-    if (!OWN_FLAT.has(flat)) throw invalid("flat container");
-    const { bytes, offsets, count: n } = flat;
+    // Only a live handle from extractSearchTermsFlat: its storage is private, so the job retains exactly what
+    // extraction made. The handle is frozen plain data; each field is read once, and checked against the storage.
+    const store = FLAT_STORE.get(flat);
+    if (!store) throw invalid("flat container");
+    const { bytes, offsets } = store, n = flat.count, byteLength = flat.byteLength;
     // The caller's size context must agree: at most `cap` terms, consistent offsets, within 3 × units.
-    if (!count(n) || offsets.length !== n + 1
+    if (!count(n) || offsets.length !== n + 1 || byteLength !== bytes.byteLength
       || offsets[0] !== 0 || offsets[n] !== bytes.byteLength || bytes.byteLength > Math.min(12000000, 3 * units)) throw invalid("flat");
     for (let i = 0; i < n; i++) if (offsets[i + 1] < offsets[i]) throw invalid("flat offsets");
     if (n > cap && cap > 0) throw invalid("flat count");
@@ -766,7 +786,8 @@ export function searchJob(env, input) {
   // SEARCH_TERMS_MAX = 0: no extraction; the text is never kept (the row is written complete as `off`).
   const off = cap === 0;
   return {
-    // The extractor's own frozen container (nothing the caller attached to the descriptor is carried into the job).
+    // The handle (nothing the caller attached to the descriptor is carried into the job). With SEARCH_TERMS_MAX = 0 the
+    // job keeps no handle; its storage is then released when the caller drops the handle (FLAT_STORE is weak).
     meta: { artifactId, projectId, revisionId }, text: off ? null : text,
     flat: off ? null : flat, terms: null, tokens: null, removes: null, adds: null,
     cap, units: off ? 0 : units, charge: 0, reason: "", digest: "",
@@ -828,8 +849,12 @@ async function prepareTokens(db, run, job) {
     job.reason = p.truncated ? capReason(db, job.cap) : "";
     run.lower(job, packedBytes(p) + SEARCH_TOKEN_BYTES * job.cap);
   } else if (job.flat !== null) {
-    job.terms = job.flat;
+    // The job takes the private storage and the handle is spent: a second use of it is refused.
+    const handle = job.flat, store = FLAT_STORE.get(handle);
+    dropFlat(handle);
     job.flat = null;
+    if (!store) throw new HttpError(500, "search_terms_invalid", "Packed search terms are invalid");
+    job.terms = { bytes: store.bytes, offsets: store.offsets, count: handle.count, truncated: handle.truncated };
     job.reason = job.terms.truncated ? capReason(db, job.cap) : "";
     run.lower(job, packedBytes(job.terms) + SEARCH_TOKEN_BYTES * job.cap);
   } else {
@@ -863,6 +888,7 @@ function finishJob(run, job, skipReason) {
   if (job.removes) for (const c of job.removes) { run.release(SEARCH_TOKEN_BYTES * c.length); run.removeValues -= c.length; }
   run.release(job.charge);
   job.charge = 0;
+  dropFlat(job.flat);
   job.text = null; job.flat = null; job.terms = null; job.tokens = null; job.removes = null; job.adds = null;
   job.done = true;
   if (skipReason) run.skip(skipReason);
@@ -1348,6 +1374,8 @@ export function admitSearchJobs(env, run, jobs) {
   const all = jobs.map((input) => searchJob(env, input));
   // Within one call, only the last job of each artifact is admitted.
   const last = new Map(all.map((j, i) => [j.meta.artifactId, i]));
+  // An earlier job of the same artifact in this call is never admitted: its flat storage is dropped now.
+  all.forEach((j, i) => { if (last.get(j.meta.artifactId) !== i) { dropFlat(j.flat); j.flat = null; } });
   for (const job of all.filter((j, i) => last.get(j.meta.artifactId) === i)) {
     // The same artifact twice: the later job replaces the earlier one (its charge released, its text dropped).
     const prev = run.holder.jobs.findIndex((j) => j.meta.artifactId === job.meta.artifactId);
@@ -1356,6 +1384,7 @@ export function admitSearchJobs(env, run, jobs) {
       run.release(old.charge);
       run.textUnits -= old.units;
       run.holder.jobs.splice(prev, 1);
+      dropFlat(old.flat);
       old.text = null; old.flat = null;
     }
     const charge = searchJobCharge(job, { upload: job.flat !== null });
@@ -1363,6 +1392,8 @@ export function admitSearchJobs(env, run, jobs) {
       // A job this one replaced is gone too: count it, not silently drop it.
       if (prev >= 0) run.skip("replaced");
       run.skip("admission");
+      dropFlat(job.flat);
+      job.flat = null;
       continue;
     }
     job.charge = charge;
