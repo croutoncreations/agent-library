@@ -123,6 +123,12 @@ is no longer found by cleanup and remains until the project is purged.
 | Request body: OAuth MCP | 1 MiB; 3 MiB for connections with file access | request | fixed | `413` JSON-RPC `-32600` |
 | Request body: `/v1` API and publisher snapshots | 11 MiB for `/v1` file create and save; the `/v1` upload PUT takes raw bytes up to the declared size (10 MiB for text); 6.5 MB (6,500,000 bytes) for other `/v1` routes and publisher snapshots | request | fixed | `413 too_large`; message names the request-size limit (the upload PUT's own errors are in the Upload body row) |
 | Request body: publisher generation parts | 256 KiB | request | fixed | `413` |
+| Request body: App Files `PUT` | 1 MiB (1,048,576 bytes), checked from `Content-Length` before reading and again while reading; larger files use the upload flow | request | fixed (`APP_FILE_MAX_BYTES`) | `413 file_too_large` |
+| App Files body deadlines | 15 s in total, no gap over 5 s (about 70 KB/s for 1 MiB) | request | fixed (`APP_FILES_RECEIVE_MS`, `APP_FILES_IDLE_MS`) | `408 request_timeout`; retry with the same `Idempotency-Key` |
+| App Files upload slots | 4 bodies at a time per server instance, at most 2 per workspace and 2 per person (the app's creator), any size; per instance, not global, and first come first served | server instance | fixed (`APP_FILES_SLOTS_PER_ISOLATE`, `_PER_WORKSPACE`, `_PER_CREATOR`) | `503 app_files_busy` (instance full) or `429 app_files_concurrency` (your workspace or person), both `Retry-After: 1` |
+| App Files slot reclaim | a slot held over 10 minutes is taken to be dead; at most 2 are set aside per instance (at most 6 bodies in memory), logged `app_files_slot_reclaimed` / `app_files_slots_stuck` | server instance | fixed (`APP_FILES_SLOT_RECLAIM_MS`, `APP_FILES_OVERRUN_MAX`) | when more stay stuck, every App Files upload on that instance answers `503` until it is recycled |
+| App Files per app (lifetime) | 10,000 files created, 100,000 versions written, 1 GiB written; never given back, also when files are deleted | publisher | fixed (`APP_FILES_MAX`, `APP_REVISIONS_MAX`, `APP_FILES_MAX_BYTES`) | `413 quota_exceeded` with `max_files`, `max_revisions`, `max_bytes` |
+| App Files paths | 1–8 segments, 64 characters each, 200 in total; list pages of 1–100 | path | fixed (`APP_PATH_MAX_*`, `APP_FILES_PAGE_MAX`) | `400 invalid_path`; `400 invalid_input` for a bad `limit` |
 
 App API, `/v1` and legacy MCP bodies are counted in UTF-8 bytes as they arrive and never buffered past the cap. `Content-Length` is checked before buffering. The 10 MiB storage limit depends on the transport: JSON escaping can push a smaller document above the 11 MiB request cap, producing `413`. MCP caps are unchanged; not every transport can write a 10 MiB document inline.
 
@@ -303,3 +309,7 @@ decides what a billing change does, in one batch (`billing.js` `applyBillingChan
 The entitlements adapter may add `billing(env, { workspaceId })`. Its result shows on the workspace page for admins and
 owners only: plan, status, a notice, and actions (same-origin POST routes that answer `{ url }` on the provider's page).
 The hosted Worker's Stripe adapter is in the private hosted repository.
+
+## App Connect publishers
+
+A publisher (an app connected through App Connect) has its own quota for the files it keeps in your library: **32 files and 256 MiB**, counting snapshot files, the snapshot manifest and App Files together. App Files and snapshots share that one file space: after about 32 App Files an app can no longer commit a snapshot (`413 quota_exceeded`). App Files also has the lifetime limits in the table above. These files do not count toward the project's 10,000 documents, but they do count toward workspace storage. Staged generations have their own limits (`GET /v1/publisher/me`, `generation_contract`). A file the app deleted keeps counting toward both. See App Files in [app-connect.md](app-connect.md).

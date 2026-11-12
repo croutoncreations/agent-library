@@ -31,7 +31,7 @@ A `*/15` cron cleans up expired uploads and their staging objects (bounded and i
   - **OAuth MCP connection.** For example ChatGPT, Claude or Cursor adding `https://MCP_HOST/mcp`. The owner picks projects and read/write access on the consent page. The connection lasts until it is revoked (access tokens are 15 minutes; refresh slides).
   - **API key** (`alk_…`). Expiring, per-project read or read/write, for scripts and REST clients.
   - **Legacy grant token.** A project-scoped bearer token for `/mcp`.
-- **Publishers (App Connect):** apps the owner registers. A publisher can create files and read or update only the files it created, inside one owner-chosen project and folder. See [app-connect.md](app-connect.md).
+- **Publishers (App Connect):** apps the owner registers. A publisher can create files and read or update only the files it created, inside one owner-chosen project and folder: as snapshots and staged generations (`/v1/publisher/*`) or file by file by path (App Files, `/v1/app/files`). Every App Files request re-checks the publisher's authorization and is fenced in the same D1 statement that writes; request bodies (at most 1 MiB) are held in Worker memory under per-instance upload slots. See [app-connect.md](app-connect.md).
 
 Every request re-checks the current grant and project scope. Nothing caches authorization in a way that would delay revocation. API, MCP and App Connect call the same service layer. Every request is authenticated, checked against its grant and project, validated, applied as a revision-guarded mutation and audited.
 
