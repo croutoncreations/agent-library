@@ -10,7 +10,7 @@ import { loadWorker } from "./load-worker.mjs";
 import { ROOT } from "./helpers.mjs";
 
 const lib = await loadWorker({
-  "crypto/keys.js": ["encryptionConfigured", "encryptionRequired", "encryptionEnabled", "workspaceDataKey", "dataKeyById", "withDataKeyMemo", "shredWorkspaceKeys"],
+  "crypto/keys.js": ["encryptionConfigured", "encryptionRequired", "encryptionEnabled", "workspaceDataKey", "dataKeyById", "withDataKeyMemo", "shredWorkspaceKeys", "ACTIVE_KEY_SQL"],
   "index.js": ["createWorker"],
   "crypto/worker-secret-keys.js": ["workerSecretKeyProvider", "dataKeyAad"],
   "adapters.js": ["withAdapters", "resolveAdapters", "defaultAdapters"],
@@ -697,6 +697,21 @@ test("shred statement order: a complete first use between the shred's two statem
   assert.equal(activeRows(sql, WS_A).length, 0, "no active row");
   assert.ok(rows(sql, WS_A).length >= 1 && rows(sql, WS_A).every((r) => r.wrapped === ""), "no unblanked row");
   await assert.rejects(lib.workspaceDataKey(request(base), WS_A), (e) => e.code === "key_shredded");
+});
+
+test("ACTIVE_KEY_SQL, the condition a write under a key carries, holds exactly for an unshredded row with a wrapped key", async () => {
+  const { sql, DB } = mkDB();
+  const base = configuredBase(DB);
+  const a = await lib.workspaceDataKey(request(base), WS_A);
+  const still = () => sql.prepare(`SELECT COUNT(*) AS n FROM workspace_keys WHERE key_id = ? AND ${lib.ACTIVE_KEY_SQL}`).get(a.keyId).n;
+  assert.equal(still(), 1);
+  sql.prepare("UPDATE workspace_keys SET wrapped = '' WHERE key_id = ?").run(a.keyId);
+  assert.equal(still(), 0, "blanked wrapped value");
+  sql.prepare("UPDATE workspace_keys SET wrapped = 'synthetic', shredded_at = 1 WHERE key_id = ?").run(a.keyId);
+  assert.equal(still(), 0, "shredded_at set");
+  sql.prepare("UPDATE workspace_keys SET wrapped = 'synthetic', shredded_at = NULL WHERE key_id = ?").run(a.keyId);
+  await lib.shredWorkspaceKeys(request(base), WS_A);
+  assert.equal(still(), 0, "after shredWorkspaceKeys");
 });
 
 test("an INSERT failure other than losing the race is reported as such, not as a missing key", async () => {

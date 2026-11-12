@@ -91,6 +91,11 @@ export async function encryptionEnabled(env) {
 const ROW_COLUMNS = "workspace_id, key_id, master_version, wrapped, created_at, shredded_at";
 // A row is shredded when shredded_at is set or its wrapped key was overwritten with ''.
 const SHREDDED_SQL = "(shredded_at IS NOT NULL OR wrapped = '')";
+/**
+ * The condition a write under a key must carry (docs/encryption.md#rules-for-code-that-uses-this): the key row, selected
+ * by its key_id, is still active. The negation of SHREDDED_SQL; use it, never a hand-written copy.
+ */
+export const ACTIVE_KEY_SQL = "(shredded_at IS NULL AND wrapped <> '')";
 const activeRow = (env, workspaceId) =>
   env.DB.prepare(`SELECT ${ROW_COLUMNS} FROM workspace_keys WHERE workspace_id = ? AND shredded_at IS NULL`).bind(workspaceId).first();
 const hasShreddedRow = async (env, workspaceId) =>
