@@ -76,7 +76,7 @@ function interstitialTarget(html) {
  * Start an isolated local server with App Connect enabled.
  * port: one of test/ports.mjs SERVER_PORTS; oidcPort: loopback port for the stand-in identity provider (default port + OIDC_OFFSET).
  */
-export async function startAppConnectServer({ port, oidcPort = port + OIDC_OFFSET, vars = {}, fresh = true } = {}) {
+export async function startAppConnectServer({ port, oidcPort = port + OIDC_OFFSET, vars = {}, fresh = true, worker } = {}) {
   const UP_CLIENT = "synthclient" + randomBytes(4).toString("hex");
   const UP_SECRET = "synthsecret-" + randomBytes(12).toString("hex");
   const OWNER = "owner@example.invalid";
@@ -92,6 +92,7 @@ export async function startAppConnectServer({ port, oidcPort = port + OIDC_OFFSE
     },
     readyBase: appUi,
     fresh,
+    worker,
   });
   let ownerSession = null;
   const h = {

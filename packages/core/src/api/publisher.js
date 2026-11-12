@@ -6,7 +6,7 @@ import { appOrigin, artifactWebUrl, previewWebUrl } from "../links.js";
 import { addressLinksResponse } from "../paths.js";
 import { explainLimit, projectLimitGuard, projectWorkspaceId } from "../limits.js";
 import { SCOPES, clientAllows, livePublisher } from "../oauth/server.js";
-import { baseParams, baseSql, isAppFileContentPath, isAppFilesPath, routeAppFiles } from "./app-files.js";
+import { appFilesSlotsInUse, baseParams, baseSql, isAppFileContentPath, isAppFilesPath, routeAppFiles } from "./app-files.js";
 import { LIMITS, connectionInfo, idemLookup } from "../service.js";
 import { memberRoleSql, readOnlyError } from "../tenancy.js";
 import { HttpError, errorBody, idemKey, int, json, nowIso, randomId, sha256Hex, str } from "../util.js";
@@ -986,7 +986,12 @@ async function handlePublisherApi(req, env, ctx) {
     if ((e.status === 429 || e.status === 503) && e.extra?.retry_after_seconds) h["retry-after"] = String(e.extra.retry_after_seconds);
     const b = errorBody(e);
     b.error.request_id = requestId;
-    return json(b, e.status, h);
+    return slotsHeader(json(b, e.status, h));
+  };
+  // Test hook: every App Files answer reports the isolate's held body slots.
+  const slotsHeader = (r) => {
+    if (testHooksOn(env, req) && isAppFilesPath(new URL(req.url).pathname)) r.headers.set("x-test-slots-in-use", String(appFilesSlotsInUse()));
+    return r;
   };
   try {
     if (req.headers.get("cookie")) throw new HttpError(400, "invalid_request", "Cookies are not accepted on the API");
@@ -1000,7 +1005,7 @@ async function handlePublisherApi(req, env, ctx) {
     const res = isAppFileContentPath(pathname) ? routed : await addressLinksResponse(env, routed, pathname, [p.project_id]);
     const r = new Response(res.body, res);
     r.headers.set("x-request-id", requestId);
-    return r;
+    return slotsHeader(r);
   } catch (e) {
     if (e instanceof HttpError) return fail(e);
     console.error("publisher_unhandled", requestId, e?.name ?? "error");

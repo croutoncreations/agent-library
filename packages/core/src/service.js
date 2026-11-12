@@ -298,7 +298,14 @@ async function textCreateMetadata(ctx, projectId, input, kind) {
   }
   return { title: str(input.title, "title", 200, { min: 1 }), folder: str(input.folder, "folder", 200, { optional: true }), folderId: await folderCheck(ctx, projectId, input.folder_id), schema };
 }
-async function createMarkdown(ctx, projectId, input, key, kind = "markdown") {
+/**
+ * Create a text artifact. `internal` (App Files only) makes it a publisher's file: { publisherId, exportName, idem,
+ * revId, fence: { sql, params }, extra: [statements gated on the revision existing] }. It is accepted only from the
+ * publisher's own context, and its idempotency record, fence and revision id are the caller's.
+ */
+async function createMarkdown(ctx, projectId, input, key, kind = "markdown", internal = null) {
+  if (internal && !(ctx.publisher && internal.publisherId === ctx.grant?.id && internal.fence && internal.revId && internal.idem))
+    throw new HttpError(500, "internal", "Invalid internal create");
   await authorizeProject(ctx, projectId, true);
   const title = str(input.title, "title", 200, { min: 1 });
   let body2, schema = null, mime = TEXT_MIME[kind] ?? "text/markdown";
@@ -312,29 +319,33 @@ async function createMarkdown(ctx, projectId, input, key, kind = "markdown") {
   const folder = str(input.folder, "folder", 200, { optional: true });
   const folderId = await folderCheck(ctx, projectId, input.folder_id);
   const digestParts = kind === "markdown" && folderId === null ? ["md", title, body2, folder] : [kind, title, body2, folder, folderId, schema];
-  const i = { op: "artifact.create", key, projectId, digest: await sha256Hex(JSON.stringify(digestParts)) };
+  const i = internal ? internal.idem : { op: "artifact.create", key, projectId, digest: await sha256Hex(JSON.stringify(digestParts)) };
   const prior = await idemLookup(ctx, i);
   if (prior) return prior;
   const artId = randomId("art");
-  const revId = randomId("rev");
+  const revId = internal ? internal.revId : randomId("rev");
   const sha2 = await sha256Hex(body2);
   const bytes = new TextEncoder().encode(body2).length;
-  const adds = { storage_bytes: bytes, items_per_project: 1 };
+  // App Files rows are a publisher's (items_per_project counts only owner files), as for snapshot files.
+  const adds = internal ? { storage_bytes: bytes } : { storage_bytes: bytes, items_per_project: 1 };
   const lg = await projectLimitGuard(ctx.env, projectId, adds);
   const az0 = authzSql(ctx, projectId);
-  const az = { sql: `${az0.sql} AND ${lg.sql}`, params: [...az0.params, ...lg.params] };
+  const az = internal
+    ? { sql: `${az0.sql} AND ${lg.sql} AND ${internal.fence.sql}`, params: [...az0.params, ...lg.params, ...internal.fence.params] }
+    : { sql: `${az0.sql} AND ${lg.sql}`, params: [...az0.params, ...lg.params] };
   const now = nowIso();
-  const result = { status: 201, body: kind === "markdown" && folderId === null ? { artifact_id: artId, revision: 1, revision_id: revId, sha256: sha2 } : { artifact_id: artId, kind, folder_id: folderId, schema, revision: 1, revision_id: revId, sha256: sha2 } };
+  const result = internal ? { status: 201, body: internal.body({ artId, revId, sha256: sha2, size: bytes }) } : { status: 201, body: kind === "markdown" && folderId === null ? { artifact_id: artId, revision: 1, revision_id: revId, sha256: sha2 } : { artifact_id: artId, kind, folder_id: folderId, schema, revision: 1, revision_id: revId, sha256: sha2 } };
   const bodyKey = await stageTextWrite(ctx.env, projectId, artId, revId, body2);
   const out2 = await commitTextWrites(ctx.env, [bodyKey], (guarded) => runBatch(ctx, guarded([
     // Idempotency row first: a duplicate concurrent retry fails here and rolls back the whole batch.
     idemInsert(ctx, i, 201, result.body, az.sql, az.params),
-    db(ctx).prepare(`INSERT INTO artifacts (id, project_id, kind, title, folder, folder_id, schema_id, head_rev, head_revision_id, created_at, updated_at)
-      SELECT ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ? WHERE ${az.sql}
-        AND (? IS NULL OR EXISTS (SELECT 1 FROM folders WHERE id = ? AND project_id = ?))`).bind(artId, projectId, kind, title, folder, folderId, schema, revId, now, now, ...az.params, folderId, folderId, projectId),
+    db(ctx).prepare(`INSERT INTO artifacts (id, project_id, kind, title, folder, folder_id, schema_id, publisher_id, export_name, head_rev, head_revision_id, created_at, updated_at)
+      SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ? WHERE ${az.sql}
+        AND (? IS NULL OR EXISTS (SELECT 1 FROM folders WHERE id = ? AND project_id = ?))`).bind(artId, projectId, kind, title, folder, folderId, schema, internal?.publisherId ?? null, internal?.exportName ?? null, revId, now, now, ...az.params, folderId, folderId, projectId),
     db(ctx).prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, body_key, size, sha256, mime, created_at, via_kind, via_id, via_label, client_info, change_note)
       SELECT ?, ?, ?, 1, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM artifacts WHERE id = ?)`).bind(revId, artId, projectId, ctx.principal.id, bodyKey, new TextEncoder().encode(body2).length, sha2, mime, now, ...provenance(ctx, input), artId),
     audit(ctx, projectId, "artifact.create", artId, 1, "ok", "EXISTS (SELECT 1 FROM artifacts WHERE id = ?)", [artId]),
+    ...internal?.extra ?? [],
     textSearchBridge(ctx.env, artId, revId, body2), textWriteComplete(ctx.env, bodyKey)
   ]), i));
   if (!Array.isArray(out2)) return out2;

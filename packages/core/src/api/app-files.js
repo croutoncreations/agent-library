@@ -1,12 +1,15 @@
 // App Files API (/v1/app/files): an app's own text files, addressed by path, in its approved destination.
 // A file's path is artifacts.export_name (unique per publisher); generation rows and the snapshot manifest are
 // invisible here. Every request re-checks the publisher's current authorization (assertStillAuthorized).
-import { CONTENT_TYPE } from "../formats.js";
+import { authzSql } from "../auth.js";
+import { CONTENT_TYPE, MIME, checkFile } from "../formats.js";
+import { explainLimit, projectLimitGuard } from "../limits.js";
+import { createMarkdown, idemLookup, mdBody, publishRevision } from "../service.js";
 import { appOrigin, artifactWebUrl, previewWebUrl } from "../links.js";
 import { clientLiveSql } from "../oauth/server.js";
 import { serveContent } from "../uploads.js";
-import { HttpError, b64url, int, json } from "../util.js";
-import { assertStillAuthorized, pubCtx } from "./publisher.js";
+import { HttpError, b64url, idemKey, int, json, randomId, sha256Hex } from "../util.js";
+import { assertStillAuthorized, pubCtx, testHooksOn, testPause } from "./publisher.js";
 
 /**
  * SQL fence: the publisher is live and its destination is still valid. write: also require an enabled app client
@@ -25,6 +28,125 @@ export const APP_PATH_MAX_CHARS = 200;
 export const APP_PATH_MAX_SEGMENTS = 8;
 export const APP_PATH_SEGMENT_MAX_CHARS = 64;
 export const APP_FILES_PAGE_MAX = 100;
+/** A body sent to App Files: at most 1 MiB, received within 15 s with no gap over 5 s. */
+export const APP_FILE_MAX_BYTES = 1048576;
+export const APP_FILES_RECEIVE_MS = 15e3;
+export const APP_FILES_IDLE_MS = 5e3;
+/** Bodies held in memory: 4 per isolate, at most 2 per workspace and 2 per creator (per isolate), any size. */
+export const APP_FILES_SLOTS_PER_ISOLATE = 4;
+export const APP_FILES_SLOTS_PER_WORKSPACE = 2;
+export const APP_FILES_SLOTS_PER_CREATOR = 2;
+/** A slot held this long is taken to be dead; at most APP_FILES_OVERRUN_MAX such slots stop counting isolate-wide. */
+export const APP_FILES_SLOT_RECLAIM_MS = 6e5;
+export const APP_FILES_OVERRUN_MAX = 2;
+const tooLarge = () => new HttpError(413, "file_too_large", "A file sent to this API can be at most 1 MiB (1,048,576 bytes)");
+
+/**
+ * Slot admission for request bodies (one table per isolate). admit() checks and reserves synchronously; release() is
+ * idempotent and is called only when the request's work settles. A slot older than the reclaim horizon moves to the
+ * overrun set (while it has room) and stops counting isolate-wide, but still counts for its workspace and creator,
+ * so at most SLOTS_PER_ISOLATE + OVERRUN_MAX bodies are ever held. `now` and `log` are injectable for tests.
+ */
+export function createSlotTable({ now = () => Date.now(), log = (e) => console.warn(JSON.stringify(e)) } = {}) {
+  const slots = new Map(), overrun = new Map(), perWs = new Map(), perCreator = new Map();
+  let stuckLogged = false;
+  const add = (m, k, t) => { let x = m.get(k); if (!x) m.set(k, x = new Set()); x.add(t); };
+  const drop = (m, k, t) => { const x = m.get(k); if (!x) return; x.delete(t); if (!x.size) m.delete(k); };
+  function admit(ws, creator, reclaimMs = APP_FILES_SLOT_RECLAIM_MS) {
+    const t = now();
+    for (const [token, slot] of slots) {
+      if (slot.admittedAt + reclaimMs > t) continue;
+      if (overrun.size < APP_FILES_OVERRUN_MAX) {
+        slots.delete(token); overrun.set(token, slot);
+        log({ event: "app_files_slot_reclaimed" });
+      } else if (!stuckLogged) {
+        stuckLogged = true;
+        log({ event: "app_files_slots_stuck" });
+      }
+    }
+    if (slots.size >= APP_FILES_SLOTS_PER_ISOLATE)
+      throw new HttpError(503, "app_files_busy", "This server is receiving as many files as it can; retry shortly with the same Idempotency-Key", { retry_after_seconds: 1 });
+    if ((perWs.get(ws)?.size ?? 0) >= APP_FILES_SLOTS_PER_WORKSPACE || (perCreator.get(creator)?.size ?? 0) >= APP_FILES_SLOTS_PER_CREATOR)
+      throw new HttpError(429, "app_files_concurrency", "This workspace or its owner is already sending 2 files to this server; wait for one to finish", { retry_after_seconds: 1 });
+    const token = randomId("afs");
+    slots.set(token, { ws, creator, admittedAt: t });
+    add(perWs, ws, token); add(perCreator, creator, token);
+    return token;
+  }
+  function release(token) {
+    const slot = slots.get(token) ?? overrun.get(token);
+    if (!slot) return;
+    slots.delete(token); overrun.delete(token);
+    drop(perWs, slot.ws, token); drop(perCreator, slot.creator, token);
+  }
+  return { admit, release, inUse: () => slots.size + overrun.size, sizes: () => ({ slots: slots.size, overrun: overrun.size, workspaces: perWs.size, creators: perCreator.size }) };
+}
+const SLOTS = createSlotTable();
+/** Bodies currently held by this isolate (for the x-test-slots-in-use test header). */
+export const appFilesSlotsInUse = () => SLOTS.inUse();
+
+/** Test hooks (AC_TEST_HOOKS on localhost only): shorter deadlines and reclaim horizon, a held publish. */
+function appHooks(env, req) {
+  const on = testHooksOn(env, req);
+  const n = (name, max) => {
+    const v = on ? Number(req.headers.get(name)) : NaN;
+    return Number.isSafeInteger(v) && v > 0 ? Math.min(v, max) : null;
+  };
+  const deadline = n("x-test-receive-deadline-ms", APP_FILES_RECEIVE_MS);
+  return {
+    receiveMs: deadline ?? APP_FILES_RECEIVE_MS, idleMs: Math.min(deadline ?? APP_FILES_IDLE_MS, APP_FILES_IDLE_MS),
+    reclaimMs: n("x-test-slot-reclaim-ms", APP_FILES_SLOT_RECLAIM_MS) ?? APP_FILES_SLOT_RECLAIM_MS,
+    holdMs: n("x-test-hold-publish-ms", 5e3) ?? 0
+  };
+}
+
+/**
+ * Run `work` holding one body slot. It runs under execCtx.waitUntil, so if the client goes away the runtime keeps it
+ * going to its `finally` (the receive's idle deadline ends it), and the slot is released exactly then.
+ */
+async function withSlot(execCtx, ws, creator, reclaimMs, work) {
+  const token = SLOTS.admit(ws, creator, reclaimMs);
+  const run = (async () => {
+    try { return await work(); } finally { SLOTS.release(token); }
+  })();
+  execCtx.waitUntil(run.catch(() => {}));
+  return run;
+}
+
+/**
+ * Read the whole body (at most `limit` bytes) with a total and an idle deadline. Timers only cancel the read; the
+ * slot is released by withSlot. Returns { bytes, sha256 }.
+ */
+async function receiveBody(req, limit, declared, { receiveMs, idleMs }) {
+  const reader = req.body?.getReader();
+  const chunks = [];
+  let n = 0, timedOut = false;
+  const cancel = () => { timedOut = true; reader?.cancel().catch(() => {}); };
+  const total = setTimeout(cancel, receiveMs);
+  let idle = setTimeout(cancel, idleMs);
+  try {
+    if (reader) for (;;) {
+      let r;
+      try { r = await reader.read(); } catch (e) {
+        if (timedOut) break;
+        throw new HttpError(400, "incomplete_body", "Body ended before the declared size; PUT the whole file again");
+      }
+      if (timedOut) break;
+      if (r.done) break;
+      n += r.value.byteLength;
+      if (n > limit) { await reader.cancel().catch(() => {}); chunks.length = 0; throw tooLarge(); }
+      chunks.push(r.value);
+      clearTimeout(idle); idle = setTimeout(cancel, idleMs);
+    }
+  } finally { clearTimeout(total); clearTimeout(idle); }
+  if (timedOut) { chunks.length = 0; throw new HttpError(408, "request_timeout", "The request body arrived too slowly; send it again with the same Idempotency-Key"); }
+  if (declared !== null && n !== declared) throw new HttpError(400, "incomplete_body", "Body ended before the declared size; PUT the whole file again");
+  const bytes = new Uint8Array(n);
+  let o = 0;
+  for (const c of chunks) { bytes.set(c, o); o += c.byteLength; }
+  chunks.length = 0;
+  return { bytes, sha256: await sha256Hex(bytes) };
+}
 const ROOT = "/v1/app/files";
 const SEGMENT = /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}$/;
 const KIND_BY_EXT = new Map([["md", "markdown"], ["markdown", "markdown"], ["html", "html"], ["htm", "html"], ["json", "json"], ["csv", "csv"]]);
@@ -146,7 +268,230 @@ async function read(req, env, p, requestId, rest) {
 export async function routeAppFiles(req, env, execCtx, p, requestId, wsId) {
   const rest = appFilesRawPath(req);
   const m = req.method;
+  if (m === "PUT" && rest !== "") return put(req, env, execCtx, p, requestId, wsId, rest);
   if (m !== "GET" && m !== "HEAD") throw new HttpError(405, "method_not_allowed", "Method not allowed");
   await assertStillAuthorized(env, p, { read: true });
   return rest === "" ? list(env, p, new URL(req.url)) : read(req, env, p, requestId, rest);
+}
+
+/** Lifetime App Files caps per app (publisher): creations, revisions, bytes written. */
+export const APP_FILES_MAX = 10000;
+export const APP_REVISIONS_MAX = 100000;
+export const APP_FILES_MAX_BYTES = 1073741824;
+/** SQL: this write keeps the publisher within its lifetime caps. Params: publisher id, files added, bytes added. */
+const capsSql = `EXISTS (SELECT 1 FROM publishers WHERE id = ?
+  AND app_files_created + ? <= ${APP_FILES_MAX} AND app_revisions_written + 1 <= ${APP_REVISIONS_MAX} AND app_bytes_written + ? <= ${APP_FILES_MAX_BYTES})`;
+const quotaExceeded = () => new HttpError(413, "quota_exceeded", "This app has reached its storage quota in the library; ask the owner",
+  { max_files: APP_FILES_MAX, max_revisions: APP_REVISIONS_MAX, max_bytes: APP_FILES_MAX_BYTES });
+const TEXT_TYPES = new Map([["text/markdown", "markdown"], ["text/html", "html"], ["application/json", "json"], ["text/csv", "csv"]]);
+const unsupportedType = () => new HttpError(415, "unsupported_type", "Allowed: " + [...TEXT_TYPES.keys()].join(", "));
+const reserved = () => new HttpError(400, "invalid_input", "manifest.json is reserved for the server");
+const trashedErr = (path, id) => new HttpError(409, "destination_file_trashed", "The owner moved this app's file to trash; ask the owner to restore it", { name: path, file_id: id });
+const pathConflict = () => new HttpError(409, "path_conflict", "This path conflicts with another file of this app (the same path in another case, a file where a folder is needed, or a reserved export file)");
+const exists = () => new HttpError(412, "precondition_failed", "A file already exists at this path");
+const missing = () => new HttpError(412, "precondition_failed", "No file exists at this path");
+const stale = (row) => new HttpError(412, "precondition_failed", "If-Match does not match the file's current version", { current_revision: row.head_rev, current_etag: `"${row.sha256}"` });
+const kindChanged = () => new HttpError(400, "invalid_input", "kind and schema of an exported file cannot change");
+
+/** Content-Type of a create or replace: one of the four text types, matching the path's kind; charset only utf-8. */
+function contentKind(req, kind) {
+  const [type, ...params] = (req.headers.get("content-type") ?? "").split(";").map((x) => x.trim().toLowerCase());
+  const t = TEXT_TYPES.get(type);
+  if (!t) throw unsupportedType();
+  for (const p of params) {
+    const [k, v] = p.split("=").map((x) => x?.trim());
+    if (k === "charset" && v?.replace(/^"|"$/g, "") !== "utf-8") throw unsupportedType();
+  }
+  if (t !== kind) throw new HttpError(415, "unsupported_type", "Content-Type does not match the file extension");
+}
+/** If-Match ("<sha256>" or rev:N) or If-None-Match: * (create). Returns { create, etag?, rev?, cond }. */
+function parsePrecondition(req) {
+  const im = req.headers.get("if-match"), inm = req.headers.get("if-none-match");
+  if (im === null && inm === null) throw new HttpError(428, "precondition_required", "PUT and DELETE need If-Match (an ETag or rev:N), or If-None-Match: * to create");
+  const bad = () => new HttpError(400, "invalid_input", "If-Match must be one quoted SHA-256 ETag or rev:N; If-None-Match must be *; not both");
+  if (im !== null && inm !== null) throw bad();
+  if (inm !== null) { if (inm.trim() !== "*") throw bad(); return { create: true, cond: "*" }; }
+  const v = im.trim();
+  let m;
+  if (m = /^"([0-9a-f]{64})"$/.exec(v)) return { create: false, etag: m[1], cond: v };
+  if ((m = /^rev:([1-9][0-9]{0,15})$/.exec(v)) && Number.isSafeInteger(Number(m[1]))) return { create: false, rev: Number(m[1]), cond: `rev:${Number(m[1])}` };
+  throw bad();
+}
+const fileView = (path, id, kind, revision, sha256, size) => ({ path, file_id: id, kind, revision, etag: `"${sha256}"`, sha256, size });
+/** A stored or fresh answer as App Files sends it (publishRevision stores its own shape; map it). */
+function answer(res, path, kind, size) {
+  const b = res.body;
+  const body = b.file ? b : { file: fileView(path, b.artifact_id, kind, b.revision, b.sha256, size), ...b.idempotent_replay ? { idempotent_replay: true } : {} };
+  return json(body, res.status, { etag: body.file.etag });
+}
+
+async function put(req, env, execCtx, p, requestId, wsId, rest) {
+  // 1. Authorization (route() already checked the token and the rate limit).
+  await assertStillAuthorized(env, p);
+  const h = appHooks(env, req);
+  // 2. Parse: nothing below reads the body.
+  const { path, kind } = parseAppPath(rest);
+  if (path === MANIFEST) throw reserved();
+  contentKind(req, kind);
+  const key = idemKey(req.headers.get("idempotency-key"));
+  const pre = parsePrecondition(req);
+  const cl = req.headers.get("content-length");
+  if (cl !== null && !/^\d+$/.test(cl)) throw new HttpError(400, "invalid_input", "Content-Length must be a non-negative integer");
+  const declared = cl === null ? null : Number(cl);
+  if (declared !== null && declared > APP_FILE_MAX_BYTES) throw tooLarge();
+  const claimed = req.headers.get("x-content-sha256");
+  if (claimed !== null && !/^[0-9a-f]{64}$/.test(claimed)) throw new HttpError(400, "invalid_input", "X-Content-SHA256 must be 64 lowercase hex chars");
+  const ctx = pubCtx(env, p, requestId);
+  const creator = p.created_by ?? p.owner_principal_id;
+  const op = "app.put";
+  const idemFor = async (r) => ({ op, key, projectId: p.project_id, digest: await sha256Hex(JSON.stringify([op, path, pre.cond, kind, r.sha256])) });
+  const hasRecord = async () => !!await env.DB.prepare("SELECT 1 AS x FROM idempotency WHERE principal_id = ? AND project_id = ? AND op = ? AND key = ?")
+    .bind(p.principal_id, p.project_id, op, key).first("x");
+  // The body is received at most once, under one slot; everything after a receive runs inside that slot's work.
+  let received = null;
+  const receive = async () => {
+    const r = await receiveBody(req, declared ?? APP_FILE_MAX_BYTES, declared, h);
+    if (claimed !== null && claimed !== r.sha256)
+      throw new HttpError(422, "integrity_mismatch", "Byte length or SHA-256 does not match declaration", { received_size: r.bytes.byteLength, received_sha256: r.sha256 });
+    return received = r;
+  };
+  const slot = (work) => withSlot(execCtx, wsId, creator, h.reclaimMs, work);
+  // A mutable-state refusal is answered only after checking that a same-key request has not committed meanwhile.
+  const refuse = async (err) => {
+    if (!await hasRecord()) throw err;
+    const replayOr = async () => {
+      const prior = await idemLookup(ctx, await idemFor(received));
+      if (prior) return answer(prior, path, kind, received.bytes.byteLength);
+      throw err;
+    };
+    return received ? replayOr() : slot(async () => { await receive(); return replayOr(); });
+  };
+  const readRow = () => env.DB.prepare(`SELECT a.id, a.kind, a.schema_id, a.head_rev, a.trashed_at, a.generation_id, r.sha256, r.size FROM artifacts a
+    LEFT JOIN revisions r ON r.id = a.head_revision_id
+    WHERE a.publisher_id = ? AND a.project_id = ? AND a.folder_id IS ? AND a.export_name = ? AND a.head_rev > 0`).bind(...ownParams(p), path).first();
+  const conflictSql = `NOT EXISTS (SELECT 1 FROM artifacts c WHERE c.publisher_id = ? AND c.export_name IS NOT NULL AND c.generation_id IS NULL
+    AND (lower(c.export_name) = lower(?) OR substr(?, 1, length(c.export_name) + 1) = c.export_name || '/' OR substr(c.export_name, 1, length(?) + 1) = ? || '/'))`;
+  const conflictParams = [p.id, path, path, path, path];
+  /** Row and precondition checks (the design's table). Returns the row to replace, or null to create. */
+  const rowChecks = async () => {
+    const row = await readRow();
+    if (pre.create) {
+      if (row?.generation_id) throw pathConflict();
+      if (row?.trashed_at) throw trashedErr(path, row.id);
+      if (row) throw exists();
+      if (!await env.DB.prepare(`SELECT ${conflictSql} AS ok`).bind(...conflictParams).first("ok")) throw pathConflict();
+      return null;
+    }
+    if (!row) throw missing();
+    if (row.generation_id) throw pathConflict();
+    if (row.trashed_at) throw trashedErr(path, row.id);
+    if (pre.etag !== undefined ? pre.etag !== row.sha256 : pre.rev !== row.head_rev) throw stale(row);
+    if (row.kind !== kind) throw kindChanged();
+    return row;
+  };
+  const caps = async (addFiles, bytes) => {
+    const c = await env.DB.prepare("SELECT app_files_created AS f, app_revisions_written AS r, app_bytes_written AS b FROM publishers WHERE id = ?").bind(p.id).first();
+    if (!c || c.f + addFiles > APP_FILES_MAX || c.r + 1 > APP_REVISIONS_MAX || c.b + bytes > APP_FILES_MAX_BYTES) throw quotaExceeded();
+    const lg = await projectLimitGuard(env, p.project_id, { storage_bytes: bytes });
+    if (lg.workspaceId && !await env.DB.prepare(`SELECT ${lg.sql} AS ok`).bind(...lg.params).first("ok"))
+      await explainLimit(env, lg.workspaceId, { storage_bytes: bytes }, lg.limits);
+  };
+  const guard = async (f) => { try { return { v: await f() }; } catch (e) { if (e instanceof HttpError) return { res: await refuse(e) }; throw e; } };
+  const unchanged = (row) => json({ file: fileView(path, row.id, row.kind, row.head_rev, row.sha256, row.size), unchanged: true }, 200, { etag: `"${row.sha256}"` });
+
+  // 3. A same-key record first: replay it (receiving the body once, under a slot), before any mutable-state check.
+  const recorded = await hasRecord();
+  await testPause(env, req, "x-test-pause-after-record-check-ms");
+  if (recorded) {
+    return slot(async () => {
+      await receive();
+      const prior = await idemLookup(ctx, await idemFor(received));
+      if (prior) return answer(prior, path, kind, received.bytes.byteLength);
+      return afterReceive(); // the record was pruned meanwhile: a new request, with these bytes
+    });
+  }
+  // 4. Row and precondition checks.
+  const c4 = await guard(rowChecks);
+  if (c4.res) return c4.res;
+  const row = c4.v;
+  // Early unchanged: the declared hash already equals the head's; nothing is read, reserved or written.
+  if (row && claimed === row.sha256) {
+    await req.body?.cancel().catch(() => {});
+    return unchanged(row);
+  }
+  // 5. Caps and workspace storage, from the declared size, before any byte is read.
+  const c5 = await guard(() => caps(row ? 0 : 1, declared ?? APP_FILE_MAX_BYTES));
+  if (c5.res) return c5.res;
+  // 6-10 under one slot.
+  return slot(async () => { await receive(); return afterReceive(); });
+
+  /** Steps 7-10 with the received bytes (inside the request's slot). */
+  async function afterReceive() {
+    const size = received.bytes.byteLength;
+    const i = await idemFor(received);
+    // 7. Idempotency: replay, or 422 for the same key with a different request.
+    const prior = await idemLookup(ctx, i);
+    if (prior) return answer(prior, path, kind, size);
+    // A path that arrived here from the replay check skipped steps 4 and 5: run them on these bytes.
+    const r4 = await guard(rowChecks);
+    if (r4.res) return r4.res;
+    const cur = r4.v;
+    // 8. Late identical PUT: same bytes as the head; re-check authorization and the row, write nothing.
+    if (cur && cur.sha256 === received.sha256) {
+      await assertStillAuthorized(env, p);
+      const again = await guard(rowChecks);
+      if (again.res) return again.res;
+      if (again.v && again.v.sha256 === received.sha256) return unchanged(again.v);
+      return refuse(stale(again.v ?? cur));
+    }
+    const r5 = await guard(() => caps(cur ? 0 : 1, size));
+    if (r5.res) return r5.res;
+    // 9. Validate: strict UTF-8, then the kind's own checks.
+    let text;
+    try { text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(received.bytes); }
+    catch { throw new HttpError(422, "invalid_content", `Invalid ${kind}: bytes are not valid UTF-8`, { format: kind, detail: "bytes are not valid UTF-8" }); }
+    if (kind === "markdown" || kind === "html") mdBody(text, kind);
+    else checkFile(kind, text, cur ? cur.schema_id : null, path);
+    await testPause(env, req, "x-test-hold-publish-ms");
+    await testPause(env, req);
+    // 10. Publish, fenced: liveness and destination, caps, and the row (replace) or no conflicting path (create).
+    const revId = randomId("rev");
+    const counterUpdate = (addFiles) => env.DB.prepare(`UPDATE publishers SET app_files_created = app_files_created + ?, app_revisions_written = app_revisions_written + 1,
+      app_bytes_written = app_bytes_written + ? WHERE id = ? AND EXISTS (SELECT 1 FROM revisions WHERE id = ?)`).bind(addFiles, size, p.id, revId);
+    const base = { sql: `${baseSql(true)} AND ${capsSql}`, params: [...baseParams(p), p.id, cur ? 0 : 1, size] };
+    try {
+      if (!cur) {
+        const res = await createMarkdown(ctx, p.project_id,
+          { title: path, folder: "", folder_id: p.folder_id ?? null, [kind === "markdown" || kind === "html" ? "body" : "content"]: text, schema: null }, key, kind,
+          { publisherId: p.id, exportName: path, idem: i, revId, extra: [counterUpdate(1)],
+            fence: { sql: `${base.sql} AND ${conflictSql}`, params: [...base.params, ...conflictParams] },
+            body: (x) => ({ file: fileView(path, x.artId, kind, 1, x.sha256, x.size) }) });
+        return answer(res, path, kind, size);
+      }
+      const rowFence = { sql: `${base.sql} AND EXISTS (SELECT 1 FROM artifacts WHERE id = ? AND publisher_id = ? AND project_id = ? AND folder_id IS ?
+        AND export_name = ? AND generation_id IS NULL AND trashed_at IS NULL)`, params: [...base.params, cur.id, ...ownParams(p), path] };
+      const res = await publishRevision(ctx, p.project_id, cur.id, cur.head_rev, i,
+        { revId, body: text, size, sha256: received.sha256, mime: MIME[kind] ?? (kind === "html" ? "text/html" : "text/markdown"), fence: rowFence }, [counterUpdate(0)]);
+      return answer(res, path, kind, size);
+    } catch (e) {
+      if (!(e instanceof HttpError)) throw e;
+      return publishRefusal(e, cur);
+    }
+  }
+  /** Map a refused publish: authorization first, then the row and path, then caps and storage. */
+  async function publishRefusal(e, cur) {
+    // Server-side outcomes and content refusals pass through unchanged.
+    if (e.status === 503 || e.status === 422 || e.status === 410 || e.status === 500) throw e;
+    // Anything else may be an authorization change during the request: that answer comes first.
+    await assertStillAuthorized(env, p);
+    if (e.status !== 402 && e.status !== 413) {
+      const r = await guard(rowChecks);
+      if (r.res) return r.res;
+      if (cur && r.v && r.v.head_rev !== cur.head_rev) return refuse(stale(r.v));
+      const k = await guard(() => caps(cur ? 0 : 1, received.bytes.byteLength));
+      if (k.res) return k.res;
+      return refuse(e.status === 409 ? e : new HttpError(409, "conflict", "Concurrent modification"));
+    }
+    return refuse(e);
+  }
 }
