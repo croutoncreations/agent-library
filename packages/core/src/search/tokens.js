@@ -1128,3 +1128,190 @@ export function admitSearchJobs(env, run, jobs) {
   }
 }
 export const runTally = (run) => ({ run: run.id, calls: run.calls, completed: run.completed, skipped: { ...run.skipped }, tokenOps: run.tokenOps, maxRemoveValues: run.maxRemoveValues });
+
+// --- Lifecycle: the project-purge step and the orphan sweep --------------------------------------------------------
+const PURGE_DOCS_PER_ROUND = 20;
+const LIFECYCLE_CHUNK_MAX = 5000;
+/**
+ * Tokens left in a selected row: exact (term_count) for a complete row, whose tokens cannot change; for a row at ''
+ * (a purge lease, a dead writer) a count bounded by ?CAP, read only for those rows (CASE is evaluated lazily).
+ */
+const tokensLeftSql = (cap) => `CASE WHEN d.revision_id <> '' THEN d.term_count
+  ELSE (SELECT COUNT(*) FROM (SELECT 1 FROM search_tokens s WHERE s.doc_id = d.doc_id LIMIT ${cap})) END`;
+const DOC_FIELDS = "d.doc_id, d.workspace_id, d.owner_id, d.project_id, d.artifact_id";
+/** The purge's per-round selection (search_token_docs_project). */
+const PURGE_SELECT_SQL = `SELECT ${DOC_FIELDS}, ${tokensLeftSql(LIFECYCLE_CHUNK_MAX + 1)} AS n FROM search_token_docs d WHERE d.project_id = ?1 LIMIT ${PURGE_DOCS_PER_ROUND}`;
+/** The purge step's eligibility: purge.js STILL_DUE with ?P (project) and ?NOW. */
+export const PURGE_ELIGIBLE = "EXISTS (SELECT 1 FROM projects d WHERE d.id = ?P AND d.deleted_at IS NOT NULL AND d.purged_at IS NULL AND d.purge_at <= ?NOW)";
+
+/**
+ * Give out up to `total` token deletions in selection order: each document with tokens gets min(its tokens, what is
+ * left), so the first document with tokens gets at least 1. Documents with tokens but no share are left out; every
+ * included document also carries X and Xc (gated on no tokens left, so they change nothing while tokens remain).
+ */
+function chunkInOrder(docs, total, values) {
+  const out = [];
+  let left = total;
+  for (const d of docs) {
+    const n = Number(d.n) || 0;
+    if (n > 0 && left <= 0) continue;
+    const chunk = Math.min(n, left);
+    left -= chunk;
+    out.push({ doc_id: d.doc_id, workspace_id: d.workspace_id, owner_id: d.owner_id, chunk, final: true, values: values(d) });
+  }
+  return out;
+}
+
+/**
+ * One round of the project-purge step: select up to 20 of the project's rows (one call), then one packed
+ * deleteSearchDocs batch with STILL_DUE as eligibility (one call). Returns { selected, tokens, docs }.
+ */
+export async function purgeSearchTokensRound(env, projectId, { now, purgeNonce: pn, rowBudget }) {
+  const docs = (await env.DB.prepare(PURGE_SELECT_SQL).bind(projectId).all()).results;
+  if (!docs.length) return { selected: 0, tokens: 0, docs: 0 };
+  const batch = chunkInOrder(docs, Math.min(LIFECYCLE_CHUNK_MAX, rowBudget), () => ({}));
+  const r = await deleteSearchDocs(env, batch, { eligible: PURGE_ELIGIBLE, values: { PN: pn, P: projectId, NOW: now } });
+  return { selected: docs.length, tokens: r.tokens, docs: r.docs };
+}
+
+// Sweep paths: A purged projects (by projects_purged), C deleting workspaces, B rows whose artifact is gone.
+const SWEEP_CALLS = 10;
+const SWEEP_DELETE_CALLS = 8;
+const SWEEP_PATH_DOCS = SWEEP_DELETE_CALLS * PURGE_DOCS_PER_ROUND;
+const SWEEP_WINDOW = { A: 20, C: 500, B: 1000 };
+/** b-tree rows written per document besides its tokens (2 each: table and index): L 1, Kc 3, X 4, Xc 3. */
+const SWEEP_DOC_ROWS = 11;
+const SWEEP_EMPTY_DOC_ROWS = 8;
+const SWEEP_CURSOR_ROWS = 2;
+const SWEEP_ROTATION_MS = 900000;
+const SWEEP_ORDERS = [["A", "C", "B"], ["C", "B", "A"], ["B", "A", "C"]];
+const SWEEP_ELIGIBLE = {
+  A: "EXISTS (SELECT 1 FROM projects WHERE id = ?P AND purged_at IS NOT NULL)",
+  B: "NOT EXISTS (SELECT 1 FROM artifacts WHERE id = ?A)",
+  C: "EXISTS (SELECT 1 FROM workspaces WHERE id = ?W AND status = 'deleting')",
+};
+const STATE = "(SELECT %s FROM search_tokens_state WHERE id = 1)";
+const st = (col) => STATE.replace("%s", col);
+// Path A's cursor is '' or '<purged_at>:<project id>'.
+const A_AFTER_T = `(SELECT CASE WHEN sweep_purged_after = '' THEN -1 ELSE CAST(substr(sweep_purged_after, 1, instr(sweep_purged_after, ':') - 1) AS INTEGER) END FROM search_tokens_state WHERE id = 1)`;
+const A_AFTER_ID = `(SELECT CASE WHEN sweep_purged_after = '' THEN '' ELSE substr(sweep_purged_after, instr(sweep_purged_after, ':') + 1) END FROM search_tokens_state WHERE id = 1)`;
+const A_WINDOW = `SELECT purged_at, id FROM projects WHERE purged_at IS NOT NULL
+  AND (purged_at > ${A_AFTER_T} OR (purged_at = ${A_AFTER_T} AND id > ${A_AFTER_ID})) ORDER BY purged_at, id LIMIT ${SWEEP_WINDOW.A}`;
+const C_WINDOW = `SELECT id FROM workspaces WHERE status = 'deleting' AND id > ${st("sweep_workspace_after")} ORDER BY id LIMIT ${SWEEP_WINDOW.C}`;
+const B_WINDOW = `SELECT doc_id FROM search_token_docs WHERE doc_id > ${st("sweep_doc_after")} ORDER BY doc_id LIMIT ${SWEEP_WINDOW.B}`;
+/** The sweep's one read batch (exported for the query-plan test). Every window statement returns exactly one row. */
+export function sweepReadSql(cap) {
+  const docs = (where) => `SELECT ${DOC_FIELDS}, ${tokensLeftSql(cap)} AS n FROM search_token_docs d WHERE ${where} LIMIT ${SWEEP_PATH_DOCS + 1}`;
+  return {
+    state: "SELECT sweep_doc_after, sweep_purged_after, sweep_workspace_after FROM search_tokens_state WHERE id = 1",
+    aWindow: `WITH w AS (${A_WINDOW}) SELECT (SELECT purged_at FROM w ORDER BY purged_at DESC, id DESC LIMIT 1) AS end_t,
+  (SELECT id FROM w ORDER BY purged_at DESC, id DESC LIMIT 1) AS end_id, (SELECT COUNT(*) FROM w) AS n`,
+    aDocs: docs(`d.project_id IN (SELECT id FROM (${A_WINDOW}))`),
+    cWindow: `SELECT MAX(id) AS end, COUNT(*) AS n FROM (${C_WINDOW})`,
+    cDocs: docs(`d.workspace_id IN (SELECT id FROM (${C_WINDOW}))`),
+    bWindow: `SELECT MAX(doc_id) AS end, COUNT(*) AS n FROM (${B_WINDOW})`,
+    bDocs: docs(`d.doc_id IN (SELECT doc_id FROM (${B_WINDOW})) AND NOT EXISTS (SELECT 1 FROM artifacts a WHERE a.id = d.artifact_id)`),
+  };
+}
+
+/**
+ * Orphan sweep (cron only): delete token rows of purged projects (A), deleting workspaces (C) and gone artifacts (B).
+ * At most 10 D1 calls and `writes` b-tree rows written (SEARCH_SWEEP_WRITES_MAX; 0 = off). One read batch, then at
+ * most 8 packed deleteSearchDocs calls, then one cursor write only when a cursor changed. The starting path rotates
+ * with floor(scheduledTime / 15 min) mod 3; no rotation state is stored. Returns a tally.
+ */
+export async function sweepSearchTokenOrphans(env, { scheduledTime, writes = searchSweepWritesMax(env) } = {}) {
+  const tally = { calls: 0, rows: 0, tokens: 0, docs: 0, paths: [], cursor: false };
+  if (writes <= 0) return tally;
+  const t = typeof scheduledTime === "number" && Number.isFinite(scheduledTime) ? scheduledTime : Date.now();
+  const order = SWEEP_ORDERS[Math.floor(t / SWEEP_ROTATION_MS) % 3];
+  // Tokens a document can lose in one batch at this budget, plus one to tell "more" apart.
+  const cap = Math.max(1, Math.min(LIFECYCLE_CHUNK_MAX, Math.floor((writes - SWEEP_CURSOR_ROWS - SWEEP_DOC_ROWS) / 2))) + 1;
+  const q = sweepReadSql(cap);
+  const names = ["state", "aWindow", "aDocs", "cWindow", "cDocs", "bWindow", "bDocs"];
+  const res = await env.DB.batch(names.map((n) => env.DB.prepare(q[n])));
+  tally.calls++;
+  const row = (n) => res[names.indexOf(n)]?.results?.[0] ?? {};
+  const rows = (n) => res[names.indexOf(n)]?.results ?? [];
+  const state = row("state");
+  const cursors = { A: state.sweep_purged_after ?? "", B: state.sweep_doc_after ?? 0, C: state.sweep_workspace_after ?? "" };
+  const paths = {
+    A: { docs: rows("aDocs"), window: row("aWindow"), size: SWEEP_WINDOW.A, next: (w) => w.n ? `${w.end_t}:${w.end_id}` : "" },
+    C: { docs: rows("cDocs"), window: row("cWindow"), size: SWEEP_WINDOW.C, next: (w) => w.n ? w.end : "" },
+    B: { docs: rows("bDocs"), window: row("bWindow"), size: SWEEP_WINDOW.B, next: (w) => w.n ? w.end : 0 },
+  };
+  const pn = purgeNonce();
+  // A row listed by two paths (a purged project's rows have no artifacts, so B lists them too) is A's or C's work,
+  // never B's (B is the catch-all for rows whose artifact is gone), whatever the rotation.
+  const claimed = new Set();
+  for (const p of ["A", "C", "B"]) {
+    const own = paths[p].docs.slice(0, SWEEP_PATH_DOCS).filter((d) => !claimed.has(d.doc_id));
+    for (const d of own) claimed.add(d.doc_id);
+    paths[p].work = own;
+  }
+  const active = order.filter((p) => paths[p].work.length);
+  let callsLeft = SWEEP_DELETE_CALLS, rowsLeft = writes - SWEEP_CURSOR_ROWS;
+  for (const [k, p] of active.entries()) {
+    const later = active.length - k - 1;
+    const path = paths[p];
+    const calls = Math.max(0, callsLeft - 2 * later);
+    let rowShare = Math.floor(rowsLeft / (later + 1));
+    const queue = path.work.map((d) => ({ ...d, left: Number(d.n) || 0, done: false }));
+    let used = 0, stop = false;
+    while (!stop && used < calls && queue.some((d) => !d.done)) {
+      const batch = [];
+      for (const d of queue) {
+        if (d.done || batch.length >= PURGE_DOCS_PER_ROUND) continue;
+        if (d.left === 0) {
+          if (rowShare < SWEEP_EMPTY_DOC_ROWS) { stop = true; break; }
+          rowShare -= SWEEP_EMPTY_DOC_ROWS; tally.rows += SWEEP_EMPTY_DOC_ROWS;
+          batch.push({ d, chunk: 0 });
+          continue;
+        }
+        const chunk = Math.min(d.left, LIFECYCLE_CHUNK_MAX, Math.floor((rowShare - SWEEP_DOC_ROWS) / 2));
+        if (chunk < 1) { stop = true; break; }
+        rowShare -= SWEEP_DOC_ROWS + 2 * chunk; tally.rows += SWEEP_DOC_ROWS + 2 * chunk;
+        batch.push({ d, chunk });
+        // A document that keeps tokens after this chunk is finished in a later batch; nothing after it fits a share.
+        if (chunk < d.left) break;
+      }
+      if (!batch.length) break;
+      const r = await deleteSearchDocs(env, batch.map(({ d, chunk }) => ({ doc_id: d.doc_id, workspace_id: d.workspace_id, owner_id: d.owner_id, chunk, final: true,
+        values: { A: d.artifact_id, P: d.project_id } })), { eligible: SWEEP_ELIGIBLE[p], values: { PN: pn } });
+      used++; tally.calls++;
+      tally.tokens += r.tokens; tally.docs += r.docs;
+      // Per document: X (5th statement when chunk > 0, 3rd otherwise) tells whether its row is gone.
+      let i = 0;
+      for (const { d, chunk } of batch) {
+        const k2 = chunk > 0 ? r.results[i + 1]?.meta?.changes ?? 0 : 0;
+        const x = r.results[i + (chunk > 0 ? 3 : 1)]?.meta?.changes ?? 0;
+        i += chunk > 0 ? 5 : 3;
+        d.left = Math.max(0, d.left - k2);
+        if (x > 0) d.done = true;
+        // Gated out (no longer eligible, or another run's lease) or miscounted: left for a later run.
+        else if (d.left === 0 || (chunk > 0 && k2 === 0)) { d.done = true; d.stuck = true; }
+      }
+    }
+    callsLeft -= used;
+    // Unused share passes on to the later paths.
+    rowsLeft = writes - SWEEP_CURSOR_ROWS - tally.rows;
+    // The window advances only when every orphan found in it was deleted in this run.
+    const complete = path.docs.length <= SWEEP_PATH_DOCS && queue.every((d) => d.done && !d.stuck);
+    path.complete = complete;
+    tally.paths.push({ path: p, calls: used, found: path.docs.length, complete });
+  }
+  const next = { ...cursors };
+  for (const p of ["A", "B", "C"]) {
+    const path = paths[p];
+    if (path.docs.length && !path.complete) continue;
+    const w = path.window;
+    next[p] = (Number(w.n) || 0) < path.size ? (p === "B" ? 0 : "") : path.next(w);
+  }
+  if (next.A !== cursors.A || next.B !== cursors.B || next.C !== cursors.C) {
+    await env.DB.prepare("UPDATE search_tokens_state SET sweep_doc_after = ?1, sweep_purged_after = ?2, sweep_workspace_after = ?3 WHERE id = 1")
+      .bind(next.B, next.A, next.C).run();
+    tally.calls++; tally.cursor = true; tally.rows += SWEEP_CURSOR_ROWS;
+  }
+  if (tally.calls > SWEEP_CALLS) throw new HttpError(500, "search_sweep_budget", "The sweep exceeded its call budget");
+  return tally;
+}

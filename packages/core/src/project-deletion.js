@@ -13,6 +13,7 @@ import { staleWritesBefore } from "./cleanup.js";
 import { deleteBlob, listBlobKeys } from "./content-store.js";
 import { explainLimit, limitGuard } from "./limits.js";
 import { ensureSlug } from "./paths.js";
+import { purgeNonce, purgeSearchTokensRound, sweepSearchTokenOrphans } from "./search/tokens.js";
 import { memberRoleSql, projectWorkspaceSql, requireWorkspaceRole, workspaceRoleSql } from "./tenancy.js";
 import { HttpError, cutLists, nowIso, nowMs } from "./util.js";
 
@@ -163,9 +164,17 @@ const STEPS = [
 
 /**
  * Cron: remove the content of projects whose purge_at has passed. Bounded per run (rowBudget rows, blobBudget R2
- * deletes); safe to repeat and to run concurrently (every step is a plain idempotent delete).
+ * deletes); safe to repeat and to run concurrently (every step is a plain idempotent delete). The cron call (no
+ * projectId) first runs the blind-index orphan sweep (search/tokens.js sweepSearchTokenOrphans), its starting path
+ * chosen by scheduledTime; the immediate purge (projectId) never does.
  */
-export async function purgeDueProjects(env, { projectId, rowBudget = 5000, blobBudget = 500 } = {}) {
+export async function purgeDueProjects(env, { projectId, rowBudget = 5000, blobBudget = 500, scheduledTime } = {}) {
+  if (!projectId) {
+    try {
+      const s = await sweepSearchTokenOrphans(env, { scheduledTime });
+      if (s.tokens || s.docs) console.log(JSON.stringify({ event: "search_sweep", calls: s.calls, rows: s.rows, tokens: s.tokens, docs: s.docs }));
+    } catch (e) { console.error(JSON.stringify({ event: "search_sweep_failed", code: e?.code ?? "error" })); }
+  }
   const now = nowMs();
   // A project with an upload still inside its finish lease or still writing waits for the next run, so no file lands
   // after its rows go.
@@ -173,7 +182,9 @@ export async function purgeDueProjects(env, { projectId, rowBudget = 5000, blobB
       AND NOT EXISTS (SELECT 1 FROM uploads u WHERE u.project_id = projects.id AND ${UPLOAD_BUSY}) ORDER BY purge_at LIMIT 5`)
     .bind(null, now, staleWritesBefore(env, now), ...projectId ? [projectId] : []).all()).results;
   const out = { projects: 0, rows: 0, files: 0, finished: [] };
-  for (const { id } of due) {
+  // One purge lease nonce per call for the blind-index rows (search/tokens.js deleteSearchDocs).
+  const searchNonce = purgeNonce();
+  projects: for (const { id } of due) {
     const stillDue = async () => !!await env.DB.prepare(`SELECT 1 AS ok WHERE ${STILL_DUE}`).bind(id, null, now).first("ok");
     // R2 first: files named by this project's revisions and uploads (keys always start blobs/<id>/ or staging/<id>/).
     for (;;) {
@@ -204,6 +215,18 @@ export async function purgeDueProjects(env, { projectId, rowBudget = 5000, blobB
         env.DB.prepare("UPDATE uploads SET staging_purged_at = ? WHERE project_id = ? AND staging_key IN (SELECT value FROM json_each(?))").bind(now, id, JSON.stringify(keys)),
         env.DB.prepare("UPDATE uploads SET final_purged_at = ? WHERE project_id = ? AND final_key IN (SELECT value FROM json_each(?))").bind(now, id, JSON.stringify(keys))
       ]);
+    }
+    // Blind-index rows before STEPS (while the project's artifacts still exist): 20 documents per round, token and
+    // document rows charged to rowBudget, STILL_DUE inside every destructive statement. A round that deletes nothing
+    // (restored after the check, or another purge run got there first) ends this project's purge for this run.
+    for (;;) {
+      if (rowBudget <= 0) return out;
+      if (!await stillDue()) return out;
+      const r = await purgeSearchTokensRound(env, id, { now, purgeNonce: searchNonce, rowBudget });
+      if (!r.selected) break;
+      const k = r.tokens + r.docs;
+      rowBudget -= k; out.rows += k;
+      if (!k) continue projects;
     }
     for (const [table, where] of STEPS) {
       for (;;) {
