@@ -95,7 +95,10 @@ export function resolveAdapters(a = {}) {
   if (a.keyProvider) {
     const missing = KEY_PROVIDER_METHODS.filter((m) => typeof a.keyProvider[m] !== "function");
     if (missing.length) throw new Error(`adapter keyProvider must define ${KEY_PROVIDER_METHODS.join(", ")}; missing: ${missing.join(", ")}`);
-    out.keyProvider = Object.freeze({ ...a.keyProvider });
+    // The four methods bound to the supplied object (prototype methods and #private fields of a class instance work),
+    // plus its name; nothing else is copied.
+    const p = a.keyProvider;
+    out.keyProvider = Object.freeze({ name: p.name, ...Object.fromEntries(KEY_PROVIDER_METHODS.map((m) => [m, p[m].bind(p)])) });
   } else out.keyProvider = Object.freeze({ ...DEFAULTS.keyProvider });
   return Object.freeze(out);
 }

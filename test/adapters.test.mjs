@@ -229,7 +229,17 @@ test("keyProvider: the default reads Worker secrets; a custom provider replaces 
   const custom = { name: "synthetic-kms", configured: () => true, currentVersion: () => 7, wrap: async () => "synthetic", unwrap: async () => null };
   const A = K.resolveAdapters({ keyProvider: custom });
   assert.equal(A.keyProvider.name, "synthetic-kms");
-  for (const m of ["configured", "currentVersion", "wrap", "unwrap"]) assert.equal(A.keyProvider[m], custom[m]);
+  // Each method is the supplied one bound to the supplied object (so class instances work), and nothing else is copied.
+  const thisSeen = [];
+  const tracking = Object.fromEntries(["configured", "currentVersion", "wrap", "unwrap"].map((m) => [m, function (...args) { thisSeen.push(this); return custom[m](...args); }]));
+  const T = K.resolveAdapters({ keyProvider: { name: "synthetic-kms", extra: 1, ...tracking } });
+  assert.deepEqual(Object.keys(T.keyProvider).sort(), ["configured", "currentVersion", "name", "unwrap", "wrap"]);
+  assert.equal(T.keyProvider.configured(), true);
+  assert.equal(T.keyProvider.currentVersion(), 7);
+  assert.equal(await T.keyProvider.wrap(), "synthetic");
+  assert.equal(await T.keyProvider.unwrap(), null);
+  assert.equal(thisSeen.length, 4);
+  assert.ok(thisSeen.every((t) => t !== T.keyProvider && t.name === "synthetic-kms" && t.extra === 1), "bound to the supplied object");
   assert.ok(Object.isFrozen(A.keyProvider));
   // No method-by-method fallback to the Worker-secret provider: a partial provider is refused at resolution.
   for (const m of ["configured", "currentVersion", "wrap", "unwrap"]) {

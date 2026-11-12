@@ -300,6 +300,29 @@ test("a custom keyProvider replaces the default: no Worker secrets are read", as
   assert.equal(lib.encryptionConfigured(request(base)), false);
 });
 
+test("a custom keyProvider written as a class instance with a private field keeps its prototype methods", async () => {
+  const { sql, DB } = mkDB();
+  const d = lib.defaultAdapters().keyProvider;
+  const secret = masterSecret();
+  class SyntheticKms {
+    #env = { CONTENT_MASTER_KEY_VERSION: "1", CONTENT_MASTER_KEY_V1: secret };
+    name = "synthetic-class-kms";
+    configured() { return d.configured(this.#env); }
+    currentVersion() { return d.currentVersion(this.#env); }
+    wrap(_env, raw, ctx) { return d.wrap(this.#env, raw, ctx); }
+    unwrap(_env, wrapped, ctx) { return d.unwrap(this.#env, wrapped, ctx); }
+  }
+  const resolved = lib.resolveAdapters({ keyProvider: new SyntheticKms() });
+  assert.equal(resolved.keyProvider.name, "synthetic-class-kms");
+  assert.ok(Object.isFrozen(resolved.keyProvider));
+  const env = () => request({ DB }, { keyProvider: new SyntheticKms() });
+  assert.equal(lib.encryptionConfigured(env()), true);
+  const k = await lib.workspaceDataKey(env(), WS_A);
+  assertDataKey(k.key);
+  assert.equal(rows(sql, WS_A)[0].key_id, k.keyId);
+  assertDataKey((await lib.dataKeyById(env(), WS_A, k.keyId)).key);
+});
+
 // ---------------------------------------------------------------- review fixes (PR 2 slice 3a)
 
 const configuredBase = (DB, extra = {}) => ({ DB, CONTENT_MASTER_KEY_VERSION: "1", CONTENT_MASTER_KEY_V1: masterSecret(), ...extra });
