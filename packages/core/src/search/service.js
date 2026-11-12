@@ -111,27 +111,31 @@ const RS_EXCERPT_TOKENS = 40;
  * prefix. Matches beyond the prefix are not seen; then the excerpt is the start of the text, as for a title-only hit.
  */
 function rsExcerpt(source, terms) {
-  const chars = Array.from(source), complete = chars.length <= RS_EXCERPT_PREFIX_CHARS; // SQL substr() counts characters
+  // SQL substr() counts characters; a UTF-16 length within the prefix already means at most that many characters.
+  const chars = source.length <= RS_EXCERPT_PREFIX_CHARS ? null : Array.from(source);
+  const complete = !chars || chars.length <= RS_EXCERPT_PREFIX_CHARS;
   const text = complete ? source : chars.slice(0, RS_EXCERPT_PREFIX_CHARS).join("");
   // Tokens and terms exactly as the index sees them (unicode61.js), so a word matches here only if it matches there.
   const tokens = [...text.matchAll(U61_TOKEN)].map((m) => ({ start: m.index, end: m.index + m[0].length, word: m[0] }));
   if (!complete && tokens.length && tokens.at(-1).end === text.length) tokens.pop(); // may be cut mid-word
-  const n = tokens.length, W = RS_EXCERPT_TOKENS, want = new Map();
-  for (const [i, t] of terms.entries()) {
+  const n = tokens.length, W = RS_EXCERPT_TOKENS, want = new Map(); // folded word -> [group, number of terms]
+  for (const t of terms) {
     const parts = t.match(U61_TOKEN) ?? [];
     if (parts.length !== 1) { want.clear(); break; } // the index matches such a term as a phrase: show the start of the text
-    const word = u61FoldToken(parts[0]);
-    want.set(word, [...want.get(word) ?? [], i]);
+    const word = u61FoldToken(parts[0]), entry = want.get(word);
+    // Terms that fold to one word always occur together: one entry weighted by their number scores the same.
+    if (entry) entry[1]++; else want.set(word, [want.size, 1]);
   }
-  const inst = []; // [position, term index], in position order like FTS5 instances
-  tokens.forEach((t, p) => { for (const k of want.get(u61FoldToken(t.word)) ?? []) inst.push([p, k]); });
+  const folded = new Map(), fold = (w) => { let f = folded.get(w); if (f === undefined) folded.set(w, f = u61FoldToken(w)); return f; };
+  const inst = []; // [position, group, weight], in position order like FTS5 instances
+  if (want.size) tokens.forEach((t, p) => { const e = want.get(fold(t.word)); if (e) inst.push([p, e[0], e[1]]); });
   const sentences = [0];
-  for (let p = 1; p < n; p++) { const gap = text.slice(tokens[p - 1].end, tokens[p].start); if (/[.:][ \t\r\n]+$/.test(gap)) sentences.push(p); }
+  if (inst.length) for (let p = 1; p < n; p++) { const gap = text.slice(tokens[p - 1].end, tokens[p].start); if (/[.:][ \t\r\n]+$/.test(gap)) sentences.push(p); }
   // Sliding window over instances for non-decreasing window starts.
-  const slider = () => { let lo = 0, hi = 0, distinct = 0, total = 0; const count = new Array(terms.length).fill(0);
+  const slider = () => { let lo = 0, hi = 0, distinct = 0, total = 0; const count = new Array(want.size).fill(0);
     return (s) => {
-      while (hi < inst.length && inst[hi][0] < s + W) { if (count[inst[hi][1]]++ === 0) distinct++; total++; hi++; }
-      while (lo < hi && inst[lo][0] < s) { if (--count[inst[lo][1]] === 0) distinct--; total--; lo++; }
+      while (hi < inst.length && inst[hi][0] < s + W) { const [, g, w] = inst[hi]; if (count[g]++ === 0) distinct += w; total += w; hi++; }
+      while (lo < hi && inst[lo][0] < s) { const [, g, w] = inst[lo]; if (--count[g] === 0) distinct -= w; total -= w; lo++; }
       return { score: distinct * 1000 + total - distinct, first: lo < hi ? inst[lo][0] : -1, last: lo < hi ? inst[hi - 1][0] + 1 : 0 };
     }; };
   const centred = slider(), fromSentence = slider();
