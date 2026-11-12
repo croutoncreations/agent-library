@@ -2,6 +2,7 @@ import { TEXT_MAX_BYTES } from "./text-limits.js";
 import { personalWorkspaceId } from "./tenancy.js";
 import { blobKeyFits, blobPrefix, blobRef, commitTextWrites, deleteBlobs, dropUnreferencedBlobs, fenceRefusal, getText, isTextWriteFenceError, keyFence, mapContent, plaintextFence, readBlobBytes, stageTextWrites, storedText, textKey, textWriteComplete, writeBlobBytes } from "./content-store.js";
 import { textSearchBridge } from "./search/service.js";
+import { deferSearchIndexing, utf8Length } from "./search/tokens.js";
 import { limitsFor, requireHuman } from "./auth.js";
 import { BINARY_TYPES, LIMITS, tplDate } from "./service.js";
 import { requireProjectRole, requireWorkspaceRole, workspaceRoleSql } from "./tenancy.js";
@@ -230,6 +231,27 @@ async function publishBackup(env, { objects, workspaceId, textKeys, build }) {
   }
 }
 
+/**
+ * After a restore or import committed: one search job per document whose head is text (a trashed head too; binary
+ * heads none), in backup order, each with the head's text as the backup holds it and its UTF-8 length. The request's
+ * run admits what fits its limits (100 documents, 10 Mi code units, the isolate's free bytes); the rest are counted
+ * skipped and stay missing for a later save or the backfill. Never awaited, never throws.
+ */
+function deferBackupIndexing(env, backup, ids) {
+  try {
+    const revs = new Map(backup.revisions.map((r) => [r.id, r]));
+    const jobs = [];
+    for (const a of backup.artifacts) {
+      const r = revs.get(a.head_revision_id);
+      if (!r || r.blob_key !== null || typeof r.body !== "string") continue;
+      jobs.push({ artifactId: ids.artifact(a.id), projectId: ids.project, revisionId: ids.revision(r.id), text: r.body, textBytes: utf8Length(r.body) });
+    }
+    deferSearchIndexing(env, jobs);
+  } catch {
+    try { console.log(JSON.stringify({ event: "search_index_skipped", skipped: backup.artifacts?.length ?? 0, reasons: { error: backup.artifacts?.length ?? 0 } })); } catch { /* never fail the restore */ }
+  }
+}
+
 async function restoreBackup(ctx, backup) {
   requireHuman(ctx);
   const DB = ctx.env.DB;
@@ -317,6 +339,7 @@ async function restoreBackup(ctx, backup) {
     if (await DB.prepare("SELECT COUNT(*) AS n FROM projects").first("n")) throw new HttpError(409, "store_not_empty", "Restore targets an empty isolated store only");
     throw out.error;
   }
+  deferBackupIndexing(ctx.env, backup, { project: pid, artifact: (id) => id, revision: (id) => id });
   return { restored_project: pid, artifacts: backup.artifacts.length, revisions: backup.revisions.length, blobs: decoded.size, grants: 0 };
 }
 
@@ -499,6 +522,7 @@ async function importBackup(ctx, workspaceId, input, idemKeyValue, digest = "") 
     await explainLimit(ctx.env, workspaceId, { projects: 1, storage_bytes: addBytes }, lg.limits);
     throw new HttpError(403, "forbidden", "Needs the admin role in an active workspace");
   }
+  deferBackupIndexing(ctx.env, backup, { project: pid, artifact: (id) => artId.get(id), revision: (id) => revId.get(id) });
   return result;
 }
 

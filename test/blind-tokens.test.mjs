@@ -746,3 +746,43 @@ test("13a/13d/13f/13j (local D1): create, save, restore and template create are 
   for (const x of samples) assert.ok(x.indexedAfterMs >= x.responseMs);
   for (const r of await d1one(COUNTERS_EXACT)) assert.equal(r.terms, r.want, r.scope);
 });
+
+test("13l (local D1): a 100 × 10 KB import responds normally; after it, a backup-order prefix is indexed and the rest missing; timing recorded", async () => {
+  const s = await h.login();
+  const ws = (await s.req("GET", "/api/workspaces")).body.workspaces.find((w) => w.role === "owner" || w.role === "admin")?.id;
+  assert.ok(ws, "a workspace the person administers");
+  const { createHash } = await import("node:crypto");
+  const at = "2026-01-01T00:00:00.000Z";
+  const tenK = (seed) => { const w = []; let x = seed; while (w.join(" ").length < 10240) { x = (x * 1103515245 + 12345) & 0x7fffffff; w.push("w" + ((x >>> 8) % 1500).toString(36)); } return w.join(" ").slice(0, 10240); };
+  const artifacts = [], revisions = [];
+  for (let i = 0; i < 100; i++) {
+    const text = tenK(100 + i), id = `art_imp_${i}`, rid = `rev_imp_${i}`;
+    artifacts.push({ id, kind: "markdown", title: `Synthetic ${i}`, folder: "", tags: "[]", head_rev: 1, head_revision_id: rid, meta_version: 1, trashed_at: null, created_at: at, updated_at: at });
+    revisions.push({ id: rid, artifact_id: id, rev_no: 1, author_id: "hum_src", body: text, blob_key: null, size: Buffer.byteLength(text), sha256: createHash("sha256").update(text).digest("hex"), mime: "text/markdown", restored_from: null, created_at: at });
+  }
+  const backup = { schema: "agent-library-backup/1", exported_at: at, project: { id: "pimp_src", title: "Synthetic import", created_at: at }, artifacts, revisions, comments: [], meta_versions: [], blobs: {} };
+  const t0 = performance.now();
+  const r = await s.req("POST", `/api/workspaces/${ws}/import`, backup);
+  const responseMs = performance.now() - t0;
+  assert.equal(r.status, 201, JSON.stringify(r.body));
+  const pid = r.body.project_id;
+  // The run stops at its limits (about 1,000 distinct terms each: the 50,000 token operations end it part-way); the
+  // rest stay missing. Poll until every document is either complete at its head or listed missing, and stable.
+  const end = Date.now() + 30000;
+  let done, miss, last = -1;
+  for (;;) {
+    done = (await d1one(`SELECT COUNT(*) AS n FROM search_token_docs d JOIN artifacts a ON a.id = d.artifact_id AND a.head_revision_id = d.revision_id WHERE a.project_id = '${pid}'`))[0].n;
+    miss = (await d1one(`SELECT COUNT(*) AS n FROM search_tokens_missing m JOIN artifacts a ON a.id = m.id WHERE a.project_id = '${pid}'`))[0].n;
+    if (done > 0 && done + miss === 100 && done === last) break;
+    last = done;
+    if (Date.now() > end) throw new Error(`${done} indexed, ${miss} missing of 100`);
+    await new Promise((x) => setTimeout(x, 250));
+  }
+  const indexedAfterMs = performance.now() - t0;
+  // The run's D1 calls for the same import are counted in process (test/blind-tokens-paths.test.mjs, 13l calls).
+  const m = { at: new Date().toISOString(), documents: 100, bytesEach: 10240, indexed: done, missing: miss, responseMs: Math.round(responseMs), settledByMs: Math.round(indexedAfterMs) };
+  mkdirSync(join(ROOT, "tmp", "test-evidence"), { recursive: true });
+  writeFileSync(join(ROOT, "tmp", "test-evidence", "blind-tokens-import-timing.json"), JSON.stringify(m, null, 2));
+  console.log("IMPORT_TIMING " + JSON.stringify(m));
+  for (const x of await d1one(COUNTERS_EXACT)) assert.equal(x.terms, x.want, x.scope);
+});

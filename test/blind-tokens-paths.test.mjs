@@ -901,3 +901,173 @@ test("R7-1: coreWorker.fetch rejecting while discardDeferredWork itself throws: 
   assert.equal(rejected, handlerError, "the handler's own error");
   idle();
 });
+
+// --- 13k, 13l, 13q, 13r, 22: backup restore and import defer search indexing ----------------------------------------
+/** A synthetic backup: one text revision per document (heads in order), optional trashed head and binary document. */
+function synthBackup({ pid = "pbk_src", docs, binary = false } = {}) {
+  const artifacts = [], revisions = [], blobs = {};
+  const at = "2026-01-01T00:00:00.000Z";
+  docs.forEach((body, i) => {
+    const id = `art_src_${String(i).padStart(4, "0")}`, rid = `rev_src_${String(i).padStart(4, "0")}`;
+    const trashed = typeof body === "object" ? body.trashed : false, text = typeof body === "object" ? body.text : body;
+    artifacts.push({ id, kind: "markdown", title: `Synthetic ${i}`, folder: "", tags: "[]", head_rev: 1, head_revision_id: rid, meta_version: 1, trashed_at: trashed ? at : null, created_at: at, updated_at: at });
+    revisions.push({ id: rid, artifact_id: id, rev_no: 1, author_id: "hum_src", body: text, blob_key: null, size: Buffer.byteLength(text), sha256: sha(text), mime: "text/markdown", restored_from: null, created_at: at });
+  });
+  if (binary) {
+    const PNG = Buffer.from("89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000b49444154789c636000020000050001a5f645400000000049454e44ae426082", "hex");
+    const key = `blobs/${pid}/art_src_bin/png1`;
+    artifacts.push({ id: "art_src_bin", kind: "binary", title: "Synthetic image", folder: "", tags: "[]", head_rev: 1, head_revision_id: "rev_src_bin", meta_version: 1, trashed_at: null, created_at: at, updated_at: at });
+    revisions.push({ id: "rev_src_bin", artifact_id: "art_src_bin", rev_no: 1, author_id: "hum_src", body: null, blob_key: key, size: PNG.length, sha256: sha(PNG), mime: "image/png", restored_from: null, created_at: at });
+    blobs[key] = { sha256: sha(PNG), data: PNG.toString("base64") };
+  }
+  return { schema: "agent-library-backup/1", exported_at: at, project: { id: pid, title: "Synthetic source", created_at: at }, artifacts, revisions, comments: [], meta_versions: [], blobs };
+}
+const wsOfPrincipal = (a) => W.one(a.world, "SELECT id FROM workspaces ORDER BY created_at LIMIT 1").id;
+const projectDocs = (a, pid) => W.all(a.world, "SELECT id, title, kind FROM artifacts WHERE project_id = ? ORDER BY title", pid);
+
+test("13k backup restore (a trashed head too; a binary head gets no job): every text head is indexed", async () => {
+  const a = await app();
+  const b0 = baseline();
+  const docs = ["restore alpha", { text: "trashed head words", trashed: true }, "restore gamma"];
+  const { result: r, events } = await captureLogs(async () => { const x = await a.req("POST", "/api/restore", synthBackup({ docs, binary: true })); await a.settle(); return x; });
+  assert.equal(r.status, 201, JSON.stringify(r.body));
+  const pid = r.body.restored_project;
+  const rows = projectDocs(a, pid);
+  docs.forEach((d, i) => assertIndexed(a, pid, `art_src_${String(i).padStart(4, "0")}`, typeof d === "object" ? d.text : d, `13k ${i}`));
+  assert.equal(docRow(a, "art_src_bin"), undefined, "binary head: no row");
+  assert.ok(!missing(a).includes("art_src_bin"));
+  assert.ok(!events.some((e) => e.event === "search_index_skipped"));
+  assert.equal(rows.length, 4);
+  assertBaseline(b0, "13k");
+});
+
+test("13l backup import: every imported text head is indexed under its new ids; a refused import defers nothing", async () => {
+  const a = await app();
+  await a.project("pkeep");
+  const ws = wsOfPrincipal(a);
+  const b0 = baseline();
+  const docs = ["import alpha words", "import beta words", { text: "import trashed", trashed: true }];
+  const r = await a.req("POST", `/api/workspaces/${ws}/import`, synthBackup({ docs, binary: true }));
+  assert.equal(r.status, 201, JSON.stringify(r.body));
+  assert.equal(a.waits.length, 1, "one run");
+  await a.settle();
+  const rows = projectDocs(a, r.body.project_id);
+  for (const [i, d] of docs.entries()) {
+    const art = rows.find((x) => x.title === `Synthetic ${i}`);
+    assertIndexed(a, r.body.project_id, art.id, typeof d === "object" ? d.text : d, `13l ${i}`);
+  }
+  assert.equal(docRow(a, rows.find((x) => x.kind === "binary").id), undefined);
+  // Refused import (a bad hash): no job, no run.
+  const bad = synthBackup({ docs: ["refused import"] });
+  bad.revisions[0].sha256 = "0".repeat(64);
+  const w0 = a.waits.length;
+  const { result: rf, events } = await captureLogs(() => a.req("POST", `/api/workspaces/${ws}/import`, bad));
+  assert.equal(rf.status, 400);
+  assert.equal(a.waits.length, w0);
+  assert.ok(!events.some((e) => /^search_/.test(e.event)));
+  // A failed publication (the text-write fence refuses inside the batch): no job, no run.
+  a.world.before = async (c) => { if (c.kind === "batch" && c.qs.some((q) => /INSERT INTO revisions/.test(q))) W.run(a.world, "UPDATE content_writes SET created_at = 0"); };
+  const { result: rf2, events: e2 } = await captureLogs(() => a.req("POST", `/api/workspaces/${ws}/import`, synthBackup({ docs: ["fenced import"] })));
+  a.world.before = null;
+  assert.ok(rf2.status >= 400, JSON.stringify(rf2.body));
+  assert.equal(a.waits.length, w0);
+  assert.ok(!e2.some((e) => /^search_/.test(e.event)));
+  assertExact(a);
+  assertBaseline(b0, "13l");
+});
+
+test("13q an import beyond the run's document budget leaves exactly the remaining documents missing; a later save completes one", async () => {
+  const a = await app();
+  await a.project("pkeep2");
+  const ws = wsOfPrincipal(a);
+  const docs = Array.from({ length: 103 }, (_, i) => `doc${i} shared words`);
+  const { result: r, events } = await captureLogs(async () => { const x = await a.req("POST", `/api/workspaces/${ws}/import`, synthBackup({ docs })); await a.settle(); return x; });
+  assert.equal(r.status, 201, JSON.stringify(r.body));
+  const rows = projectDocs(a, r.body.project_id);
+  const byOrder = docs.map((_, i) => rows.find((x) => x.title === `Synthetic ${i}`).id);
+  const indexed = byOrder.filter((id) => docRow(a, id)?.revision_id === headOf(a, id));
+  assert.deepEqual(indexed, byOrder.slice(0, 100), "the first 100 in backup order");
+  assert.deepEqual(missing(a).filter((id) => byOrder.includes(id)).sort(), byOrder.slice(100).sort(), "exactly the rest missing");
+  assert.deepEqual(events.filter((e) => e.event === "search_index_skipped").map((e) => e.reasons), [{ admission: 3 }]);
+  const late = byOrder[101];
+  assert.equal((await a.req("PUT", `/api/projects/${r.body.project_id}/artifacts/${late}`, { expected_revision: 1, body: "completed later" })).status, 200);
+  await a.settle();
+  assertIndexed(a, r.body.project_id, late, "completed later");
+  idle();
+});
+
+test("13r an import of 300 empty documents responds normally: at most 100 complete rows, the rest missing; the run's calls counted", async () => {
+  const a = await app();
+  await a.project("pkeep3");
+  const ws = wsOfPrincipal(a);
+  const docs = Array.from({ length: 300 }, () => "");
+  const runCalls = [];
+  a.world.before = async (c) => { if ((c.qs ?? [c.q]).some((q) => /search_token|workspace_search_keys|\) AS cw,/.test(q))) runCalls.push(c.kind); };
+  const t0 = Date.now();
+  const r = await a.req("POST", `/api/workspaces/${ws}/import`, synthBackup({ docs }));
+  const ms = Date.now() - t0;
+  assert.equal(r.status, 201, JSON.stringify(r.body));
+  assert.deepEqual(runCalls, [], "no run call before the response");
+  await captureLogs(() => a.settle());
+  a.world.before = null;
+  const ids = projectDocs(a, r.body.project_id).map((x) => x.id);
+  const complete = ids.filter((id) => docRow(a, id)?.revision_id === headOf(a, id));
+  assert.equal(complete.length, 100);
+  for (const id of complete) assert.equal(tokensOf(a, id).length, 0);
+  assert.equal(missing(a).filter((id) => ids.includes(id)).length, 200);
+  assert.ok(runCalls.length <= 9, `the run's D1 calls: ${runCalls.length}`);
+  assertExact(a);
+  idle();
+  console.log(JSON.stringify({ event: "test_measure", test: "13r", responseMs: ms, runCalls: runCalls.length }));
+});
+
+test("22: a 300-empty-document import into a nearly full workspace writes only the rows that fit (5 units each); the rest stay missing", async () => {
+  const a = await app({ SEARCH_WORKSPACE_TERMS_MAX: "25" });
+  await a.project("pkeep4");
+  const ws = wsOfPrincipal(a);
+  const r = await a.req("POST", `/api/workspaces/${ws}/import`, synthBackup({ docs: Array.from({ length: 300 }, () => "") }));
+  assert.equal(r.status, 201, JSON.stringify(r.body));
+  await captureLogs(() => a.settle());
+  const ids = projectDocs(a, r.body.project_id).map((x) => x.id);
+  const rows = ids.filter((id) => docRow(a, id));
+  const counter = W.one(a.world, "SELECT terms FROM search_term_counters WHERE scope = ?", "w:" + ws);
+  assert.ok(counter.terms <= 25, JSON.stringify(counter));
+  assert.equal(rows.length, Math.floor(25 / 5), "five rows of 5 units fit");
+  assert.equal(missing(a).filter((id) => ids.includes(id)).length, 300 - rows.length);
+  assertExact(a);
+  idle();
+});
+
+test("13l calls: a 100 × 10 KB import adds no D1 call before its response; the deferred run's calls are counted", async () => {
+  const a = await app();
+  await a.project("pcalls");
+  const ws = wsOfPrincipal(a);
+  const tenK = (seed) => { const w = []; let x = seed; while (w.join(" ").length < 10240) { x = (x * 1103515245 + 12345) & 0x7fffffff; w.push("w" + ((x >>> 8) % 1500).toString(36)); } return w.join(" ").slice(0, 10240); };
+  const docs = Array.from({ length: 100 }, (_, i) => tenK(100 + i));
+  const isRun = (c) => (c.qs ?? [c.q]).some((q) => /search_token|search_term_counters|workspace_search_keys|\) AS cw,/.test(q));
+  const calls = { before: 0, run: 0, all: 0 };
+  let responded = false;
+  a.world.before = async (c) => { calls.all++; if (isRun(c)) { if (responded) calls.run++; else calls.before++; } };
+  const t0 = Date.now();
+  const r = await a.req("POST", `/api/workspaces/${ws}/import`, synthBackup({ docs }));
+  const responseMs = Date.now() - t0;
+  responded = true;
+  const atResponse = calls.all;
+  assert.equal(r.status, 201, JSON.stringify(r.body));
+  const { events } = await captureLogs(() => a.settle());
+  a.world.before = null;
+  assert.equal(calls.before, 0, "no token call before the response");
+  // About 1,000 distinct terms each: the run's 50,000 token operations stop it part-way (decision 4: the run's limits
+  // stop the rest). The indexed documents are a prefix in backup order; exactly the rest are missing.
+  const byOrder = docs.map((_, i) => projectDocs(a, r.body.project_id).find((x) => x.title === `Synthetic ${i}`).id);
+  const indexed = byOrder.filter((id) => docRow(a, id)?.revision_id === headOf(a, id));
+  assert.ok(indexed.length > 0);
+  assert.deepEqual(indexed, byOrder.slice(0, indexed.length), "a prefix in backup order");
+  assert.deepEqual(missing(a).filter((id) => byOrder.includes(id)).sort(), byOrder.slice(indexed.length).sort());
+  for (const id of indexed) assert.deepEqual(tokensOf(a, id), expectedFor(a.world, ws, words(docs[byOrder.indexOf(id)])));
+  assert.ok(calls.run <= 18, `run calls ${calls.run}`);
+  assertExact(a);
+  idle();
+  const skipped = events.filter((e) => e.event === "search_index_skipped").map((e) => e.reasons);
+  console.log(JSON.stringify({ event: "test_measure", test: "13l calls", requestCalls: atResponse, runCalls: calls.run, responseMs, indexed: indexed.length, skipped }));
+});
