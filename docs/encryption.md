@@ -118,12 +118,20 @@ For the slices that wire this into reads and writes:
   could span a configuration or rollout change.
 - **A plaintext write.** The statement or `batch` that publishes it must itself carry `NO_REAL_KEY_SQL` (exported
   from `keys.js`; the same test `encryptionEnabled` makes), for the same reason: encryption may start in the meantime.
+  The condition holds until the first real key row exists, so a plaintext write decided before encryption was
+  configured can still publish until some workspace gets its first key; it is stored and read as plaintext.
 - **A refused condition must abort the whole publication.** A D1 `batch` rolls back only when a statement fails, and
-  a guarded statement that matches no rows does not fail: the rest of the batch would still commit. In a batch,
-  write the condition as an assertion that fails its statement, the way the
-  [text write deadline](#text-write-deadline-and-orphan-safety) deliberately violates a NOT NULL constraint. For a
-  single publishing statement, check that it changed exactly the expected rows and treat anything else as an error.
-  Nothing may be published in part, and the caller gets a retryable error.
+  a guarded statement that matches no rows does not fail: the rest of the batch would still commit. So write the
+  condition as an assertion that fails its statement, the way the
+  [text write deadline](#text-write-deadline-and-orphan-safety) deliberately violates a NOT NULL constraint. This is
+  required for every `batch` and for any statement that can publish more than one row: a statement that skips some
+  rows has already committed the others by the time a row count is read. Only a single statement that publishes at
+  most one row may instead check that it changed exactly that row and treat anything else as an error. Nothing may
+  be published in part.
+- **A refusal must be told apart from other failures**, for example by probing again after the failure, so that it
+  is not reported as an expired text-write intent (`text_write_expired`). A refused plaintext write is retryable
+  (the retry encrypts). A write refused because its key was shredded answers `410 key_shredded`. A refused upload
+  ends failed, and a retry starts a new upload.
 - **A refusal must leave the staged object reclaimable.** The row that lets cleanup find the object (the text-write
   intent, the upload row) must survive the refusal, and an upload must end failed, so that the existing cleanup (the
   intent sweep, upload cleanup) removes the object.
