@@ -1,9 +1,9 @@
-import { blobSha256Hex, deleteBlob, getBlob, getBlobHead, headBlob, putBlobStream, getText, getTextRange, getUploadedText } from "./content-store.js";
+import { blobPrefix, blobRef, deleteBlob, fenceRefusal, getText, getTextRange, getUploadedText, inspectUploadedBlob, isBlobWriteError, keyFence, plaintextFence, putBlobStream, readBlob, writeUploadBlob } from "./content-store.js";
 import { authenticate, authorizeProject, authzSql, contentWriteSql, enforceRate, limitsFor, requireCsrf } from "./auth.js";
 import { PUT_MARGIN_MS, reconcileUploads } from "./cleanup.js";
 import { CONTENT_TYPE, MEASUREMENTS, checkFile, spreadsheetSafeCsv } from "./formats.js";
 import { __name } from "./runtime.js";
-import { FILE_BYTES_CEILING, explainLimit, fileTooLarge, guardSql, projectLimitGuard } from "./limits.js";
+import { FILE_BYTES_CEILING, explainLimit, fileTooLarge, guardSql, projectLimitGuard, projectWorkspaceId } from "./limits.js";
 import { BINARY_TYPES, IMAGE_TYPES, VIDEO_TYPES, appConnectEnabled, assertWritable, audit, idemLookup, loadArtifact, mdBody, provenance, publishRevision, requireAppConnect, textCreateMetadata } from "./service.js";
 import { TEXT_MAX_BYTES } from "./text-limits.js";
 import { HttpError, int, nowIso, nowMs, randomId, sha256Hex, str } from "./util.js";
@@ -63,7 +63,7 @@ function uploadBeginFields(appConnect) {
   };
 }
 // Upload-owned bytes: immutable published binary content, or temporary raw input for text publication.
-var finalKeyFor = (projectId, artifactId) => `blobs/${projectId}/${artifactId}/${randomId("rev")}`;
+var finalKeyFor = (projectId, artifactId) => blobPrefix(projectId, artifactId) + randomId("rev");
 // Options are transport-owned, never request fields. transfer(uploadId) gives the transport's own { put_url, instructions }.
 async function uploadBegin(ctx, projectId, input, key, { allowText = false, allowBinary = true, transfer } = {}) {
   await authorizeProject(ctx, projectId, true);
@@ -200,6 +200,8 @@ async function uploadPut(req, env, requestId, uploadId, linkCtx, { projectId, ra
     if (textKind === "json" || textKind === "csv") requireAppConnect(ctx);
     assertWritable(ctx, await loadArtifact(ctx, u.project_id, u.artifact_id, { allowUnpublished: u.base_rev === 0 }), "content");
   }
+  // Binary uploads write under the server-side project's workspace key when encryption is on (never a request field).
+  const workspaceId = textKind ? null : await projectWorkspaceId(env, u.project_id);
   const azBase = authzSql(ctx, u.project_id);
   const cw = textKind ? contentWriteSql(ctx, u.artifact_id) : { sql: "1", params: [] };
   const az = { sql: `${azBase.sql} AND ${cw.sql}`, params: [...azBase.params, ...cw.params] };
@@ -216,7 +218,7 @@ async function uploadPut(req, env, requestId, uploadId, linkCtx, { projectId, ra
     // stream), and the put is abandoned at expires_at + PUT_MARGIN_MS, so cleanup can treat older write counts as stale.
     const deadline = u.expires_at;
     const expired = () => new HttpError(410, "upload_expired", "Upload expired during transfer");
-    let stored, bodyCtl, abortTimer, marginTimer, timedOut = false, abandoned = false;
+    let written, bodyCtl, abortTimer, marginTimer, timedOut = false, abandoned = false;
     const body = (req.body ?? new ReadableStream({ start(c) { c.close(); } })).pipeThrough(new TransformStream({
       start(c) { bodyCtl = c; },
       transform(chunk, out) {
@@ -229,18 +231,23 @@ async function uploadPut(req, env, requestId, uploadId, linkCtx, { projectId, ra
       const margin = new Promise((_, reject) => {
         marginTimer = setTimeout(() => { timedOut = abandoned = true; bodyCtl.error(expired()); reject(expired()); }, Math.max(0, deadline + PUT_MARGIN_MS - nowMs()));
       });
-      const put = putBlobStream(env, finalKey, body, u.expected_size, { sha256: u.expected_sha256, httpMetadata: { contentType: u.mime } });
+      // Text input stays plaintext (slice 3c); a binary goes through writeUploadBlob, which encrypts when enabled.
+      const put = textKind
+        ? putBlobStream(env, finalKey, body, u.expected_size, { sha256: u.expected_sha256, httpMetadata: { contentType: u.mime } })
+          .then((stored) => ({ ...stored, keyId: null, header: null }))
+        : writeUploadBlob(env, { key: finalKey, body, size: u.expected_size, sha256: u.expected_sha256, contentType: u.mime, workspaceId });
       // An abandoned put may still reject later; never let that surface as an unhandled rejection (it carries R2's message).
       put.catch(() => {
       });
-      stored = await Promise.race([put, margin]);
+      written = await Promise.race([put, margin]);
     } catch (e) {
       const m = String(e?.message ?? e);
+      const kind = isBlobWriteError(e);
       // A digest rejection is a real answer even if a timer fired meanwhile: report it (and end the upload) as 422.
-      if (!abandoned && /SHA-256 checksum you specified did not match|10037/.test(m)) throw new HttpError(422, "integrity_mismatch", "The body's SHA-256 does not match the declared sha256; this upload has ended, start a new upload");
+      if (!abandoned && (kind === "digest" || textKind && /SHA-256 checksum you specified did not match|10037/.test(m))) throw new HttpError(422, "integrity_mismatch", "The body's SHA-256 does not match the declared sha256; this upload has ended, start a new upload");
       if (timedOut) throw expired();
-      if (/too many bytes/i.test(m)) throw new HttpError(413, "too_large", "Body exceeds declared size");
-      if (/did not see all expected bytes/i.test(m)) throw new HttpError(400, "incomplete_body", "Body ended before the declared size; PUT the whole file again");
+      if (kind === "too_long" || textKind && /too many bytes/i.test(m)) throw new HttpError(413, "too_large", "Body exceeds declared size");
+      if (kind === "too_short" || textKind && /did not see all expected bytes/i.test(m)) throw new HttpError(400, "incomplete_body", "Body ended before the declared size; PUT the whole file again");
       throw e;
     } finally {
       clearTimeout(abortTimer);
@@ -252,10 +259,11 @@ async function uploadPut(req, env, requestId, uploadId, linkCtx, { projectId, ra
         console.warn(JSON.stringify({ event: "upload_final_write_release_failed" }));
       });
     }
-    const n = stored?.size ?? null;
-    const sha2 = blobSha256Hex(stored);
-    // Re-checks the grant (same as the claim): access revoked mid-transfer leaves the upload unreceived.
-    const rec = await env.DB.prepare(`UPDATE uploads SET state = 'received', received_size = ?, received_sha256 = ? WHERE id = ? AND state = 'receiving' AND ${az.sql}`).bind(n, sha2, uploadId, ...az.params).run();
+    const n = written?.size ?? null;
+    const sha2 = written?.sha256 ?? null;
+    // Re-checks the grant (same as the claim): access revoked mid-transfer leaves the upload unreceived. The
+    // encryption pair (NULL for plaintext) is always bound: finish reads the object under exactly this header.
+    const rec = await env.DB.prepare(`UPDATE uploads SET state = 'received', received_size = ?, received_sha256 = ?, enc_key_id = ?, enc_header = ? WHERE id = ? AND state = 'receiving' AND ${az.sql}`).bind(n, sha2, written?.keyId ?? null, written?.header ?? null, uploadId, ...az.params).run();
     if (!rec.meta.changes) {
       if (await env.DB.prepare("SELECT 1 AS x FROM uploads WHERE id = ? AND state = 'receiving'").bind(uploadId).first("x"))
         throw new HttpError(403, "forbidden", "Grant no longer valid");
@@ -274,9 +282,10 @@ async function uploadPut(req, env, requestId, uploadId, linkCtx, { projectId, ra
       headers: { "content-type": "application/json", "cache-control": "private, no-store" }
     });
   } catch (e) {
-    // The declared SHA-256 can't match on any retry of these bytes: end the upload so finish replays the 422 and a new
-    // upload_begin can start. Nothing was stored, so the slot and quota are freed at once. 400 and 413 stay retryable.
-    if (e instanceof HttpError && e.code === "integrity_mismatch") {
+    // The declared SHA-256 can't match on any retry of these bytes (or the workspace key is shredded, which is
+    // permanent): end the upload so finish replays the answer and a new upload_begin can start. Nothing was stored, so
+    // the slot and quota are freed at once. 400, 413 and 500 encryption_misconfigured go back to pending (retryable).
+    if (e instanceof HttpError && (e.code === "integrity_mismatch" || e.code === "key_shredded")) {
       const failed = await env.DB.prepare("UPDATE uploads SET state = 'failed', result = ? WHERE id = ? AND state = 'receiving'")
         .bind(JSON.stringify({ status: e.status, code: e.code, message: e.message }), uploadId).run();
       if (failed.meta.changes) {
@@ -350,7 +359,7 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
     if (cur !== "sealed") throw new HttpError(409, "upload_not_ready", `Upload state is ${cur}; PUT the bytes first`);
   }
   const token = randomId("fin");
-  const current = () => db2(ctx).prepare("SELECT state, result, final_key, finalize_token, finalize_until FROM uploads WHERE id = ?").bind(uploadId).first();
+  const current = () => db2(ctx).prepare("SELECT state, result, final_key, finalize_token, finalize_until, received_size, received_sha256, enc_key_id, enc_header FROM uploads WHERE id = ?").bind(uploadId).first();
   const busy = (row) => new HttpError(409, "finish_in_progress", "Another finish of this upload is in progress; retry shortly", { retry_after_seconds: Math.max(1, Math.ceil(((row?.finalize_until ?? nowMs()) - nowMs()) / 1e3)) });
   const pause = () => new Promise((r2) => setTimeout(r2, 250));
   // Not (or no longer) the finisher: replay the recorded outcome, waiting briefly for the finisher that holds the lease.
@@ -388,7 +397,11 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
   try {
     const held = await current();
     const finalKey = held?.final_key;
-    const prefix = `blobs/${projectId}/${u.artifact_id}/`;
+    // The encoded prefix only. The unencoded form of one id can be another's encoded prefix (a document literally named
+    // "a%2Fb" vs "a/b"), so accepting it would let one document's key pass for the other. For every id the app creates
+    // the two are the same string; an upload begun by the previous Worker on a restored document whose id needs
+    // encoding is refused here and must be started again.
+    const prefix = blobPrefix(projectId, u.artifact_id);
     if (held?.finalize_token !== token || typeof finalKey !== "string" || !finalKey.startsWith(prefix) || !/^rev_[A-Za-z0-9_-]+$/.test(finalKey.slice(prefix.length)))
       throw new HttpError(500, "publish_failed", "Upload finalization state is inconsistent");
     const kind = Object.hasOwn(TEXT_UPLOAD_KINDS, u.mime) ? TEXT_UPLOAD_KINDS[u.mime] : null;
@@ -415,16 +428,38 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
       if (row && (row.state === "failed" || row.state === "conflict")) await dropUnpublished(ctx.env, uploadId, finalKey);
       return await lost();
     };
-    // No write and no whole-object read: the upload's PUT already stored the bytes at final_key, and R2 checked their
-    // length and the declared SHA-256 on the way in. Confirm what R2 recorded (fail closed without a checksum), then
-    // check the type signature on the first bytes (BINARY_TYPES checks need at most 13).
-    const stored = await headBlob(ctx.env, finalKey);
-    if (!stored) return await fail(409, "missing_bytes", "Uploaded bytes missing", "failed");
-    const size = stored.size;
-    const sha2 = blobSha256Hex(stored);
-    if (sha2 === null) return await fail(500, "publish_failed", "Stored object has no SHA-256 checksum", "failed");
-    if (size !== u.expected_size || sha2 !== u.expected_sha256)
-      return await fail(422, "integrity_mismatch", "Byte length or SHA-256 does not match declaration", "failed", { received_size: size, received_sha256: sha2 });
+    // A binary is never empty (uploadBegin refuses size 0): no signature can match, so refuse before any R2 read.
+    if (!kind && u.expected_size === 0) return await fail(415, "signature_mismatch", `Bytes are not a valid ${u.mime}`, "failed");
+    // No write and no whole-object read: the upload's PUT already stored the bytes at final_key. One head, plus (for a
+    // binary) one ranged get of the first bytes. Plaintext: R2 checked length and the declared SHA-256 on the way in;
+    // confirm what it recorded (fail closed without a checksum). Encrypted: the PUT's plainTap counted and hashed the
+    // plaintext; the object's metadata and stored size must match and chunk 0 must authenticate under the recorded
+    // header. Then check the type signature on the first bytes (BINARY_TYPES checks need at most 13).
+    const workspaceId = held.enc_key_id ? await projectWorkspaceId(ctx.env, projectId) : null;
+    let check;
+    try {
+      check = await inspectUploadedBlob(ctx.env, { key: finalKey, projectId, artifactId: u.artifact_id, workspaceId, size: u.expected_size, sha256: u.expected_sha256,
+        keyId: held.enc_key_id ?? null, header: held.enc_header ?? null, receivedSize: held.received_size, receivedSha256: held.received_sha256 }, kind ? 0 : 16);
+    } catch (e) {
+      if (e instanceof HttpError && e.code === "key_shredded") return await fail(e.status, e.code, e.message, "failed");
+      // The recorded key id names no key of this workspace, or its row is malformed: retrying this upload cannot heal
+      // that, so it ends failed (publish_failed). This assumes key rows are read from the primary database (a key
+      // created moments ago is always visible); revisit if D1 read replicas are ever enabled for this request. Configuration and provider errors (encryption_misconfigured,
+      // encryption_not_configured, master_key_*, key_unwrap_failed, key_provider_invalid) can heal: the upload stays
+      // sealed and retryable.
+      if (e instanceof HttpError && (e.code === "key_not_found" || e.code === "key_row_invalid" || e.code === "invalid_key_id")) {
+        console.error(JSON.stringify({ event: "upload_finish_key_error", code: e.code, projectId, artifactId: u.artifact_id }));
+        return await fail(500, "publish_failed", "Stored object failed verification", "failed");
+      }
+      throw e;
+    }
+    if (!check.ok && check.reason === "missing") return await fail(409, "missing_bytes", "Uploaded bytes missing", "failed");
+    if (!check.ok && check.reason === "no_checksum") return await fail(500, "publish_failed", "Stored object has no SHA-256 checksum", "failed");
+    if (!check.ok && check.reason === "mismatch")
+      return await fail(422, "integrity_mismatch", "Byte length or SHA-256 does not match declaration", "failed", { received_size: check.size, received_sha256: check.sha256 });
+    if (!check.ok) return await fail(500, "publish_failed", "Stored object failed verification", "failed");
+    const size = check.size;
+    const sha2 = check.sha256;
     if (kind) {
       if (kind === "json" || kind === "csv") requireAppConnect(ctx);
       const a = await loadArtifact(ctx, projectId, u.artifact_id, { allowUnpublished: u.base_rev === 0 });
@@ -445,9 +480,8 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
         throw e;
       }
     } else {
-      // Binary finish must never read the whole object or perform a second write.
-      const head = await getBlobHead(ctx.env, finalKey, 16);
-      if (!head) return await fail(409, "missing_bytes", "Uploaded bytes missing", "failed");
+      // Binary finish must never read the whole object or perform a second write: check.head is its first 16 bytes.
+      const head = check.head;
       // An upload begun before own-property checking may carry an inherited name: it is never a valid type.
       if (!Object.hasOwn(BINARY_TYPES, u.mime) || !BINARY_TYPES[u.mime](head)) return await fail(415, "signature_mismatch", `Bytes are not a valid ${u.mime}`, "failed");
     }
@@ -466,7 +500,10 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
         u.base_rev,
         i,
         // change_note: recorded at upload_begin by OAuth connections (migration 0013); undefined on older schemas.
-        { ...kind ? { body: text, reservedUpload: { id: uploadId, token } } : { blobKey: finalKey }, size, sha256: sha2, mime: u.mime, revId, change_note: u.change_note ?? void 0, fence: { sql: fenced, params: [uploadId, token] } },
+        // A binary carries its publication fence LAST (docs/encryption.md): its key must still be active, or (plaintext)
+        // no real key may exist yet. Text publication is unchanged until slice 3c.
+        { ...kind ? { body: text, reservedUpload: { id: uploadId, token } } : { blobKey: finalKey, blobKeyId: held.enc_key_id ?? null, blobHeader: held.enc_header ?? null,
+          contentFences: [held.enc_key_id ? keyFence(ctx.env, { keyId: held.enc_key_id, workspaceId }) : plaintextFence(ctx.env)] }, size, sha256: sha2, mime: u.mime, revId, change_note: u.change_note ?? void 0, fence: { sql: fenced, params: [uploadId, token] } },
         [db2(ctx).prepare(`UPDATE uploads SET state = 'published', final_revision_id = ?, result = ?, finalize_token = NULL, finalize_until = NULL WHERE id = ? AND state = 'sealed' AND finalize_token = ? AND ${gate}`).bind(revId, JSON.stringify({ status: 200, body: ok2 }), uploadId, token, revId)],
         "upload.publish"
       );
@@ -481,6 +518,16 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
       // The fenced insert also fails when the lease was lost; only the current finisher may record a conflict.
       const row = await current();
       if (!row || row.state !== "sealed" || row.finalize_token !== token) return await lostAfterWrite();
+      // A fence refusal (410 key_shredded, 409 encryption_started) BEFORE the conflict branch: nothing was published
+      // (runBatch already returned any stored answer instead), so the upload ends failed, never conflict, and its object
+      // is reclaimed. A retry is a new upload.
+      const refusal = fenceRefusal(e);
+      if (refusal) {
+        if (!await end(refusal.status, refusal.code, refusal.message, "failed")) return await lost();
+        await dropUnpublished(ctx.env, uploadId, finalKey);
+        await purgeStaging(ctx.env, u);
+        throw refusal;
+      }
       if (e instanceof HttpError && (e.status === 409 || e.code === "protected_source")) {
         if (!await end(e.status, e.code, e.message, "conflict", e.extra)) return await lost();
         await dropUnpublished(ctx.env, uploadId, finalKey);
@@ -573,9 +620,10 @@ async function serveContent(ctx, req, projectId, artifactId, revParam) {
     const b = await getTextRange(ctx.env, r, start, end - start + 1);
     return new Response(b, { status, headers });
   }
-  const obj2 = await getBlob(ctx.env, r.blob_key, partial ? { offset: start, length: end - start + 1 } : void 0);
-  if (!obj2) throw new HttpError(500, "blob_missing", "Stored bytes missing");
-  return new Response(obj2.body, { status, headers });
+  // One R2 request; an encrypted version's first chunk is authenticated before the headers go out, and a later
+  // failure errors the body (docs/encryption.md#rules-for-code-that-uses-this).
+  const body = await readBlob(ctx.env, await blobRef(ctx.env, r, { projectId, artifactId }), partial ? { start, end } : null);
+  return new Response(body, { status, headers });
 }
 
 export { TEXT_UPLOAD_KINDS, UPLOAD_BEGIN_DESCRIPTION, UPLOAD_FINISH_DESCRIPTION, quotaUsedSql, serveContent, uploadBegin, uploadBeginFields, uploadFinish, uploadPut };

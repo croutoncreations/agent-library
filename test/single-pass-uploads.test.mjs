@@ -12,12 +12,13 @@ import { SERVER_PORTS } from "./ports.mjs";
 import { P, PNG, SHA, lib, world } from "./upload-world.mjs";
 import { moduleScript } from "./module-source.mjs";
 
-test("uploads.js: no direct byte buffering or stream hashing; exactly one streaming PUT call site", () => {
+test("uploads.js: no direct byte buffering or stream hashing; one binary write call site and one plaintext text PUT call site", () => {
   const src = readFileSync(join(ROOT, "packages", "core", "src", "uploads.js"), "utf8");
   assert.doesNotMatch(src, /DigestStream|sha256HexStream|getBlobBytes|\.arrayBuffer\(\)/);
-  // getBlob always gets a range argument (serveContent's is undefined only to stream a whole-file GET response).
-  assert.doesNotMatch(src, /getBlob\(\s*[^,()]+,\s*[^,()]+\)/, "getBlob without a range argument");
-  assert.equal([...src.matchAll(/putBlobStream\(/g)].length, 1, "exactly one putBlobStream call site (the PUT)");
+  // Stored bytes are read only through content-store's checked readers (readBlob, inspectUploadedBlob, getUploadedText).
+  assert.doesNotMatch(src, /\b(?:getBlob|getBlobHead|headBlob|blobSha256Hex)\b/, "a raw R2 reader in uploads.js");
+  assert.equal([...src.matchAll(/writeUploadBlob\(/g)].length, 1, "exactly one writeUploadBlob call site (the binary PUT)");
+  assert.equal([...src.matchAll(/putBlobStream\(/g)].length, 1, "exactly one putBlobStream call site (the text PUT)");
 });
 
 test("uploadFinish: every fail/lost/lostAfterWrite outcome is awaited before its finally releases the lease", () => {
