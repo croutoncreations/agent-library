@@ -3,6 +3,7 @@ import { appOrigin, artifactWebUrl, previewWebUrl } from "../links.js";
 import { appConnectEnabled, db, rtReadAuthzSql } from "../service.js";
 import { HttpError, nowMs, sha256Hex } from "../util.js";
 import { addressLinks, resolveProjectRef } from "../paths.js";
+import { U61_TOKEN, u61FoldToken } from "./unicode61.js";
 
 /** Temporary plaintext FTS bridge: only the first 1 MiB, safely below D1's 2,000,000-byte value ceiling. */
 export function textSearchBridge(env, artifactId, revisionId, text) {
@@ -104,8 +105,6 @@ async function rsCursorDecode(secret,binding,cursor) {
 // the matches in one document (minutes for a 1 MiB body of one repeated word), so it is not used.
 const RS_EXCERPT_PREFIX_CHARS = 16384;
 const RS_EXCERPT_TOKENS = 40;
-// Approximates unicode61 remove_diacritics 2: letter/number/mark runs, accents removed, lower case.
-const rsFold = (s) => s.normalize("NFD").replace(/\p{M}/gu, "").toLowerCase();
 /**
  * The window FTS5 snippet(…,40) would pick (centred on a match, or from a sentence start: +120 at the start of the
  * text, +100 elsewhere; 1000 per distinct word in the window, 1 per repeat), computed in linear time over a bounded
@@ -114,12 +113,18 @@ const rsFold = (s) => s.normalize("NFD").replace(/\p{M}/gu, "").toLowerCase();
 function rsExcerpt(source, terms) {
   const chars = Array.from(source), complete = chars.length <= RS_EXCERPT_PREFIX_CHARS; // SQL substr() counts characters
   const text = complete ? source : chars.slice(0, RS_EXCERPT_PREFIX_CHARS).join("");
-  const tokens = [...text.matchAll(/[\p{L}\p{N}\p{Co}\p{M}]+/gu)].map((m) => ({ start: m.index, end: m.index + m[0].length, word: m[0] }));
+  // Tokens and terms exactly as the index sees them (unicode61.js), so a word matches here only if it matches there.
+  const tokens = [...text.matchAll(U61_TOKEN)].map((m) => ({ start: m.index, end: m.index + m[0].length, word: m[0] }));
   if (!complete && tokens.length && tokens.at(-1).end === text.length) tokens.pop(); // may be cut mid-word
   const n = tokens.length, W = RS_EXCERPT_TOKENS, want = new Map();
-  terms.forEach((t, i) => want.set(rsFold(t), [...want.get(rsFold(t)) ?? [], i]));
+  for (const [i, t] of terms.entries()) {
+    const parts = t.match(U61_TOKEN) ?? [];
+    if (parts.length !== 1) { want.clear(); break; } // the index matches such a term as a phrase: show the start of the text
+    const word = u61FoldToken(parts[0]);
+    want.set(word, [...want.get(word) ?? [], i]);
+  }
   const inst = []; // [position, term index], in position order like FTS5 instances
-  tokens.forEach((t, p) => { for (const k of want.get(rsFold(t.word)) ?? []) inst.push([p, k]); });
+  tokens.forEach((t, p) => { for (const k of want.get(u61FoldToken(t.word)) ?? []) inst.push([p, k]); });
   const sentences = [0];
   for (let p = 1; p < n; p++) { const gap = text.slice(tokens[p - 1].end, tokens[p].start); if (/[.:][ \t\r\n]+$/.test(gap)) sentences.push(p); }
   // Sliding window over instances for non-decreasing window starts.
