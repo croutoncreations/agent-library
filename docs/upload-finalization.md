@@ -15,13 +15,34 @@ memory. Binary bytes pass through the Worker once. Text uploads are limited to 1
   integrity_mismatch` the same guarded update (`state = 'receiving'`) ends it `failed` with that result: finish replays
   the 422, a re-PUT gets `409`, and the identity's upload slot and the quota are freed at once (nothing was stored).
   Start again with a new `upload_begin`. `final_writes - 1` runs when the put settles. On success it records R2's `size` and `checksums.sha256`.
-  Each PUT has a deadline: the body is aborted at the upload's `expires_at`, and the put is abandoned at `expires_at +
-  PUT_MARGIN_MS` (60 s; `410 upload_expired`), so no put commits later than that.
+  Each PUT has a deadline: the body is aborted at the upload's `expires_at`, and the Worker stops waiting for the put
+  at `expires_at + PUT_MARGIN_MS` (60 s; `410 upload_expired`). The deadline bounds how long the Worker waits and how
+  long it accepts body bytes; it does not bound when R2 commits a put it has already received (see
+  [Interrupted writes](#interrupted-writes)).
+- With encryption configured ([encryption.md](encryption.md#files)), a binary PUT counts and hashes the plaintext in
+  front of the encryptor instead of relying on R2's checksum; the outcomes above are the same. A PUT whose workspace
+  key is shredded ends the upload `failed` with `410 key_shredded`; `500 encryption_misconfigured` leaves it
+  `pending`. Text uploads are unchanged and stay plaintext in this release.
 - `uploadFinish` checks `head(final_key)` under its lease: size and recorded SHA-256 must match the declaration.
   No recorded checksum fails closed with `500 publish_failed`. Binary finish checks the type signature in the first
   16 bytes and publishes that object without moving or rewriting it. Text finish reads the temporary input once,
   decodes strict UTF-8, runs the ordinary document validator and publishes through the intent-fenced text writer.
   Its isolate-local finish slot expires with its lease, follows renewal and can only be released by its holder.
+- Binary finish refuses a 0-byte binary with `415 signature_mismatch` before any R2 read. For an encrypted upload it
+  checks the size and SHA-256 the PUT counted, the object's metadata and stored size (one `head`), and that chunk 0
+  authenticates under the header recorded at PUT (one ranged read); later chunks are verified when they are read.
+  Publication carries a fence last in its batch. New finish outcomes, each of which ends the upload `failed` and
+  reclaims its object (a new upload is the retry):
+
+  | Answer | When |
+  |---|---|
+  | `410 key_shredded` | the workspace key was shredded (before or during publication) |
+  | `409 encryption_started` | a plaintext upload whose publication found that encryption had been configured meanwhile |
+  | `500 publish_failed` | the stored object's metadata, size or chunk 0 does not match what the PUT recorded (for example a late write of the same key), or the recorded key id names no key of the workspace, or its key row is malformed |
+
+  A finish whose publication already committed gets its stored answer on retry, even if a fence would now refuse.
+  Configuration and key-provider errors (`encryption_misconfigured`, `master_key_*`, `key_unwrap_failed`) leave the
+  upload `sealed` and retryable.
 
 Why this is safe:
 
