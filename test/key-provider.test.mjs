@@ -389,6 +389,26 @@ test("encryptionEnabled does not cache 'no key rows': a row created by another r
   await assert.rejects(lib.encryptionEnabled(r), (e) => e.status === 500 && e.code === "encryption_misconfigured");
 });
 
+test("the unwrap memo is bound to the wrapped value: a row whose wrapped value changes in the same request is unwrapped afresh and fails", async () => {
+  const { sql, DB } = mkDB();
+  const base = configuredBase(DB);
+  const { calls, keyProvider } = countingProvider();
+  const r = request(base, { keyProvider });
+  const a = await lib.workspaceDataKey(r, WS_A);
+  await lib.workspaceDataKey(request(base), WS_B);
+  const { wrapped } = rows(sql, WS_A)[0];
+  const corrupted = Buffer.from(wrapped, "base64url"); corrupted[20] ^= 1;
+  for (const other of [rows(sql, WS_B)[0].wrapped, b64url(corrupted)]) {
+    sql.prepare("UPDATE workspace_keys SET wrapped = ? WHERE key_id = ?").run(other, a.keyId);
+    const before = calls.unwrap;
+    await assert.rejects(lib.workspaceDataKey(r, WS_A), (e) => e.code === "key_unwrap_failed");
+    await assert.rejects(lib.dataKeyById(r, WS_A, a.keyId), (e) => e.code === "key_unwrap_failed");
+    assert.equal(calls.unwrap, before + 2, "unwrapped afresh, not the cached key");
+  }
+  sql.prepare("UPDATE workspace_keys SET wrapped = ? WHERE key_id = ?").run(wrapped, a.keyId);
+  assert.equal((await lib.workspaceDataKey(r, WS_A)).key, a.key, "the original row still hits the memo");
+});
+
 test("encryptionRequired reads CONTENT_ENCRYPTION_REQUIRED; only \"1\" means required", () => {
   for (const [v, want] of [[undefined, false], ["", false], ["0", false], ["1", true], [1, true]]) {
     assert.equal(lib.encryptionRequired({ CONTENT_ENCRYPTION_REQUIRED: v }), want, String(v));
