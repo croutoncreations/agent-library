@@ -107,7 +107,7 @@ test("test 20: the previous Worker keeps working on the new schema (its writes a
 // --- Statements (tests 3, 4, 26): the real compiled statements of search/tokens.js, executed on node:sqlite ---------
 const { loadWorker } = await import("./load-worker.mjs");
 const W = await import("./blind-tokens-world.mjs");
-const lib = await loadWorker({ "search/tokens.js": ["SEARCH_SQL", "lifecycleStatements", "stableReadSql", "named", "SEARCH_WRITER_ELIGIBLE"] });
+const lib = await loadWorker({ "search/tokens.js": ["SEARCH_SQL", "lifecycleStatements", "stableReadSql", "named", "SEARCH_WRITER_ELIGIBLE", "PURGE_SELECT_SQL"] });
 const S = lib.SEARCH_SQL;
 const STILL_DUE_NAMED = "EXISTS (SELECT 1 FROM projects d WHERE d.id = ?P AND d.deleted_at IS NOT NULL AND d.purged_at IS NULL AND d.purge_at <= ?NOW)";
 const PATH_A = "EXISTS (SELECT 1 FROM projects WHERE id = ?P AND purged_at IS NOT NULL)";
@@ -165,8 +165,19 @@ test("test 3: every statement's placeholders are numbered once per distinct name
     assert.ok(distinctNames.length <= 100);
     world.sql.prepare(st.sql);
   }
-  const stable = lib.stableReadSql(40);
-  assert.equal(new Set([...stable.matchAll(/\?(\d+)/g)].map((m) => m[1])).size, 81, "40 pairs and the LIMIT");
+  // Raw statements bound positionally: placeholders numbered 1..n, and node:sqlite accepts exactly n values (one more
+  // is refused; D1 refuses a mismatch either way).
+  const raw = [["stableReadSql(40)", lib.stableReadSql(40), 81], ["stableReadSql(1)", lib.stableReadSql(1), 3],
+    ["purge selection", lib.PURGE_SELECT_SQL, 1], ["lease read", S.LEASE_READ.sql, 1]];
+  for (const [name, q, n] of raw) {
+    const nums = [...q.matchAll(/\?(\d+)/g)].map((m) => Number(m[1]));
+    assert.equal(new Set(nums).size, n, name);
+    assert.equal(Math.max(...nums), n, name);
+    const st = W.mkWorld().sql.prepare(q);
+    st.all(...Array(n).fill(1));
+    assert.throws(() => st.all(...Array(n + 1).fill(1)), /out of range/, `${name}: ${n + 1} values refused`);
+  }
+  assert.doesNotMatch(lib.PURGE_SELECT_SQL + S.LEASE_READ.sql + lib.stableReadSql(1), /\?(?!\d)/, "no unnumbered placeholder");
   const t = (st) => st.template.replace(/\s+/g, " ");
   assert.match(t(S.T1s), /WHERE doc_id = \?SEEN_DOC AND artifact_id = \?A AND gen = \?SEEN_GEN AND revision_id <> '' AND workspace_id = \?W AND owner_id = \?O/);
   for (const k of ["L", "K", "X"]) assert.match(t(lifecycle[k]), /workspace_id = \?W AND owner_id = \?O/, k);
@@ -475,4 +486,48 @@ test("test 26: a dead writer between two caps never leaves more than its bound; 
   const row = W.docRow(world, "art_1");
   assert.deepEqual([row.revision_id, row.writer], ["", "V"]);
   assertExact(world);
+});
+
+// --- Review fixes: T1r (commit A item 3) -----------------------------------------------------------------------------
+test("review A3: T1r never matches a row at '', and with [T1u, T1r] exactly one changes the row", () => {
+  const world = setup();
+  indexNew(world, [tok(1), tok(2)]);
+  const v = base({ NONCE: "R1", DIGEST: "other" });
+  // Complete row: T1u changes nothing, T1r takes it.
+  assert.deepEqual(batch(world, [[S.T1u, v], [S.T1r, v]]), [0, 1]);
+  assert.deepEqual([W.docRow(world, "art_1").revision_id, W.docRow(world, "art_1").writer], ["", "R1"]);
+  // Row at '': T1r never matches it; T1u takes it.
+  const v2 = base({ NONCE: "R2", DIGEST: "other" });
+  assert.equal(exec(world, S.T1r, v2), 0);
+  assert.deepEqual(batch(world, [[S.T1u, v2], [S.T1r, v2]]), [1, 0]);
+  assert.equal(W.docRow(world, "art_1").writer, "R2");
+});
+
+test("review A3: T1r leaves a row that is already correct for this head, key and target untouched", () => {
+  const world = setup();
+  indexNew(world, [tok(1), tok(2)]);
+  const before = W.docRow(world, "art_1");
+  assert.equal(exec(world, S.T1r, base({ NONCE: "R1", DIGEST: "dg" })), 0, "same head, key and digest");
+  assert.deepEqual(W.docRow(world, "art_1"), before);
+  assert.equal(exec(world, S.T1r, base({ NONCE: "R1", DIGEST: "dg", K: "sk_2" })), 1, "another key: re-leased");
+});
+
+test("review A3: a re-plan after losing to another writer's T4 ends exact", () => {
+  const world = setup();
+  indexNew(world, [tok(1), tok(2)]);
+  const d0 = W.docRow(world, "art_1");
+  // X planned a stable rewrite to {2, 3}; Y completed {1, 4} first (gen moved), so X's T1s fails and X re-plans.
+  const Y = base({ NONCE: "Y", D: d0.doc_id, SEEN_DOC: d0.doc_id, SEEN_GEN: d0.gen });
+  batch(world, [[S.T1s, Y], [S.existing.R, { ...Y, REM: JSON.stringify([tok(2)]) }], [S.Rc, Y], [S.existing.A, { ...Y, ADD: JSON.stringify([tok(4)]) }], [S.Ac, Y],
+    [S.existing.T4, { ...Y, N: 2, REASON: "", DIGEST: "y" }]]);
+  const X = base({ NONCE: "X", D: d0.doc_id, SEEN_DOC: d0.doc_id, SEEN_GEN: d0.gen, DIGEST: "x" });
+  assert.equal(exec(world, S.T1s, X), 0, "stale gen");
+  assert.deepEqual(batch(world, [[S.T1u, X], [S.T1r, X]]), [0, 1]);
+  const have = exec(world, S.LEASE_READ, X).map((r) => r.t);
+  assert.deepEqual(have, [tok(1), tok(4)]);
+  batch(world, [[S.fresh.R, { ...X, REM: JSON.stringify([tok(1), tok(4)]) }], [S.Rc, X], [S.fresh.A, { ...X, ADD: JSON.stringify([tok(2), tok(3)]) }], [S.Ac, X],
+    [S.fresh.T4, { ...X, N: 2, REASON: "" }]]);
+  assert.deepEqual(W.tokensOf(world, "art_1"), [tok(2), tok(3)]);
+  assert.equal(W.docRow(world, "art_1").token_digest, "x");
+  assertClaims(world); assertExact(world);
 });

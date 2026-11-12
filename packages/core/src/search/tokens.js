@@ -48,22 +48,35 @@ const DOC_ROW_UNITS = 5;
 const SCOPE_REASONS = ["workspace", "owner", "installation"];
 
 // --- Worker vars --------------------------------------------------------------------------------------------------
-const varCount = (v) => typeof v === "number" ? (Number.isSafeInteger(v) && v >= 0 ? v : null)
+const parseCount = (v) => typeof v === "number" ? (Number.isSafeInteger(v) && v >= 0 ? v : null)
   : typeof v === "string" && /^\d{1,12}$/.test(v) ? Number(v) : null;
+/** Vars already logged as invalid in this isolate (by name, never the value). */
+const invalidVarsLogged = new Set();
+/** A SEARCH_* var as a count, or null when unset; a value that is not accepted logs search_var_invalid once and is null. */
+function varCount(env, name) {
+  const v = env?.[name];
+  if (v === undefined || v === null || v === "") return null;
+  const n = parseCount(v);
+  if (n === null && !invalidVarsLogged.has(name)) {
+    invalidVarsLogged.add(name);
+    console.error(JSON.stringify({ event: "search_var_invalid", name }));
+  }
+  return n;
+}
 /** SEARCH_TERMS_MAX: 0–20000 (lower only; default 20000). 0 = no body tokens and no extraction. */
-export const searchTermsMax = (env) => Math.min(varCount(env?.SEARCH_TERMS_MAX) ?? SEARCH_TERMS_CEILING, SEARCH_TERMS_CEILING);
+export const searchTermsMax = (env) => Math.min(varCount(env, "SEARCH_TERMS_MAX") ?? SEARCH_TERMS_CEILING, SEARCH_TERMS_CEILING);
 /** The three bounds in charged units; `limits` is the workspace's entitlements (its `search_terms`, if any). */
 export function searchScopeBounds(env, limits = {}) {
   const plan = limits?.search_terms;
   return {
-    workspace: Number.isSafeInteger(plan) && plan >= 0 ? plan : varCount(env?.SEARCH_WORKSPACE_TERMS_MAX) ?? SEARCH_BOUNDS_DEFAULT.workspace,
-    owner: varCount(env?.SEARCH_OWNER_TERMS_MAX) ?? SEARCH_BOUNDS_DEFAULT.owner,
-    installation: Math.min(varCount(env?.SEARCH_INSTALLATION_TERMS_MAX) ?? SEARCH_BOUNDS_DEFAULT.installation, SEARCH_BOUNDS_DEFAULT.installation),
+    workspace: Number.isSafeInteger(plan) && plan >= 0 ? plan : varCount(env, "SEARCH_WORKSPACE_TERMS_MAX") ?? SEARCH_BOUNDS_DEFAULT.workspace,
+    owner: varCount(env, "SEARCH_OWNER_TERMS_MAX") ?? SEARCH_BOUNDS_DEFAULT.owner,
+    installation: Math.min(varCount(env, "SEARCH_INSTALLATION_TERMS_MAX") ?? SEARCH_BOUNDS_DEFAULT.installation, SEARCH_BOUNDS_DEFAULT.installation),
   };
 }
 /** SEARCH_SWEEP_WRITES_MAX: b-tree rows the sweep writes per cron run (lower only, default 10000; 0 off; 1–49 as 50). */
 export function searchSweepWritesMax(env) {
-  const n = Math.min(varCount(env?.SEARCH_SWEEP_WRITES_MAX) ?? 10000, 10000);
+  const n = Math.min(varCount(env, "SEARCH_SWEEP_WRITES_MAX") ?? 10000, 10000);
   return n === 0 ? 0 : Math.max(n, 50);
 }
 /** UTF-8 length of a string without encoding it (a lone surrogate counts as U+FFFD, 3 bytes). */
@@ -100,13 +113,26 @@ export function u61FoldTokenBounded(word, max = SEARCH_TERM_UNITS_MAX) {
 /** Calls add(term) for each distinct folded term, in text order, up to `cap`. Returns true if a further one was cut. */
 function scanTerms(text, cap, add) {
   if (cap <= 0 || !text) return false;
+  try { return scanTermsIn(text, cap, add); } finally { forgetLastMatch(); }
+}
+/**
+ * The legacy RegExp statics (RegExp.input, lastMatch, …) keep the last subject a regular expression matched alive, so
+ * after scanning a large text the text itself would stay reachable. One match on an empty string replaces them.
+ */
+const EMPTY_MATCH = /(?:)/;
+const forgetLastMatch = () => { EMPTY_MATCH.exec(""); };
+function scanTermsIn(text, cap, add) {
   const seen = new Set();
   for (const m of text.matchAll(U61_TOKEN)) {
-    const t = u61FoldTokenBounded(m[0]);
-    if (!t || seen.has(t)) continue;
-    if (seen.size >= cap) return true;
-    seen.add(t);
-    add(t);
+    // A lone surrogate reaches SQLite as U+FFFD, a separator: re-tokenize just that match (rare; no whole-text copy).
+    const words = /** @type {any} */ (m[0]).isWellFormed() ? [m[0]] : Array.from(/** @type {any} */ (m[0]).toWellFormed().matchAll(U61_TOKEN), (x) => x[0]);
+    for (const w of words) {
+      const t = u61FoldTokenBounded(w);
+      if (!t || seen.has(t)) continue;
+      if (seen.size >= cap) return true;
+      seen.add(t);
+      add(t);
+    }
   }
   return false;
 }
@@ -211,12 +237,14 @@ export async function searchTokenKey(env, workspaceId) {
     return { keyId: dk.keyId, key: await p, encrypted: true };
   }
   const fresh = crypto.getRandomValues(new Uint8Array(32));
-  const [, read] = await env.DB.batch([
-    env.DB.prepare("INSERT INTO workspace_search_keys (workspace_id, key_id, secret, created_at) VALUES (?, ?, ?, ?) ON CONFLICT (workspace_id) DO NOTHING")
-      .bind(workspaceId, randomId("sk"), b64urlEncode(fresh), Date.now()),
-    env.DB.prepare("SELECT key_id, secret FROM workspace_search_keys WHERE workspace_id = ?").bind(workspaceId),
-  ]);
-  fresh.fill(0);
+  let read;
+  try {
+    [, read] = await env.DB.batch([
+      env.DB.prepare("INSERT INTO workspace_search_keys (workspace_id, key_id, secret, created_at) VALUES (?, ?, ?, ?) ON CONFLICT (workspace_id) DO NOTHING")
+        .bind(workspaceId, randomId("sk"), b64urlEncode(fresh), Date.now()),
+      env.DB.prepare("SELECT key_id, secret FROM workspace_search_keys WHERE workspace_id = ?").bind(workspaceId),
+    ]);
+  } finally { fresh.fill(0); }
   const row = read?.results?.[0];
   if (!row) throw new HttpError(500, "search_key_invalid", "A workspace search key record is missing");
   const raw = decodeSearchSecret(row.secret);
@@ -319,7 +347,8 @@ WHERE artifact_id = ?A AND revision_id = '' AND workspace_id = ?W AND owner_id =
   // any complete row under the same gates; the set is then read under the lease, so no gen pin is needed.
   T1r: named(`UPDATE search_token_docs SET revision_id = '', writer = ?NONCE, gen = gen + 1, key_id = ?K, token_digest = '',
   truncated = 0, truncated_by = '', updated_at = ?NOW
-WHERE artifact_id = ?A AND revision_id <> '' AND workspace_id = ?W AND owner_id = ?O AND ${H} AND ${LIVE}`),
+WHERE artifact_id = ?A AND revision_id <> '' AND workspace_id = ?W AND owner_id = ?O AND ${H} AND ${LIVE}
+  AND NOT (revision_id = ?R AND key_id = ?K AND token_digest = ?DIGEST)`),
   LEASE_READ: named(`SELECT d.writer, lower(hex(s.token)) AS t FROM search_token_docs d LEFT JOIN search_tokens s ON s.doc_id = d.doc_id
   WHERE d.artifact_id = ?A ORDER BY s.token LIMIT ${SET_READ_LIMIT}`),
   Rc: named(`UPDATE search_term_counters SET terms = terms - changes() WHERE ${SCOPES}`),
@@ -411,6 +440,11 @@ function phase(run, name) {
 }
 
 // --- Runs ---------------------------------------------------------------------------------------------------------
+/** A byte or call amount: a finite non-negative integer, else 500 search_amount_invalid (nothing is stored). */
+function amount(n) {
+  if (!Number.isSafeInteger(n) || n < 0) throw new HttpError(500, "search_amount_invalid", "A search reservation amount is invalid");
+  return n;
+}
 /** Thrown to end a run without storing anything further: deadline, budget, detached, or an error already logged. */
 class RunStop extends Error {
   constructor(reason) { super(reason); this.reason = reason; }
@@ -456,6 +490,7 @@ function detachExpired(now, except = null) {
  * refusal while the detached set is full logs search_admission_stuck (the caller logs it at most once per request).
  */
 export function openSearchRun({ declaredCalls = 0 } = {}) {
+  amount(declaredCalls);
   const now = Date.now();
   detachExpired(now);
   const bytes = SEARCH_CALL_ENVELOPE_BYTES + SEARCH_RUN_BASE_BYTES;
@@ -483,9 +518,11 @@ export class SearchRun {
     this.phases = new Set();
     this.skipped = {};
     this.completed = 0;
+    this.unchanged = 0;
   }
   /** Add `bytes` to the payload if the run (26 MiB) and the isolate (32 MiB) stay within their limits; else false. */
   reserve(bytes) {
+    amount(bytes);
     if (this.detached || this.settled) return false;
     if (this.envelope + this.payload + bytes > SEARCH_RUN_MAX_BYTES) return false;
     detachExpired(Date.now(), this);
@@ -495,13 +532,14 @@ export class SearchRun {
     return true;
   }
   release(bytes) {
+    amount(bytes);
     if (this.detached || this.settled) return;
     const n = Math.min(bytes, this.payload);
     this.payload -= n;
     isolate.activeBytes -= n;
   }
   /** Lower (never raise) a job's charge to `bytes`. */
-  lower(job, bytes) { if (bytes < job.charge) { this.release(job.charge - bytes); job.charge = bytes; } }
+  lower(job, bytes) { amount(bytes); if (bytes < job.charge) { this.release(job.charge - bytes); job.charge = bytes; } }
   skip(reason, n = 1) { this.skipped[reason] = (this.skipped[reason] ?? 0) + n; }
   /** Before any call or bounded step: refuse if detached, past the deadline or (for D1 calls) out of calls. */
   before(isCall) {
@@ -571,16 +609,37 @@ async function step(run, work) {
 }
 
 /** A job as the holder keeps it: meta is small; text, flat, terms, tokens, removes and adds are the large fields. */
-export function searchJob(env, { artifactId, projectId, revisionId, text = null, flat = null, textBytes, textUnits }) {
-  if (typeof artifactId !== "string" || typeof projectId !== "string" || typeof revisionId !== "string")
-    throw new HttpError(500, "search_job_invalid", "A search job needs artifact, project and revision ids");
-  const bytes = textBytes ?? (text === null ? 0 : utf8Length(text));
-  const cap = searchDocCap(env, bytes);
+/**
+ * A job as the holder keeps it, from a descriptor { artifactId, projectId, revisionId } plus either { text, textBytes }
+ * (textBytes: the stored UTF-8 size, required; admission never scans the text) or { flat, textBytes, textUnits }
+ * (upload finish: flat from extractSearchTermsFlat). Anything else is 500 search_job_invalid, thrown before any
+ * reservation changes.
+ */
+export function searchJob(env, input) {
+  const invalid = (why) => new HttpError(500, "search_job_invalid", "A search job is invalid: " + why);
+  const { artifactId, projectId, revisionId, text = null, flat = null, textBytes, textUnits } = input ?? {};
+  if (typeof artifactId !== "string" || typeof projectId !== "string" || typeof revisionId !== "string") throw invalid("ids");
+  const count = (n) => Number.isSafeInteger(n) && n >= 0;
+  if ((text === null) === (flat === null)) throw invalid("exactly one of text and flat");
+  if (!count(textBytes)) throw invalid("textBytes");
+  if (text !== null && typeof text !== "string") throw invalid("text");
+  if (text !== null && textUnits !== undefined && textUnits !== text.length) throw invalid("textUnits");
+  if (flat !== null && !count(textUnits)) throw invalid("textUnits");
+  const cap = searchDocCap(env, textBytes);
+  const units = text !== null ? text.length : textUnits;
+  if (flat !== null) {
+    // The flat terms must be what their charge covers: at most `cap` terms, consistent offsets, within 3 × units.
+    const { bytes, offsets, count: n } = flat;
+    if (!(bytes instanceof Uint8Array) || !(offsets instanceof Uint32Array) || !count(n) || offsets.length !== n + 1
+      || offsets[0] !== 0 || offsets[n] !== bytes.byteLength || bytes.byteLength > Math.min(12000000, 3 * units)) throw invalid("flat");
+    for (let i = 0; i < n; i++) if (offsets[i + 1] < offsets[i]) throw invalid("flat offsets");
+    if (n > cap && cap > 0) throw invalid("flat count");
+  }
   // SEARCH_TERMS_MAX = 0: no extraction; the text is never kept (the row is written complete as `off`).
-  if (cap === 0) { text = null; flat = null; }
+  const off = cap === 0;
   return {
-    meta: { artifactId, projectId, revisionId }, text, flat, terms: null, tokens: null, removes: null, adds: null,
-    cap, units: cap === 0 ? 0 : textUnits ?? (text === null ? 0 : text.length), charge: 0, reason: "", digest: "",
+    meta: { artifactId, projectId, revisionId }, text: off ? null : text, flat: off ? null : flat, terms: null, tokens: null, removes: null, adds: null,
+    cap, units: off ? 0 : units, charge: 0, reason: "", digest: "",
     kind: null, row: null, scope: null, done: false, replanned: false,
   };
 }
@@ -630,6 +689,7 @@ async function workspaceSetup(db, run, job) {
 
 /** Extract (if needed) and HMAC one job's terms into job.tokens, then its digest. Text and terms are released. */
 async function prepareTokens(db, run, job) {
+  run.current = job.meta.artifactId;
   const ws = await workspaceSetup(db, run, job);
   if (job.text !== null) {
     const p = extractSearchTermsUnits(job.text, job.cap);
@@ -857,15 +917,22 @@ async function writeUnstable(db, run, job, queue) {
   const v = jobValues(run, job);
   const fence = job.fence.kind === "key" ? keyFence(db, { keyId: job.fence.keyId, workspaceId: job.fence.workspaceId }) : plaintextFence(db);
   let leased;
+  // A re-plan is not started without the calls to finish it: the lease batch, the lease read and one write.
+  if (job.replanned && run.callBudget - run.calls < 3) { finishJob(run, job, "budget"); return; }
   try {
-    // A re-planned row may be complete again (T1r); exactly one of the two can change it.
+    // A re-planned row may be complete again (T1r); exactly one of the two can change it. T1r leaves a row that is
+    // already correct for this head, key and target alone, and the job then ends unchanged.
     leased = await db.DB.batch(job.replanned ? [bindNamed(db, SEARCH_SQL.T1u, v), bindNamed(db, SEARCH_SQL.T1r, v), fence] : [bindNamed(db, SEARCH_SQL.T1u, v), fence]);
   } catch (e) {
     if (e instanceof RunStop) throw e;
     logError("search_index_failed", { artifactId: job.meta.artifactId, code: fenceRefusal(e)?.code ?? e?.code ?? "error" });
     throw new RunStop("error");
   }
-  if (!(leased[0]?.meta?.changes > 0) && !(job.replanned && leased[1]?.meta?.changes > 0)) { finishJob(run, job, "lost"); return; }
+  if (!(leased[0]?.meta?.changes > 0) && !(job.replanned && leased[1]?.meta?.changes > 0)) {
+    if (job.replanned && await rowIsCurrent(db, job)) { run.unchanged++; finishJob(run, job); return; }
+    finishJob(run, job, "lost");
+    return;
+  }
   for (let attempt = 0; ; attempt++) {
     run.holder.set = (await db.DB.prepare(SEARCH_SQL.LEASE_READ.sql).bind(job.meta.artifactId).all()).results;
     const h = run.holder;
@@ -880,6 +947,11 @@ async function writeUnstable(db, run, job, queue) {
   await writeJob(db, run, job, null, queue);
 }
 
+/** Is the job's row complete for its head, key and target (another writer finished the same work)? */
+async function rowIsCurrent(db, job) {
+  const r = await db.DB.prepare("SELECT revision_id, key_id, token_digest FROM search_token_docs WHERE artifact_id = ?").bind(job.meta.artifactId).first();
+  return !!r && r.revision_id === job.meta.revisionId && r.key_id === job.keyId && r.token_digest === job.digest;
+}
 /** Oversize path: delete the set under this run's own lease with K/Kc ($H AND $LIVE), log, leave the row at ''. */
 async function oversize(db, run, job) {
   logError("search_set_oversize", { artifactId: job.meta.artifactId });
@@ -895,7 +967,12 @@ async function oversize(db, run, job) {
   finishJob(run, job, "oversize");
 }
 
-/** Stable group: the pinned read, then (no await) the diffs of as many members as can be charged; set nulled after. */
+/**
+ * Stable group: the pinned read, then (no await) the diffs of as many members as can be charged; set nulled after.
+ * Every member's diff is built before any is packed (a deviation from the design's one-current-document remainder).
+ * The bound still holds: a group holds at most 20,000 stored tokens, so its removes are at most 20,000, each charged
+ * before it is retained, plus at most one pending batch (10,000) from earlier documents: at most 30,000 charged.
+ */
 async function writeStableGroup(db, run, group, queue) {
   const params = [];
   let rows = 0;
@@ -952,7 +1029,7 @@ async function writeRun(db, run) {
         if (group.length && tokens + j.row.term_count > STABLE_GROUP_TOKENS) break;
         await prepareTokens(db, run, j);
         i++;
-        if (j.row.revision_id === j.meta.revisionId && j.row.key_id === j.keyId && j.row.token_digest === j.digest) { finishJob(run, j); continue; }
+        if (j.row.revision_id === j.meta.revisionId && j.row.key_id === j.keyId && j.row.token_digest === j.digest) { run.unchanged++; finishJob(run, j); continue; }
         j.noAdds = SCOPE_REASONS.includes(j.row.truncated_by) && j.scope.left <= 0;
         tokens += j.row.term_count;
         group.push(j);
@@ -967,11 +1044,11 @@ async function writeRun(db, run) {
     // New document: base empty. No tokens (empty text or off): T1z, complete at once.
     if (!job.tokens.length) {
       job.kind = "empty";
-      diffInto(run, job, () => "", 0);
+      if (!diffInto(run, job, () => "", 0)) { finishJob(run, job, "charge"); continue; }
       await writeJob(db, run, job, [SEARCH_SQL.T1z, SEARCH_SQL.T1nc], queue);
       continue;
     }
-    diffInto(run, job, () => "", 0);
+    if (!diffInto(run, job, () => "", 0)) { finishJob(run, job, "charge"); continue; }
     await writeJob(db, run, job, [SEARCH_SQL.T1n, SEARCH_SQL.T1nc], queue);
   }
   await flush(db, run, queue);
@@ -994,6 +1071,7 @@ export async function runSearchIndexing(env, run) {
   try {
     await nextTurn();
     if (run.detached) return;
+    if (run.stopped) throw new RunStop(run.stopped);
     run.startedAt = Date.now();
     run.deadline = run.startedAt + SEARCH_RUN_DEADLINE_MS;
     phase(run, "deferred_start");
@@ -1005,7 +1083,7 @@ export async function runSearchIndexing(env, run) {
       if (e.reason === "deadline") phase(run, "deadline");
       for (const job of run.holder.jobs ?? []) if (!job.done) run.skip(e.reason);
     } else {
-      logError("search_index_failed", { run: run.id, code: fenceRefusal(e)?.code ?? e?.code ?? "error" });
+      logError("search_index_failed", { run: run.id, ...run.current ? { artifactId: run.current } : {}, code: fenceRefusal(e)?.code ?? e?.code ?? "error" });
       for (const job of run.holder.jobs ?? []) if (!job.done) run.skip("error");
     }
   } finally {
@@ -1023,8 +1101,9 @@ export async function runSearchIndexing(env, run) {
  */
 export async function indexSearchJobs(env, jobs, { declaredCalls = 0 } = {}) {
   const run = openSearchRun({ declaredCalls });
-  if (!run) return { run: null, calls: 0, completed: 0, skipped: { admission: jobs.length }, tokenOps: 0, maxRemoveValues: 0 };
-  admitSearchJobs(env, run, jobs);
+  if (!run) return { run: null, calls: 0, completed: 0, unchanged: 0, skipped: { admission: jobs.length }, tokenOps: 0, maxRemoveValues: 0 };
+  // A descriptor that throws settles the run (holder cleared, reservation released) before the error goes on.
+  try { admitSearchJobs(env, run, jobs); } catch (e) { run.settle(); throw e; }
   await track(run, runSearchIndexing(env, run));
   return runTally(run);
 }
@@ -1092,8 +1171,20 @@ export function startDeferredWork(env, ctx) {
   }
   for (const [k, n] of Object.entries(q.skipped)) run.skip(k, n);
   q.skipped = {};
+  // Without a usable ctx.waitUntil the run is never started: it is settled and its jobs counted as skipped.
+  if (typeof ctx?.waitUntil !== "function") { dropRun(q, run, "unstarted"); return; }
   phase(run, "handler_done");
-  ctx.waitUntil(track(run, runSearchIndexing(env, run)));
+  const p = track(run, runSearchIndexing(env, run));
+  // The run has not done anything yet (it begins with scheduler.wait(0)): if waitUntil throws, it stops at once.
+  try { ctx.waitUntil(p); } catch { run.stopped = "unstarted"; }
+}
+/** Settle a run that never started: count its jobs as skipped for `reason` and log the request's skips. */
+function dropRun(q, run, reason) {
+  for (const [k, n] of Object.entries(run.skipped)) q.skipped[k] = (q.skipped[k] ?? 0) + n;
+  const n = run.holder.jobs?.length ?? 0;
+  if (n) q.skipped[reason] = (q.skipped[reason] ?? 0) + n;
+  run.settle();
+  logRequestSkips(q);
 }
 /** In the fetch wrapper's `finally`: a run that was not started is dropped (holder nulled, reservation released). */
 export function discardDeferredWork(env) {
@@ -1102,12 +1193,8 @@ export function discardDeferredWork(env) {
   q.discarded = true;
   const run = q.run;
   q.run = null;
-  if (run) {
-    for (const [k, n] of Object.entries(run.skipped)) q.skipped[k] = (q.skipped[k] ?? 0) + n;
-    q.skipped.discarded = (q.skipped.discarded ?? 0) + (run.holder.jobs?.length ?? 0);
-    run.settle();
-  }
-  logRequestSkips(q);
+  if (run) dropRun(q, run, "discarded");
+  else logRequestSkips(q);
 }
 /** Resolves when every run started in this isolate so far has settled (tests and local tools). */
 export async function drainSearchIndexing() {
@@ -1118,8 +1205,20 @@ export async function drainSearchIndexing() {
  * the isolate's free bytes); the rest are counted as skipped (admission). Rejected jobs never enter the holder.
  */
 export function admitSearchJobs(env, run, jobs) {
-  for (const input of jobs) {
-    const job = searchJob(env, input);
+  // Every descriptor is checked before anything is reserved, so a bad one changes no counter.
+  const all = jobs.map((input) => searchJob(env, input));
+  // Within one call, only the last job of each artifact is admitted.
+  const last = new Map(all.map((j, i) => [j.meta.artifactId, i]));
+  for (const job of all.filter((j, i) => last.get(j.meta.artifactId) === i)) {
+    // The same artifact twice: the later job replaces the earlier one (its charge released, its text dropped).
+    const prev = run.holder.jobs.findIndex((j) => j.meta.artifactId === job.meta.artifactId);
+    if (prev >= 0) {
+      const old = run.holder.jobs[prev];
+      run.release(old.charge);
+      run.textUnits -= old.units;
+      run.holder.jobs.splice(prev, 1);
+      old.text = null; old.flat = null;
+    }
     const charge = searchJobCharge(job, { upload: job.flat !== null });
     if (run.holder.jobs.length >= SEARCH_RUN_LIMITS.docs || run.textUnits + job.units > SEARCH_RUN_LIMITS.textUnits || !run.reserve(charge)) { run.skip("admission"); continue; }
     job.charge = charge;
@@ -1127,7 +1226,7 @@ export function admitSearchJobs(env, run, jobs) {
     run.holder.jobs.push(job);
   }
 }
-export const runTally = (run) => ({ run: run.id, calls: run.calls, completed: run.completed, skipped: { ...run.skipped }, tokenOps: run.tokenOps, maxRemoveValues: run.maxRemoveValues });
+export const runTally = (run) => ({ run: run.id, calls: run.calls, completed: run.completed, unchanged: run.unchanged, skipped: { ...run.skipped }, tokenOps: run.tokenOps, maxRemoveValues: run.maxRemoveValues });
 
 // --- Lifecycle: the project-purge step and the orphan sweep --------------------------------------------------------
 const PURGE_DOCS_PER_ROUND = 20;
@@ -1140,7 +1239,7 @@ const tokensLeftSql = (cap) => `CASE WHEN d.revision_id <> '' THEN d.term_count
   ELSE (SELECT COUNT(*) FROM (SELECT 1 FROM search_tokens s WHERE s.doc_id = d.doc_id LIMIT ${cap})) END`;
 const DOC_FIELDS = "d.doc_id, d.workspace_id, d.owner_id, d.project_id, d.artifact_id";
 /** The purge's per-round selection (search_token_docs_project). */
-const PURGE_SELECT_SQL = `SELECT ${DOC_FIELDS}, ${tokensLeftSql(LIFECYCLE_CHUNK_MAX + 1)} AS n FROM search_token_docs d WHERE d.project_id = ?1 LIMIT ${PURGE_DOCS_PER_ROUND}`;
+export const PURGE_SELECT_SQL = `SELECT ${DOC_FIELDS}, ${tokensLeftSql(LIFECYCLE_CHUNK_MAX + 1)} AS n FROM search_token_docs d WHERE d.project_id = ?1 LIMIT ${PURGE_DOCS_PER_ROUND}`;
 /** The purge step's eligibility: purge.js STILL_DUE with ?P (project) and ?NOW. */
 export const PURGE_ELIGIBLE = "EXISTS (SELECT 1 FROM projects d WHERE d.id = ?P AND d.deleted_at IS NOT NULL AND d.purged_at IS NULL AND d.purge_at <= ?NOW)";
 

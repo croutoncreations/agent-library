@@ -20,6 +20,9 @@ const lib = await loadWorker({
   "adapters.js": ["withAdapters", "resolveAdapters"],
 });
 const AT = "2026-11-11T00:00:00.000Z";
+/** Text jobs carry their stored UTF-8 size (textBytes is required: admission never scans the text). */
+const withBytes = (j) => typeof j.text === "string" && j.textBytes === undefined ? { ...j, textBytes: Buffer.byteLength(j.text) } : j;
+const indexJobs = (env, jobs, opts) => lib.indexSearchJobs(env, jobs.map(withBytes), opts);
 const QUARTER = 900000;
 const quiet = async (fn) => {
   const { log, error } = console, out = [];
@@ -165,7 +168,7 @@ test("test 14: a project restored between rounds keeps its remaining rows, which
   W.seedDoc(world, { project: "p_s", artifact: "keep_1" });
   const env = envOf(world);
   W.run(world, "UPDATE projects SET deleted_at = NULL, purge_at = NULL WHERE id = 'p_s'");
-  await quiet(() => lib.indexSearchJobs(env, [{ artifactId: "keep_1", projectId: "p_s", revisionId: "rev_keep_1", text: "one two three four five six" }]));
+  await quiet(() => indexJobs(env, [{ artifactId: "keep_1", projectId: "p_s", revisionId: "rev_keep_1", text: "one two three four five six" }]));
   W.run(world, "UPDATE projects SET deleted_at = 1, purge_at = 1 WHERE id = 'p_s'");
   assert.ok(!W.missing(world).includes("keep_1"), "a soft-deleted project's documents are not missing");
   // One round with a tiny budget: the purge leases the row and deletes 2 tokens.
@@ -173,7 +176,7 @@ test("test 14: a project restored between rounds keeps its remaining rows, which
   assert.equal(W.docRow(world, "keep_1").revision_id, "");
   W.run(world, "UPDATE projects SET deleted_at = NULL, purge_at = NULL WHERE id = 'p_s'");
   assert.ok(W.missing(world).includes("keep_1"), "back after the restore, listed missing");
-  const { result } = await quiet(() => lib.indexSearchJobs(env, [{ artifactId: "keep_1", projectId: "p_s", revisionId: "rev_keep_1", text: "one two three four five six" }]));
+  const { result } = await quiet(() => indexJobs(env, [{ artifactId: "keep_1", projectId: "p_s", revisionId: "rev_keep_1", text: "one two three four five six" }]));
   assert.equal(result.completed, 1);
   assert.equal(W.tokensOf(world, "keep_1").length, 6);
   assert.ok(!W.missing(world).includes("keep_1"));
@@ -192,7 +195,7 @@ test("test 14: counters return to their start after the purge and sweep path C d
     W.seedDoc(world, { project: p, artifact: a });
     jobs.push({ artifactId: a, projectId: p, revisionId: `rev_${a}`, text: `alpha beta ${a} gamma${i}` });
   }
-  assert.equal((await quiet(() => lib.indexSearchJobs(env, jobs))).result.completed, 6);
+  assert.equal((await quiet(() => indexJobs(env, jobs))).result.completed, 6);
   assert.notDeepEqual(W.counters(world), start);
   W.run(world, "UPDATE projects SET deleted_at = 1, purge_at = 1 WHERE id = 'proj_n1'");
   for (let i = 0; i < 5 && !purgedAt(world, "proj_n1"); i++) await quiet(() => lib.purgeDueProjects(env, { projectId: "proj_n1" }));
@@ -219,7 +222,7 @@ test("test 14: multi-batch path C cleanup of 3 documents × 20,000 tokens stays 
     assert.equal(before - (W.counters(world)["w:wsp_c"] ?? 0), t.tokens + 5 * t.docs, "counters drop by exactly what was deleted");
     assertExact(world);
     // A writer tries mid-cleanup: $LIVE fails for a deleting workspace, so it writes nothing.
-    const w = (await quiet(() => lib.indexSearchJobs(env, [{ artifactId: ids[0], projectId: "proj_c", revisionId: `rev_${ids[0]}`, text: "alpha" }]))).result;
+    const w = (await quiet(() => indexJobs(env, [{ artifactId: ids[0], projectId: "proj_c", revisionId: `rev_${ids[0]}`, text: "alpha" }]))).result;
     assert.equal(w.completed, 0);
     assertClaims(world);
   }
@@ -462,12 +465,18 @@ test("test 21 (timing): one cron sweep run over about 1 million token rows on lo
   const total = (await d1one("SELECT COUNT(*) AS n FROM search_tokens"))[0].n;
   assert.ok(total >= 1000000, `${total} token rows`);
   const before = (await d1one("SELECT terms FROM search_term_counters WHERE scope = 'i'"))[0].terms;
+  // Wait for this cron run's own completion signal: its search_sweep log line (bounded at 5 minutes, not 10 s).
+  const logPath = join(ROOT, "tmp", "test-state-blind-tokens.log");
+  const sweepsBefore = readFileSync(logPath, "utf8").split('"event":"search_sweep"').length;
   const t0 = Date.now();
   const r = await cron(1767225600000);
   await r.text();
-  let after = before;
-  for (let i = 0; i < 100 && after === before; i++) { await new Promise((r2) => setTimeout(r2, 100)); after = (await d1one("SELECT terms FROM search_term_counters WHERE scope = 'i'"))[0].terms; }
+  while (readFileSync(logPath, "utf8").split('"event":"search_sweep"').length === sweepsBefore) {
+    assert.ok(Date.now() - t0 < 300000, "the cron's sweep finished within 5 minutes");
+    await new Promise((r2) => setTimeout(r2, 100));
+  }
   const sweepMs = Date.now() - t0;
+  const after = (await d1one("SELECT terms FROM search_term_counters WHERE scope = 'i'"))[0].terms;
   assert.ok(before - after > 0 && before - after <= 5000 + 5 * 20, `one run deleted ${before - after} units`);
   for (const row of await d1one(COUNTERS_EXACT)) assert.equal(row.terms, row.want, row.scope);
   // Writer timings on node:sqlite over about 1 million existing entries.
@@ -478,11 +487,11 @@ test("test 21 (timing): one cron sweep run over about 1 million token rows on lo
   const env = envOf(world);
   const words = (n, p) => Array.from({ length: n }, (_, i) => p + i.toString(36).padStart(6, "0")).join(" ");
   let t = Date.now();
-  const first = (await quiet(() => lib.indexSearchJobs(env, [{ artifactId: "bench_1", projectId: "proj_a", revisionId: "rev_bench_1", text: words(25000, "a") }]))).result;
+  const first = (await quiet(() => indexJobs(env, [{ artifactId: "bench_1", projectId: "proj_a", revisionId: "rev_bench_1", text: words(25000, "a") }]))).result;
   const firstMs = Date.now() - t;
   W.setHead(world, "bench_1", "rev_bench_2");
   t = Date.now();
-  const rewrite = (await quiet(() => lib.indexSearchJobs(env, [{ artifactId: "bench_1", projectId: "proj_a", revisionId: "rev_bench_2", text: words(20000, "b") }]))).result;
+  const rewrite = (await quiet(() => indexJobs(env, [{ artifactId: "bench_1", projectId: "proj_a", revisionId: "rev_bench_2", text: words(20000, "b") }]))).result;
   const rewriteMs = Date.now() - t;
   assert.equal(first.completed, 1); assert.equal(rewrite.completed, 1);
   // One A statement of 5,000 tokens, sorted against unsorted.

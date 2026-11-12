@@ -21,6 +21,9 @@ const lib = await loadWorker({
   "adapters.js": ["withAdapters", "resolveAdapters"],
 });
 const MiB = 1048576;
+/** Text jobs carry their stored UTF-8 size (textBytes is required: admission never scans the text). */
+const withBytes = (j) => typeof j.text === "string" && j.textBytes === undefined ? { ...j, textBytes: Buffer.byteLength(j.text) } : j;
+const indexJobs = (env, jobs, opts) => lib.indexSearchJobs(env, jobs.map(withBytes), opts);
 const envOf = (world, vars = {}, adapters = {}) => lib.withAdapters({ DB: world.DB, ...vars }, lib.resolveAdapters(adapters));
 /** Distinct synthetic words: w0, w1, … in base 36 with a prefix. */
 const words = (n, prefix = "w", from = 0) => Array.from({ length: n }, (_, i) => prefix + (from + i).toString(36).padStart(7, "0"));
@@ -55,6 +58,12 @@ test("test 5: terms match FTS5 unicode61 remove_diacritics 2 (fts5vocab) on hard
   const cases = ["é e É café CAFÉ", "Straße STRASSE ß", "İstanbul ıi I", "日本語の文章です 東京", "שָׁלוֹם שלום סֵפֶר", "1 22 4096 2026x x2026",
     "emoji 😀 ok 👍🏽 done", "\u0301leading mark word", "a\u0301b\u0302c ümlaut", "mixed-UP_case.words, and; more"];
   for (const c of cases) assert.deepEqual(ours(c), ftsTerms(c), JSON.stringify(c));
+  // A lone surrogate: unicode61 separates at it, and so do we.
+  for (const c of ["ab\uD800cd", "x\uDC00y z", "\uD800"]) assert.deepEqual(ours(c), ftsTerms(c), JSON.stringify(c));
+  // A word longer than 200 units: the index keeps it, we skip it (queries are at most 200); nothing else differs.
+  const long = "w" + "y".repeat(250);
+  assert.deepEqual(ftsTerms(`alpha ${long} beta`), ["alpha", "beta", long].sort());
+  assert.deepEqual(ours(`alpha ${long} beta`), ["alpha", "beta"]);
   const vocab = ["alpha", "Beta", "café", "naïve", "Zürich", "straße", "ÉCOLE", "łódź", "日本", "テスト", "мой", "ёлка", "λόγος", "كِتَاب", "x1", "2026"];
   let prose = "", seed = 7;
   while (prose.length < MiB) { seed = (seed * 1103515245 + 12345) & 0x7fffffff; prose += vocab[(seed >>> 8) % vocab.length] + ((seed >>> 4) % 7 ? " " : ". ") + ((seed >>> 3) % 97).toString(36) + " "; }
@@ -108,7 +117,7 @@ test("test 6: the run's scanned-units budget (10 Mi code units) refuses the job 
   W.seedWorkspace(world);
   const big = "x ".repeat(3 * MiB);
   for (const a of ["d1", "d2"]) W.seedDoc(world, { artifact: a });
-  const { result } = await logs(() => lib.indexSearchJobs(envOf(world), [
+  const { result } = await logs(() => indexJobs(envOf(world), [
     { artifactId: "d1", projectId: "proj_a", revisionId: "rev_d1", text: big },
     { artifactId: "d2", projectId: "proj_a", revisionId: "rev_d2", text: big }]));
   assert.equal(result.skipped.admission, 1);
@@ -187,19 +196,22 @@ test("test 8: encryption on: the run derives from the workspace data key and fen
   W.seedWorkspace(world);
   W.seedDoc(world, { artifact: "enc_1" });
   const env = envOf(world, { CONTENT_MASTER_KEY_VERSION: "1", CONTENT_MASTER_KEY_V1: Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64") });
-  const { result } = await logs(() => lib.indexSearchJobs(env, [{ artifactId: "enc_1", projectId: "proj_a", revisionId: "rev_enc_1", text: "alpha beta" }]));
+  const { result } = await logs(() => indexJobs(env, [{ artifactId: "enc_1", projectId: "proj_a", revisionId: "rev_enc_1", text: "alpha beta" }]));
   assert.equal(result.completed, 1);
   const row = W.docRow(world, "enc_1");
   assert.equal(row.key_id, W.one(world, "SELECT key_id FROM workspace_keys WHERE workspace_id = 'wsp_a'").key_id);
   assert.equal(W.one(world, "SELECT COUNT(*) AS n FROM workspace_search_keys").n, 0, "no plaintext key when encryption is on");
   assert.ok(batches(world).some((b) => b.qs.at(-1).includes("key_active")), "keyFence last");
-  // A shredded key: the next run stores nothing and logs key_shredded.
+  // The workspace key is shredded (configuration unchanged and valid): the next run stores nothing, logs key_shredded.
   W.run(world, "UPDATE workspace_keys SET shredded_at = 1, wrapped = '' WHERE workspace_id = 'wsp_a'");
   W.setHead(world, "enc_1", "rev_enc_2");
-  const second = await logs(() => lib.indexSearchJobs(envOf(world, { CONTENT_MASTER_KEY_VERSION: "1", CONTENT_MASTER_KEY_V1: "AAAA" }),
-    [{ artifactId: "enc_1", projectId: "proj_a", revisionId: "rev_enc_2", text: "gamma" }]));
+  const tokensBefore = W.tokensOf(world, "enc_1"), countersBefore = W.counters(world);
+  const second = await logs(() => indexJobs(env, [{ artifactId: "enc_1", projectId: "proj_a", revisionId: "rev_enc_2", text: "gamma" }]));
   assert.equal(second.result.completed, 0);
+  assert.deepEqual(second.events.filter((e) => e.event === "search_index_failed").map((e) => [e.artifactId, e.code]), [["enc_1", "key_shredded"]]);
   assert.equal(W.docRow(world, "enc_1").revision_id, "rev_enc_1");
+  assert.deepEqual(W.tokensOf(world, "enc_1"), tokensBefore);
+  assert.deepEqual(W.counters(world), countersBefore);
 });
 
 // --- Test 11: budgets and tallies ----------------------------------------------------------------------------------
@@ -212,7 +224,7 @@ test("test 11: first index of a capped document takes setup + 1 + 4 calls in bou
   W.seedWorkspace(world);
   W.seedDoc(world, { artifact: "cap_1" });
   const text = cappedText("a");
-  const { result } = await logs(() => lib.indexSearchJobs(envOf(world), [{ artifactId: "cap_1", projectId: "proj_a", revisionId: "rev_cap_1", text }]));
+  const { result } = await logs(() => indexJobs(envOf(world), [{ artifactId: "cap_1", projectId: "proj_a", revisionId: "rev_cap_1", text }]));
   assert.equal(result.completed, 1);
   assert.equal(result.calls, SETUP + 1 + 4, JSON.stringify(result));
   assert.ok(result.calls <= 11);
@@ -225,7 +237,7 @@ test("test 11: first index of a capped document takes setup + 1 + 4 calls in bou
   W.setHead(world, "cap_1", "rev_cap_2");
   world.log.length = 0;
   const text2 = cappedText("b");
-  const r2 = (await logs(() => lib.indexSearchJobs(envOf(world), [{ artifactId: "cap_1", projectId: "proj_a", revisionId: "rev_cap_2", text: text2 }]))).result;
+  const r2 = (await logs(() => indexJobs(envOf(world), [{ artifactId: "cap_1", projectId: "proj_a", revisionId: "rev_cap_2", text: text2 }]))).result;
   assert.equal(r2.completed, 1);
   assert.equal(r2.calls, SETUP + 1 + 1 + 4, JSON.stringify(r2));
   assertBatchBounds(world);
@@ -236,7 +248,7 @@ test("test 11: first index of a capped document takes setup + 1 + 4 calls in bou
   W.run(world, "UPDATE search_token_docs SET revision_id = '', writer = 'dead' WHERE artifact_id = 'cap_1'");
   W.setHead(world, "cap_1", "rev_cap_3");
   world.log.length = 0;
-  const r3 = (await logs(() => lib.indexSearchJobs(envOf(world), [{ artifactId: "cap_1", projectId: "proj_a", revisionId: "rev_cap_3", text }]))).result;
+  const r3 = (await logs(() => indexJobs(envOf(world), [{ artifactId: "cap_1", projectId: "proj_a", revisionId: "rev_cap_3", text }]))).result;
   assert.equal(r3.completed, 1);
   assert.equal(r3.calls, SETUP + 1 + 1 + 1 + 4, JSON.stringify(r3));
   assertBatchBounds(world);
@@ -249,11 +261,11 @@ test("test 11: a 9-file snapshot of small existing files takes one group read an
   W.seedWorkspace(world);
   const files = Array.from({ length: 9 }, (_, i) => ({ artifactId: `f${i}`, projectId: "proj_a", revisionId: `rev_f${i}`, text: words(1000, `f${i}x`).join(" ") }));
   for (const f of files) W.seedDoc(world, { artifact: f.artifactId });
-  await logs(() => lib.indexSearchJobs(envOf(world), files));
+  await logs(() => indexJobs(envOf(world), files));
   for (const f of files) W.setHead(world, f.artifactId, f.revisionId + "b");
   world.log.length = 0;
   const next = files.map((f) => ({ ...f, revisionId: f.revisionId + "b", text: f.text + " " + words(50, f.artifactId + "y").join(" ") }));
-  const { result } = await logs(() => lib.indexSearchJobs(envOf(world), next));
+  const { result } = await logs(() => indexJobs(envOf(world), next));
   assert.equal(result.completed, 9);
   assert.equal(result.calls, SETUP + 1 + 1 + 1, JSON.stringify(result));
   assert.ok(result.calls <= 9);
@@ -267,7 +279,7 @@ test("test 11: a 100-document import of 500 tokens each, and 300 empty documents
   W.seedWorkspace(world);
   const docs = Array.from({ length: 100 }, (_, i) => ({ artifactId: `imp${i}`, projectId: "proj_a", revisionId: `rev_imp${i}`, text: words(500, `i${i}z`).join(" ") }));
   for (const d of docs) W.seedDoc(world, { artifact: d.artifactId });
-  const { result } = await logs(() => lib.indexSearchJobs(envOf(world), docs));
+  const { result } = await logs(() => indexJobs(envOf(world), docs));
   assert.equal(result.completed, 100, JSON.stringify(result));
   assert.ok(result.calls <= 17, `${result.calls} calls`);
   assertBatchBounds(world);
@@ -275,7 +287,7 @@ test("test 11: a 100-document import of 500 tokens each, and 300 empty documents
   const empties = Array.from({ length: 300 }, (_, i) => ({ artifactId: `e${i}`, projectId: "proj_a", revisionId: `rev_e${i}`, text: "" }));
   for (const d of empties) W.seedDoc(world, { artifact: d.artifactId });
   world.log.length = 0;
-  const e = (await logs(() => lib.indexSearchJobs(envOf(world), empties))).result;
+  const e = (await logs(() => indexJobs(envOf(world), empties))).result;
   assert.equal(e.completed, 100);
   assert.equal(e.skipped.admission, 200);
   assert.ok(e.calls <= 9, `${e.calls} calls`);
@@ -289,7 +301,7 @@ test("test 11: with SEARCH_TERMS_MAX = 0 a document gets a complete off row with
   const world = W.mkWorld();
   W.seedWorkspace(world);
   W.seedDoc(world, { artifact: "off_1" });
-  const { result } = await logs(() => lib.indexSearchJobs(envOf(world, { SEARCH_TERMS_MAX: "0" }), [{ artifactId: "off_1", projectId: "proj_a", revisionId: "rev_off_1", text: "alpha beta" }]));
+  const { result } = await logs(() => indexJobs(envOf(world, { SEARCH_TERMS_MAX: "0" }), [{ artifactId: "off_1", projectId: "proj_a", revisionId: "rev_off_1", text: "alpha beta" }]));
   assert.equal(result.completed, 1);
   const row = W.docRow(world, "off_1");
   assert.deepEqual([row.revision_id, row.truncated, row.truncated_by, row.term_count], ["rev_off_1", 1, "off", 0]);
@@ -301,12 +313,12 @@ test("test 11: the call budget (clamped by declared calls) leaves the files beyo
   const world = W.mkWorld();
   W.seedWorkspace(world);
   const files = Array.from({ length: 9 }, (_, i) => ({ artifactId: `c${i}`, projectId: "proj_a", revisionId: `rev_c${i}`, text: words(21000, `c${i}q`).join(" ") }));
-  for (const f of files) { W.seedDoc(world, { artifact: f.artifactId }); await logs(() => lib.indexSearchJobs(envOf(world), [f])); }
+  for (const f of files) { W.seedDoc(world, { artifact: f.artifactId }); await logs(() => indexJobs(envOf(world), [f])); }
   // Each file changes 2,000 words: 2,000 removes + 2,000 adds; 36,000 values over the run.
   const next = files.map((f, i) => ({ ...f, revisionId: f.revisionId + "b", text: words(19000, `c${i}q`, 2000).join(" ") + " " + words(2000, `c${i}n`).join(" ") }));
   for (const f of next) W.setHead(world, f.artifactId, f.revisionId);
   world.log.length = 0;
-  const { result } = await logs(() => lib.indexSearchJobs(envOf(world), next, { declaredCalls: 1000 - 20 - 10 }));
+  const { result } = await logs(() => indexJobs(envOf(world), next, { declaredCalls: 1000 - 20 - 10 }));
   assert.equal(result.calls, 10, "budget min(18, 1000 − declared − 20)");
   assert.ok(result.completed >= 1 && result.completed < 9, JSON.stringify(result));
   assertBatchBounds(world);
@@ -322,7 +334,7 @@ test("test 25: a first index that died after 15,000 tokens (stored count 0) conv
   W.seedWorkspace(world);
   W.seedDoc(world, { artifact: "dead_1" });
   const text = cappedText("d", 20000);
-  await logs(() => lib.indexSearchJobs(envOf(world), [{ artifactId: "dead_1", projectId: "proj_a", revisionId: "rev_dead_1", text }]));
+  await logs(() => indexJobs(envOf(world), [{ artifactId: "dead_1", projectId: "proj_a", revisionId: "rev_dead_1", text }]));
   // Simulate the dead first index: 15,000 tokens left, term_count 0, row at '' under a dead writer.
   const d = W.docRow(world, "dead_1").doc_id;
   W.run(world, "DELETE FROM search_tokens WHERE doc_id = ? AND token IN (SELECT token FROM search_tokens WHERE doc_id = ? ORDER BY token DESC LIMIT 5000)", d, d);
@@ -330,7 +342,7 @@ test("test 25: a first index that died after 15,000 tokens (stored count 0) conv
   W.run(world, "UPDATE search_term_counters SET terms = terms - 5000");
   assertExact(world);
   world.log.length = 0;
-  const { result } = await logs(() => lib.indexSearchJobs(envOf(world), [{ artifactId: "dead_1", projectId: "proj_a", revisionId: "rev_dead_1", text }]));
+  const { result } = await logs(() => indexJobs(envOf(world), [{ artifactId: "dead_1", projectId: "proj_a", revisionId: "rev_dead_1", text }]));
   assert.equal(result.completed, 1);
   assert.ok(world.log.some((c) => c.kind === "all" && /LIMIT 20001/.test(c.q)), "lease read with LIMIT 20001");
   assert.equal(W.docRow(world, "dead_1").term_count, 20000);
@@ -342,13 +354,13 @@ test("test 25: a row changed between planning and its stable read, or a wrong st
   W.seedWorkspace(world);
   for (const a of ["s1", "s2"]) W.seedDoc(world, { artifact: a });
   const job = (a, rev, text) => ({ artifactId: a, projectId: "proj_a", revisionId: rev, text });
-  await logs(() => lib.indexSearchJobs(envOf(world), [job("s1", "rev_s1", "one two three"), job("s2", "rev_s2", "four five")]));
+  await logs(() => indexJobs(envOf(world), [job("s1", "rev_s1", "one two three"), job("s2", "rev_s2", "four five")]));
   for (const a of ["s1", "s2"]) W.setHead(world, a, `rev_${a}b`);
   // s1: a writer bumps gen after planning, before the stable read. s2: its stored count is wrong.
   W.run(world, "UPDATE search_token_docs SET term_count = 7 WHERE artifact_id = 's2'");
   let reads = 0;
   world.before = ({ kind, q }) => { if (kind === "all" && /d\.gen = \?2/.test(q) && reads++ === 0) W.run(world, "UPDATE search_token_docs SET gen = gen + 1 WHERE artifact_id = 's1'"); };
-  const { result } = await logs(() => lib.indexSearchJobs(envOf(world), [job("s1", "rev_s1b", "one two six"), job("s2", "rev_s2b", "four seven")]));
+  const { result } = await logs(() => indexJobs(envOf(world), [job("s1", "rev_s1b", "one two six"), job("s2", "rev_s2b", "four seven")]));
   world.before = null;
   assert.equal(result.completed, 2, JSON.stringify(result));
   assert.ok(world.log.filter((c) => c.kind === "all" && /LIMIT 20001/.test(c.q)).length === 2, "both re-planned as unstable");
@@ -363,11 +375,11 @@ test("test 25: stable groups never exceed 40 documents or 20,000 tokens", async 
   const docs = Array.from({ length: 45 }, (_, i) => ({ artifactId: `g${i}`, projectId: "proj_a", revisionId: `rev_g${i}`, text: `word${i} shared` }));
   docs.push({ artifactId: "gbig", projectId: "proj_a", revisionId: "rev_gbig", text: cappedText("gb", 20000) });
   for (const d of docs) W.seedDoc(world, { artifact: d.artifactId });
-  await logs(() => lib.indexSearchJobs(envOf(world), docs));
+  await logs(() => indexJobs(envOf(world), docs));
   for (const d of docs) W.setHead(world, d.artifactId, d.revisionId + "b");
   world.log.length = 0;
   const next = docs.map((d) => ({ ...d, revisionId: d.revisionId + "b", text: d.text + " extra" }));
-  const { result } = await logs(() => lib.indexSearchJobs(envOf(world), next));
+  const { result } = await logs(() => indexJobs(envOf(world), next));
   assert.equal(result.completed, 46, JSON.stringify(result));
   const groupReads = world.log.filter((c) => c.kind === "all" && /ORDER BY d\.doc_id, s\.token/.test(c.q));
   assert.ok(groupReads.length >= 3, `${groupReads.length} group reads`);
@@ -380,7 +392,7 @@ test("test 26: an unstable set of 20,001 rows takes the oversize path: deleted u
   const world = W.mkWorld();
   W.seedWorkspace(world);
   W.seedDoc(world, { artifact: "big_1" });
-  await logs(() => lib.indexSearchJobs(envOf(world), [{ artifactId: "big_1", projectId: "proj_a", revisionId: "rev_big_1", text: "seed" }]));
+  await logs(() => indexJobs(envOf(world), [{ artifactId: "big_1", projectId: "proj_a", revisionId: "rev_big_1", text: "seed" }]));
   // Broken invariant (manual SQL): 20,001 stored tokens on a row at '' under a dead writer, counted exactly.
   const d = W.docRow(world, "big_1").doc_id;
   W.run(world, "DELETE FROM search_tokens WHERE doc_id = ?", d);
@@ -390,7 +402,7 @@ test("test 26: an unstable set of 20,001 rows takes the oversize path: deleted u
   W.run(world, "UPDATE search_term_counters SET terms = terms + 20000");
   assertExact(world);
   W.setHead(world, "big_1", "rev_big_2");
-  const { result, events } = await logs(() => lib.indexSearchJobs(envOf(world), [{ artifactId: "big_1", projectId: "proj_a", revisionId: "rev_big_2", text: "alpha" }]));
+  const { result, events } = await logs(() => indexJobs(envOf(world), [{ artifactId: "big_1", projectId: "proj_a", revisionId: "rev_big_2", text: "alpha" }]));
   assert.equal(result.completed, 0);
   assert.equal(result.skipped.oversize, 1);
   assert.deepEqual(events.filter((e) => e.event === "search_set_oversize"), [{ event: "search_set_oversize", artifactId: "big_1" }]);
@@ -400,7 +412,7 @@ test("test 26: an unstable set of 20,001 rows takes the oversize path: deleted u
   assert.ok(W.missing(world).includes("big_1"));
   assertExact(world);
   // A later run indexes it from a fresh base.
-  const again = (await logs(() => lib.indexSearchJobs(envOf(world), [{ artifactId: "big_1", projectId: "proj_a", revisionId: "rev_big_2", text: "alpha" }]))).result;
+  const again = (await logs(() => indexJobs(envOf(world), [{ artifactId: "big_1", projectId: "proj_a", revisionId: "rev_big_2", text: "alpha" }]))).result;
   assert.equal(again.completed, 1);
   assert.equal(W.docRow(world, "big_1").revision_id, "rev_big_2");
   assertExact(world);
@@ -428,7 +440,7 @@ function assertIdle() {
   const s = adm.searchAdmissionState();
   assert.deepEqual([s.active, s.activeBytes, s.detached, s.running], [0, 0, 0, 0], JSON.stringify(s));
 }
-const job = (a, text, rev = `rev_${a}`) => ({ artifactId: a, projectId: "proj_a", revisionId: rev, text });
+const job = (a, text, rev = `rev_${a}`) => ({ artifactId: a, projectId: "proj_a", revisionId: rev, text, textBytes: Buffer.byteLength(text) });
 function world1(artifacts) {
   const world = W.mkWorld();
   W.seedWorkspace(world);
@@ -493,7 +505,7 @@ test("test 10: phase accounting: the reservation falls after extraction and HMAC
   const world = world1(["ph"]);
   const env = aenv(world);
   const textA = words(3000, "pa").join(" "), textB = words(2000, "pa", 1000).join(" ") + " " + words(1000, "pb").join(" ");
-  await logs(() => lib.indexSearchJobs(env, [job("ph", textA)]));
+  await logs(() => indexJobs(env, [job("ph", textA)]));
   W.setHead(world, "ph", "rev_ph2");
   const samples = [];
   let run;
@@ -533,7 +545,7 @@ test("test 10 and 28: deadline after the first of four batches: the call in flig
   assertExact(world);
   assertIdle();
   world.log.length = 0;
-  const { result } = await logs(() => lib.indexSearchJobs(env, [job("dl", text)]));
+  const { result } = await logs(() => indexJobs(env, [job("dl", text)]));
   assert.equal(result.completed, 1);
   assert.ok(world.log.some((c) => c.kind === "all" && /LIMIT 20001/.test(c.q)), "T1u then the lease read");
   assert.equal(W.docRow(world, "dl").term_count, 20000);
@@ -670,6 +682,8 @@ test("test 10: deferral: jobs wait for startDeferredWork, run under one waitUnti
   assertIdle();
 });
 
+/** A source text of about 6 MiB in two-byte storage (more than the 4 MiB envelope if retained): distinct words, then padding. */
+const bigSource = (prefix) => words(5000, prefix).join(" ") + " " + "\u00e9".repeat(3 * MiB);
 /** Heap retained by a blocked call once the run is detached (holder nulled), relative to `baseline`. */
 async function retainedWhileBlocked(run, baseline) {
   run.detach();
@@ -683,7 +697,7 @@ test("test 27: blocked operations retain at most the 4 MiB envelope once the hol
     const world = world1(["b1"]);
     const env = aenv(world);
     const text = words(20000, "ba").join(" ");
-    await logs(() => lib.indexSearchJobs(env, [job("b1", text)]));
+    await logs(() => indexJobs(env, [job("b1", text)]));
     W.setHead(world, "b1", "rev_b1b");
     const block = gate();
     let inFlight = null;
@@ -701,7 +715,7 @@ test("test 27: blocked operations retain at most the 4 MiB envelope once the hol
   {
     const world = world1(["b2"]);
     const env = aenv(world);
-    await logs(() => lib.indexSearchJobs(env, [job("b2", words(25000, "bx").join(" "))]));
+    await logs(() => indexJobs(env, [job("b2", words(25000, "bx").join(" "))]));
     W.setHead(world, "b2", "rev_b2b");
     const block = gate();
     let seen = null;
@@ -721,7 +735,8 @@ test("test 27: blocked operations retain at most the 4 MiB envelope once the hol
     crypto.subtle.sign = async function (...a) { signing = true; await block.wait; return sign.apply(this, a); };
     try {
       const base0 = await heap();
-      const { run, done } = start(env, [job("b3", words(5000, "bd").join(" "))]);
+      // A 6 MiB source (above the 4 MiB bound) whose first 5,000 words are distinct: retaining it would fail the bound.
+      const { run, done } = start(env, [job("b3", bigSource("bd"))]);
       while (!signing) await new Promise((r) => setTimeout(r, 5));
       sizes.hmac = await retainedWhileBlocked(run, base0);
       block.open(); await done;
@@ -737,7 +752,7 @@ test("test 27: blocked operations retain at most the 4 MiB envelope once the hol
       unwrap: async () => { unwrapping = true; await block.wait; return crypto.subtle.importKey("raw", new Uint8Array(32), "HKDF", false, ["deriveKey"]); } };
     const env = aenv(world, {}, { keyProvider: provider });
     const base0 = await heap();
-    const { run, done } = start(env, [job("b4", words(5000, "be").join(" "))]);
+    const { run, done } = start(env, [job("b4", bigSource("be"))]);
     while (!unwrapping) await new Promise((r) => setTimeout(r, 5));
     sizes.keyProvider = await retainedWhileBlocked(run, base0);
     block.open(); await done;
@@ -772,7 +787,7 @@ test("test 28: whole-document charge, clearing of sent removes, ADD lifetime and
   const world = world1(["wd", "wd2"]);
   const env = aenv(world);
   const textA = words(20000, "wa").join(" ");
-  await logs(() => lib.indexSearchJobs(env, [job("wd", textA), job("wd2", "small text here")]));
+  await logs(() => indexJobs(env, [job("wd", textA), job("wd2", "small text here")]));
   for (const a of ["wd", "wd2"]) W.setHead(world, a, `rev_${a}b`);
   const samples = [];
   let run, firstChunk = null;
@@ -810,7 +825,9 @@ test("test 28: whole-document charge, clearing of sent removes, ADD lifetime and
   assert.deepEqual(writes.map((x) => x.removes), [20000, 15000, 10000, 5002, 2]);
   // Clearing: by the second batch the first chunk's array is gone (gc), while the unsent rest is held.
   assert.deepEqual(writes.slice(0, 4).map((x) => x.chunks), [3, 2, 1, 0]);
-  if (firstChunk) assert.equal(writes[1].firstGone, true);
+  assert.ok(firstChunk, "the first remove chunk was captured before its batch was sent");
+  assert.equal(writes[0].firstGone, false, "held while unsent");
+  assert.equal(writes[1].firstGone, true);
   // ADD lifetime: while the last batch is in flight its token charge still counts.
   assert.equal(writes[3].final, true);
   assert.equal(writes[3].tokens, true);
@@ -829,7 +846,7 @@ test("test 28: removes charge does not fit, then fits after the flush; still doe
     const world = world1(["cf1", "cf2"]);
     const env = aenv(world);
     const a1 = words(3000, "c1").join(" "), a2 = words(3000, "c2").join(" ");
-    await logs(() => lib.indexSearchJobs(env, [job("cf1", a1), job("cf2", a2)]));
+    await logs(() => indexJobs(env, [job("cf1", a1), job("cf2", a2)]));
     for (const a of ["cf1", "cf2"]) W.setHead(world, a, `rev_${a}b`);
     const b1 = words(3000, "c1", 1000).join(" "), b2 = words(3000, "c2", 2000).join(" ");
     let run, setRef = null, flushState = null, reads = 0;
@@ -874,7 +891,7 @@ test("test 28: a capped 10 MiB document: text released before its set read, abou
   const world = world1(["ten"]);
   const env = aenv(world);
   const tenMiB = (prefix) => { const w = words(1200000, prefix).join(" "); return w.slice(0, 10 * MiB); };
-  await logs(() => lib.indexSearchJobs(env, [job("ten", tenMiB("ta"))]));
+  await logs(() => indexJobs(env, [job("ten", tenMiB("ta"))]));
   W.setHead(world, "ten", "rev_tenb");
   let run, peak = 0, atRead = null, atWrite = null;
   world.before = ({ kind, q, qs }) => {
@@ -906,5 +923,235 @@ test("test 10: rejected jobs never enter the holder", () => {
   assert.ok(r.holder.jobs.every((j) => Number(j.meta.artifactId.slice(2)) < 100));
   assert.equal(r.skipped.admission, 5);
   r.settle();
+  assertIdle();
+});
+
+// --- Review fixes: admission inputs and settlement on throw (commit A items 1, 2) ------------------------------------
+/** The isolate is back to exactly zero, every figure finite, and a further admission succeeds and settles. */
+function assertRecovered() {
+  const s = adm.searchAdmissionState();
+  for (const [k, v] of Object.entries(s)) assert.ok(Number.isFinite(v), `${k} = ${v}`);
+  assertIdle();
+  const r = adm.openSearchRun();
+  assert.ok(r, "a further admission succeeds");
+  r.settle();
+  assertIdle();
+}
+const MALFORMED = [
+  ["text not a string", { text: 12345, textBytes: 5 }],
+  ["text without textBytes", { text: "alpha" }],
+  ["textBytes NaN", { text: "alpha", textBytes: NaN }],
+  ["textBytes negative", { text: "alpha", textBytes: -1 }],
+  ["textBytes fractional", { text: "alpha", textBytes: 1.5 }],
+  ["textBytes Infinity", { text: "alpha", textBytes: Infinity }],
+  ["textBytes a string", { text: "alpha", textBytes: "5" }],
+  ["textUnits NaN", { text: "alpha", textBytes: 5, textUnits: NaN }],
+  ["flat count above the cap", { flat: { bytes: new Uint8Array(4), offsets: Uint32Array.from([0, 1, 2, 3, 4]), count: 4, truncated: false }, textBytes: 4, textUnits: 4, cap: 2 }],
+  ["flat offsets inconsistent", { flat: { bytes: new Uint8Array(2), offsets: Uint32Array.from([0, 1, 9]), count: 2, truncated: false }, textBytes: 9, textUnits: 9 }],
+  ["flat bytes larger than charged", { flat: { bytes: new Uint8Array(100), offsets: Uint32Array.from([0, 100]), count: 1, truncated: false }, textBytes: 10, textUnits: 10 }],
+  ["flat count not an integer", { flat: { bytes: new Uint8Array(1), offsets: Uint32Array.from([0, 1]), count: "1", truncated: false }, textBytes: 1, textUnits: 1 }],
+  ["flat textUnits missing", { flat: { bytes: new Uint8Array(1), offsets: Uint32Array.from([0, 1]), count: 1, truncated: false }, textBytes: 1 }],
+];
+
+test("review A1: each malformed descriptor is refused with search_job_invalid before any counter changes", () => {
+  const world = world1([]);
+  for (const [why, extra] of MALFORMED) {
+    const { cap, ...rest } = extra;
+    const env = aenv(world, cap ? { SEARCH_TERMS_MAX: String(cap) } : {});
+    const r = adm.openSearchRun();
+    const before = adm.searchAdmissionState();
+    const payload = r.payload;
+    assert.throws(() => adm.admitSearchJobs(env, r, [{ artifactId: "m", projectId: "proj_a", revisionId: "rev_m", ...rest }]),
+      (e) => e.code === "search_job_invalid", why);
+    assert.deepEqual(adm.searchAdmissionState(), before, why);
+    assert.equal(r.payload, payload, why);
+    assert.equal(r.holder.jobs.length, 0, why);
+    r.settle();
+    assertRecovered();
+  }
+});
+
+test("review A1: reserve, release, lower and declaredCalls refuse non-finite or negative amounts and never store NaN", () => {
+  for (const bad of [NaN, -1, Infinity, -Infinity, "4", undefined, 1.5]) {
+    const r = adm.openSearchRun();
+    const p = r.payload;
+    assert.throws(() => r.reserve(bad), (e) => e.code === "search_amount_invalid", `reserve ${bad}`);
+    assert.throws(() => r.release(bad), (e) => e.code === "search_amount_invalid", `release ${bad}`);
+    assert.throws(() => r.lower({ charge: 10 }, bad), (e) => e.code === "search_amount_invalid", `lower ${bad}`);
+    assert.equal(r.payload, p);
+    r.settle();
+    // undefined means the default (0 declared calls).
+    if (bad !== undefined) assert.throws(() => adm.openSearchRun({ declaredCalls: bad }), (e) => e.code === "search_amount_invalid", `declaredCalls ${bad}`);
+    assertRecovered();
+  }
+});
+
+test("review A1: admitting a 10 MiB text never scans it, also when SEARCH_TERMS_MAX = 0", () => {
+  const world = world1([]);
+  // A string whose content is never read: any character access through the String prototype throws.
+  const text = "q".repeat(10 * MiB);
+  const watched = ["charCodeAt", "codePointAt", "at", "charAt", "matchAll", "match", "normalize", "slice", "substring", Symbol.iterator];
+  for (const vars of [{}, { SEARCH_TERMS_MAX: "0" }]) {
+    const saved = watched.map((k) => [k, String.prototype[k]]);
+    let scanned = 0;
+    for (const [k, f] of saved) String.prototype[k] = function (...a) { if (this.length === text.length) scanned++; return f.apply(this, a); };
+    const r = adm.openSearchRun();
+    try {
+      adm.admitSearchJobs(aenv(world, vars), r, [{ artifactId: "big", projectId: "proj_a", revisionId: "rev_big", text, textBytes: 10 * MiB }]);
+    } finally { for (const [k, f] of saved) String.prototype[k] = f; }
+    assert.equal(scanned, 0, `no scan (${JSON.stringify(vars)})`);
+    assert.equal(r.holder.jobs.length, 1);
+    if (vars.SEARCH_TERMS_MAX === "0") assert.equal(r.holder.jobs[0].text, null, "off mode keeps no text");
+    r.settle();
+    assertRecovered();
+  }
+});
+
+test("review A2: a run whose admission throws is settled (first descriptor, and after an admitted prefix)", async () => {
+  const world = world1(["ok1", "ok2"]);
+  const env = aenv(world);
+  for (let i = 0; i < 5; i++) {
+    const jobs = i % 2 ? [job("ok1", "alpha"), job("ok2", "beta"), { artifactId: "bad", projectId: "proj_a", revisionId: "rev_bad", text: 7, textBytes: 1 }]
+      : [{ artifactId: "bad", projectId: "proj_a", revisionId: "rev_bad", text: "x" }];
+    await assert.rejects(lib.indexSearchJobs(env, jobs), (e) => e.code === "search_job_invalid");
+    assertRecovered();
+  }
+  assert.equal(world.calls, 0, "nothing ran");
+});
+
+test("review A2: startDeferredWork without a usable ctx.waitUntil settles the run; four in a row fill nothing", async () => {
+  const world = world1(["dw"]);
+  const env = aenv(world);
+  for (const ctx of [undefined, {}, { waitUntil: () => { throw new Error("no waitUntil"); } }, { waitUntil: "nope" }]) {
+    const req = adm.withDeferredWork(env);
+    adm.deferSearchIndexing(req, [job("dw", "alpha")]);
+    assert.equal(adm.searchAdmissionState().active, 1);
+    const { events } = await logs(async () => { adm.startDeferredWork(req, ctx); await adm.drainSearchIndexing(); });
+    assert.ok(events.some((e) => e.event === "search_index_skipped"), "the dropped job is counted");
+    assertRecovered();
+  }
+  assert.equal(adm.searchAdmissionState().detached, 0);
+  assert.equal(W.docRow(world, "dw"), undefined);
+});
+
+test("review A3: a re-plan with fewer than 3 calls left leaves a complete row complete (skipped as budget)", async () => {
+  const world = world1(["rb"]);
+  const env = aenv(world);
+  await logs(() => indexJobs(env, [job("rb", "alpha beta")]));
+  W.setHead(world, "rb", "rev_rb2");
+  // Another writer completes the same head between this run's planning and its stable read (gen moves).
+  let moved = false;
+  world.before = ({ kind, q }) => {
+    if (!moved && kind === "all" && /ORDER BY d\.doc_id/.test(q)) {
+      moved = true;
+      W.run(world, "UPDATE search_token_docs SET revision_id = 'rev_rb2', gen = gen + 2, token_digest = 'other' WHERE artifact_id = 'rb'");
+    }
+  };
+  // Budget: setup 2 + plan 1 + stable read 1 = 4 used; with a budget of 6 only 2 calls are left for the re-plan.
+  const { result } = await logs(() => indexJobs(env, [job("rb", "alpha gamma", "rev_rb2")], { declaredCalls: 1000 - 20 - 6 }));
+  world.before = null;
+  assert.deepEqual(result.skipped, { budget: 1 }, JSON.stringify(result));
+  const row = W.docRow(world, "rb");
+  assert.deepEqual([row.revision_id, row.token_digest, row.writer], ["rev_rb2", "other", ""], "left as it was");
+  assertExact(world);
+  assertIdle();
+});
+
+test("review A3: a job whose row is already correct counts as unchanged", async () => {
+  const world = world1(["uc"]);
+  const env = aenv(world);
+  await logs(() => indexJobs(env, [job("uc", "alpha beta")]));
+  const { result } = await logs(() => indexJobs(env, [job("uc", "alpha beta")]));
+  assert.equal(result.unchanged, 1);
+  assert.equal(result.completed, 0);
+  assert.deepEqual(result.skipped, {});
+});
+
+// --- Review fixes: smaller items (commit A item 4) --------------------------------------------------------------------
+test("review A4: jobs are de-duplicated by artifact, keeping the last", async () => {
+  const world = world1(["dd"]);
+  const env = aenv(world);
+  const r = adm.openSearchRun();
+  adm.admitSearchJobs(env, r, [job("dd", "very old"), job("dd", "old words")]);
+  // A later call (another deferSearchIndexing in the same request) replaces it too.
+  adm.admitSearchJobs(env, r, [job("dd", "new words here", "rev_dd")]);
+  assert.equal(r.holder.jobs.length, 1);
+  assert.equal(r.textUnits, "new words here".length);
+  assert.equal(r.payload, BASE + r.holder.jobs[0].charge, "the replaced job's charge is released");
+  const { done } = { done: logs(() => adm.runSearchIndexing(env, r)) };
+  await done;
+  assert.deepEqual(W.tokensOf(world, "dd"), expectedTokens(secretOf(world, "wsp_a"), ["new", "words", "here"]));
+  assertIdle();
+});
+
+test("review A4: a new or empty document whose diff charge is refused is skipped (charge), not crashed", async () => {
+  const world = world1(["nd", "ne"]);
+  const env = aenv(world);
+  const run = adm.openSearchRun();
+  adm.admitSearchJobs(env, run, [job("nd", "alpha"), job("ne", "")]);
+  // Every later reservation on this run is refused (the diff's charge is the only one taken after admission).
+  run.reserve = (bytes) => { if (!Number.isSafeInteger(bytes) || bytes < 0) throw new Error("bad"); return false; };
+  const { events } = await logs(() => adm.runSearchIndexing(env, run));
+  assert.ok(!events.some((e) => e.event === "search_index_failed"), JSON.stringify(events));
+  assert.deepEqual(events.find((e) => e.event === "search_index_skipped").reasons, { charge: 2 });
+  assert.equal(W.docRow(world, "nd"), undefined);
+  assert.equal(W.docRow(world, "ne"), undefined);
+  assertIdle();
+});
+
+test("review A4: search_index_failed names the artifact when one job is known", async () => {
+  const world = world1(["fx"]);
+  const env = aenv(world);
+  // The workspace key read fails for this job (a shredded workspace under encryption).
+  const envEnc = aenv(world, { CONTENT_MASTER_KEY_VERSION: "1", CONTENT_MASTER_KEY_V1: Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64") });
+  W.run(world, "INSERT INTO workspace_keys (workspace_id, key_id, master_version, wrapped, created_at, shredded_at) VALUES ('wsp_a', 'wk_gone', 0, '', 1, 1)");
+  const { events } = await logs(() => indexJobs(envEnc, [job("fx", "alpha")]));
+  const failed = events.filter((e) => e.event === "search_index_failed");
+  assert.equal(failed.length, 1, JSON.stringify(events));
+  assert.deepEqual(failed[0], { event: "search_index_failed", run: failed[0].run, artifactId: "fx", code: "key_shredded" });
+  void env;
+});
+
+test("review A4: a SEARCH_* var with a value that is not accepted is logged once per isolate by name, and falls back", async () => {
+  const fresh = await loadWorker({ "search/tokens.js": ["searchTermsMax", "searchScopeBounds", "searchSweepWritesMax"] });
+  const { events, result } = await logs(() => {
+    const env = { SEARCH_TERMS_MAX: "lots", SEARCH_WORKSPACE_TERMS_MAX: "-5", SEARCH_OWNER_TERMS_MAX: "1e6", SEARCH_INSTALLATION_TERMS_MAX: " 9", SEARCH_SWEEP_WRITES_MAX: "x" };
+    const out = [];
+    for (let i = 0; i < 3; i++) out.push([fresh.searchTermsMax(env), fresh.searchScopeBounds(env), fresh.searchSweepWritesMax(env)]);
+    return out;
+  });
+  assert.deepEqual(result[0], [20000, { workspace: 1000000, owner: 3000000, installation: 50000000 }, 10000]);
+  const logged = events.filter((e) => e.event === "search_var_invalid");
+  assert.deepEqual(logged.map((e) => e.name).sort(), ["SEARCH_INSTALLATION_TERMS_MAX", "SEARCH_OWNER_TERMS_MAX", "SEARCH_SWEEP_WRITES_MAX", "SEARCH_TERMS_MAX", "SEARCH_WORKSPACE_TERMS_MAX"]);
+  for (const e of logged) assert.deepEqual(Object.keys(e).sort(), ["event", "name"]);
+  // Unset and accepted values log nothing.
+  const quietRun = await logs(() => fresh.searchTermsMax({ SEARCH_TERMS_MAX: "200" }) + fresh.searchSweepWritesMax({}));
+  assert.equal(quietRun.events.length, 0);
+});
+
+test("review A6 (test 28): a stable group builds every member's diff before packing; charged removes stay within 30,000", async () => {
+  const world = world1(["sg1", "sg2", "sg3", "sg4"]);
+  const env = aenv(world);
+  // Four stored sets of 5,000 tokens: one group of 20,000 stored tokens (the group bound).
+  const base = (i) => words(5000, `s${i}a`).join(" ");
+  await logs(() => indexJobs(env, [1, 2, 3, 4].map((i) => job(`sg${i}`, base(i)))));
+  for (let i = 1; i <= 4; i++) W.setHead(world, `sg${i}`, `rev_sg${i}b`);
+  let run, done, maxCharged = 0, atFirstWrite = null, groupReads = 0;
+  world.before = ({ kind, q, qs }) => {
+    maxCharged = Math.max(maxCharged, run.removeValues);
+    if (kind === "all" && /ORDER BY d\.doc_id/.test(q)) groupReads++;
+    if (kind === "batch" && !atFirstWrite && qs.some((x) => /search_tokens/.test(x)))
+      atFirstWrite = { charged: run.removeValues, built: run.holder.jobs.filter((j) => j.removes).length };
+  };
+  // Each member's whole set is replaced: 5,000 removes each, 20,000 in the group.
+  ({ run, done } = start(env, [1, 2, 3, 4].map((i) => job(`sg${i}`, words(5000, `s${i}b`).join(" "), `rev_sg${i}b`))));
+  await done;
+  world.before = null;
+  assert.equal(groupReads, 1, "one group of four");
+  assert.deepEqual(atFirstWrite, { charged: 20000, built: 4 }, "every member's diff was built and charged before the first batch");
+  assert.ok(maxCharged <= 30000, `${maxCharged} charged removes`);
+  assert.ok(run.maxRemoveValues <= 30000);
+  for (let i = 1; i <= 4; i++) assert.equal(W.docRow(world, `sg${i}`).revision_id, `rev_sg${i}b`);
+  assertExact(world);
   assertIdle();
 });
