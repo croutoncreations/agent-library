@@ -3,7 +3,8 @@
 // test recomputes the stored bytes independently with node:crypto so the format is pinned, not just self-consistent.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createCipheriv, hkdfSync, randomBytes } from "node:crypto";
+import { createCipheriv, hkdfSync } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { moduleScript } from "./module-source.mjs";
 
 const EXPORTS = [
@@ -68,6 +69,12 @@ async function drain(stream) {
     }
   } catch (e) { error = e; }
   return { bytes: concat(parts), error };
+}
+
+/** Byte equality without assert.deepEqual's per-element diff, which is very slow on multi-MiB arrays that differ. */
+function assertSameBytes(actual, expected, message = "bytes") {
+  assert.equal(actual.length, expected.length, `${message}: length`);
+  assert.ok(Buffer.from(actual.buffer, actual.byteOffset, actual.length).equals(expected), `${message}: content`);
 }
 
 function concat(parts) {
@@ -172,7 +179,7 @@ for (const len of LENGTHS) {
       assert.equal(parseChunkedHeader(stored.slice(0, 48)).plaintextLength, len);
       const { bytes, error } = await decryptBytes(stored, { pieces });
       assert.equal(error, null);
-      assert.deepEqual(bytes, plain);
+      assertSameBytes(bytes, plain);
     });
   }
 }
@@ -182,18 +189,18 @@ test("1-byte input pieces over 3.5 chunks round trip", async () => {
   const stored = await encryptBytes(plain, { pieces: [1] });
   const { bytes, error } = await decryptBytes(stored, { pieces: [1] });
   assert.equal(error, null);
-  assert.deepEqual(bytes, plain);
+  assertSameBytes(bytes, plain);
 });
 
 test("two writes of the same plaintext to the same storage key use different salts and ciphertext, and both decrypt", async () => {
   const plain = plaintextOf(2 * C + 10, 4);
   const a = await encryptBytes(plain);
   const b = await encryptBytes(plain);
-  assert.notDeepEqual(a.slice(16, 48), b.slice(16, 48), "salts differ");
+  assert.ok(!Buffer.from(a.slice(16, 48)).equals(b.slice(16, 48)), "salts differ");
   assert.deepEqual(a.slice(0, 16), b.slice(0, 16), "fixed header fields are equal");
-  for (let i = 0; i < 3; i++) assert.notDeepEqual(chunkSlice(a, i, plain.length), chunkSlice(b, i, plain.length), `chunk ${i} differs`);
-  assert.deepEqual((await decryptBytes(a)).bytes, plain);
-  assert.deepEqual((await decryptBytes(b)).bytes, plain);
+  for (let i = 0; i < 3; i++) assert.ok(!Buffer.from(chunkSlice(a, i, plain.length)).equals(chunkSlice(b, i, plain.length)), `chunk ${i} differs`);
+  assertSameBytes((await decryptBytes(a)).bytes, plain);
+  assertSameBytes((await decryptBytes(b)).bytes, plain);
 });
 
 // ---------------------------------------------------------------- encrypt input checks
@@ -265,10 +272,13 @@ test("known answer: fixed key, salt and plaintext give the stored bytes node:cry
   assert.equal(stored.length, expected.length);
   assert.ok(Buffer.from(stored).equals(expected), "stored bytes equal the independent computation");
   assert.equal(Buffer.from(stored.slice(0, 16)).toString("hex"), "414c4531011000000000000000020064");
-  assert.deepEqual((await decryptBytes(stored)).bytes, plain);
+  assertSameBytes((await decryptBytes(stored)).bytes, plain);
 });
 
-test("the test-only salt parameter is refused by the production encrypt function", () => {
+test("the fixed-salt function is not exported, and the production encrypt function refuses a salt", () => {
+  const source = readFileSync(new URL("../packages/core/src/crypto/chunked.js", import.meta.url), "utf8");
+  assert.ok(source.includes("\nfunction encryptChunkedStreamWithSaltForTestOnly("));
+  assert.doesNotMatch(source, /export[^\n]*encryptChunkedStreamWithSaltForTestOnly/);
   assert.throws(() => encryptChunkedStream(sourceOf(new Uint8Array(0)), { plaintextLength: 0, dataKey: DATA_KEY, objectKey: OBJECT_KEY, salt: new Uint8Array(32) }), /salt/i);
 });
 
@@ -292,7 +302,7 @@ test("decrypt fails on a flipped byte anywhere, releasing nothing from the faili
     bad[position] ^= 0x01;
     const released = await assertDecryptFails(bad, `flipped ${name}`);
     assert.equal(released.length, failingChunk * C, `${name}: only chunks before ${failingChunk} released`);
-    assert.deepEqual(released, PLAIN.slice(0, released.length));
+    assertSameBytes(released, PLAIN.slice(0, released.length));
   }
 });
 
@@ -417,7 +427,7 @@ for (const [name, start, end, storedStart, storedEnd] of RANGES) {
     const calls = [];
     const { bytes, error } = await readRange(STORED, start, end, { calls });
     assert.equal(error, null);
-    assert.deepEqual(bytes, PLAIN.slice(start, end + 1));
+    assertSameBytes(bytes, PLAIN.slice(start, end + 1));
     assert.deepEqual(calls, [[storedStart, storedEnd]]);
   });
 }
@@ -431,7 +441,7 @@ test("range: fetchStored may return a ReadableStream or an ArrayBuffer", async (
     };
     const { bytes, error } = await drain(decryptChunkedRange({ header, dataKey: DATA_KEY, objectKey: OBJECT_KEY, start: C - 5, end: 2 * C + 5, fetchStored }));
     assert.equal(error, null, shape);
-    assert.deepEqual(bytes, PLAIN.slice(C - 5, 2 * C + 6), shape);
+    assertSameBytes(bytes, PLAIN.slice(C - 5, 2 * C + 6), shape);
   }
 });
 
