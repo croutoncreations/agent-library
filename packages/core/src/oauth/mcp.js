@@ -8,7 +8,7 @@ import { SCOPES, liveConnection } from "./server.js";
 import { __name } from "../runtime.js";
 import { FILE_BYTES_CEILING } from "../limits.js";
 import { BINARY_TYPES, IMAGE_TYPES, RS_SCHEMA, RT_ID_TOO_LONG, RT_KINDS_ALL, RT_KINDS_DOCS, appConnectEnabled, connectionInfo, createMarkdown, db, diffRevisions, getArtifact, history, listArtifacts, listChanges, loadArtifact, provenance, readRecords, readTextChunk, restoreMetadata, restoreRevision, rsToolReady, rtChunkLimit, rtFit, rtIdBytes, saveMarkdown, searchArtifacts, tplTools } from "../service.js";
-import { serveContent, uploadBegin, uploadFinish, uploadPut } from "../uploads.js";
+import { TEXT_UPLOAD_KINDS, UPLOAD_BEGIN_DESCRIPTION, UPLOAD_FINISH_DESCRIPTION, serveContent, uploadBegin, uploadBeginFields, uploadFinish, uploadPut } from "../uploads.js";
 import { CHANGE_NOTE_SCHEMA, HttpError, errorBody, idemKey, json, mcpClientInfo, nowIso, nowMs, randomId, rememberClientInfo, sha256Hex, str } from "../util.js";
 
 function truncateUtf8(s, max) {
@@ -56,9 +56,9 @@ async function handleOAuthMcp(req, env, ctx) {
   if (!canRead) return insufficientScope(ctx.auth, [SCOPES.read]);
   const len = Number(req.headers.get("content-length") ?? "0");
   const bodyMax = ftMcpBodyMax(conn);
-  if (len > bodyMax) return reply(rpcErr(null, -32600, "Payload too large"), 413);
+  if (len > bodyMax) return reply(rpcErr(null, -32600, ftTooLarge(conn)), 413);
   const text = await ftReadCapped(req, bodyMax);
-  if (text === null) return reply(rpcErr(null, -32600, "Payload too large"), 413);
+  if (text === null) return reply(rpcErr(null, -32600, ftTooLarge(conn)), 413);
   let msg;
   try {
     msg = JSON.parse(text);
@@ -252,7 +252,7 @@ TOOLS = [
   {
     name: "diff_revisions",
     title: "Compare versions",
-    description: "Compare two versions of a document line by line (default: the current version against the one before it). Returns unified hunks (lines start with ' ', '-' or '+') and added/removed counts.",
+    description: "Compare two versions (default: current against previous). Text diffs return unified hunks and added/removed counts when bounded; non-identical inputs over 1 MiB or 20,000 lines return no hunks and null counts. Identical hashes still report identical.",
     inputSchema: S({ project_id: P, artifact_id: A, from: { type: "integer", minimum: 1 }, to: { type: "integer", minimum: 1 } }, ["artifact_id"]),
     annotations: RO,
     write: false,
@@ -280,7 +280,7 @@ TOOLS = [
   {
     name: "create_markdown",
     title: "Create document",
-    description: 'Create a new document in a connected project that allows editing. Markdown by default; set format "html" for an HTML page (static HTML/CSS: scripts and external resources are removed when shown; embed same-project images/videos with src="art_\u2026").',
+    description: 'Create a new document in a connected project that allows editing. Markdown by default; set format "html" for an HTML page (static HTML/CSS: scripts and external resources are removed when shown; embed same-project images/videos with src="art_\u2026"). For large text, use upload_begin \u2192 HTTP PUT \u2192 upload_finish when available.',
     inputSchema: S({ project_id: P, title: { type: "string", minLength: 1, maxLength: 200 }, body: { type: "string" }, format: { type: "string", enum: ["markdown", "html"], description: "Document format (default markdown)" }, change_note: NOTE, idempotency_key: K }, ["title", "idempotency_key"]),
     annotations: RW,
     write: true,
@@ -289,7 +289,7 @@ TOOLS = [
   {
     name: "save_markdown",
     title: "Edit document",
-    description: "Save a new revision of a Markdown or HTML document (the format is kept). expected_revision must be the revision you read; on revision_conflict re-read and merge. Every save is kept as an immutable version the owner can compare and restore. Always set change_note to one line on why you made the change; the owner reads it in History.",
+    description: "Save a new revision of a Markdown or HTML document (the format is kept). expected_revision must be the revision you read; on revision_conflict re-read and merge. Every save is kept as an immutable version the owner can compare and restore. Always set change_note to one line on why you made the change; the owner reads it in History. For large Markdown or HTML that will not fit a tool request, use upload_begin \u2192 HTTP PUT raw UTF-8 \u2192 upload_finish, if those tools are available and you can make HTTP requests.",
     inputSchema: S({ project_id: P, artifact_id: A, expected_revision: { type: "integer", minimum: 1 }, body: { type: "string" }, change_note: NOTE, idempotency_key: K }, ["artifact_id", "expected_revision", "body", "idempotency_key"]),
     annotations: RW,
     write: true,
@@ -327,7 +327,7 @@ HDR = { "content-type": "application/json", "cache-control": "no-store" };
 toolError = (err2) => ({ content: [{ type: "text", text: JSON.stringify({ error: err2 }) }], structuredContent: { error: err2 }, isError: true });
 
 // Files for OAuth (MCP) connections: list, read (inline image + short-lived download link) and upload new files or
-// versions (begin -> HTTP PUT to a single-upload link -> finish). See docs/agent-setup.md#files. Needs migration
+// versions (begin -> HTTP PUT to a single-upload link -> finish). See docs/agent-setup.md#files-and-large-text-uploads. Needs migration
 // 0013_oauth_file_access.sql.
 //  - Only connections approved on a consent page that offered files (oauth_connections.file_access = 1) get these
 //    tools. Older connections keep exactly what they were shown (documents and history) until the owner reconnects.
@@ -345,6 +345,12 @@ var FT_INLINE_IMAGE_BYTES = 1024 * 1024;
 var FT_INLINE_UPLOAD_BYTES = 2 * 1024 * 1024;
 var FT_INLINE_B64_MAX = Math.ceil(FT_INLINE_UPLOAD_BYTES / 3) * 4;
 var FT_MCP_BODY_MAX = 3 * 1024 * 1024;
+// Over-cap advice names upload tools only to connections that have them (file access).
+function ftTooLarge(conn) {
+  return conn?.file_access === 1
+    ? "Payload too large. For document content, use upload_begin, HTTP PUT raw UTF-8 bytes to put_url, then upload_finish (text up to 10 MiB). This requires an HTTP-capable client; otherwise send a smaller document."
+    : "Payload too large. This connection has no upload tools. Send a smaller document, or ask the owner to reconnect with file access and use upload_begin \u2192 HTTP PUT \u2192 upload_finish from an HTTP-capable client.";
+}
 function ftMcpBodyMax(conn) {
   return conn?.file_access === 1 ? FT_MCP_BODY_MAX : 1024 * 1024;
 }
@@ -447,18 +453,23 @@ async function ftUploadBegin(c, p, a, opts = {}) {
   const note = provenance(c, a)[4];
   if (!note) throw new HttpError(400, "change_note_required", "change_note is required: one line on why you are adding or changing this file");
   const isNew = a.artifact_id === void 0;
+  // upload_file (binaryOnly) never reads mime here: its getter checks it later, preserving its error precedence.
+  const textKind = !opts.binaryOnly && typeof a.mime === "string" && Object.hasOwn(TEXT_UPLOAD_KINDS, a.mime) ? TEXT_UPLOAD_KINDS[a.mime] : null;
   if (isNew ? a.title === void 0 || a.expected_revision !== void 0 : a.title !== void 0 || a.expected_revision === void 0)
-    throw new HttpError(400, "invalid_input", "Pass title for a new file, or artifact_id and expected_revision for a new version");
+    throw new HttpError(400, "invalid_input", textKind ? "Pass title and optional create metadata for a new document, or artifact_id and expected_revision for a new version" : "Pass title for a new file, or artifact_id and expected_revision for a new version");
   const uc = await ftUploadCtx(c, true);
   const key = idemKey(a.idempotency_key);
   if (!isNew) {
     const cur = await loadArtifact(c, p, str(a.artifact_id, "artifact_id", 64));
-    if (cur.kind !== "binary") throw new HttpError(415, "unsupported_kind", "Not a file; use save_markdown for documents");
+    // Text versions go to documents of the same kind (checked by uploadBegin); everything else to files only.
+    if (!textKind && cur.kind !== "binary") throw new HttpError(415, "unsupported_kind", "Not a file; use save_markdown for documents");
     // Fail early on a stale revision, except when retrying a begin that already succeeded (it replays below).
     const retry = await db(c).prepare("SELECT 1 AS x FROM idempotency WHERE principal_id = ? AND project_id = ? AND op = 'upload.begin' AND key = ?").bind(uc.principal.id, p, key).first("x");
     if (!retry && cur.head_rev !== a.expected_revision) throw new HttpError(409, "revision_conflict", "Expected revision is stale", { current_revision: cur.head_rev, expected_revision: a.expected_revision });
   }
-  const r = unwrap(await uploadBegin(uc, p, { title: a.title, folder: a.folder, artifact_id: a.artifact_id, expected_revision: a.expected_revision, mime: a.mime, size: a.size, sha256: a.sha256 }, key));
+  const r = unwrap(await uploadBegin(uc, p, textKind
+    ? { title: a.title, folder: a.folder, folder_id: a.folder_id, schema: a.schema, artifact_id: a.artifact_id, expected_revision: a.expected_revision, mime: a.mime, size: a.size, sha256: a.sha256, change_note: a.change_note }
+    : { title: a.title, folder: a.folder, artifact_id: a.artifact_id, expected_revision: a.expected_revision, mime: a.mime, size: a.size, sha256: a.sha256 }, key, { allowText: !opts.binaryOnly }));
   const u = await db(c).prepare("SELECT state, expires_at FROM uploads WHERE id = ? AND principal_id = ?").bind(r.upload_id, uc.principal.id).first();
   if (!u) throw new HttpError(404, "not_found", "Upload not found");
   const open = u.state === "pending" && u.expires_at > nowMs();
@@ -470,7 +481,8 @@ async function ftUploadBegin(c, p, a, opts = {}) {
     ...open && opts.link === false ? {} : open ? {
       put_url: await ftMint(c, "upload", p, r.artifact_id, null, r.upload_id, u.expires_at),
       method: "PUT",
-      instructions: "HTTP PUT the raw file bytes (exactly size bytes) to put_url; no Authorization header is needed. Then call upload_finish with upload_id. put_url works for this one upload only and expires at expires_at."
+      // Binary answers keep their earlier wording byte for byte.
+      instructions: textKind ? "HTTP PUT exactly size raw bytes to put_url; no Authorization header is needed. Text must be UTF-8. Then call upload_finish with upload_id. This link is only for this upload and expires at expires_at." : "HTTP PUT the raw file bytes (exactly size bytes) to put_url; no Authorization header is needed. Then call upload_finish with upload_id. put_url works for this one upload only and expires at expires_at."
     } : { instructions: "This upload is no longer accepting bytes; call upload_finish with upload_id to get its outcome." }
   };
 }
@@ -513,7 +525,7 @@ async function ftUploadInline(c, p, a) {
       if (!BINARY_TYPES[mime]) throw new HttpError(415, "unsupported_type", "Allowed: " + Object.keys(BINARY_TYPES).join(", "));
       return mime;
     }
-  }, { link: false });
+  }, { link: false, binaryOnly: true });
   if (begun.state === "pending") {
     const uc = await ftUploadCtx(c, false);
     await uploadPut(new Request("https://upload.invalid/inline", { method: "PUT", body: bytes, headers: { "content-length": String(bytes.length) } }), c.env, c.requestId, begun.upload_id, uc);
@@ -534,6 +546,36 @@ async function ftList(c, p, a) {
   const shown = appConnectEnabled(c.env) ? r.artifacts : r.artifacts.filter((x) => x.kind !== "json" && x.kind !== "csv");
   const artifacts = shown.map((x) => ({ ...x, mime: info.get(x.id)?.mime ?? null, size: info.get(x.id)?.size ?? null })).filter((x) => !prefix || (x.mime ?? "").startsWith(prefix));
   return { ...r, artifacts };
+}
+// upload_begin: text documents (Markdown and HTML; JSON and CSV with App Connect) or binary files.
+var ftUploadBeginCache = /* @__PURE__ */ new Map();
+function ftUploadBeginTool(appConnect) {
+  let t = ftUploadBeginCache.get(appConnect);
+  if (t) return t;
+  const f = uploadBeginFields(appConnect);
+  t = {
+    name: "upload_begin",
+    title: "Start upload",
+    description: UPLOAD_BEGIN_DESCRIPTION + ` The returned upload link needs no Authorization header. Binary-only upload_file is available up to ${FT_INLINE_UPLOAD_BYTES / 1048576} MiB if HTTP PUT is unavailable.`,
+    inputSchema: S({
+      project_id: P,
+      title: { type: "string", minLength: 1, maxLength: 200, description: f.title },
+      folder: { type: "string", maxLength: 200, description: f.folder },
+      ...f.appConnect,
+      artifact_id: { ...A, description: f.artifact_id },
+      expected_revision: { type: "integer", minimum: 1, description: "Current revision of artifact_id" },
+      mime: { ...f.mime, enum: f.mimeTypes },
+      size: f.size,
+      sha256: { type: "string", pattern: "^[0-9a-f]{64}$", description: "SHA-256 of the bytes, lowercase hex" },
+      change_note: NOTE,
+      idempotency_key: K
+    }, ["mime", "size", "sha256", "change_note", "idempotency_key"]),
+    annotations: RW,
+    write: true,
+    run: (c, p, a) => ftUploadBegin(c, p, a)
+  };
+  ftUploadBeginCache.set(appConnect, t);
+  return t;
 }
 // Tool definitions are built lazily: S, P, A, K, NOTE, RO and RW are set when the OAuth MCP module initialises.
 var ftDefs = null;
@@ -564,26 +606,8 @@ function ftToolsFor(env, conn) {
       write: false,
       run: (c, p, a) => ftReadFile(c, p, a)
     },
-    upload_begin: {
-      name: "upload_begin",
-      title: "Upload a file",
-      description: `Start uploading a new file (pass title) or a new version of a file (pass artifact_id and expected_revision; revision_conflict if it is stale). Allowed: PNG, JPEG, WebP, GIF, PDF, MP4, WebM or other binary (application/octet-stream, download-only), up to the workspace plan's file size limit (too_large says it; never more than ${FILE_BYTES_CEILING / 1048576} MiB). Declare the exact size and SHA-256 of the bytes. Then HTTP PUT the raw bytes to the returned put_url (single-use upload link, expires in minutes) and call upload_finish. If the PUT answers 422 integrity_mismatch, this upload has ended: call upload_begin again with a new idempotency_key. If you cannot make HTTP requests, use upload_file instead (up to ${FT_INLINE_UPLOAD_BYTES / 1048576} MiB). Each version is kept; always set change_note to why.`,
-      inputSchema: S({
-        project_id: P,
-        title: { type: "string", minLength: 1, maxLength: 200, description: "Title of a new file" },
-        folder: { type: "string", maxLength: 200 },
-        artifact_id: { ...A, description: "File to add a new version to" },
-        expected_revision: { type: "integer", minimum: 1, description: "Current revision of artifact_id" },
-        mime: { type: "string", enum: Object.keys(BINARY_TYPES) },
-        size: { type: "integer", minimum: 1, maximum: FILE_BYTES_CEILING },
-        sha256: { type: "string", pattern: "^[0-9a-f]{64}$", description: "SHA-256 of the bytes, lowercase hex" },
-        change_note: NOTE,
-        idempotency_key: K
-      }, ["mime", "size", "sha256", "change_note", "idempotency_key"]),
-      annotations: RW,
-      write: true,
-      run: (c, p, a) => ftUploadBegin(c, p, a)
-    },
+    // Replaced per request by ftUploadBeginTool (its fields depend on App Connect).
+    upload_begin: null,
     upload_file: {
       name: "upload_file",
       title: "Upload a small file",
@@ -606,7 +630,7 @@ function ftToolsFor(env, conn) {
     upload_finish: {
       name: "upload_finish",
       title: "Finish upload",
-      description: "Finish an upload after the PUT (the PUT itself refuses bytes whose size or SHA-256 differ from upload_begin: on 400 incomplete_body or 413 PUT the whole file again; on 422 integrity_mismatch the upload has ended, and finish returns the same 422, so start a new upload_begin): checks the file type, then publishes exactly one new version (shown in History with your change_note). Safe to retry; returns artifact_id, revision and web_url (for the user's browser).",
+      description: UPLOAD_FINISH_DESCRIPTION,
       inputSchema: S({ project_id: P, upload_id: { type: "string", maxLength: 64 }, idempotency_key: K }, ["upload_id", "idempotency_key"]),
       annotations: RW,
       write: true,
@@ -648,11 +672,11 @@ function ftToolsFor(env, conn) {
         }
       }, ftDefs.read_file);
     } else out2.push(t);
-    if (t.name === "save_markdown") out2.push(ftDefs.upload_file, ftDefs.upload_begin, ftDefs.upload_finish);
+    if (t.name === "save_markdown") out2.push(ftDefs.upload_file, ftUploadBeginTool(appConnectEnabled(env)), ftDefs.upload_finish);
   }
   return out2;
 }
-var FT_INSTRUCTIONS = "Agent Library: documents (Markdown, HTML, JSON, CSV) and files (images, PDFs, video) in owner-approved projects. Call list_projects first; pass project_id when more than one project is connected. Read before editing; saves need expected_revision and a fresh idempotency_key. read_file returns images inline and a short-lived download_url for any file. To add a file or a new version: upload_file (bytes as base64, up to 2 MiB), or upload_begin, HTTP PUT the bytes to put_url, then upload_finish. Every change is kept as a version the owner reviews in History: whenever a tool has a change_note field, always set it to one line on why.";
+var FT_INSTRUCTIONS = "Agent Library: documents (Markdown, HTML, JSON, CSV) and files (images, PDFs, video) in owner-approved projects. Call list_projects first; pass project_id when more than one project is connected. Read before editing; saves need expected_revision and a fresh idempotency_key. read_file returns images inline and a short-lived download_url for any file. For large text (up to 10 MiB), use upload_begin, HTTP PUT raw UTF-8 bytes to put_url, then upload_finish. Binary files use the same flow, or binary-only upload_file for up to 2 MiB inline. Every change is kept as a version the owner reviews in History: whenever a tool has a change_note field, always set it to one line on why.";
 // GET/HEAD /files/d/<token> (download one revision) and PUT /files/u/<token> (bytes of one upload), on the MCP host.
 async function handleFileTransfer(req, env, url) {
   const requestId = randomId("req", 9);

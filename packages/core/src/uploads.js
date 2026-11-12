@@ -1,9 +1,9 @@
 import { blobSha256Hex, deleteBlob, getBlob, getBlobHead, headBlob, putBlobStream, getText, getTextRange, getUploadedText } from "./content-store.js";
 import { authenticate, authorizeProject, authzSql, contentWriteSql, enforceRate, limitsFor, requireCsrf } from "./auth.js";
 import { PUT_MARGIN_MS, reconcileUploads } from "./cleanup.js";
-import { CONTENT_TYPE, checkFile, spreadsheetSafeCsv } from "./formats.js";
+import { CONTENT_TYPE, MEASUREMENTS, checkFile, spreadsheetSafeCsv } from "./formats.js";
 import { __name } from "./runtime.js";
-import { explainLimit, fileTooLarge, guardSql, projectLimitGuard } from "./limits.js";
+import { FILE_BYTES_CEILING, explainLimit, fileTooLarge, guardSql, projectLimitGuard } from "./limits.js";
 import { BINARY_TYPES, IMAGE_TYPES, VIDEO_TYPES, assertWritable, audit, idemLookup, loadArtifact, mdBody, provenance, publishRevision, requireAppConnect, textCreateMetadata } from "./service.js";
 import { TEXT_MAX_BYTES } from "./text-limits.js";
 import { HttpError, int, nowIso, nowMs, randomId, sha256Hex, str } from "./util.js";
@@ -41,13 +41,31 @@ async function dropUnpublished(env, uploadId, finalKey) {
   await deleteBlob(env, finalKey);
   await env.DB.prepare("UPDATE uploads SET final_purged_at = ? WHERE id = ? AND final_purged_at IS NULL").bind(nowMs(), uploadId).run();
 }
+// MCP upload_begin/upload_finish wording and text-upload fields, shared by the legacy and OAuth transports.
+// JSON/CSV fields are listed only with App Connect enabled (the server refuses them otherwise).
+const UPLOAD_BEGIN_DESCRIPTION = "Start a text document (UTF-8, up to 10 MiB) or binary upload (plan file limit, at most 90 MiB). New: pass title; new version: artifact_id and expected_revision. Declare mime, exact size and SHA-256; HTTP PUT raw bytes to put_url, then call upload_finish. Keep your local file on conflict. Set change_note to why.";
+const UPLOAD_FINISH_DESCRIPTION = "Validate uploaded bytes and publish one immutable version: UTF-8 and document rules for text, type signature for binaries. Safe to retry with the same key. Validation failure ends the upload; correct the file and start upload_begin again. A revision conflict requires re-reading and merging.";
+function uploadBeginFields(appConnect) {
+  return {
+    mime: { type: "string", description: appConnect ? "Exact MIME type: text/markdown, text/html, application/json, text/csv, or a supported binary type." : "Exact MIME type: text/markdown, text/html, or a supported binary type." },
+    mimeTypes: [...Object.keys(BINARY_TYPES), ...Object.keys(TEXT_UPLOAD_KINDS).filter((m) => appConnect || TEXT_UPLOAD_KINDS[m] === "markdown" || TEXT_UPLOAD_KINDS[m] === "html")],
+    size: { type: "integer", minimum: 0, maximum: FILE_BYTES_CEILING, description: "Raw byte length, not JSON-escaped length. Text: at most 10,485,760 bytes; binaries: plan file limit." },
+    title: "Title for a new document or file.",
+    artifact_id: "Existing document or file to add a version to; also pass expected_revision.",
+    folder: "Legacy folder label for a new document or file.",
+    appConnect: appConnect ? {
+      schema: { type: ["string", "null"], enum: [MEASUREMENTS, null], description: "New JSON/CSV: agentlib.measurements/1 to validate measurement records; omit for no schema. Existing documents keep their stored schema." },
+      folder_id: { type: "string", maxLength: 64, description: "Same-project folder ID for a new text document (App Connect required); omit for project root." }
+    } : {}
+  };
+}
 // Upload-owned bytes: immutable published binary content, or temporary raw input for text publication.
 var finalKeyFor = (projectId, artifactId) => `blobs/${projectId}/${artifactId}/${randomId("rev")}`;
 // Options are transport-owned, never request fields. transfer(uploadId) gives the transport's own { put_url, instructions }.
 async function uploadBegin(ctx, projectId, input, key, { allowText = false, allowBinary = true, transfer } = {}) {
   await authorizeProject(ctx, projectId, true);
   const mime = str(input.mime, "mime", 100);
-  // Text acceptance is transport-owned, never a request field; MCP stays binary-only until its own slice.
+  // Text acceptance is transport-owned, never a request field (MCP upload_file stays binary-only).
   const kind = allowText && Object.hasOwn(TEXT_UPLOAD_KINDS, mime) ? TEXT_UPLOAD_KINDS[mime] : null;
   if (!kind && !(allowBinary && BINARY_TYPES[mime])) throw new HttpError(415, "unsupported_type", "Allowed: " + [...allowBinary ? Object.keys(BINARY_TYPES) : [], ...allowText ? Object.keys(TEXT_UPLOAD_KINDS) : []].join(", "));
   const size = int(input.size, "size", kind ? 0 : 1, Number.MAX_SAFE_INTEGER);
@@ -553,4 +571,4 @@ async function serveContent(ctx, req, projectId, artifactId, revParam) {
   return new Response(obj2.body, { status, headers });
 }
 
-export { quotaUsedSql, serveContent, uploadBegin, uploadFinish, uploadPut };
+export { TEXT_UPLOAD_KINDS, UPLOAD_BEGIN_DESCRIPTION, UPLOAD_FINISH_DESCRIPTION, quotaUsedSql, serveContent, uploadBegin, uploadBeginFields, uploadFinish, uploadPut };

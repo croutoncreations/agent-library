@@ -2,8 +2,8 @@ import { authenticate, enforceRate } from "./auth.js";
 import { WEB_URL_OUTPUT_SCHEMAS, WEB_URL_TOOL_NOTE, appOrigin, withWebUrls } from "./links.js";
 import { addressLinks, resolveProjectRef } from "./paths.js";
 import { __name } from "./runtime.js";
-import { RS_SCHEMA, RT_ID_TOO_LONG, addComment, auditDenied, createMarkdown, diffRevisions, getArtifact, history, legacyConnectionInfo, listArtifacts, listChanges, listComments, listProjects, readTextChunk, restoreMetadata, restoreRevision, rsToolReady, rtChunkLimit, rtFit, rtIdBytes, saveMarkdown, searchArtifacts, tplTools, updateMetadata } from "./service.js";
-import { uploadBegin, uploadFinish } from "./uploads.js";
+import { RS_SCHEMA, RT_ID_TOO_LONG, addComment, appConnectEnabled, auditDenied, createMarkdown, diffRevisions, getArtifact, history, legacyConnectionInfo, listArtifacts, listChanges, listComments, listProjects, provenance, readTextChunk, restoreMetadata, restoreRevision, rsToolReady, rtChunkLimit, rtFit, rtIdBytes, saveMarkdown, searchArtifacts, tplTools, updateMetadata } from "./service.js";
+import { TEXT_UPLOAD_KINDS, UPLOAD_BEGIN_DESCRIPTION, UPLOAD_FINISH_DESCRIPTION, uploadBegin, uploadBeginFields, uploadFinish } from "./uploads.js";
 import { CHANGE_NOTE_SCHEMA, HttpError, idemKey, mcpClientInfo, readTextCapped, rememberClientInfo } from "./util.js";
 
 var SUPPORTED2 = ["2025-11-25", "2025-06-18", "2025-03-26"];
@@ -38,7 +38,7 @@ var TOOLS2 = [
   },
   {
     name: "diff_revisions",
-    description: "Compare two versions line by line (default: current against the previous one). Unified hunks; lines start with ' ', '-' or '+'.",
+    description: "Compare two versions (default: current against previous). Text diffs return unified hunks and added/removed counts when bounded; non-identical inputs over 1 MiB or 20,000 lines return no hunks and null counts. Identical hashes still report identical.",
     inputSchema: S2({ project_id: P2, artifact_id: A2, from: { type: "integer" }, to: { type: "integer" } }, ["project_id", "artifact_id"]),
     run: (c, a) => diffRevisions(c, a.project_id, a.artifact_id, a.from, a.to)
   },
@@ -57,13 +57,13 @@ var TOOLS2 = [
 
   {
     name: "create_markdown",
-    description: 'Create a document: Markdown by default, or format "html" for a static HTML page (scripts/external resources removed when shown; embed same-project media with src="art_\u2026").',
+    description: 'Create a document: Markdown by default, or format "html" for a static HTML page (scripts/external resources removed when shown; embed same-project media with src="art_\u2026"). For large text, use upload_begin \u2192 HTTP PUT \u2192 upload_finish when available.',
     inputSchema: S2({ project_id: P2, title: { type: "string" }, body: { type: "string" }, folder: { type: "string" }, format: { type: "string", enum: ["markdown", "html"] }, change_note: CHANGE_NOTE_SCHEMA, idempotency_key: K2 }, ["project_id", "title", "idempotency_key"]),
     run: async (c, a) => unwrap2(await createMarkdown(c, a.project_id, a, idemKey(a.idempotency_key), a.format === "html" ? "html" : "markdown"))
   },
   {
     name: "save_markdown",
-    description: "Save a new revision of a Markdown or HTML document. Fails with revision_conflict if expected_revision is not the current head; your text is not discarded \u2014 re-read and merge explicitly. Every save is kept as an immutable version. Always set change_note to one line on why you made the change; the owner reads it in History.",
+    description: "Save a new revision of a Markdown or HTML document. Fails with revision_conflict if expected_revision is not the current head; your text is not discarded \u2014 re-read and merge explicitly. Every save is kept as an immutable version. Always set change_note to one line on why you made the change; the owner reads it in History. For large Markdown or HTML that will not fit a tool request, use upload_begin \u2192 HTTP PUT raw UTF-8 \u2192 upload_finish, if those tools are available and you can make HTTP requests.",
     inputSchema: S2({ project_id: P2, artifact_id: A2, expected_revision: { type: "integer" }, body: { type: "string" }, change_note: CHANGE_NOTE_SCHEMA, idempotency_key: K2 }, ["project_id", "artifact_id", "expected_revision", "body", "idempotency_key"]),
     run: async (c, a) => unwrap2(await saveMarkdown(c, a.project_id, a.artifact_id, a, idemKey(a.idempotency_key)))
   },
@@ -79,18 +79,11 @@ var TOOLS2 = [
     inputSchema: S2({ project_id: P2, artifact_id: A2, cursor: { type: "string", maxLength: 512 } }, ["project_id", "artifact_id"]),
     run: (c, a) => listComments(c, a.project_id, a.artifact_id, a.cursor)
   },
-  {
-    name: "upload_begin",
-    description: "Begin a binary upload (PNG/PDF/MP4/other, <=5 MiB). The server cannot read your local files: you must then HTTP PUT the raw bytes to put_url with your bearer token, then call upload_finish.",
-    inputSchema: S2(
-      { project_id: P2, title: { type: "string" }, artifact_id: A2, expected_revision: { type: "integer" }, mime: { type: "string" }, size: { type: "integer" }, sha256: { type: "string" }, idempotency_key: K2 },
-      ["project_id", "mime", "size", "sha256", "idempotency_key"]
-    ),
-    run: async (c, a) => unwrap2(await uploadBegin(c, a.project_id, a, idemKey(a.idempotency_key)))
-  },
+  // Replaced per request by legacyUploadBegin (its fields depend on App Connect).
+  { name: "upload_begin" },
   {
     name: "upload_finish",
-    description: "Verify uploaded bytes (length + SHA-256 + signature) and publish exactly one immutable version.",
+    description: UPLOAD_FINISH_DESCRIPTION,
     inputSchema: S2({ project_id: P2, upload_id: { type: "string" }, idempotency_key: K2 }, ["project_id", "upload_id", "idempotency_key"]),
     run: async (c, a) => unwrap2(await uploadFinish(c, a.project_id, a.upload_id, idemKey(a.idempotency_key)))
   },
@@ -101,6 +94,31 @@ var TOOLS2 = [
     run: async (c, a) => unwrap2(await updateMetadata(c, a.project_id, a.artifact_id, { expected_meta_version: a.expected_meta_version, trashed: true }, idemKey(a.idempotency_key)))
   }
 ];
+// Text (Markdown and HTML; JSON and CSV with App Connect) or binary; text acceptance is this transport's option.
+var legacyUploadBeginCache = /* @__PURE__ */ new Map();
+function legacyUploadBegin(appConnect) {
+  let t = legacyUploadBeginCache.get(appConnect);
+  if (t) return t;
+  const f = uploadBeginFields(appConnect);
+  t = {
+    name: "upload_begin",
+    description: UPLOAD_BEGIN_DESCRIPTION + " Resolve a relative put_url against this server and use the same bearer credential.",
+    inputSchema: S2(
+      { project_id: P2, title: { type: "string", description: f.title }, folder: { type: "string", description: f.folder }, ...f.appConnect, artifact_id: { ...A2, description: f.artifact_id }, expected_revision: { type: "integer" }, mime: f.mime, size: f.size, sha256: { type: "string" }, change_note: CHANGE_NOTE_SCHEMA, idempotency_key: K2 },
+      ["project_id", "mime", "size", "sha256", "idempotency_key"]
+    ),
+    run: async (c, a) => {
+      // Text uploads record change_note at begin; a binary upload records it here, as OAuth upload_begin does.
+      const note = provenance(c, a)[4];
+      const r = unwrap2(await uploadBegin(c, a.project_id, a, idemKey(a.idempotency_key), { allowText: true }));
+      if (note && r?.upload_id && !Object.hasOwn(TEXT_UPLOAD_KINDS, a.mime)) await c.env.DB.prepare("UPDATE uploads SET change_note = ? WHERE id = ? AND principal_id = ? AND state = 'pending' AND change_note IS NULL").bind(note, r.upload_id, c.principal.id).run();
+      return r;
+    }
+  };
+  legacyUploadBeginCache.set(appConnect, t);
+  return t;
+}
+var legacyTools = (env) => TOOLS2.map((t) => t.name === "upload_begin" ? legacyUploadBegin(appConnectEnabled(env)) : t);
 var rpc2 = /* @__PURE__ */ __name((id, result) => ({ jsonrpc: "2.0", id, result }), "rpc");
 var rpcErr2 = /* @__PURE__ */ __name((id, code, message) => ({ jsonrpc: "2.0", id: id ?? null, error: { code, message } }), "rpcErr");
 async function handleMcp(req, env, requestId, origin) {
@@ -129,7 +147,7 @@ async function handleMcp(req, env, requestId, origin) {
   if (pv && !SUPPORTED2.includes(pv)) return new Response(JSON.stringify(rpcErr2(null, -32600, "Unsupported protocol version")), { status: 400, headers: hdr });
   // At most 2 MiB of UTF-8 bytes.
   const text = await readTextCapped(req, 2 * 1024 * 1024);
-  if (text === null) return new Response(JSON.stringify(rpcErr2(null, -32600, "Payload too large")), { status: 413, headers: hdr });
+  if (text === null) return new Response(JSON.stringify(rpcErr2(null, -32600, "Payload too large. For document content, use upload_begin, HTTP PUT raw UTF-8 bytes to put_url with your bearer credential, then upload_finish (text up to 10 MiB). This requires an HTTP-capable client; otherwise send a smaller document.")), { status: 413, headers: hdr });
   let msg;
   try {
     msg = JSON.parse(text);
@@ -158,13 +176,13 @@ async function handleMcp(req, env, requestId, origin) {
         protocolVersion: SUPPORTED2.includes(want) ? want : SUPPORTED2[0],
         capabilities: { tools: { listChanged: false } },
         serverInfo: { name: "agent-library", version: "0.1.0" },
-        instructions: "Agent Library: project-scoped Markdown and binary artifacts. Saves require expected_revision; mutations require idempotency_key. When saving, creating or restoring a document (tools with a change_note field), always set change_note to one line on why; the owner reads it in History."
+        instructions: `Agent Library: project-scoped ${appConnectEnabled(env) ? "Markdown, HTML and supported data documents" : "Markdown and HTML documents"}, plus binary artifacts. Saves require expected_revision; mutations require idempotency_key. When saving, creating or restoring a document (tools with a change_note field), always set change_note to one line on why; the owner reads it in History. Large text uses upload_begin \u2192 HTTP PUT raw UTF-8 \u2192 upload_finish; this needs an HTTP-capable client.`
       }));
     }
     case "ping":
       return reply(rpc2(msg.id, {}));
     case "tools/list":
-      return reply(rpc2(msg.id, { tools: TOOLS2.filter(t => (t.name !== "search_artifacts" || searchReady) && (!t.write || !!ctx.grant?.can_write)).map(({ name, description, inputSchema, annotations }) => ({
+      return reply(rpc2(msg.id, { tools: legacyTools(env).filter(t => (t.name !== "search_artifacts" || searchReady) && (!t.write || !!ctx.grant?.can_write)).map(({ name, description, inputSchema, annotations }) => ({
         annotations,
         name,
         description: WEB_URL_OUTPUT_SCHEMAS[name] ? description + WEB_URL_TOOL_NOTE : description,
@@ -172,7 +190,7 @@ async function handleMcp(req, env, requestId, origin) {
         ...WEB_URL_OUTPUT_SCHEMAS[name] ? { outputSchema: WEB_URL_OUTPUT_SCHEMAS[name] } : {}
       })) }));
     case "tools/call": {
-      const tool = TOOLS2.filter(t => t.name !== "search_artifacts" || searchReady).find((t) => t.name === msg.params?.name);
+      const tool = legacyTools(env).filter(t => t.name !== "search_artifacts" || searchReady).find((t) => t.name === msg.params?.name);
       if (!tool) return reply(rpcErr2(msg.id, -32602, "Unknown tool"));
       const args = msg.params?.arguments ?? {};
       if (typeof args !== "object" || Array.isArray(args)) return reply(rpcErr2(msg.id, -32602, "arguments must be an object"));

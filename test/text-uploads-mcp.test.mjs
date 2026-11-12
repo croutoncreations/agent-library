@@ -93,9 +93,11 @@ test("tool lists: upload_begin, upload_finish, save/create and diff descriptions
     assert.deepEqual(b.inputSchema.properties.schema.enum, ["agentlib.measurements/1", null]);
     assert.ok(b.inputSchema.properties.change_note, transport);
     assert.equal(tools.upload_finish.description, FINISH, transport);
-    assert.ok(tools.save_markdown.description.endsWith(" " + SAVE_ADD), transport);
+    // tools/list appends the existing web-link note (WEB_URL_TOOL_NOTE) after the tool's own description.
+    const own = (t) => t.description.replace(/ Results include browser links for the user .*$/, "");
+    assert.ok(own(tools.save_markdown).endsWith(" " + SAVE_ADD), transport);
     assert.match(tools.save_markdown.description, /Always set change_note/);
-    assert.ok(tools.create_markdown.description.endsWith(" " + CREATE_ADD), transport);
+    assert.ok(own(tools.create_markdown).endsWith(" " + CREATE_ADD), transport);
     assert.equal(tools.diff_revisions.description, DIFF, transport);
     if (transport === "oauth") {
       assert.equal(b.title, "Start upload");
