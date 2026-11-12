@@ -380,6 +380,15 @@ test("a lookup that starts after a completed shred is refused, even while an ear
   assertDataKey(a.key);
 });
 
+test("encryptionEnabled does not cache 'no key rows': a row created by another request during this one is seen", async () => {
+  const { sql, DB } = mkDB();
+  const r = request({ DB });
+  assert.equal(await lib.encryptionEnabled(r), false);
+  sql.prepare("INSERT INTO workspace_keys (workspace_id, key_id, master_version, wrapped, created_at, shredded_at) VALUES (?, ?, ?, ?, ?, ?)")
+    .run(WS_A, "wk_synthetic", 1, "synthetic-wrapped", Date.now(), null);
+  await assert.rejects(lib.encryptionEnabled(r), (e) => e.status === 500 && e.code === "encryption_misconfigured");
+});
+
 test("encryptionRequired reads CONTENT_ENCRYPTION_REQUIRED; only \"1\" means required", () => {
   for (const [v, want] of [[undefined, false], ["", false], ["0", false], ["1", true], [1, true]]) {
     assert.equal(lib.encryptionRequired({ CONTENT_ENCRYPTION_REQUIRED: v }), want, String(v));
@@ -394,12 +403,12 @@ test("encryptionEnabled: true when configured (no query); false only when not co
   assert.equal(queries, 0, "configured costs no query");
   const misconfigured = (e) => e.status === 500 && e.code === "encryption_misconfigured" && !/CONTENT_|wsp_|wk_/.test(e.message);
   await assert.rejects(lib.encryptionEnabled(request({ DB: countingDB, CONTENT_ENCRYPTION_REQUIRED: "1" })), misconfigured, "required but unset");
-  // Not required, no rows: off. The row probe is memoized per request.
+  // Not required, no rows: off. The row probe runs on every call (a "no rows" answer is never cached).
   const r = request({ DB: countingDB });
   queries = 0;
   assert.equal(await lib.encryptionEnabled(r), false);
   assert.equal(await lib.encryptionEnabled(r), false);
-  assert.equal(queries, 1, "one probe per request");
+  assert.equal(queries, 2, "one probe per call");
   // A malformed configuration is an error, never "off".
   await assert.rejects(lib.encryptionEnabled(request({ DB, CONTENT_MASTER_KEY_VERSION: "1", CONTENT_MASTER_KEY_V1: "short" })), (e) => e.code === "master_key_invalid");
   // Encryption was in use (rows exist), then the version var was removed: never plaintext.
