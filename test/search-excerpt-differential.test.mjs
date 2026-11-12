@@ -105,3 +105,10 @@ test("the tokenizer tables reproduce unicode61 remove_diacritics 2 for every cod
   for (let c = 0; c < texts.length; c++) if (texts[c] && JSON.stringify(tokenize(texts[c])) !== JSON.stringify(index[c] ?? [])) wrong.push(c.toString(16));
   assert.deepEqual(wrong.slice(0, 20), []);
 });
+
+// An excerpt with no word in it is empty, so the service shows the title instead (`rsExcerpt(…) || r.title`).
+test("a prefix with no complete word gives an empty excerpt", () => {
+  assert.equal(rsExcerpt("- ".repeat(9000), ["x"]), "", "only separators beyond the prefix");
+  assert.equal(rsExcerpt("w".repeat(20000), ["x"]), "", "one word longer than the prefix");
+  assert.equal(rsExcerpt("w".repeat(20000) + " x", ["x"]), "", "the match lies beyond the prefix");
+});

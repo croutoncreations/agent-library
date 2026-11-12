@@ -150,8 +150,8 @@ function rsExcerpt(source, terms) {
   const cut = (start > 0 ? " … ".length - tokens[start].start : 0);
   if (complete && endToken >= n - 1) return out.slice(0, 500);
   const last = tokens[Math.min(endToken, n - 1)];
-  out = last ? out.slice(0, last.end + cut) : "";
-  return (out + " … ").slice(0, 500);
+  if (!last) return ""; // no complete word in the prefix: the caller shows the title
+  return (out.slice(0, last.end + cut) + " … ").slice(0, 500);
 }
 async function searchArtifacts(ctx, args, transport = "api") {
   if (ctx.publisher) throw new HttpError(403, "forbidden", "Search is unavailable to publishers");
