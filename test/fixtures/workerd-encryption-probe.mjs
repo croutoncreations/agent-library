@@ -109,13 +109,17 @@ async function probeRange(env) {
   return { size: o.size, customMetadata: o.customMetadata ?? null, range: o.range ?? null, bodyLength: body.length };
 }
 
-// (e) a body that errors after its first chunk, with a Content-Length.
-function erroringBody() {
+// (e1, e2) a body that errors after its first chunk, with a Content-Length. delayMs: how long the second pull waits
+// before erroring (e2 gives the head and first chunk time to reach the client). Invocations are counted per run id.
+const invocations = new Map();
+function erroringBody(id, delayMs) {
+  invocations.set(id, (invocations.get(id) ?? 0) + 1);
   const length = 300_000;
   let sent = false;
   const body = new ReadableStream({
-    pull(controller) {
+    async pull(controller) {
       if (!sent) { sent = true; controller.enqueue(random(65_536)); return; }
+      if (delayMs) await new Promise((resolve) => setTimeout(resolve, delayMs));
       controller.error(new Error("probe: chunk 1 failed authentication"));
     },
   }, { highWaterMark: 0 });
@@ -153,7 +157,8 @@ export default {
         case "/probe/b": return json(await probePut(env));
         case "/probe/c": return json(await probeFlushThrow(env, Number(url.searchParams.get("size"))));
         case "/probe/d": return json(await probeRange(env));
-        case "/probe/e": return erroringBody();
+        case "/probe/e": return erroringBody(url.searchParams.get("id"), Number(url.searchParams.get("delay") ?? 0));
+        case "/probe/e-count": return json({ invocations: invocations.get(url.searchParams.get("id")) ?? 0 });
         case "/probe/f": return json(await probeOnlyIf(env));
         default: return json({ error: "not_found" }, 404);
       }
