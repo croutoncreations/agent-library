@@ -51,6 +51,19 @@ test("backup import: at most IMPORT_MAX_ROWS (2,000) documents and files per imp
   assert.throws(() => lib.checkImportRows({}, backup(2000), new Map(), { items_per_project: 10000 }), (e) => !/at most/.test(e.message));
 });
 
+test("backup import: a file version's mime must be a supported type itself, not an inherited property name", () => {
+  const backup = (mime) => ({
+    artifacts: [{ id: "art_b", kind: "binary", title: "t", head_rev: 1, meta_version: 1, created_at: "x", updated_at: "x", head_revision_id: "rev_b" }],
+    revisions: [{ id: "rev_b", artifact_id: "art_b", rev_no: 1, created_at: "x", mime, size: 3, blob_key: "k", body: null }], comments: []
+  });
+  const decoded = new Map([["k", new Uint8Array([1, 2, 3])]]);
+  for (const mime of ["constructor", "toString", "__proto__", "hasOwnProperty", "valueOf"])
+    assert.throws(() => lib.checkImportRows({}, backup(mime), decoded, { items_per_project: 10 }), (e) => e.code === "bad_backup" && e.message === "Unsupported file type", mime);
+  // A supported type and octet-stream still pass.
+  lib.checkImportRows({}, backup("application/octet-stream"), decoded, { items_per_project: 10 });
+  assert.throws(() => lib.checkImportRows({}, backup("image/png"), decoded, { items_per_project: 10 }), (e) => e.message === "A file's contents don't match its type");
+});
+
 test("agent rate limits read a workspace's plan once per request; a new request reads it again", async () => {
   const { sql, DB, reads } = mkDB();
   const base = lib.withAdapters({ DB, PLAN_LIMITS: JSON.stringify(PLANS) }, lib.resolveAdapters({ entitlements: lib.planEntitlements }));

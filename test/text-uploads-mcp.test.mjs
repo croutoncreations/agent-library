@@ -284,3 +284,90 @@ test("over-cap MCP bodies: legacy, file-enabled OAuth and documents-only OAuth a
     assert.deepEqual([j.error.code, j.error.message], [-32600, message], `${what} streamed=${streamed}`);
   }
 });
+
+// Rows written, including unpublished placeholders (head_rev = 0): "nothing written" is asserted from the database.
+const rowCounts = () => sql("SELECT (SELECT COUNT(*) FROM uploads) AS uploads, (SELECT COUNT(*) FROM artifacts) AS artifacts")[0];
+const ALLOWED_ON = "Allowed: image/png, image/jpeg, image/webp, image/gif, application/pdf, video/mp4, video/webm, application/octet-stream, text/markdown, text/html, application/json, text/csv";
+
+test("prototype property names are not MIME types: 415 at begin on both MCP servers and the app API, nothing written", async () => {
+  const bytes = Buffer.from("%PDF-1.4 synthetic\n");
+  const before = rowCounts();
+  for (const mime of ["constructor", "toString", "__proto__", "hasOwnProperty"]) {
+    const decl = { project_id: P, title: "Proto " + mime, mime, size: bytes.length, sha256: sha256(bytes), change_note: "x" };
+    for (const [transport, c] of [["legacy", legacy], ["oauth", oauth]]) {
+      const r = await c.call("upload_begin", { ...decl, idempotency_key: key("ub") });
+      assert.deepEqual(r.data.error, { status: 415, code: "unsupported_type", message: ALLOWED_ON }, `${transport} ${mime}`);
+    }
+    const a = await owner.req("POST", `/api/projects/${P}/uploads`, { title: "Proto " + mime, mime, size: bytes.length, sha256: sha256(bytes) });
+    assert.equal(a.status, 415, `app ${mime} ${JSON.stringify(a.body)}`);
+    assert.deepEqual([a.body.error.code, a.body.error.message], ["unsupported_type", ALLOWED_ON], mime);
+    assert.deepEqual(rowCounts(), before, mime);
+  }
+});
+
+test("App Connect on: the 415 list and the JSON/CSV size refusal are unchanged on the app API and both MCP servers", async () => {
+  const before = rowCounts();
+  const plain = { project_id: P, title: "Plain text", mime: "text/plain", size: 1, sha256: sha256("x"), change_note: "x" };
+  for (const c of [legacy, oauth]) assert.deepEqual((await c.call("upload_begin", { ...plain, idempotency_key: key("ub") })).data.error, { status: 415, code: "unsupported_type", message: ALLOWED_ON });
+  const a = await owner.req("POST", `/api/projects/${P}/uploads`, { title: "Plain text", mime: "text/plain", size: 1, sha256: sha256("x") });
+  assert.deepEqual([a.status, a.body.error.message], [415, ALLOWED_ON]);
+  for (const [mime, k] of [["application/json", "json"], ["text/csv", "csv"]]) {
+    const big = { project_id: P, title: "Big " + k, mime, size: MIB10 + 1, sha256: sha256("x"), change_note: "x" };
+    for (const c of [legacy, oauth]) assert.deepEqual((await c.call("upload_begin", { ...big, idempotency_key: key("ub") })).data.error, { status: 413, code: "too_large", message: `${k} file exceeds 10 MiB` });
+    const r = await owner.req("POST", `/api/projects/${P}/uploads`, { title: "Big " + k, mime, size: MIB10 + 1, sha256: sha256("x") });
+    assert.deepEqual([r.status, r.body.error.message], [413, `${k} file exceeds 10 MiB`]);
+  }
+  assert.deepEqual(rowCounts(), before);
+});
+
+test("legacy binary upload_begin: change_note and folder are recorded; omitted, as before; bad notes; read-only gets 403", async () => {
+  const png = makePng(6, 6), png2 = makePng(7, 7);
+  const bin = async (args, bytes) => {
+    const b = await legacy.call("upload_begin", { project_id: P, mime: "image/png", size: bytes.length, sha256: sha256(bytes), idempotency_key: key("ub"), ...args });
+    assert.equal(b.isError, false, JSON.stringify(b.data));
+    assert.equal((await fetch(new URL(b.data.put_url, h.appUi), { method: "PUT", body: bytes, headers: { authorization: `Bearer ${legacyToken}` } })).status, 200);
+    const f = await legacy.call("upload_finish", { project_id: P, upload_id: b.data.upload_id, idempotency_key: key("uf") });
+    assert.equal(f.isError, false, JSON.stringify(f.data));
+    return f.data.artifact_id;
+  };
+  const withNote = await bin({ title: "Noted.png", folder: "Synthetic pictures", change_note: "Synthetic binary note" }, png);
+  const hist = await legacy.call("artifact_history", { project_id: P, artifact_id: withNote });
+  assert.deepEqual(hist.data.revisions.map((r) => [r.rev, r.change_note]), [[1, "Synthetic binary note"]]);
+  assert.equal(sql(`SELECT folder FROM artifacts WHERE id = '${withNote}'`)[0].folder, "Synthetic pictures");
+  const plain = await bin({ title: "Plain.png" }, png2);
+  assert.deepEqual((await legacy.call("artifact_history", { project_id: P, artifact_id: plain })).data.revisions.map((r) => [r.rev, r.change_note]), [[1, null]]);
+  assert.equal(sql(`SELECT folder FROM artifacts WHERE id = '${plain}'`)[0].folder, "", "no folder label, as before");
+  const before = rowCounts();
+  const decl = { project_id: P, title: "Bad note.png", mime: "image/png", size: png.length, sha256: sha256(png) };
+  const notString = await legacy.call("upload_begin", { ...decl, change_note: 5, idempotency_key: key("ub") });
+  assert.deepEqual(notString.data.error, { status: 400, code: "invalid_input", message: "change_note must be a string" });
+  const tooLong = await legacy.call("upload_begin", { ...decl, change_note: "n".repeat(281), idempotency_key: key("ub") });
+  assert.deepEqual(tooLong.data.error, { status: 413, code: "too_large", message: "change_note exceeds 280 characters" });
+  const roLegacy = await sdkClient(h.appUi, roGrantToken, "synthetic-ro-note");
+  try {
+    for (const change_note of [5, "n".repeat(281), "fine"]) {
+      const r = await roLegacy.call("upload_begin", { ...decl, change_note, idempotency_key: key("ub") });
+      assert.deepEqual(r.data.error, { status: 403, code: "forbidden", message: "Grant is read-only" }, String(change_note).slice(0, 10));
+    }
+  } finally { await roLegacy.client.close(); }
+  assert.deepEqual(rowCounts(), before);
+});
+
+test("0-byte text: Markdown begin, empty PUT and finish publish an empty document (legacy MCP and the app API); 0-byte binary is refused", async () => {
+  const empty = Buffer.alloc(0);
+  const viaMcp = await upload(legacy, "legacy", { title: "Empty via MCP", mime: "text/markdown" }, empty);
+  assert.equal(viaMcp.begin.isError, false, JSON.stringify(viaMcp.begin.data));
+  assert.equal(viaMcp.put.status, 200);
+  assert.equal(viaMcp.finish.isError, false, JSON.stringify(viaMcp.finish.data));
+  assert.deepEqual([viaMcp.finish.data.revision, viaMcp.finish.data.size], [1, 0]);
+  assert.equal((await content(viaMcp.finish.data.artifact_id)).length, 0);
+  const b = await owner.req("POST", `/api/projects/${P}/uploads`, { title: "Empty via app", mime: "text/markdown", size: 0, sha256: sha256(empty) });
+  assert.equal(b.status, 201, JSON.stringify(b.body));
+  assert.equal((await owner.req("PUT", b.body.put_url, undefined, { raw: empty, idem: false })).status, 200);
+  const f = await owner.req("POST", `/api/projects/${P}/uploads/${b.body.upload_id}/finish`, {});
+  assert.equal(f.status, 200, JSON.stringify(f.body));
+  assert.deepEqual([f.body.revision, f.body.size], [1, 0]);
+  assert.equal((await content(f.body.artifact_id)).length, 0);
+  const bin = await legacy.call("upload_begin", { project_id: P, title: "Empty.png", mime: "image/png", size: 0, sha256: sha256(empty), idempotency_key: key("ub") });
+  assert.deepEqual(bin.data.error, { status: 400, code: "invalid_input", message: "size must be an integer in [1, 9007199254740991]" });
+});
