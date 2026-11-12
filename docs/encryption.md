@@ -130,20 +130,29 @@ For the slices that wire this into reads and writes:
   be published in part.
 - **Write these conditions with the fences in `content-store.js`**, never by hand: `keyFence(env, { keyId,
   workspaceId })` for a write under a key and `plaintextFence(env)` for a plaintext write (both fail by violating a
-  NOT NULL constraint on the always-empty `content_fences` table, migration `0030_content_fences.sql`). Put the fence
-  last in the batch, after every statement whose result the caller reads. `fenceRefusal(error)` turns a refusal into
-  its answer: `410 key_shredded` for a key fence, `409 encryption_started` for a plaintext fence, and `null` for
-  any other error.
-- **A refusal must be told apart from other failures**, for example by probing again after the failure, so that it
-  is not reported as an expired text-write intent (`text_write_expired`). A refused plaintext write is retryable
-  (the retry re-evaluates encryption and cannot publish plaintext: it encrypts while the master-key settings are
-  present, and is refused otherwise). Probing again is reliable because both conditions only ever move one way: the
-  code never deletes a real key row or sets it back to master version 0, and never undoes a shred. A write refused
-  because its key was shredded answers `410 key_shredded`. A refused upload ends failed, and a retry starts a new
-  upload.
+  NOT NULL constraint on the always-empty `content_fences` table, migration `0030_content_fences.sql`, whose CHECK
+  also refuses any non-NULL row). Never give a fence a conflict clause (`OR IGNORE`, `OR REPLACE`, `ON CONFLICT`):
+  it would turn a refusal into a pass. Put the fence last in the batch, after every statement whose result the
+  caller reads. A refusal answers `410 key_shredded` for a key fence and `409 encryption_started` for a plaintext
+  fence. `runBatch` and `commitTextWrites` already return the refusal as that HTTP answer; `fenceRefusal(error)` is
+  for code that runs a batch itself (it returns the answer, or `null` for any other error, and is safe to call on an
+  answer it already returned).
+- **A refusal must be told apart from other failures**, so that it is not reported as an expired text-write intent
+  (`text_write_expired`) or a conflict. A refusal is recognised from the constraint the failed statement names
+  (`fenceRefusal`), not by probing. A refused plaintext write is retryable (the retry re-evaluates encryption and
+  cannot publish plaintext: it encrypts while the master-key settings are present, and is refused otherwise). This
+  code never deletes a key row, never changes a row's master version and never clears a shred, so within the code
+  both conditions only move one way. A database restore or a manual edit can undo that; it is the same limit as for
+  shredding (see [Limits](#limits)). Any later code that removes workspace data must keep the rows of
+  `workspace_keys`. A write refused because its key was shredded answers `410 key_shredded`. A refused upload ends
+  failed, and a retry starts a new upload.
+- An error that is not recognised as a refusal is still a failed batch: nothing was published. Never retry it with a
+  write that carries no fence.
 - **A refusal must leave the staged object reclaimable.** The row that lets cleanup find the object (the text-write
   intent, the upload row) must survive the refusal, and an upload must end failed, so that the existing cleanup (the
-  intent sweep, upload cleanup) removes the object.
+  intent sweep, upload cleanup) removes the object. `commitTextWrites` removes the unreferenced staged text of a
+  recognised refusal at once, as it does for an expired intent (a refusal means the batch rolled back); if that
+  cleanup fails, the intent stays for the sweep.
 - Worker versions from before these conditions existed do not honour them, so encryption may be configured only
   after a Worker that fences its writes is fully deployed. Set `CONTENT_ENCRYPTION_REQUIRED="1"` in the same deploy
   as the master-key settings: set earlier, it refuses every request until they arrive.
