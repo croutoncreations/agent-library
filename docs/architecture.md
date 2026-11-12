@@ -88,7 +88,7 @@ The Worker is ordinary ES modules in two packages. `packages/core/src/` holds ev
 
 - `packages/core/src/web/*.txt` are the browser assets (UI shell, styles, app script, Home loader, prebuilt CodeMirror editor). They are imported as text and served verbatim; `app.js.txt` has three build-free placeholders filled in `packages/core/src/ui.js`.
 - `packages/core/src/service.js` is the shared service layer used by the browser API, `/v1`, MCP and App Connect. Focused modules split from it: `search/`, `changes/`, `reads/`, `history/`, `templates/`.
-- `packages/core/src/content-store.js` is the only module that touches R2 (`BLOBS`); it is the seam for per-workspace encryption ([encryption.md](encryption.md)).
+- `packages/core/src/content-store.js` is the only module that touches R2 (`BLOBS`); it is the seam for per-workspace encryption ([encryption.md](encryption.md)) and builds the publication fences (`keyFence`, `plaintextFence`, `fenceRefusal`) that make a batch fail when its key was shredded or encryption started.
 - `packages/core/src/oauth/` is the OAuth server, consent pages and MCP-over-OAuth; `packages/core/src/api/` holds `/v1`, API keys, app clients and the publisher API.
 
 `npm run check:bundle` builds twice in fresh directories and fails if the outputs differ, if the bundle imports anything but `cloudflare:workers`, or if an installation-specific value appears. The editor bundle's provenance is checked separately (`npm run check:editor`).

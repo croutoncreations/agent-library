@@ -128,10 +128,19 @@ For the slices that wire this into reads and writes:
   rows has already committed the others by the time a row count is read. Only a single statement that publishes at
   most one row may instead check that it changed exactly that row and treat anything else as an error. Nothing may
   be published in part.
+- **Write these conditions with the fences in `content-store.js`**, never by hand: `keyFence(env, { keyId,
+  workspaceId })` for a write under a key and `plaintextFence(env)` for a plaintext write (both fail by violating a
+  NOT NULL constraint on the always-empty `content_fences` table, migration `0030_content_fences.sql`). Put the fence
+  last in the batch, after every statement whose result the caller reads. `fenceRefusal(error)` turns a refusal into
+  its answer: `410 key_shredded` for a key fence, `409 encryption_started` for a plaintext fence, and `null` for
+  any other error.
 - **A refusal must be told apart from other failures**, for example by probing again after the failure, so that it
   is not reported as an expired text-write intent (`text_write_expired`). A refused plaintext write is retryable
-  (the retry encrypts). A write refused because its key was shredded answers `410 key_shredded`. A refused upload
-  ends failed, and a retry starts a new upload.
+  (the retry re-evaluates encryption and cannot publish plaintext: it encrypts while the master-key settings are
+  present, and is refused otherwise). Probing again is reliable because both conditions only ever move one way: the
+  code never deletes a real key row or sets it back to master version 0, and never undoes a shred. A write refused
+  because its key was shredded answers `410 key_shredded`. A refused upload ends failed, and a retry starts a new
+  upload.
 - **A refusal must leave the staged object reclaimable.** The row that lets cleanup find the object (the text-write
   intent, the upload row) must survive the refusal, and an upload must end failed, so that the existing cleanup (the
   intent sweep, upload cleanup) removes the object.
