@@ -220,7 +220,6 @@ async function listArtifacts(ctx, projectId, q) {
   await authorizeProject(ctx, projectId, false);
   const offset = q.cursor ? int(Number(q.cursor), "cursor", 0, 1e5) : 0;
   const term = q.query ? str(q.query, "query", 200) : "";
-  const like = "%" + term.replace(/[\\%_]/g, (c) => "\\" + c) + "%";
   const kind = q.kind ?? "";
   if (kind && !["markdown", "html", "json", "csv", "binary"].includes(kind)) throw new HttpError(400, "invalid_input", "kind must be markdown, html, json, csv or binary");
   const folder = q.folderId ?? "";
@@ -228,11 +227,11 @@ async function listArtifacts(ctx, projectId, q) {
   const r = await db(ctx).prepare(
     `SELECT ${ART_COLS}, r.mime AS head_mime FROM artifacts a LEFT JOIN revisions r ON r.id = a.head_revision_id
      WHERE a.project_id = ? AND a.head_rev > 0 AND (a.trashed_at IS NOT NULL) = ?
-       AND (? = '' OR a.title LIKE ? ESCAPE '\\')
+       AND (? = '' OR instr(lower(a.title), lower(?)) > 0) -- same as LIKE with ESCAPE, without D1's 50-byte pattern limit
        AND (? = '' OR a.kind = ?)
        AND (? = '' OR (? = 'root' AND a.folder_id IS NULL) OR a.folder_id = ?)
      ORDER BY a.updated_at DESC, a.id LIMIT ? OFFSET ?`
-  ).bind(projectId, q.trashed ? 1 : 0, term, like, kind, kind, folder, folder, folder, LIMITS.pageSize + 1, offset).all();
+  ).bind(projectId, q.trashed ? 1 : 0, term, term, kind, kind, folder, folder, folder, LIMITS.pageSize + 1, offset).all();
   const rows = r.results.slice(0, LIMITS.pageSize);
   return {
     artifacts: rows.map((a) => q.withMime ? { ...artifactView(a, appConnectEnabled(ctx.env)), mime: a.head_mime ?? null } : artifactView(a, appConnectEnabled(ctx.env))),
