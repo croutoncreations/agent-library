@@ -10,6 +10,7 @@ import { randomBytes } from "node:crypto";
 import { ROOT, startServer, agentHttp, setupProject, grant, sha256 } from "./helpers.mjs";
 import { SERVER_PORTS } from "./ports.mjs";
 import { P, PNG, SHA, lib, world } from "./upload-world.mjs";
+import { moduleScript } from "./module-source.mjs";
 
 test("uploads.js: no direct byte buffering or stream hashing; exactly one streaming PUT call site", () => {
   const src = readFileSync(join(ROOT, "packages", "core", "src", "uploads.js"), "utf8");
@@ -17,6 +18,16 @@ test("uploads.js: no direct byte buffering or stream hashing; exactly one stream
   // getBlob always gets a range argument (serveContent's is undefined only to stream a whole-file GET response).
   assert.doesNotMatch(src, /getBlob\(\s*[^,()]+,\s*[^,()]+\)/, "getBlob without a range argument");
   assert.equal([...src.matchAll(/putBlobStream\(/g)].length, 1, "exactly one putBlobStream call site (the PUT)");
+});
+
+test("uploadFinish: every fail/lost/lostAfterWrite outcome is awaited before its finally releases the lease", () => {
+  const src = moduleScript("packages/core/src/uploads.js");
+  const start = src.indexOf("async function uploadFinish(");
+  assert.ok(start >= 0, "uploadFinish found");
+  const end = src.indexOf("\nasync function ", start + 1);
+  const body = src.slice(start, end < 0 ? void 0 : end);
+  assert.match(body, /return await fail\(/, "guard sees the real body");
+  assert.deepEqual(body.match(/return (?:fail|lost|lostAfterWrite)\(/g), null, "un-awaited return of fail/lost/lostAfterWrite in uploadFinish");
 });
 
 // begin -> PUT -> finish against the BLOBS spy, as a human (no CSRF needed with the linkCtx path).
