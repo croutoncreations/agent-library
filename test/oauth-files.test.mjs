@@ -90,7 +90,7 @@ test("tools: read connections get read_file and no upload tools; edit connection
   assert.equal(by.upload_begin.annotations.readOnlyHint, false);
   assert.match(by.read_file.description, /not a share link/);
   assert.match(by.read_file.description, /web_url is for the user's browser/);
-  assert.match(by.upload_begin.description, /up to the workspace plan's file size limit .*never more than 90 MiB/);
+  assert.match(by.upload_begin.description, /binary upload \(plan file limit, at most 90 MiB\)/);
   assert.equal(by.upload_begin.inputSchema.properties.size.maximum, 90 * 1024 * 1024);
   assert.match(sdk.getInstructions() ?? "", /read_file returns images inline/);
 });
@@ -222,7 +222,8 @@ test("limits and safety: size, MIME outside BINARY_TYPES, signature mismatch, SV
   const big = await rw.call("upload_begin", { project_id: P, title: "big", mime: "video/mp4", size: 25 * 1024 * 1024 + 1, sha256: "a".repeat(64), change_note: "x", idempotency_key: key("ub") });
   assert.ok(big.isError);
   assert.equal(big.data.error.code, "too_large");
-  for (const mime of ["image/svg+xml", "text/html"]) {
+  // text/html is an accepted text upload since text uploads reached MCP (test/text-uploads-mcp.test.mjs); SVG is not.
+  for (const mime of ["image/svg+xml"]) {
     const bad = await rw.call("upload_begin", { project_id: P, title: "bad", mime, size: 10, sha256: "a".repeat(64), change_note: "x", idempotency_key: key("ub") });
     assert.ok(bad.isError, mime);
   }

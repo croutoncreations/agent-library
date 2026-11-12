@@ -87,3 +87,26 @@ test("browser: the feature probe is 404 with the flag off, and Upload file offer
     assert.doesNotMatch(help, /CSV|JSON/);
   } finally { await browser.close(); }
 });
+
+test("legacy MCP upload_begin with the flag off: Markdown/HTML wording only; JSON/CSV refused as on /api, nothing reserved", async () => {
+  const { mcpClient, grant, sha256 } = await import("./helpers.mjs");
+  const g = await grant(owner, "off-test", "Synthetic off uploader");
+  const m = await mcpClient(APP, g.token);
+  try {
+    const b = (await m.client.listTools()).tools.find((t) => t.name === "upload_begin");
+    assert.equal(b.inputSchema.properties.mime.description, "Exact MIME type: text/markdown, text/html, or a supported binary type.");
+    assert.ok(!("schema" in b.inputSchema.properties) && !("folder_id" in b.inputSchema.properties));
+    const before = (await owner.req("GET", "/api/projects/off-test/artifacts")).body.artifacts.length;
+    for (const mime of ["application/json", "text/csv"]) {
+      const r = await m.call("upload_begin", { project_id: "off-test", title: "x", mime, size: 2, sha256: sha256("{}"), idempotency_key: key("ub") });
+      assert.deepEqual(r.data.error, { status: 404, code: "not_found", message: "Not found" }, mime);
+    }
+    assert.equal((await owner.req("GET", "/api/projects/off-test/artifacts")).body.artifacts.length, before);
+    const md = Buffer.from("# off\n");
+    const ok = await m.call("upload_begin", { project_id: "off-test", title: "off md", mime: "text/markdown", size: md.length, sha256: sha256(md), idempotency_key: key("ub") });
+    assert.equal(ok.isError, false, JSON.stringify(ok.data));
+    assert.equal((await fetch(APP + ok.data.put_url, { method: "PUT", body: md, headers: { authorization: `Bearer ${g.token}` } })).status, 200);
+    const f = await m.call("upload_finish", { project_id: "off-test", upload_id: ok.data.upload_id, idempotency_key: key("uf") });
+    assert.equal(f.isError, false, JSON.stringify(f.data)); assert.equal(f.data.revision, 1);
+  } finally { await m.close(); }
+});

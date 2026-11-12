@@ -54,15 +54,14 @@ test("binary upload_file continues to publish normally", async () => {
   const r = await call({ mime: "image/png", content_base64: PNG.toString("base64") });
   assert.equal(r.isError, false, JSON.stringify(r.structuredContent)); assert.equal(r.structuredContent.revision, 1);
 });
-test("OAuth and legacy upload_begin retain binary-only refusal for all text MIME types without writing anything", async () => {
+test("OAuth and legacy upload_begin refuse an unsupported type without writing anything (text types are accepted: test/text-uploads-mcp.test.mjs)", async () => {
   const before = counts();
-  for (const mime of ["text/markdown", "text/html", "application/json", "text/csv"]) {
-    const args = { project_id: P, title: "Synthetic refused text", mime, size: 1, sha256: sha256("x"), idempotency_key: key() };
-    const oauth = await sdk.callTool({ name: "upload_begin", arguments: { ...args, change_note: "Synthetic binary-only begin" } });
-    assert.equal(oauth.isError, true); assert.deepEqual(oauth.structuredContent.error, expected);
-    const old = await legacy.call("upload_begin", args); assert.equal(old.isError, true); assert.deepEqual(old.data.error, expected);
-    assert.deepEqual(counts(), before);
-  }
+  const all = { status: 415, code: "unsupported_type", message: expected.message + ", text/markdown, text/html, application/json, text/csv" };
+  const args = { project_id: P, title: "Synthetic refused type", mime: "text/plain", size: 1, sha256: sha256("x"), idempotency_key: key() };
+  const oauth = await sdk.callTool({ name: "upload_begin", arguments: { ...args, change_note: "Synthetic refused begin" } });
+  assert.equal(oauth.isError, true); assert.deepEqual(oauth.structuredContent.error, all);
+  const old = await legacy.call("upload_begin", args); assert.equal(old.isError, true); assert.deepEqual(old.data.error, all);
+  assert.deepEqual(counts(), before);
 });
 test("MCP principals cannot PUT or finish an app-owner text upload", async () => {
   const b = await owner.req("POST", `/api/projects/${P}/uploads`, { title: "Synthetic owner-only input", mime: "text/markdown", size: 1, sha256: sha256("x") });
