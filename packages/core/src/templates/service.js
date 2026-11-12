@@ -5,7 +5,7 @@ import { provenance } from "../history/service.js";
 import { appOrigin, artifactWebUrl, previewWebUrl } from "../links.js";
 import { renderMarkdown } from "../markdown.js";
 import { rtReadAuthzSql } from "../reads/service.js";
-import { audit, db, folderCheck, idemInsert, idemLookup, mdBody, runBatch } from "../service.js";
+import { audit, db, deferIndexing, folderCheck, idemInsert, idemLookup, mdBody, runBatch } from "../service.js";
 import { HttpError, idemKey, int, nowIso, randomId, sha256Hex, str } from "../util.js";import { explainLimit, projectLimitGuard } from "../limits.js";
 
 
@@ -116,6 +116,8 @@ async function tplCopy(ctx, projectId, input, key, definition = false) {
     if (lg.workspaceId) await explainLimit(ctx.env, lg.workspaceId, adds, lg.limits, projectId);
     throw new HttpError(403, "forbidden", "Grant no longer valid");
   }
+  // Committed: index the new document after the response (as create).
+  deferIndexing(ctx, id, projectId, rid, body, adds.storage_bytes);
   return result;
 }
 async function createFromTemplate(ctx, pid, input, key) { return tplCopy(ctx, pid, input, key, false); }

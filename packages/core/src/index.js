@@ -14,6 +14,7 @@ import { WEB_ROUTE } from "./links.js";
 import { requireWorkspaceRole, visibleProjects } from "./tenancy.js";
 import { withRequestMemo, workspaceUsage } from "./limits.js";
 import { ENCRYPTION_MISCONFIGURED_MESSAGE, encryptionConfigured, encryptionRequired, withDataKeyMemo } from "./crypto/keys.js";
+import { discardDeferredWork, startDeferredWork, withDeferredWork } from "./search/tokens.js";
 import { RESERVED_HANDLES, addressLinksResponse, resolveProjectRef } from "./paths.js";
 import { imageRefs, renderMarkdown } from "./markdown.js";
 import { getRenderSource } from "./render-source.js";
@@ -384,8 +385,21 @@ function createWorker(adapterConfig = {}) {
   const refuseEncryption = () => new Response(JSON.stringify({ error: { code: "encryption_misconfigured", message: ENCRYPTION_MISCONFIGURED_MESSAGE } }), { status: 500, headers: { "content-type": "application/json" } });
   return {
     scheduled: (ev, env, ctx) => coreWorker.scheduled(ev, withAdapters(env, A), ctx),
-    fetch: async (req, env, ctx) => misconfigured(env) ? refuse() : encryptionMissing(env) ? refuseEncryption()
-      : coreWorker.fetch(req, withDataKeyMemo(withRequestMemo(withAdapters(env, A))), ctx)
+    fetch: async (req, env, ctx) => {
+      if (misconfigured(env)) return refuse();
+      if (encryptionMissing(env)) return refuseEncryption();
+      // The request's deferred work (search indexing, search/tokens.js): every service env derives from this one by
+      // spreading it, which keeps the Symbol-keyed queue. It starts only after coreWorker.fetch has resolved its
+      // Response, and a run that was not started is discarded in finally (also when fetch rejects).
+      const e = withDeferredWork(withDataKeyMemo(withRequestMemo(withAdapters(env, A))));
+      try {
+        const res = await coreWorker.fetch(req, e, ctx);
+        try { startDeferredWork(e, ctx); } catch { /* never changes the response; the run is discarded below */ }
+        return res;
+      } finally {
+        discardDeferredWork(e);
+      }
+    }
   };
 }
 var coreWorker = {

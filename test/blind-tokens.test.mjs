@@ -686,3 +686,63 @@ test("review B8: the immediate purge of one project still throws", async () => {
   world.before = null;
   assert.equal(purgedAt(world, "p_e3"), null);
 });
+
+// --- Part 2 on local D1 (wrangler dev): the publishing routes defer indexing; the save's response excludes it --------
+test("13a/13d/13f/13j (local D1): create, save, restore and template create are indexed after the response; timing recorded", async () => {
+  const s = await h.login();
+  const pr = await s.req("POST", "/api/projects", { title: "Synthetic" });   // ids are server-assigned (seeded people)
+  assert.equal(pr.status, 201);
+  const pid = pr.body.id;
+  const ws = (await d1one(`SELECT workspace_id FROM projects WHERE id = '${pid}'`))[0].workspace_id;
+  const head = async (a) => (await d1one(`SELECT head_revision_id AS h FROM artifacts WHERE id = '${a}'`))[0].h;
+  const row = async (a) => (await d1one(`SELECT revision_id, truncated_by, term_count FROM search_token_docs WHERE artifact_id = '${a}'`))[0];
+  const tokens = async (a) => (await d1one(`SELECT lower(hex(s.token)) AS t FROM search_tokens s JOIN search_token_docs d ON d.doc_id = s.doc_id WHERE d.artifact_id = '${a}' ORDER BY s.token`)).map((r) => r.t);
+  const expected = async (terms) => {
+    const secret = Buffer.from((await d1one(`SELECT secret FROM workspace_search_keys WHERE workspace_id = '${ws}'`))[0].secret, "base64url");
+    const { createHmac } = await import("node:crypto");
+    return [...new Set(terms)].map((t) => createHmac("sha256", secret).update(t).digest().subarray(0, 16).toString("hex")).sort();
+  };
+  /** Poll until the document is complete at its head (deferred work; a deadline, never a fixed sleep). */
+  const indexed = async (a, ms = 15000) => {
+    const end = Date.now() + ms;
+    for (;;) {
+      const r = await row(a);
+      if (r && r.revision_id === await head(a)) return r;
+      if (Date.now() > end) throw new Error(`${a} not indexed`);
+      await new Promise((r2) => setTimeout(r2, 50));
+    }
+  };
+  const words = (t) => t.toLowerCase().match(/[a-z0-9]+/g);
+  const c = await s.req("POST", `/api/projects/${pid}/artifacts`, { title: "Synthetic", body: "alpha beta gamma" });
+  assert.equal(c.status, 201);
+  const id = c.body.artifact_id;
+  await indexed(id);
+  assert.deepEqual(await tokens(id), await expected(words("alpha beta gamma")), "13a");
+  assert.equal((await s.req("PUT", `/api/projects/${pid}/artifacts/${id}`, { expected_revision: 1, body: "delta epsilon" })).status, 200);
+  await indexed(id);
+  assert.deepEqual(await tokens(id), await expected(words("delta epsilon")), "13d");
+  assert.equal((await s.req("POST", `/api/projects/${pid}/artifacts/${id}/restore`, { expected_revision: 2, from_revision: 1 })).status, 200);
+  await indexed(id);
+  assert.deepEqual(await tokens(id), await expected(words("alpha beta gamma")), "13f");
+  const t = await s.req("POST", `/api/projects/${pid}/templates`, { source_artifact_id: id, source_revision: 3, title: "Synthetic template" });
+  assert.equal(t.status, 201);
+  await indexed(t.body.artifact_id);
+  assert.deepEqual(await tokens(t.body.artifact_id), await expected(words("alpha beta gamma")), "13j");
+  // Timing of a plain 10 KB save: the response, then the deferred run until the row is complete at the new head.
+  const tenK = (seed) => { const w = []; let x = seed; while (w.join(" ").length < 10240) { x = (x * 1103515245 + 12345) & 0x7fffffff; w.push("w" + ((x >>> 8) % 1500).toString(36)); } return w.join(" ").slice(0, 10240); };
+  const samples = [];
+  for (let i = 0; i < 5; i++) {
+    const t0 = performance.now();
+    const r = await s.req("PUT", `/api/projects/${pid}/artifacts/${id}`, { expected_revision: 3 + i, body: tenK(10 + i) });
+    const responseMs = performance.now() - t0;
+    assert.equal(r.status, 200);
+    await indexed(id);
+    samples.push({ responseMs: Math.round(responseMs), indexedAfterMs: Math.round(performance.now() - t0) });
+  }
+  // responseMs is the save's own response; indexedAfterMs is when the polled row was complete at the new head.
+  mkdirSync(join(ROOT, "tmp", "test-evidence"), { recursive: true });
+  writeFileSync(join(ROOT, "tmp", "test-evidence", "blind-tokens-save-timing.json"), JSON.stringify({ at: new Date().toISOString(), samples }, null, 2));
+  console.log("SAVE_TIMING " + JSON.stringify(samples));
+  for (const x of samples) assert.ok(x.indexedAfterMs >= x.responseMs);
+  for (const r of await d1one(COUNTERS_EXACT)) assert.equal(r.terms, r.want, r.scope);
+});
