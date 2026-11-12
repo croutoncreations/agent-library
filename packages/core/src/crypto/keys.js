@@ -93,7 +93,8 @@ const ROW_COLUMNS = "workspace_id, key_id, master_version, wrapped, created_at, 
 const SHREDDED_SQL = "(shredded_at IS NOT NULL OR wrapped = '')";
 /**
  * The condition a write under a key must carry (docs/encryption.md#rules-for-code-that-uses-this): the key row, selected
- * by its key_id, is still active. The negation of SHREDDED_SQL; use it, never a hand-written copy.
+ * by its key_id, is still active. The negation of SHREDDED_SQL; use it, never a hand-written copy. Its column names
+ * carry no table prefix, so use it only inside a subquery on workspace_keys.
  */
 export const ACTIVE_KEY_SQL = "(shredded_at IS NULL AND wrapped <> '')";
 /**
@@ -101,7 +102,7 @@ export const ACTIVE_KEY_SQL = "(shredded_at IS NULL AND wrapped <> '')";
  * (master_version > 0, shredded or not; tombstones do not count). encryptionEnabled probes exactly this; use the export,
  * never a hand-written copy.
  */
-export const NO_REAL_KEY_SQL = "NOT EXISTS (SELECT 1 FROM workspace_keys WHERE master_version > 0)";
+export const NO_REAL_KEY_SQL = "(NOT EXISTS (SELECT 1 FROM workspace_keys WHERE master_version > 0))";
 const activeRow = (env, workspaceId) =>
   env.DB.prepare(`SELECT ${ROW_COLUMNS} FROM workspace_keys WHERE workspace_id = ? AND shredded_at IS NULL`).bind(workspaceId).first();
 const hasShreddedRow = async (env, workspaceId) =>
