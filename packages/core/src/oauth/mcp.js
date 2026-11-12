@@ -718,4 +718,5 @@ async function handleFileTransfer(req, env, url) {
   }
 }
 
-export { handleFileTransfer, handleOAuthMcp };
+// ftReadFile is exported for the World test of the encrypted read_file path (test/encrypted-blobs.test.mjs).
+export { ftReadFile, handleFileTransfer, handleOAuthMcp };

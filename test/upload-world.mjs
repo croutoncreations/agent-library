@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { ROOT } from "./helpers.mjs";
 import { loadWorker } from "./load-worker.mjs";
 
-export const lib = await loadWorker({ "uploads.js": ["quotaUsedSql", "uploadBegin", "uploadFinish", "uploadPut", "serveContent"], "cleanup.js": ["reconcileUploads"], "project-deletion.js": ["purgeDueProjects"], "adapters.js": ["withAdapters", "defaultAdapters"], "service.js": ["loadArtifact", "createMarkdown", "saveMarkdown", "saveFile", "restoreRevision", "getArtifact"], "backup.js": ["exportBackup", "restoreBackup", "importBackup"], "content-store.js": ["blobRef", "readBlob", "readBlobBytes"], "crypto/keys.js": ["workspaceDataKey", "shredWorkspaceKeys", "withDataKeyMemo"] });
+export const lib = await loadWorker({ "uploads.js": ["quotaUsedSql", "uploadBegin", "uploadFinish", "uploadPut", "serveContent"], "cleanup.js": ["reconcileUploads"], "project-deletion.js": ["purgeDueProjects"], "adapters.js": ["withAdapters", "defaultAdapters"], "service.js": ["loadArtifact", "createMarkdown", "saveMarkdown", "saveFile", "restoreRevision", "getArtifact"], "backup.js": ["exportBackup", "restoreBackup", "importBackup"], "content-store.js": ["blobRef", "readBlob", "readBlobBytes"], "crypto/keys.js": ["workspaceDataKey", "shredWorkspaceKeys", "withDataKeyMemo"], "oauth/mcp.js": ["ftReadFile"] });
 // The workerd stream class uploadPut uses, a minimal Node stand-in with workerd's messages: FixedLengthStream (errors
 // unless exactly n bytes).
 globalThis.FixedLengthStream ??= class extends TransformStream {
@@ -68,7 +68,7 @@ export function world({ encryption = false } = {}) {
   const blobs = new Map();
   // customMetadata and httpMetadata per stored key, as R2 keeps them with the object.
   const meta = new Map();
-  const r2 = { onPut: null, beforeCommit: null, onGet: null, failHead: false, gets: [], deletes: [] };
+  const r2 = { onPut: null, beforeCommit: null, onGet: null, failHead: false, gets: [], deletes: [], cancels: [] };
   const digest = (b) => new Uint8Array(createHash("sha256").update(b).digest()).buffer;
   const BLOBS = {
     // R2ObjectBody-like: size (always the whole object's, as on a ranged get), customMetadata, a byte stream and
@@ -80,7 +80,10 @@ export function world({ encryption = false } = {}) {
       const whole = blobs.get(k);
       if (!whole) return null;
       const b = opts?.range ? whole.subarray(opts.range.offset, opts.range.offset + opts.range.length) : whole;
-      return { size: whole.length, customMetadata: { ...meta.get(k)?.customMetadata }, httpMetadata: { ...meta.get(k)?.httpMetadata }, body: new Blob([b]).stream(), async arrayBuffer() { return b; } };
+      // The body records a cancel in r2.cancels (the reader must release a body it refuses to read).
+      const inner = new Blob([b]).stream().getReader();
+      const body = new ReadableStream({ async pull(c) { const { done, value } = await inner.read(); if (done) c.close(); else c.enqueue(value); }, cancel(reason) { r2.cancels.push(k); return inner.cancel(reason); } }, { highWaterMark: 0 });
+      return { size: whole.length, customMetadata: { ...meta.get(k)?.customMetadata }, httpMetadata: { ...meta.get(k)?.httpMetadata }, body, async arrayBuffer() { return b; } };
     },
     async put(k, b, opts) {
       const bytes = b instanceof ReadableStream ? Buffer.from(await new Response(b).arrayBuffer()) : b;

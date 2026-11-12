@@ -314,6 +314,84 @@ test("design test 17 (World): restoring a legacy plaintext version with encrypti
   assert.ok(Buffer.from(await (await s.get(art, { rev: 3 })).arrayBuffer()).equals(plain));
 });
 
+// Review fixes for part 1 (Lows 2 and 4).
+test("range path: a stored-size mismatch and a plaintext row whose object is marked encrypted are 500, and the unread R2 body is cancelled", async () => {
+  const s = setup();
+  const art = s.artifact();
+  const bytes = randomBytes(CHUNK + 50);
+  const v = await s.version(art, bytes);
+  s.w.blobs.set(v.blobKey, Buffer.concat([s.w.blobs.get(v.blobKey), Buffer.from([0])]));
+  s.w.r2.cancels.length = 0;
+  await assert.rejects(s.get(art, { range: "bytes=0-9" }), status(500, "blob_corrupt"), "encrypted range, stored size mismatch");
+  await assert.rejects(s.get(art), status(500, "blob_corrupt"), "encrypted full read, stored size mismatch");
+  assert.deepEqual(s.w.r2.cancels, [v.blobKey, v.blobKey], "each refused body was cancelled");
+
+  const plainArt = s.artifact();
+  const p = await s.version(plainArt, randomBytes(500), { encrypted: false });
+  s.w.meta.get(p.blobKey).customMetadata = { "al-enc": "1", "al-key": "wk_x" };
+  s.w.r2.cancels.length = 0;
+  await assert.rejects(s.get(plainArt, { range: "bytes=0-9" }), status(500, "blob_corrupt"), "plaintext range, object marked encrypted");
+  await assert.rejects(s.get(plainArt), status(500, "blob_corrupt"), "plaintext full read, object marked encrypted");
+  assert.deepEqual(s.w.r2.cancels, [p.blobKey, p.blobKey]);
+});
+
+test("a storage read error during the first chunk answers 500 blob_corrupt but is logged as read_failed", async () => {
+  const s = setup();
+  const art = s.artifact();
+  await s.version(art, randomBytes(CHUNK + 1));
+  const get = s.w.env.BLOBS.get;
+  s.w.env.BLOBS.get = async (k, o) => {
+    const obj = await get(k, o);
+    return { ...obj, body: new ReadableStream({ pull(c) { c.error(new Error("synthetic network connection lost")); } }) };
+  };
+  const logs = [];
+  const real = console.error;
+  console.error = (...a) => logs.push(a.join(" "));
+  try { await assert.rejects(s.get(art), status(500, "blob_corrupt")); } finally { console.error = real; s.w.env.BLOBS.get = get; }
+  assert.ok(logs.some((l) => /"reason":"read_failed"/.test(l)), logs.join("\n"));
+  assert.ok(!logs.some((l) => /"reason":"first_chunk"/.test(l)), "not recorded as corruption");
+});
+
+test("read_file (ftReadFile) inlines an encrypted image, read under the version's own document prefix", async () => {
+  const s = setup();
+  const art = s.artifact();
+  const png = Buffer.concat([Buffer.from("89504e470d0a1a0a", "hex"), randomBytes(2000)]);
+  await s.version(art, png);
+  const c = { ...s.ctx, ftConn: { id: "oc_synthetic" }, ftOrigin: "https://files.example.test" };
+  const r = await lib.ftReadFile(c, P, { artifact_id: art });
+  assert.equal(r.image_inline, true);
+  const blocks = Object.getOwnPropertySymbols(r).map((k) => r[k]).find(Array.isArray);
+  const image = blocks.find((b) => b.type === "image");
+  assert.ok(Buffer.from(image.data, "base64").equals(png), "decrypted bytes inline");
+  // The same row read for another document id fails the prefix check: ftReadFile passes the version's own artifact id.
+  const other = s.artifact();
+  const row = s.w.sql.prepare("SELECT blob_key, size, blob_key_id, blob_header FROM revisions WHERE artifact_id = ?").get(art);
+  await assert.rejects(async () => lib.readBlobBytes(s.env, await lib.blobRef(s.env, row, { projectId: P, artifactId: other })), status(500, "blob_corrupt"));
+});
+
+test("a second workspace: an object under a valid prefix encrypted with another workspace's key does not read, and a row naming another workspace's key id is refused", async () => {
+  const s = setup();
+  const art = s.artifact();
+  const bytes = randomBytes(CHUNK + 20);
+  const v = await s.version(art, bytes);
+  const OTHER_WS = "wsp_hum_other";
+  const foreign = await lib.workspaceDataKey(s.env, OTHER_WS);
+  assert.notEqual(foreign.keyId, v.keyId);
+  // (1) The object (at this version's own key) re-encrypted under the other workspace's key; the row and metadata
+  // point at the other key id: dataKeyById refuses a key of another workspace.
+  const stored = await encrypt(bytes, foreign.key, v.blobKey);
+  s.w.blobs.set(v.blobKey, stored);
+  s.w.meta.get(v.blobKey).customMetadata = { "al-enc": "1", "al-key": foreign.keyId };
+  s.w.sql.prepare("UPDATE revisions SET blob_key_id = ?, blob_header = ? WHERE id = ?").run(foreign.keyId, b64url(stored.subarray(0, CHUNKED_HEADER_BYTES)), v.revId);
+  await assert.rejects(s.get(art), (e) => e?.status === 500 && e?.code === "key_not_found", "a row naming another workspace's key id");
+  await assert.rejects(s.get(art, { range: "bytes=0-0" }), (e) => e?.status === 500 && e?.code === "key_not_found");
+  // (2) The row and metadata name this workspace's key, but the bytes were encrypted under the other workspace's key.
+  s.w.meta.get(v.blobKey).customMetadata = { "al-enc": "1", "al-key": v.keyId };
+  s.w.sql.prepare("UPDATE revisions SET blob_key_id = ?, blob_header = ? WHERE id = ?").run(v.keyId, b64url(stored.subarray(0, CHUNKED_HEADER_BYTES)), v.revId);
+  await assert.rejects(s.get(art), status(500, "blob_corrupt"), "does not authenticate under this workspace's key");
+  await assert.rejects(s.get(art, { range: "bytes=0-0" }), status(500, "blob_corrupt"));
+});
+
 test("publishRevision binds NULL encryption columns when a caller passes none (text versions)", async () => {
   const s = setup({ encryption: false });
   const c = await lib.createMarkdown(s.ctx, P, { title: "Doc", body: "synthetic body" }, "idem-md-1");

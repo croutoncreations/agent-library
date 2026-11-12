@@ -76,11 +76,23 @@ async function readErroring(query) {
   return { status: r.status, declared, received, readRejected: error !== null, error };
 }
 
+/**
+ * Fail closed: a 5xx in place of the response, or a 200/206 that declares the expected Content-Length and whose body
+ * read rejects. A 200/206 whose body ends cleanly fails the gate whatever its byte count, and so does one without the
+ * expected Content-Length (a clean short end could not be told from a complete one).
+ */
+function assertFailClosed(o, label) {
+  if (o.status >= 500) return;
+  assert.ok(o.status === 200 || o.status === 206, `${label}: unexpected status: ${seen(o)}`);
+  assert.equal(o.declared, 300_000, `${label}: a 200/206 must declare the expected Content-Length: ${seen(o)}`);
+  assert.equal(o.readRejected, true, `${label}: a 200/206 body must reject, never end cleanly: ${seen(o)}`);
+  assert.ok(o.received < o.declared, `${label}: fewer bytes than Content-Length: ${seen(o)}`);
+}
+
 test("probe (e1): a response body that errors after its first chunk fails closed (never a complete 200/206)", async () => {
   const id = `e1-${Date.now()}`;
   const o = await readErroring(`id=${id}`);
-  const complete = (o.status === 200 || o.status === 206) && !o.readRejected && o.declared !== null && o.received >= o.declared;
-  assert.equal(complete, false, `the client got a response that looks complete: ${seen(o)}`);
+  assertFailClosed(o, "e1");
   const { invocations } = await get(`/probe/e-count?id=${id}`);
   console.log(`probe (e1) observed: ${seen({ ...o, invocations })}`);
 });
@@ -90,7 +102,8 @@ test("probe (e2), information only: the same body erroring 500 ms after the firs
   const o = await readErroring(`id=${id}&delay=500`);
   const { invocations } = await get(`/probe/e-count?id=${id}`);
   console.log(`probe (e2) observed: ${seen({ ...o, invocations })}`);
-  assert.equal(typeof o.status, "number", seen(o));
+  // The exact status, byte count and invocation count are information; failing closed is required here too.
+  assertFailClosed(o, "e2");
 });
 
 test("probe (f), information only: does an R2 conditional put (onlyIf) refuse to overwrite an existing object", async () => {

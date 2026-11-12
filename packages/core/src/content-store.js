@@ -124,6 +124,19 @@ function checkObjectMetadata(ref, object) {
   if (object.size !== chunkedStoredLength(ref.size)) throw blobCorrupt(ref, "stored_size_mismatch");
 }
 
+/** checkObjectMetadata, cancelling the unread R2 body before a refusal is thrown (so the connection is released). */
+async function checkedObject(ref, object) {
+  try { checkObjectMetadata(ref, object); }
+  catch (e) { await object.body?.cancel(e).catch(() => {}); throw e; }
+  return object;
+}
+
+/** The codec's own failures (authentication, framing, header) carry this prefix (crypto/chunked.js chunkedError). */
+const isCodecError = (e) => String(e?.message ?? "").startsWith("chunked object: ");
+/** A failure while reading stored bytes: the codec's is blob_corrupt; any other (a storage read error) is logged as
+ * read_failed and answered the same way, so a storage hiccup is not recorded as corruption. */
+const readFailure = (ref, e, codecReason) => e instanceof HttpError ? e : blobCorrupt(ref, isCodecError(e) ? codecReason : "read_failed");
+
 /** Checks that need no object, in order: storage-key prefix, header shape and plaintext length; then the data key. */
 async function encryptedReadSetup(env, ref) {
   if (typeof ref.key !== "string" || !ref.key.startsWith(`blobs/${ref.projectId}/${ref.artifactId}/`)) throw blobCorrupt(ref, "prefix");
@@ -163,7 +176,7 @@ async function firstChunkAuthenticated(plain, ref) {
   const reader = plain.getReader();
   let first;
   try { first = await reader.read(); }
-  catch (e) { throw e instanceof HttpError ? e : blobCorrupt(ref, "first_chunk"); }
+  catch (e) { throw readFailure(ref, e, "first_chunk"); }
   return new ReadableStream({
     start(controller) {
       if (first.done) controller.close();
@@ -191,7 +204,7 @@ export async function readBlob(env, ref, range) {
   if (ref.keyId === null) {
     const object = await getBlob(env, ref.key, range ? { offset: range.start, length: range.end - range.start + 1 } : undefined);
     if (!object) throw blobMissing();
-    checkObjectMetadata(ref, object);
+    await checkedObject(ref, object);
     return object.body;
   }
   const { header, dataKey } = await encryptedReadSetup(env, ref);
@@ -200,7 +213,7 @@ export async function readBlob(env, ref, range) {
     const plan = planChunkedRange(ref.size, range.start, range.end);
     const object = await getBlob(env, ref.key, { offset: plan.storedStart, length: plan.storedEnd - plan.storedStart + 1 });
     if (!object) throw blobMissing();
-    checkObjectMetadata(ref, object);
+    await checkedObject(ref, object);
     plain = decryptChunkedRange({
       header, dataKey, objectKey: ref.key, start: range.start, end: range.end,
       fetchStored: (storedStart, storedEnd) => {
@@ -211,7 +224,7 @@ export async function readBlob(env, ref, range) {
   } else {
     const object = await getBlob(env, ref.key);
     if (!object) throw blobMissing();
-    checkObjectMetadata(ref, object);
+    await checkedObject(ref, object);
     plain = decryptChunkedStream(headerPin(object.body, header, ref), { dataKey, objectKey: ref.key });
   }
   // A known length, so the response keeps its Content-Length (as R2's own body stream does for plaintext).
@@ -229,7 +242,7 @@ export async function readBlobBytes(env, ref) {
   if (ref.keyId === null) {
     const object = await getBlob(env, ref.key);
     if (!object) throw blobMissing();
-    checkObjectMetadata(ref, object);
+    await checkedObject(ref, object);
     return new Uint8Array(await object.arrayBuffer());
   }
   const stream = await readBlob(env, ref, null);
@@ -240,11 +253,11 @@ export async function readBlobBytes(env, ref) {
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
-      if (at + value.byteLength > out.length) throw new Error("longer than recorded");
+      if (at + value.byteLength > out.length) throw blobCorrupt(ref, "longer_than_recorded");
       out.set(value, at);
       at += value.byteLength;
     }
-  } catch (e) { throw e instanceof HttpError ? e : blobCorrupt(ref, "later_chunk"); }
+  } catch (e) { throw readFailure(ref, e, "later_chunk"); }
   if (at !== out.length) throw blobCorrupt(ref, "short");
   return out;
 }
