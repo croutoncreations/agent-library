@@ -1,7 +1,7 @@
 // Workspace data keys (docs/encryption.md#workspace-keys): one active key per workspace in D1 `workspace_keys`, wrapped
 // by the keyProvider adapter (default: worker-secret-keys.js). In memory a data key exists only as a non-extractable
 // HKDF CryptoKey (usages ["deriveKey"]); its raw bytes exist only while a new key is created, then are zeroed.
-// Nothing calls this yet: content is not encrypted.
+// Nothing calls this yet: content is not encrypted. docs/encryption.md#rules-for-code-that-uses-this says how to.
 import { adapters } from "../adapters.js";
 import { HttpError, randomId } from "../util.js";
 
@@ -11,7 +11,7 @@ const DATA_KEY_MEMO = Symbol("agent-library.data-key-memo");
 /** A request's env with its own data-key memo (createWorker attaches one per fetch). Never shared across requests. */
 export const withDataKeyMemo = (env) => ({ ...env, [DATA_KEY_MEMO]: new Map() });
 
-/** Within one request each key is unwrapped once; a failure is forgotten so the next call tries again. */
+/** Within one request, load once per name; a failure is forgotten so the next call tries again. */
 function memoized(env, name, load) {
   const memo = env?.[DATA_KEY_MEMO];
   if (!memo) return load();
@@ -19,25 +19,92 @@ function memoized(env, name, load) {
   return memo.get(name);
 }
 
-/** Is content encryption configured? false when unset; throws when the configuration is malformed. */
+/** Concurrent callers in one request share one in-flight load; it is forgotten once settled, so later calls load again. */
+function shared(env, name, load) {
+  const memo = env?.[DATA_KEY_MEMO];
+  if (!memo) return load();
+  let p = memo.get(name);
+  if (!p) {
+    p = load().finally(() => { if (memo.get(name) === p) memo.delete(name); });
+    memo.set(name, p);
+  }
+  return p;
+}
+
+/** Server log for a refusal: ids and codes only, never key material. Client-visible messages carry neither. */
+const logKeyEvent = (event, detail) => console.error(JSON.stringify({ event, ...detail }));
+const providerInvalid = (message) => new HttpError(500, "key_provider_invalid", message);
+const isPositiveVersion = (v) => Number.isSafeInteger(v) && v > 0;
+/** Keep a rejected Promise that is about to be refused from surfacing as an unhandled rejection. */
+const quiet = (v) => { if (typeof v?.then === "function") v.then(() => {}, () => {}); };
+
+/**
+ * Is content encryption configured? The keyProvider's configured(env), which must return a boolean synchronously:
+ * anything else (a Promise included) is an error, never "off". Throws when the configuration is malformed.
+ */
 export function encryptionConfigured(env) {
-  return adapters(env).keyProvider.configured(env) === true;
+  const v = adapters(env).keyProvider.configured(env);
+  if (typeof v !== "boolean") {
+    quiet(v);
+    throw providerInvalid("The key provider's configured() must return a boolean synchronously");
+  }
+  return v;
+}
+
+/** Does this installation require content encryption? Worker var CONTENT_ENCRYPTION_REQUIRED = "1". */
+export function encryptionRequired(env) {
+  return String(env?.CONTENT_ENCRYPTION_REQUIRED ?? "") === "1";
+}
+
+/** The message of every encryption_misconfigured refusal (also createWorker's). Names no secret. */
+export const ENCRYPTION_MISCONFIGURED_MESSAGE = "Content encryption is required but not configured";
+
+/**
+ * Should new content be encrypted? The one decision later slices use for writing (never encryptionConfigured() alone).
+ * true when configured (no query). false only when not configured, not required and `workspace_keys` has no row at all
+ * (probed once per request). Otherwise 500 encryption_misconfigured: required but not configured, or encryption was
+ * in use (rows exist) and its configuration is gone, which must never turn into writing plaintext. A malformed
+ * configuration throws its own error.
+ */
+export async function encryptionEnabled(env) {
+  if (encryptionConfigured(env)) return true;
+  const required = encryptionRequired(env);
+  const inUse = !required && await memoized(env, "probe:any-key-row", async () =>
+    !!(await env.DB.prepare("SELECT 1 AS x FROM workspace_keys LIMIT 1").first("x")));
+  if (required || inUse) {
+    logKeyEvent("encryption_misconfigured", { reason: required ? "required_not_configured" : "key_rows_exist_not_configured" });
+    throw new HttpError(500, "encryption_misconfigured", ENCRYPTION_MISCONFIGURED_MESSAGE);
+  }
+  return false;
 }
 
 const ROW_COLUMNS = "workspace_id, key_id, master_version, wrapped, created_at, shredded_at";
+// A row is shredded when shredded_at is set or its wrapped key was overwritten with ''.
+const SHREDDED_SQL = "(shredded_at IS NOT NULL OR wrapped = '')";
 const activeRow = (env, workspaceId) =>
   env.DB.prepare(`SELECT ${ROW_COLUMNS} FROM workspace_keys WHERE workspace_id = ? AND shredded_at IS NULL`).bind(workspaceId).first();
 const hasShreddedRow = async (env, workspaceId) =>
-  !!(await env.DB.prepare("SELECT 1 AS x FROM workspace_keys WHERE workspace_id = ? AND shredded_at IS NOT NULL LIMIT 1").bind(workspaceId).first("x"));
-const shredded = (workspaceId) => new HttpError(410, "key_shredded", `The content key of workspace ${workspaceId} was destroyed`);
+  !!(await env.DB.prepare(`SELECT 1 AS x FROM workspace_keys WHERE workspace_id = ? AND ${SHREDDED_SQL} LIMIT 1`).bind(workspaceId).first("x"));
+const isShredded = (row) => (row.shredded_at !== null && row.shredded_at !== undefined) || row.wrapped === "";
+const shredded = () => new HttpError(410, "key_shredded", "This workspace's content key has been shredded");
 
-/** Unwrap a row's data key through the provider (once per request per key id) and check what the provider returned. */
+/**
+ * Unwrap a row's data key through the provider and check what the provider returned. Refuses a shredded row and an
+ * invalid master version before the provider sees anything. The memo is keyed by everything the wrap authenticates
+ * (workspace id, key id, master version, wrapped value), so a row that changed during the request is unwrapped afresh.
+ */
 function unwrapRow(env, row) {
-  return memoized(env, "key:" + row.key_id, async () => {
+  if (isShredded(row)) throw shredded();
+  if (!isPositiveVersion(row.master_version) || typeof row.wrapped !== "string") {
+    logKeyEvent("key_row_invalid", { workspaceId: row.workspace_id, keyId: row.key_id });
+    throw new HttpError(500, "key_row_invalid", "A workspace key record is invalid");
+  }
+  const memoKey = "key:" + JSON.stringify([row.workspace_id, row.key_id, row.master_version, row.wrapped]);
+  return memoized(env, memoKey, async () => {
     const ctx = { workspaceId: row.workspace_id, keyId: row.key_id, masterVersion: row.master_version };
     const key = await adapters(env).keyProvider.unwrap(env, row.wrapped, ctx);
-    if (!(key instanceof CryptoKey) || key.algorithm?.name !== "HKDF" || key.extractable || key.usages.length !== 1 || key.usages[0] !== "deriveKey") {
-      throw new HttpError(500, "key_provider_invalid", "The key provider must return a non-extractable HKDF key usable only for deriveKey");
+    if (!(key instanceof CryptoKey) || key.algorithm?.name !== "HKDF" || key.extractable !== false || key.usages.length !== 1 || key.usages[0] !== "deriveKey") {
+      throw providerInvalid("The key provider must return a non-extractable HKDF key usable only for deriveKey");
     }
     return Object.freeze({ ...ctx, key });
   });
@@ -47,50 +114,97 @@ function unwrapRow(env, row) {
 async function createDataKey(env, workspaceId) {
   const provider = adapters(env).keyProvider;
   const masterVersion = provider.currentVersion(env);
+  if (!isPositiveVersion(masterVersion)) {
+    quiet(masterVersion);
+    throw providerInvalid("The key provider's currentVersion() must return a positive integer");
+  }
   const keyId = randomId("wk");
   const raw = crypto.getRandomValues(new Uint8Array(DATA_KEY_BYTES));
   let wrapped;
   try { wrapped = await provider.wrap(env, raw, { workspaceId, keyId, masterVersion }); }
   finally { raw.fill(0); }
-  if (typeof wrapped !== "string" || !wrapped) throw new HttpError(500, "key_provider_invalid", "The key provider returned no wrapped key");
-  // The partial unique index (one active key per workspace) makes concurrent first use keep exactly one row; the
-  // NOT EXISTS keeps a workspace whose key was shredded from getting a new one.
-  await env.DB.prepare(
-    `INSERT OR IGNORE INTO workspace_keys (workspace_id, key_id, master_version, wrapped, created_at, shredded_at)
-     SELECT ?, ?, ?, ?, ?, NULL WHERE NOT EXISTS (SELECT 1 FROM workspace_keys WHERE workspace_id = ? AND shredded_at IS NOT NULL)`
-  ).bind(workspaceId, keyId, masterVersion, wrapped, Date.now(), workspaceId).run();
+  if (typeof wrapped !== "string" || !wrapped) {
+    quiet(wrapped);
+    throw providerInvalid("The key provider returned no wrapped key");
+  }
+  // Losing the race to a concurrent first use hits the partial unique index (one active key per workspace) and does
+  // nothing; the caller re-selects the winner. Any other failure throws (key_create_failed). The NOT EXISTS keeps a
+  // shredded or tombstoned workspace from getting a new key, even if it was shredded after the pre-check.
+  try {
+    await env.DB.prepare(
+      `INSERT INTO workspace_keys (workspace_id, key_id, master_version, wrapped, created_at, shredded_at)
+       SELECT ?, ?, ?, ?, ?, NULL WHERE NOT EXISTS (SELECT 1 FROM workspace_keys WHERE workspace_id = ? AND ${SHREDDED_SQL})
+       ON CONFLICT (workspace_id) WHERE shredded_at IS NULL DO NOTHING`
+    ).bind(workspaceId, keyId, masterVersion, wrapped, Date.now(), workspaceId).run();
+  } catch (e) {
+    logKeyEvent("key_create_failed", { workspaceId, keyId, error: String(e?.message ?? e).slice(0, 200) });
+    throw new HttpError(500, "key_create_failed", "The workspace key could not be created");
+  }
+}
+
+/** The workspace's active row, creating the first key if there is none. Refuses a shredded workspace. */
+async function activeOrCreatedRow(env, workspaceId) {
+  const row = await activeRow(env, workspaceId);
+  if (row) return row;
+  if (await hasShreddedRow(env, workspaceId)) throw shredded();
+  await createDataKey(env, workspaceId);
+  const created = await activeRow(env, workspaceId);
+  if (created) return created;
+  if (await hasShreddedRow(env, workspaceId)) throw shredded();
+  logKeyEvent("key_not_found", { workspaceId, after: "create" });
+  throw new HttpError(500, "key_not_found", "The workspace key disappeared after it was created");
 }
 
 /**
  * The workspace's active data key for encrypting: { workspaceId, keyId, masterVersion, key }, creating it on first use.
- * Concurrent first use yields one key for every caller. Refuses (410 key_shredded) a workspace whose key was shredded,
- * and (500 encryption_not_configured) when the keyProvider is not configured.
+ * Every call re-reads the active row (only the unwrap is memoized per request); concurrent calls in one request share
+ * one in-flight lookup, so concurrent first use yields one key for every caller. Refuses unless the keyProvider is
+ * configured and well-formed, even if the workspace already has a row (500 encryption_not_configured, or the
+ * configuration's own error), and refuses a shredded workspace (410 key_shredded).
  */
 export async function workspaceDataKey(env, workspaceId) {
   if (typeof workspaceId !== "string" || !workspaceId) throw new HttpError(500, "invalid_workspace", "A workspace id is required");
-  return memoized(env, "ws:" + workspaceId, async () => {
-    let row = await activeRow(env, workspaceId);
-    if (!row) {
-      if (await hasShreddedRow(env, workspaceId)) throw shredded(workspaceId);
-      if (!encryptionConfigured(env)) throw new HttpError(500, "encryption_not_configured", "Content encryption is not configured");
-      await createDataKey(env, workspaceId);
-      row = await activeRow(env, workspaceId);
-      if (!row) throw (await hasShreddedRow(env, workspaceId)) ? shredded(workspaceId) : new HttpError(500, "key_not_found", "The workspace key could not be created");
-    }
-    return unwrapRow(env, row);
-  });
+  if (!encryptionConfigured(env)) throw new HttpError(500, "encryption_not_configured", "Content encryption is not configured");
+  const row = await shared(env, "active:" + workspaceId, () => activeOrCreatedRow(env, workspaceId));
+  return unwrapRow(env, row);
 }
 
 /**
- * The data key a stored object names, for decrypting: { workspaceId, keyId, masterVersion, key }. Refuses an unknown
- * key id (500 key_not_found), a shredded key (410 key_shredded) and a key of another workspace than expected
- * (500 key_workspace_mismatch).
+ * The data key a stored object names, for decrypting: { workspaceId, keyId, masterVersion, key }. workspaceId must
+ * come from the server-side project, never from the stored object. Refuses an unknown key id (500 key_not_found), a
+ * key of another workspace than expected (500 key_workspace_mismatch) and a shredded key (410 key_shredded). Needs no
+ * current configuration beyond the row's master key: whether to decrypt is decided by the stored object.
  */
 export async function dataKeyById(env, workspaceId, keyId) {
   if (typeof workspaceId !== "string" || !workspaceId || typeof keyId !== "string" || !keyId) throw new HttpError(500, "invalid_key_id", "A workspace id and key id are required");
   const row = await env.DB.prepare(`SELECT ${ROW_COLUMNS} FROM workspace_keys WHERE key_id = ?`).bind(keyId).first();
-  if (!row) throw new HttpError(500, "key_not_found", `Workspace key ${keyId} does not exist`);
-  if (row.workspace_id !== workspaceId) throw new HttpError(500, "key_workspace_mismatch", `Workspace key ${keyId} belongs to another workspace`);
-  if (row.shredded_at !== null && row.shredded_at !== undefined) throw shredded(workspaceId);
+  if (!row) {
+    logKeyEvent("key_not_found", { workspaceId, keyId });
+    throw new HttpError(500, "key_not_found", "The workspace key does not exist");
+  }
+  if (row.workspace_id !== workspaceId) {
+    logKeyEvent("key_workspace_mismatch", { workspaceId, keyId, rowWorkspaceId: row.workspace_id });
+    throw new HttpError(500, "key_workspace_mismatch", "The workspace key does not belong to this workspace");
+  }
   return unwrapRow(env, row);
+}
+
+/**
+ * Shred a workspace's keys (docs/encryption.md#limits says what this does not protect against). Every row of the
+ * workspace gets shredded_at (an existing one is kept) and its wrapped key overwritten with ''. A workspace with no
+ * row at all gets a tombstone (shredded, wrapped '', master_version 0) so it can never get a key later. Idempotent.
+ * The tombstone goes in before the update: a concurrent first use either sees it (and is refused by NOT EXISTS) or
+ * inserted its row first (and the update shreds it). A key already unwrapped by a request in flight stays usable in
+ * that request (docs/encryption.md#rules-for-code-that-uses-this). Nothing calls this yet.
+ */
+export async function shredWorkspaceKeys(env, workspaceId) {
+  if (typeof workspaceId !== "string" || !workspaceId) throw new HttpError(500, "invalid_workspace", "A workspace id is required");
+  const now = Date.now();
+  await env.DB.prepare(
+    `INSERT INTO workspace_keys (workspace_id, key_id, master_version, wrapped, created_at, shredded_at)
+     SELECT ?, ?, 0, '', ?, ? WHERE NOT EXISTS (SELECT 1 FROM workspace_keys WHERE workspace_id = ?)`
+  ).bind(workspaceId, randomId("wk"), now, now, workspaceId).run();
+  await env.DB.prepare(
+    "UPDATE workspace_keys SET shredded_at = COALESCE(shredded_at, ?), wrapped = '' WHERE workspace_id = ? AND (shredded_at IS NULL OR wrapped <> '')"
+  ).bind(now, workspaceId).run();
 }

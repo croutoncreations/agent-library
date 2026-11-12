@@ -10,7 +10,8 @@ import { loadWorker } from "./load-worker.mjs";
 import { ROOT } from "./helpers.mjs";
 
 const lib = await loadWorker({
-  "crypto/keys.js": ["encryptionConfigured", "workspaceDataKey", "dataKeyById", "withDataKeyMemo"],
+  "crypto/keys.js": ["encryptionConfigured", "encryptionRequired", "encryptionEnabled", "workspaceDataKey", "dataKeyById", "withDataKeyMemo", "shredWorkspaceKeys"],
+  "index.js": ["createWorker"],
   "crypto/worker-secret-keys.js": ["workerSecretKeyProvider", "dataKeyAad"],
   "adapters.js": ["withAdapters", "resolveAdapters", "defaultAdapters"],
   "limits.js": ["projectWorkspaceId"]
@@ -55,6 +56,14 @@ const assertDataKey = (k) => {
   assert.equal(k.extractable, false);
   assert.deepEqual(k.usages, ["deriveKey"]);
 };
+/** Run fn with console.error captured; returns the logged lines. */
+async function captureErrors(fn) {
+  const logs = [];
+  const real = console.error;
+  console.error = (...a) => logs.push(a.map(String).join(" "));
+  try { await fn(); } finally { console.error = real; }
+  return logs;
+}
 const rows = (sql, ws) => sql.prepare("SELECT workspace_id, key_id, master_version, wrapped, created_at, shredded_at FROM workspace_keys WHERE workspace_id = ? ORDER BY created_at").all(ws);
 
 test("a created key round-trips: a later request gets a non-extractable HKDF key with the same bytes", async () => {
@@ -167,8 +176,9 @@ test("master rotation: version 2 unwraps a version-1 row with both secrets; new 
   assert.equal(rows(sql, WS_A)[0].master_version, 1);
 
   const v1Gone = { DB, CONTENT_MASTER_KEY_VERSION: "2", CONTENT_MASTER_KEY_V2: v2 };
-  await assert.rejects(lib.dataKeyById(request(v1Gone), WS_A, a.keyId),
-    (e) => e.code === "master_key_missing" && /CONTENT_MASTER_KEY_V1\b/.test(e.message) && !e.message.includes(v2));
+  const logs = await captureErrors(() => assert.rejects(lib.dataKeyById(request(v1Gone), WS_A, a.keyId),
+    (e) => e.code === "master_key_missing" && !/CONTENT_MASTER_KEY/.test(e.message) && !e.message.includes(v2)));
+  assert.ok(logs.some((l) => /master_key_missing/.test(l) && /CONTENT_MASTER_KEY_V1\b/.test(l) && !l.includes(v2)), "the log names the missing secret");
   await assert.rejects(lib.workspaceDataKey(request(v1Gone), WS_A), (e) => e.code === "master_key_missing");
   assert.ok(await sameKeyBytes(b.key, (await lib.dataKeyById(request(v1Gone), WS_B, b.keyId)).key), "version-2 rows still work");
 });
@@ -193,9 +203,14 @@ test("configuration: unset is 'not configured'; a malformed master key or versio
     [{ CONTENT_MASTER_KEY_VERSION: "v1", CONTENT_MASTER_KEY_V1: masterSecret() }, "master_key_version_invalid", null],
   ];
   for (const [vars, code, secret] of bad) {
-    const check = (e) => e.code === code && (!secret || !e.message.includes(secret)) && /CONTENT_MASTER_KEY_V/.test(e.message);
-    assert.throws(() => lib.encryptionConfigured(env(vars)), check, JSON.stringify(Object.keys(vars)));
-    await assert.rejects(lib.workspaceDataKey(env(vars), WS_A), check);
+    // The message can reach a client (errorBody), so it names neither the secret nor its value; the log names the secret.
+    const check = (e) => e.code === code && (!secret || !e.message.includes(secret)) && !/CONTENT_MASTER_KEY/.test(e.message);
+    const logs = await captureErrors(async () => {
+      assert.throws(() => lib.encryptionConfigured(env(vars)), check, JSON.stringify(Object.keys(vars)));
+      await assert.rejects(lib.workspaceDataKey(env(vars), WS_A), check);
+    });
+    assert.ok(logs.some((l) => l.includes(code) && /CONTENT_MASTER_KEY_V/.test(l)), `logged: ${code}`);
+    assert.ok(!secret || !logs.some((l) => l.includes(secret)), "the log never shows the value");
   }
 });
 
@@ -281,6 +296,316 @@ test("a custom keyProvider replaces the default: no Worker secrets are read", as
   assert.equal(lib.encryptionConfigured(request(base)), false);
 });
 
+// ---------------------------------------------------------------- review fixes (PR 2 slice 3a)
+
+const configuredBase = (DB, extra = {}) => ({ DB, CONTENT_MASTER_KEY_VERSION: "1", CONTENT_MASTER_KEY_V1: masterSecret(), ...extra });
+const activeRows = (sql, ws) => sql.prepare("SELECT key_id FROM workspace_keys WHERE workspace_id = ? AND shredded_at IS NULL").all(ws);
+
+test("the unwrap memo is bound to the whole row: a row moved to another workspace in the same request fails, not A's key", async () => {
+  const { sql, DB } = mkDB();
+  const base = configuredBase(DB);
+  const { calls, keyProvider } = countingProvider();
+  const r = request(base, { keyProvider });
+  const a = await lib.dataKeyById(r, WS_A, (await lib.workspaceDataKey(r, WS_A)).keyId);
+  assert.equal(a.workspaceId, WS_A);
+  sql.prepare("UPDATE workspace_keys SET workspace_id = ? WHERE key_id = ?").run(WS_B, a.keyId);
+  await assert.rejects(lib.dataKeyById(r, WS_B, a.keyId), (e) => e.code === "key_unwrap_failed");
+  await assert.rejects(lib.workspaceDataKey(r, WS_B), (e) => e.code === "key_unwrap_failed");
+  assert.ok(calls.unwrap >= 2, "the changed row was unwrapped afresh");
+  // A changed master version or wrapped value in the same request is also unwrapped afresh.
+  sql.prepare("UPDATE workspace_keys SET workspace_id = ? WHERE key_id = ?").run(WS_A, a.keyId);
+  assert.ok(await sameKeyBytes(a.key, (await lib.dataKeyById(r, WS_A, a.keyId)).key));
+  sql.prepare("UPDATE workspace_keys SET master_version = 2 WHERE key_id = ?").run(a.keyId);
+  await assert.rejects(lib.dataKeyById(r, WS_A, a.keyId), (e) => e.code === "master_key_missing" || e.code === "key_unwrap_failed");
+});
+
+test("no stale answer about the active key: load, shred, load again in the same request is refused", async () => {
+  const { sql, DB } = mkDB();
+  const base = configuredBase(DB);
+  const { calls, keyProvider } = countingProvider();
+  const r = request(base, { keyProvider });
+  const a = await lib.workspaceDataKey(r, WS_A);
+  await lib.shredWorkspaceKeys(r, WS_A);
+  await assert.rejects(lib.workspaceDataKey(r, WS_A), (e) => e.code === "key_shredded");
+  await assert.rejects(lib.dataKeyById(r, WS_A, a.keyId), (e) => e.code === "key_shredded");
+  assert.deepEqual(calls, { wrap: 1, unwrap: 1 });
+  assert.equal(activeRows(sql, WS_A).length, 0);
+});
+
+test("concurrent first use inside one request shares one creation, which is forgotten once settled", async () => {
+  const { sql, DB } = mkDB();
+  const { calls, keyProvider } = countingProvider();
+  const r = request(configuredBase(DB), { keyProvider });
+  const got = await Promise.all([1, 2, 3].map(() => lib.workspaceDataKey(r, WS_A)));
+  assert.equal(calls.wrap, 1);
+  assert.ok(got.every((g) => g.key === got[0].key));
+  // Settled: after the row is deleted (an operator mistake), the same request creates a new key instead of reusing.
+  sql.prepare("DELETE FROM workspace_keys WHERE workspace_id = ?").run(WS_A);
+  const again = await lib.workspaceDataKey(r, WS_A);
+  assert.notEqual(again.keyId, got[0].keyId);
+  assert.equal(calls.wrap, 2);
+});
+
+test("encryptionRequired reads CONTENT_ENCRYPTION_REQUIRED; only \"1\" means required", () => {
+  for (const [v, want] of [[undefined, false], ["", false], ["0", false], ["1", true], [1, true]]) {
+    assert.equal(lib.encryptionRequired({ CONTENT_ENCRYPTION_REQUIRED: v }), want, String(v));
+  }
+});
+
+test("encryptionEnabled: true when configured (no query); false only when not configured, not required and no key rows; otherwise a 500", async () => {
+  const { sql, DB } = mkDB();
+  let queries = 0;
+  const countingDB = { prepare: (q) => { queries++; return DB.prepare(q); } };
+  assert.equal(await lib.encryptionEnabled(request(configuredBase(countingDB))), true);
+  assert.equal(queries, 0, "configured costs no query");
+  const misconfigured = (e) => e.status === 500 && e.code === "encryption_misconfigured" && !/CONTENT_|wsp_|wk_/.test(e.message);
+  await assert.rejects(lib.encryptionEnabled(request({ DB: countingDB, CONTENT_ENCRYPTION_REQUIRED: "1" })), misconfigured, "required but unset");
+  // Not required, no rows: off. The row probe is memoized per request.
+  const r = request({ DB: countingDB });
+  queries = 0;
+  assert.equal(await lib.encryptionEnabled(r), false);
+  assert.equal(await lib.encryptionEnabled(r), false);
+  assert.equal(queries, 1, "one probe per request");
+  // A malformed configuration is an error, never "off".
+  await assert.rejects(lib.encryptionEnabled(request({ DB, CONTENT_MASTER_KEY_VERSION: "1", CONTENT_MASTER_KEY_V1: "short" })), (e) => e.code === "master_key_invalid");
+  // Encryption was in use (rows exist), then the version var was removed: never plaintext.
+  const base = configuredBase(DB);
+  await lib.workspaceDataKey(request(base), WS_A);
+  const removed = { ...base, CONTENT_MASTER_KEY_VERSION: undefined };
+  await assert.rejects(lib.encryptionEnabled(request(removed)), misconfigured, "version var removed while rows exist");
+  await assert.rejects(lib.encryptionEnabled(request({ ...base, CONTENT_MASTER_KEY_VERSION: "" })), misconfigured, "version var blanked");
+  // Even when the only rows are shredded ones (a tombstone).
+  sql.prepare("DELETE FROM workspace_keys").run();
+  await lib.shredWorkspaceKeys(request(removed), WS_B);
+  await assert.rejects(lib.encryptionEnabled(request(removed)), misconfigured, "only a tombstone");
+});
+
+test("workspaceDataKey refuses to hand out a key for encrypting when the configuration is missing or malformed, even with a row", async () => {
+  const { DB } = mkDB();
+  const base = configuredBase(DB);
+  await lib.workspaceDataKey(request(base), WS_A);
+  await assert.rejects(lib.workspaceDataKey(request({ ...base, CONTENT_MASTER_KEY_VERSION: undefined }), WS_A), (e) => e.code === "encryption_not_configured");
+  await assert.rejects(lib.workspaceDataKey(request({ ...base, CONTENT_MASTER_KEY_VERSION: "x" }), WS_A), (e) => e.code === "master_key_version_invalid");
+  await assert.rejects(lib.workspaceDataKey(request({ ...base, CONTENT_MASTER_KEY_VERSION: "2" }), WS_A), (e) => e.code === "master_key_missing");
+  // Decrypting by key id is decided by the stored object, not the configuration: it still works.
+  const keyId = (await lib.workspaceDataKey(request(base), WS_A)).keyId;
+  assertDataKey((await lib.dataKeyById(request({ ...base, CONTENT_MASTER_KEY_VERSION: undefined }), WS_A, keyId)).key);
+});
+
+test("createWorker refuses every request when encryption is required but not configured (or malformed); unchanged otherwise", async () => {
+  const { DB } = mkDB();
+  const call = (env, adapters) => lib.createWorker(adapters).fetch(new Request("https://app.example.test/api/me"), { APP_HOST: "app.example.test", DB, ...env }, { waitUntil() {} });
+  const refusedBody = { error: { code: "encryption_misconfigured", message: "Content encryption is required but not configured" } };
+  const secret = masterSecret();
+  for (const env of [
+    { CONTENT_ENCRYPTION_REQUIRED: "1" },
+    { CONTENT_ENCRYPTION_REQUIRED: "1", CONTENT_MASTER_KEY_V1: secret },
+    { CONTENT_ENCRYPTION_REQUIRED: "1", CONTENT_MASTER_KEY_VERSION: "1", CONTENT_MASTER_KEY_V1: "not-32-bytes" },
+    { CONTENT_ENCRYPTION_REQUIRED: "1", CONTENT_MASTER_KEY_VERSION: "1" },
+  ]) {
+    const res = await call(env);
+    assert.equal(res.status, 500, JSON.stringify(Object.keys(env)));
+    const text = await res.text();
+    assert.deepEqual(JSON.parse(text), refusedBody);
+    assert.ok(!text.includes(secret) && !/CONTENT_/.test(text));
+  }
+  // A custom provider whose configured() throws or says false is refused too.
+  const d = lib.defaultAdapters().keyProvider;
+  const off = { ...d, name: "synthetic-off", configured: () => false };
+  assert.equal((await call({ CONTENT_ENCRYPTION_REQUIRED: "1" }, { keyProvider: off })).status, 500);
+  const broken = { ...d, name: "synthetic-broken", configured: () => { throw new Error("synthetic"); } };
+  assert.equal((await call({ CONTENT_ENCRYPTION_REQUIRED: "1" }, { keyProvider: broken })).status, 500);
+  // Required and configured, or not required: requests go through to core (whatever core answers, it is not this refusal).
+  for (const env of [{ CONTENT_ENCRYPTION_REQUIRED: "1", CONTENT_MASTER_KEY_VERSION: "1", CONTENT_MASTER_KEY_V1: secret }, {}, { CONTENT_ENCRYPTION_REQUIRED: "0" },
+    { CONTENT_MASTER_KEY_VERSION: "1", CONTENT_MASTER_KEY_V1: "not-32-bytes" }]) {
+    const body = await (await call(env)).text();
+    assert.ok(!body.includes("encryption_misconfigured"), JSON.stringify(Object.keys(env)));
+  }
+});
+
+test("provider results are validated: configured must be a synchronous boolean, currentVersion a positive safe integer, wrap a non-empty string", async () => {
+  const { sql, DB } = mkDB();
+  const d = lib.defaultAdapters().keyProvider;
+  const base = configuredBase(DB);
+  const invalid = (e) => e.status === 500 && e.code === "key_provider_invalid";
+  for (const configured of [async () => true, async () => false, () => "yes", () => 1, () => undefined]) {
+    const env = request(base, { keyProvider: { ...d, configured } });
+    assert.throws(() => lib.encryptionConfigured(env), invalid, String(configured));
+    await assert.rejects(lib.encryptionEnabled(env), invalid);
+    await assert.rejects(lib.workspaceDataKey(env, WS_A), invalid);
+  }
+  let wraps = 0;
+  for (const v of [0, -1, 1.5, "1", 2 ** 53, null, Promise.resolve(1)]) {
+    const kp = { ...d, currentVersion: () => v, wrap: (...a) => { wraps++; return d.wrap(...a); } };
+    await assert.rejects(lib.workspaceDataKey(request(base, { keyProvider: kp }), WS_A), invalid, String(v));
+  }
+  assert.equal(wraps, 0, "no wrap with an invalid version");
+  for (const w of ["", 42, null, undefined, { wrapped: "x" }]) {
+    await assert.rejects(lib.workspaceDataKey(request(base, { keyProvider: { ...d, wrap: async () => w } }), WS_A), invalid, String(w));
+  }
+  assert.equal(rows(sql, WS_A).length, 0);
+});
+
+test("a row's master_version is validated before it names a secret or reaches a provider", async () => {
+  const { sql, DB } = mkDB();
+  const base = configuredBase(DB);
+  const a = await lib.workspaceDataKey(request(base), WS_A);
+  const { calls, keyProvider } = countingProvider();
+  for (const v of [0, -1, 1.5, "1; x", "V1"]) {
+    sql.prepare("UPDATE workspace_keys SET master_version = ? WHERE key_id = ?").run(v, a.keyId);
+    await assert.rejects(lib.dataKeyById(request(base, { keyProvider }), WS_A, a.keyId), (e) => e.code === "key_row_invalid" && !e.message.includes(a.keyId), String(v));
+    await assert.rejects(lib.workspaceDataKey(request(base, { keyProvider }), WS_A), (e) => e.code === "key_row_invalid", String(v));
+  }
+  assert.equal(calls.unwrap, 0);
+  // The default provider checks it too, for callers that reach it directly.
+  await assert.rejects(Promise.resolve().then(() => lib.defaultAdapters().keyProvider.unwrap(base, "x", { workspaceId: WS_A, keyId: a.keyId, masterVersion: "1/../2" })), (e) => e.code === "key_row_invalid");
+});
+
+test("shredWorkspaceKeys: no new key and no unwrap afterwards; idempotent; a workspace that never had a key cannot get one", async () => {
+  const { sql, DB } = mkDB();
+  const base = configuredBase(DB);
+  const a = await lib.workspaceDataKey(request(base), WS_A);
+  await lib.shredWorkspaceKeys(request(base), WS_A);
+  await lib.shredWorkspaceKeys(request(base), WS_A);
+  const after = rows(sql, WS_A);
+  assert.equal(after.length, 1, "idempotent: no tombstone added next to a shredded key");
+  assert.equal(after[0].wrapped, "", "the wrapped key is overwritten");
+  assert.ok(Number.isSafeInteger(after[0].shredded_at));
+  const { calls, keyProvider } = countingProvider();
+  await assert.rejects(lib.workspaceDataKey(request(base, { keyProvider }), WS_A), (e) => e.code === "key_shredded" && !e.message.includes(WS_A));
+  await assert.rejects(lib.dataKeyById(request(base, { keyProvider }), WS_A, a.keyId), (e) => e.code === "key_shredded");
+  assert.deepEqual(calls, { wrap: 0, unwrap: 0 }, "a shredded workspace never reaches the provider (the pre-check)");
+  // Never had a key: a tombstone.
+  await lib.shredWorkspaceKeys(request(base), WS_B);
+  await lib.shredWorkspaceKeys(request(base), WS_B);
+  const tomb = rows(sql, WS_B);
+  assert.equal(tomb.length, 1);
+  assert.equal(tomb[0].wrapped, "");
+  assert.ok(tomb[0].shredded_at !== null);
+  await assert.rejects(lib.workspaceDataKey(request(base, { keyProvider }), WS_B), (e) => e.code === "key_shredded");
+  assert.deepEqual(calls, { wrap: 0, unwrap: 0 });
+  // A row whose wrapped value is empty is shredded even if shredded_at was cleared (never sent to a provider).
+  sql.prepare("UPDATE workspace_keys SET shredded_at = NULL WHERE key_id = ?").run(a.keyId);
+  await assert.rejects(lib.workspaceDataKey(request(base, { keyProvider }), WS_A), (e) => e.code === "key_shredded");
+  await assert.rejects(lib.dataKeyById(request(base, { keyProvider }), WS_A, a.keyId), (e) => e.code === "key_shredded");
+  assert.deepEqual(calls, { wrap: 0, unwrap: 0 });
+});
+
+test("shredding racing first use, in both orders and concurrently, never leaves an active key", async () => {
+  for (const order of ["first use, then shred", "shred, then first use", "concurrent", "concurrent, shred first"]) {
+    const { sql, DB } = mkDB();
+    const base = configuredBase(DB);
+    const use = () => lib.workspaceDataKey(request(base), WS_A).catch((e) => e);
+    const shred = () => lib.shredWorkspaceKeys(request(base), WS_A);
+    if (order === "first use, then shred") { await use(); await shred(); }
+    else if (order === "shred, then first use") { await shred(); assert.equal((await use()).code, "key_shredded"); }
+    else if (order === "concurrent") await Promise.all([use(), use(), shred(), use()]);
+    else await Promise.all([shred(), use(), use()]);
+    assert.equal(activeRows(sql, WS_A).length, 0, order);
+    assert.ok(rows(sql, WS_A).every((r) => r.wrapped === ""), `${order}: no wrapped key survives`);
+    assert.equal((await use()).code, "key_shredded", order);
+  }
+});
+
+test("the NOT EXISTS guard: a shred landing after the pre-check but before the insert still leaves no active key", async () => {
+  const { sql, DB } = mkDB();
+  const base = configuredBase(DB);
+  const d = lib.defaultAdapters().keyProvider;
+  // The provider's wrap runs between the pre-check and the INSERT; the workspace is shredded (a tombstone) there.
+  const keyProvider = { ...d, async wrap(env, raw, ctx) { await lib.shredWorkspaceKeys(request(base), ctx.workspaceId); return d.wrap(env, raw, ctx); } };
+  await assert.rejects(lib.workspaceDataKey(request(base, { keyProvider }), WS_A), (e) => e.code === "key_shredded");
+  assert.equal(activeRows(sql, WS_A).length, 0);
+  assert.equal(rows(sql, WS_A).length, 1, "only the tombstone");
+});
+
+test("an INSERT failure other than losing the race is reported as such, not as a missing key", async () => {
+  const { sql, DB } = mkDB();
+  // Rebuild the table with a CHECK that rejects one synthetic workspace (INSERT OR IGNORE would silently skip it).
+  sql.exec(`DROP TABLE workspace_keys;
+    CREATE TABLE workspace_keys (workspace_id TEXT NOT NULL CHECK (workspace_id <> 'wsp_broken'), key_id TEXT PRIMARY KEY,
+      master_version INTEGER NOT NULL, wrapped TEXT NOT NULL, created_at INTEGER NOT NULL, shredded_at INTEGER);`);
+  sql.exec(readFileSync(join(ROOT, "migrations", "0029_workspace_keys.sql"), "utf8"));
+  const base = configuredBase(DB);
+  const logs = await captureErrors(() => assert.rejects(lib.workspaceDataKey(request(base), "wsp_broken"),
+    (e) => e.status === 500 && e.code === "key_create_failed" && !/wsp_broken|CHECK/.test(e.message)));
+  assert.ok(logs.some((l) => l.includes("key_create_failed") && l.includes("wsp_broken")), "the log has the workspace id");
+  assert.equal((await lib.workspaceDataKey(request(base), WS_A)).workspaceId, WS_A, "other workspaces are fine");
+});
+
+test("the core check of what a provider's unwrap returns: an extractable, non-HKDF or wider-usage key is rejected", async () => {
+  const { DB } = mkDB();
+  const base = configuredBase(DB);
+  await lib.workspaceDataKey(request(base), WS_A);
+  const d = lib.defaultAdapters().keyProvider;
+  // Node's WebCrypto cannot make an extractable HKDF key, so a CryptoKey whose getters are shadowed stands in.
+  const fakeKey = (props) => Object.defineProperties(Object.create(CryptoKey.prototype), Object.fromEntries(Object.entries(props).map(([k, value]) => [k, { value }])));
+  const raw = crypto.getRandomValues(new Uint8Array(32));
+  const returns = {
+    "extractable HKDF": fakeKey({ algorithm: { name: "HKDF" }, extractable: true, usages: ["deriveKey"], type: "secret" }),
+    "PBKDF2 (not HKDF)": await crypto.subtle.importKey("raw", raw, "PBKDF2", false, ["deriveKey"]),
+    "AES-GCM key": await crypto.subtle.importKey("raw", raw, "AES-GCM", false, ["encrypt"]),
+    "HKDF with deriveKey and deriveBits": await crypto.subtle.importKey("raw", raw, "HKDF", false, ["deriveKey", "deriveBits"]),
+    "HKDF with deriveBits only": await crypto.subtle.importKey("raw", raw, "HKDF", false, ["deriveBits"]),
+    "raw bytes": raw,
+  };
+  for (const [name, key] of Object.entries(returns)) {
+    await assert.rejects(lib.workspaceDataKey(request(base, { keyProvider: { ...d, unwrap: async () => key } }), WS_A), (e) => e.code === "key_provider_invalid", name);
+  }
+});
+
+test("two wraps of the same key bytes use different IVs", async () => {
+  const base = { CONTENT_MASTER_KEY_VERSION: "1", CONTENT_MASTER_KEY_V1: masterSecret() };
+  const P = lib.defaultAdapters().keyProvider;
+  const raw = crypto.getRandomValues(new Uint8Array(32));
+  const ctx = { workspaceId: WS_A, keyId: "wk_synthetic", masterVersion: 1 };
+  const w1 = Buffer.from(await P.wrap(base, raw.slice(), ctx), "base64url");
+  const w2 = Buffer.from(await P.wrap(base, raw.slice(), ctx), "base64url");
+  assert.notEqual(w1.subarray(0, 12).toString("hex"), w2.subarray(0, 12).toString("hex"), "IVs differ");
+  assert.notEqual(w1.subarray(12).toString("hex"), w2.subarray(12).toString("hex"), "ciphertexts differ");
+});
+
+test("the master key is imported with only the usage each operation needs", async () => {
+  const base = { CONTENT_MASTER_KEY_VERSION: "1", CONTENT_MASTER_KEY_V1: masterSecret() };
+  const P = lib.defaultAdapters().keyProvider;
+  const ctx = { workspaceId: WS_A, keyId: "wk_synthetic", masterVersion: 1 };
+  const seen = [];
+  const subtle = crypto.subtle;
+  const real = subtle.importKey;
+  subtle.importKey = function (...a) { seen.push(a[4]); return real.apply(subtle, a); };
+  try {
+    const wrapped = await P.wrap(base, crypto.getRandomValues(new Uint8Array(32)), ctx);
+    await P.unwrap(base, wrapped, ctx);
+  } finally { delete subtle.importKey; }
+  assert.equal(subtle.importKey, real);
+  assert.deepEqual(seen, [["encrypt"], ["unwrapKey"]]);
+});
+
+test("master secret and version parsing: alphabets, padding, newline, 32 characters, empty and numeric version", async () => {
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  const std = Buffer.from(bytes).toString("base64"); // 44 characters, one "="
+  const url = Buffer.from(bytes).toString("base64url"); // 43 characters
+  const P = lib.defaultAdapters().keyProvider;
+  const ctx = { workspaceId: WS_A, keyId: "wk_synthetic", masterVersion: 1 };
+  const env = (secret, version = "1") => ({ CONTENT_MASTER_KEY_VERSION: version, CONTENT_MASTER_KEY_V1: secret });
+  // Every accepted spelling decodes to the same 32 bytes, so a key wrapped with one unwraps with another.
+  let mixed = std.replace(/=$/, "");
+  for (let i = 0; i < mixed.length; i++) if (mixed[i] === "+" || mixed[i] === "/") { mixed = mixed.slice(0, i) + (mixed[i] === "+" ? "-" : "_") + mixed.slice(i + 1); break; }
+  const accepted = [std, url, url + "=", std.replace(/=$/, ""), mixed];
+  const wrapped = await P.wrap(env(std), crypto.getRandomValues(new Uint8Array(32)), ctx);
+  for (const s of accepted) {
+    assert.equal(P.configured(env(s)), true, s.length + " chars");
+    assertDataKey(await P.unwrap(env(s), wrapped, ctx));
+  }
+  const rejected = [std + "\n", " " + std, std + "==".slice(0, 1) + "=", "a".repeat(32), Buffer.from("a".repeat(32)).toString("hex"), std.slice(0, -2)];
+  for (const s of rejected) assert.throws(() => P.configured(env(s)), (e) => e.code === "master_key_invalid", JSON.stringify(s.slice(-3)) + " " + s.length);
+  // Version: "" and unset are "not configured"; a number is accepted like a string of digits.
+  assert.equal(P.configured(env(std, "")), false);
+  assert.equal(P.configured({ CONTENT_MASTER_KEY_V1: std }), false);
+  assert.equal(P.configured(env(std, 1)), true);
+  assert.equal(P.currentVersion(env(std, 1)), 1);
+  for (const v of [0, -1, 1.5, NaN, 2 ** 53, "01", " 1", "1 "]) assert.throws(() => P.configured(env(std, v)), (e) => e.code === "master_key_version_invalid", String(v));
+});
+
 test("migration 0029 applies twice without error and adds the partial unique index", () => {
   const sql = new DatabaseSync(":memory:");
   for (const f of MIGRATIONS) sql.exec(readFileSync(join(ROOT, "migrations", f), "utf8"));
@@ -291,4 +616,11 @@ test("migration 0029 applies twice without error and adds the partial unique ind
   ins.run("wsp_x", "wk_1", 5);
   ins.run("wsp_x", "wk_2", null);
   assert.throws(() => ins.run("wsp_x", "wk_3", null), /UNIQUE/);
+  // A plain index serves the lookups by workspace (shredded rows, NOT EXISTS) without scanning the table.
+  const indexes = sql.prepare("PRAGMA index_list(workspace_keys)").all().map((i) => i.name);
+  assert.ok(indexes.includes("workspace_keys_active") && indexes.includes("workspace_keys_workspace"), indexes.join());
+  for (const q of ["SELECT 1 FROM workspace_keys WHERE workspace_id = ? AND shredded_at IS NOT NULL LIMIT 1", "SELECT 1 FROM workspace_keys WHERE workspace_id = ? LIMIT 1"]) {
+    const plan = sql.prepare("EXPLAIN QUERY PLAN " + q).all("wsp_x").map((r) => r.detail).join(" | ");
+    assert.match(plan, /USING (COVERING )?INDEX workspace_keys_workspace/, plan);
+  }
 });

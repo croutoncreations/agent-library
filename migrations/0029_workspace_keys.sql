@@ -11,3 +11,5 @@ CREATE TABLE IF NOT EXISTS workspace_keys (
   shredded_at INTEGER
 );
 CREATE UNIQUE INDEX IF NOT EXISTS workspace_keys_active ON workspace_keys(workspace_id) WHERE shredded_at IS NULL;
+-- Lookups by workspace that the partial index cannot serve (shredded rows, the NOT EXISTS guard on first use).
+CREATE INDEX IF NOT EXISTS workspace_keys_workspace ON workspace_keys(workspace_id);

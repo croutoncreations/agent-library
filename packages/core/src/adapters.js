@@ -73,12 +73,14 @@ export const logMailer = { async send(m) { console.log("mail_not_sent", JSON.str
  * keyProvider (workspace data keys for content encryption; docs/encryption.md#workspace-keys): wraps and unwraps a
  * data key for ctx { workspaceId, keyId, masterVersion }. configured(env) -> bool (throws if malformed),
  * currentVersion(env) -> positive integer, wrap(env, raw32Bytes, ctx) -> string, unwrap(env, wrapped, ctx) -> a
- * non-extractable HKDF CryptoKey with usages ["deriveKey"]. The default reads Worker secrets
- * (crypto/worker-secret-keys.js); a hosted installation may supply a KMS-backed one.
+ * non-extractable HKDF CryptoKey with usages ["deriveKey"]. configured and currentVersion are synchronous; core checks
+ * every result (crypto/keys.js). The default reads Worker secrets (crypto/worker-secret-keys.js); a hosted installation
+ * may supply a KMS-backed one, which replaces the default whole: it must define all four methods.
  */
+const KEY_PROVIDER_METHODS = ["configured", "currentVersion", "wrap", "unwrap"];
 const DEFAULTS = Object.freeze({ identity: noIdentity, entitlements: unlimited, lifecycle: noLifecycle, mailer: logMailer, keyProvider: workerSecretKeyProvider, routes: [] });
 
-/** Fill unset adapters (and unset methods) with the defaults. */
+/** Fill unset adapters (and unset methods) with the defaults. A supplied keyProvider is used whole, never merged. */
 export function resolveAdapters(a = {}) {
   const routes = Array.isArray(a.routes) ? a.routes : [];
   for (const r of routes) {
@@ -87,7 +89,14 @@ export function resolveAdapters(a = {}) {
     if (r.path instanceof RegExp && (r.path.global || r.path.sticky)) throw new Error("adapter route RegExp must not use the g or y flag");
   }
   const out = { routes: Object.freeze(routes.map((r) => Object.freeze({ ...r }))) };
-  for (const k of ["identity", "entitlements", "lifecycle", "mailer", "keyProvider"]) out[k] = Object.freeze({ ...DEFAULTS[k], ...(a[k] ?? {}) });
+  for (const k of ["identity", "entitlements", "lifecycle", "mailer"]) out[k] = Object.freeze({ ...DEFAULTS[k], ...(a[k] ?? {}) });
+  // Never mixed with the Worker-secret provider: half of one and half of the other would wrap and unwrap under
+  // different keys, or quietly use Worker secrets an installation meant to replace.
+  if (a.keyProvider) {
+    const missing = KEY_PROVIDER_METHODS.filter((m) => typeof a.keyProvider[m] !== "function");
+    if (missing.length) throw new Error(`adapter keyProvider must define ${KEY_PROVIDER_METHODS.join(", ")}; missing: ${missing.join(", ")}`);
+    out.keyProvider = Object.freeze({ ...a.keyProvider });
+  } else out.keyProvider = Object.freeze({ ...DEFAULTS.keyProvider });
   return Object.freeze(out);
 }
 const RESOLVED_DEFAULTS = resolveAdapters();

@@ -219,18 +219,25 @@ test("Turnstile fails closed on configuration mistakes (never silently off)", as
   assert.ok(logs.some((l) => /turnstile_not_configured bad_site_key/.test(l)));
 });
 
-test("keyProvider: the default reads Worker secrets; a custom provider (and each unset method) is merged like other adapters", async () => {
+test("keyProvider: the default reads Worker secrets; a custom provider replaces it whole and must define all four methods", async () => {
   const K = await loadWorker({ "adapters.js": ["resolveAdapters", "defaultAdapters", "withAdapters", "adapters"], "crypto/worker-secret-keys.js": ["workerSecretKeyProvider"], "crypto/keys.js": ["encryptionConfigured"] });
   const d = K.defaultAdapters().keyProvider;
   assert.equal(d.name, "worker-secret");
   for (const m of ["configured", "currentVersion", "wrap", "unwrap"]) assert.equal(d[m], K.workerSecretKeyProvider[m]);
   assert.equal(d.configured({}), false);
   assert.ok(Object.isFrozen(d));
-  const custom = { name: "synthetic-kms", configured: () => true };
+  const custom = { name: "synthetic-kms", configured: () => true, currentVersion: () => 7, wrap: async () => "synthetic", unwrap: async () => null };
   const A = K.resolveAdapters({ keyProvider: custom });
   assert.equal(A.keyProvider.name, "synthetic-kms");
-  assert.equal(A.keyProvider.configured, custom.configured);
-  assert.equal(A.keyProvider.unwrap, d.unwrap, "unset methods fall back to the default");
+  for (const m of ["configured", "currentVersion", "wrap", "unwrap"]) assert.equal(A.keyProvider[m], custom[m]);
+  assert.ok(Object.isFrozen(A.keyProvider));
+  // No method-by-method fallback to the Worker-secret provider: a partial provider is refused at resolution.
+  for (const m of ["configured", "currentVersion", "wrap", "unwrap"]) {
+    const partial = { ...custom, [m]: undefined };
+    assert.throws(() => K.resolveAdapters({ keyProvider: partial }), new RegExp(`keyProvider.*${m}`), m);
+    assert.throws(() => W.createWorker({ keyProvider: partial }), /keyProvider/, `createWorker: ${m}`);
+  }
+  assert.throws(() => K.resolveAdapters({ keyProvider: { name: "synthetic-kms", configured: () => true } }), /keyProvider/);
   assert.equal(K.encryptionConfigured(K.withAdapters({}, A)), true, "core asks the installation's provider, not the default");
   assert.equal(K.encryptionConfigured(K.withAdapters({}, K.defaultAdapters())), false);
   // createWorker attaches the same resolved provider to every request's env.

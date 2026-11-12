@@ -107,7 +107,9 @@ APP_CONNECT_ENABLED = "1"
 #   OIDC_CLIENT_SECRET         (only with OIDC_ISSUER)
 # Content encryption keys (docs/encryption.md#workspace-keys; nothing is encrypted yet, leave both unset):
 #   CONTENT_MASTER_KEY_V1      (secret: base64 of 32 random bytes; later versions V2, V3, ... for rotation)
-#   CONTENT_MASTER_KEY_VERSION (var: the current version number, e.g. 1)
+#   CONTENT_MASTER_KEY_VERSION (var: the current version number, e.g. "1"; a TOML integer works too)
+#   CONTENT_ENCRYPTION_REQUIRED (var: "1" makes encryption required: every request is refused with a 500 while the
+#                               two settings above are missing or malformed; unset means not required)
 
 [[env.hosted.kv_namespaces]]
 binding = "OAUTH_KV"
