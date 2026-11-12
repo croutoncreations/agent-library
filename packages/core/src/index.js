@@ -390,14 +390,14 @@ function createWorker(adapterConfig = {}) {
 }
 var coreWorker = {
   // Cron: expire abandoned uploads and delete their R2 objects (bounded, idempotent).
-  async scheduled(_ev, env, ctx) {
+  async scheduled(ev, env, ctx) {
     ctx.waitUntil(cleanupChanges(env));
     ctx.waitUntil(reconcileUploads(env, { limit: 100 }).then((r) => console.log("reconcile", JSON.stringify(r))));
     // Expired sessions, idempotency records past 30 days, audits past AUDIT_RETENTION_DAYS (bounded per run).
     ctx.waitUntil(pruneExpiredRows(env).then((r) => { if (r.sessions || r.idempotency || r.audits) console.log("retention", JSON.stringify(r)); },
       (e) => console.error(JSON.stringify({ event: "retention_failed", message: String(e?.message ?? e).slice(0, 200) }))));
     // Deleted projects past their 30 days (D21): bounded per run, finished by later runs.
-    ctx.waitUntil(purgeDueProjects(env).then((r) => { if (r.projects || r.rows || r.files) console.log("project_purge", JSON.stringify({ projects: r.projects, rows: r.rows, files: r.files })); }));
+    ctx.waitUntil(purgeDueProjects(env, { scheduledTime: ev.scheduledTime }).then((r) => { if (r.projects || r.rows || r.files) console.log("project_purge", JSON.stringify({ projects: r.projects, rows: r.rows, files: r.files })); }));
   },
   async fetch(req, env, ctx) {
     const url = new URL(req.url);
