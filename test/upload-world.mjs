@@ -101,7 +101,8 @@ export function world({ encryption = false } = {}) {
   const at = new Date().toISOString();
   sql.prepare("INSERT INTO principals (id, kind, issuer, subject, label, created_at) VALUES ('hum_synthetic','human','synthetic','owner','Synthetic owner',?)").run(at);
   sql.prepare("INSERT INTO projects (id, owner_id, title, created_at) VALUES (?,'hum_synthetic','Synthetic project',?)").run(P, at);
-  const env = { DB, BLOBS, ...encryption ? keyVars() : {} };
+  // With the default adapters attached, as createWorker does for every request (encryptionEnabled needs them).
+  const env = lib.withAdapters({ DB, BLOBS, ...encryption ? keyVars() : {} }, lib.defaultAdapters());
   const ctx = { env, principal: { id: "hum_synthetic", kind: "human", label: "Synthetic owner" }, requestId: "req_synthetic" };
   let n = 0;
   const upload = ({ state = "received", expiresAt = Date.now() + 900000 } = {}) => {

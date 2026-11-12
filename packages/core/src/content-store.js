@@ -36,7 +36,7 @@ export async function getUploadedText(env, key, kind) {
 }
 
 /** The first `length` bytes of a stored object (fewer if it is shorter), or null if missing. */
-export async function getBlobHead(env, key, length) {
+async function getBlobHead(env, key, length) {
   const o = await env.BLOBS.get(key, { range: { offset: 0, length } });
   return o ? new Uint8Array(await o.arrayBuffer()) : null;
 }
@@ -49,21 +49,23 @@ export async function putBlob(env, key, bytes, options) {
 /**
  * Write a stream of exactly `length` bytes under an immutable key without buffering it (R2 accepts a stream only
  * with a known length, hence FixedLengthStream). Rejects, storing nothing, if the stream errors or is not exactly
- * `length` bytes long, or if `options.sha256` is given and the stored bytes hash differently. Returns the R2 object
- * (size, checksums). Plaintext only.
+ * `length` bytes long, or if `options.sha256` is given and the stored bytes hash differently. Returns what R2
+ * recorded: { size, sha256 (lowercase hex, or null without a checksum) }. Plaintext only: the text upload PUT (raw
+ * text-upload input stays plaintext until slice 3c) and writeUploadBlob's plaintext mode.
  */
 export async function putBlobStream(env, key, stream, length, options) {
-  return env.BLOBS.put(key, stream.pipeThrough(new FixedLengthStream(length)), options);
+  const stored = await env.BLOBS.put(key, stream.pipeThrough(new FixedLengthStream(length)), options);
+  return { size: stored?.size ?? null, sha256: blobSha256Hex(stored) };
 }
 
 /** The SHA-256 (lowercase hex) R2 recorded for an object from put() or head(), or null if it has none. */
-export function blobSha256Hex(obj) {
+function blobSha256Hex(obj) {
   const b = obj?.checksums?.sha256;
   return b ? [...new Uint8Array(b)].map((x) => x.toString(16).padStart(2, "0")).join("") : null;
 }
 
 /** Object metadata (size, checksums), or null. */
-export async function headBlob(env, key) {
+async function headBlob(env, key) {
   return env.BLOBS.head(key);
 }
 
@@ -350,7 +352,7 @@ export async function writeUploadBlob(env, { key, body, size, sha256, contentTyp
       if (/did not see all expected bytes/i.test(m)) throw blobWriteError("too_short", e);
       throw e;
     }
-    return { size: stored?.size ?? null, sha256: blobSha256Hex(stored), keyId: null, header: null };
+    return { size: stored.size, sha256: stored.sha256, keyId: null, header: null };
   }
   if (typeof workspaceId !== "string" || !workspaceId) throw new HttpError(500, "invalid_workspace", "A workspace id is required");
   const { keyId, key: dataKey } = await workspaceDataKey(env, workspaceId);
@@ -410,7 +412,8 @@ export function blobKeyFits(key) {
 
 /**
  * Upload finish's check of what the PUT stored, without reading the whole object: one head and one ranged get (the
- * first `headBytes` bytes of plaintext; for an encrypted object, chunk 0, decrypted with the database header).
+ * first `headBytes` bytes of plaintext, none when headBytes is 0; for an encrypted object, chunk 0, decrypted with the
+ * database header).
  * Returns { ok: true, size, sha256, head } or { ok: false, reason: "missing" | "no_checksum" | "mismatch" | "corrupt",
  * size?, sha256? } (mismatch carries the received values). Throws 410 key_shredded (and the key layer's other errors).
  */
@@ -428,6 +431,7 @@ export async function inspectUploadedBlob(env, { key, projectId, artifactId, wor
     const got = blobSha256Hex(stored);
     if (got === null) return { ok: false, reason: "no_checksum" };
     if (stored.size !== size || got !== sha256) return { ok: false, reason: "mismatch", size: stored.size, sha256: got };
+    if (!headBytes) return { ok: true, size, sha256: got, head: new Uint8Array(0) };
     const head = await getBlobHead(env, key, headBytes);
     if (!head) return { ok: false, reason: "missing" };
     return { ok: true, size, sha256: got, head };

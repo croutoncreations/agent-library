@@ -48,14 +48,26 @@ test("customMetadata appears in no source file other than content-store.js", () 
   const users = jsFiles(join(ROOT, "packages")).filter((f) => /\bcustomMetadata\b/.test(readFileSync(f, "utf8"))).map(rel);
   assert.deepEqual(users, ["packages/core/src/content-store.js"]);
 });
-test("the raw whole-object readers getBlob and getBlobBytes are module-internal to content-store.js", () => {
+test("the raw R2 readers (getBlob, getBlobHead, getBlobBytes, headBlob, blobSha256Hex) are module-internal to content-store.js", () => {
   const store = readFileSync(join(ROOT, "packages", "core", "src", "content-store.js"), "utf8");
-  assert.doesNotMatch(store, /export\s+(?:async\s+)?function\s+(?:getBlob|getBlobBytes)\b/);
+  assert.doesNotMatch(store, /export\s+(?:async\s+)?function\s+(?:getBlob|getBlobHead|getBlobBytes|headBlob|blobSha256Hex)\b/);
   const importers = jsFiles(join(ROOT, "packages"))
     .filter((f) => !f.endsWith("content-store.js"))
-    .filter((f) => [...readFileSync(f, "utf8").matchAll(/import\s*\{([^}]*)\}\s*from\s*["'][^"']*content-store\.js["']/g)].some((m) => /\b(?:getBlob|getBlobBytes)\b/.test(m[1])))
+    .filter((f) => [...readFileSync(f, "utf8").matchAll(/import\s*\{([^}]*)\}\s*from\s*["'][^"']*content-store\.js["']/g)].some((m) => /\b(?:getBlob|getBlobHead|getBlobBytes|headBlob|blobSha256Hex)\b/.test(m[1])))
     .map(rel);
   assert.deepEqual(importers, []);
+});
+test("ACTIVE_KEY_SQL and NO_REAL_KEY_SQL are imported only by content-store.js (crypto/keys.js defines them)", () => {
+  const importers = jsFiles(join(ROOT, "packages"))
+    .filter((f) => !rel(f).startsWith("packages/core/src/crypto/"))
+    .filter((f) => [...readFileSync(f, "utf8").matchAll(/import\s*\{([^}]*)\}\s*from/g)].some((m) => /\b(?:ACTIVE_KEY_SQL|NO_REAL_KEY_SQL)\b/.test(m[1])))
+    .map(rel);
+  assert.deepEqual(importers, ["packages/core/src/content-store.js"]);
+});
+test("exactly one writeUploadBlob( call site and one putBlobStream( call site outside content-store.js", () => {
+  const count = (re) => jsFiles(join(ROOT, "packages")).filter((f) => !f.endsWith("content-store.js")).reduce((n, f) => n + [...readFileSync(f, "utf8").matchAll(re)].length, 0);
+  assert.equal(count(/\bwriteUploadBlob\(/g), 1);
+  assert.equal(count(/\bputBlobStream\(/g), 1);
 });
 
 // Publication conditions are written once (docs/encryption.md#rules-for-code-that-uses-this): crypto/keys.js defines
