@@ -134,9 +134,10 @@ For the slices that wire this into reads and writes:
   also refuses any non-NULL row). Never give a fence a conflict clause (`OR IGNORE`, `OR REPLACE`, `ON CONFLICT`):
   it would turn a refusal into a pass. Put the fence last in the batch, after every statement whose result the
   caller reads. A refusal answers `410 key_shredded` for a key fence and `409 encryption_started` for a plaintext
-  fence. `runBatch` and `commitTextWrites` already return the refusal as that HTTP answer; `fenceRefusal(error)` is
-  for code that runs a batch itself (it returns the answer, or `null` for any other error, and is safe to call on an
-  answer it already returned).
+  fence. `runBatch` and `commitTextWrites` already return the refusal as that HTTP answer. If the same request already
+  succeeded under the same idempotency key, `runBatch` returns that stored response in place of the refusal.
+  `fenceRefusal(error)` is for code that runs a batch itself (it returns the answer, or `null` for any other error,
+  and is safe to call on an answer it already returned).
 - **A refusal must be told apart from other failures**, so that it is not reported as an expired text-write intent
   (`text_write_expired`) or a conflict. A refusal is recognised from the constraint the failed statement names
   (`fenceRefusal`), not by probing. A refused plaintext write is retryable (the retry re-evaluates encryption and
@@ -146,13 +147,15 @@ For the slices that wire this into reads and writes:
   shredding (see [Limits](#limits)). Any later code that removes workspace data must keep the rows of
   `workspace_keys`. A write refused because its key was shredded answers `410 key_shredded`. A refused upload ends
   failed, and a retry starts a new upload.
-- An error that is not recognised as a refusal is still a failed batch: nothing was published. Never retry it with a
-  write that carries no fence.
+- An error that is not recognised as a refusal says nothing about the outcome: the batch may have failed, or it may
+  have committed with its acknowledgement lost. Never retry it with a write that carries no fence; retry the same
+  request with the same idempotency key, and delete nothing that the batch might have published.
 - **A refusal must leave the staged object reclaimable.** The row that lets cleanup find the object (the text-write
   intent, the upload row) must survive the refusal, and an upload must end failed, so that the existing cleanup (the
   intent sweep, upload cleanup) removes the object. `commitTextWrites` removes the unreferenced staged text of a
-  recognised refusal at once, as it does for an expired intent (a refusal means the batch rolled back); if that
-  cleanup fails, the intent stays for the sweep.
+  recognised refusal at once, as it does for an expired intent (a failed fence statement means the batch rolled back;
+  the cleanup in any case removes only objects that no revision or comment refers to); if that cleanup fails, the
+  intent stays for the sweep.
 - Worker versions from before these conditions existed do not honour them, so encryption may be configured only
   after a Worker that fences its writes is fully deployed. Set `CONTENT_ENCRYPTION_REQUIRED="1"` in the same deploy
   as the master-key settings: set earlier, it refuses every request until they arrive.
