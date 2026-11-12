@@ -112,3 +112,63 @@ plaintext, read both), encrypt in the Worker before insert, and replace the SQL-
 part: options are a title-only index, a bounded decrypt-and-scan within one project, or an index of keyed HMAC
 tokens. Old plaintext remains in D1 Time Travel and backups until they age out; any announcement should say so.
 Deleting a workspace's data key then makes all of its content unreadable (crypto-shredding).
+
+## Object format (version 1)
+
+**Nothing is encrypted yet.** `packages/core/src/crypto/chunked.js` implements the format below, but no read or
+write path calls it, and every stored object is still plaintext. Wiring it into `content-store.js` is a later slice.
+The module uses WebCrypto only and never touches R2.
+
+A stored object is a 48-byte header followed by chunks:
+
+| Bytes | Field |
+|---|---|
+| 0–3 | magic `ALE1` |
+| 4 | format version `1` |
+| 5 | chunk-size exponent `16` (65,536-byte chunks) |
+| 6–7 | reserved, zero |
+| 8–15 | plaintext length, unsigned 64-bit big-endian, at most 2^40 |
+| 16–47 | salt: 32 random bytes, fresh for every write |
+
+- **Per-write key.** `HKDF-SHA-256(workspace data key, salt = header salt, info = "al-obj/1" ‖ 0x00 ‖ UTF-8 of the
+  storage object key)` gives a non-extractable AES-256-GCM key. The data key (a non-extractable WebCrypto HKDF key
+  from the key provider) never encrypts content directly.
+- **Chunks.** The plaintext is cut into 65,536-byte chunks; the last may be shorter, and an empty plaintext is one
+  empty final chunk. Chunk *i* is AES-GCM with nonce = 4 zero bytes ‖ *i* (u64 big-endian) and additional data =
+  the 48 header bytes ‖ *i* (u64 big-endian) ‖ `1` for the final chunk, `0` otherwise. Each stored chunk is its
+  ciphertext followed by the 16-byte tag.
+- **Stored length** = `48 + len + 16 × max(1, ceil(len / 65536))`. Lengths above 2^40 and chunk indexes of 2^32 or
+  more are refused.
+
+What each binding prevents:
+
+| Binding | Prevents |
+|---|---|
+| Fresh salt per write in the HKDF salt | (key, nonce) reuse when the same storage key is written twice, for example a retried upload: each write gets its own key, so the chunk-index nonce is unique per key. Two salts collide with probability about 2^-256 per pair (in practice negligible). |
+| Storage object key in the HKDF info | Moving or copying a stored object to another key: it no longer decrypts. |
+| Workspace data key as the HKDF input | Reading one workspace's objects with another's key; shredding the data key makes every object unreadable. |
+| Header in every chunk's additional data | Changing the length, salt, version or exponent; splicing chunks from another write (even of the same plaintext under the same storage key). |
+| Chunk index in the nonce and additional data | Missing, repeated or reordered chunks. |
+| Final-chunk flag | Truncation at a chunk boundary: a non-final chunk cannot end the object. Trailing bytes after the final chunk are refused too. |
+
+Reads:
+
+- **Whole object** (`decryptChunkedStream`): releases plaintext one authenticated chunk at a time. On any failure the
+  stream errors and the failing chunk's bytes are never released, but **earlier chunks have already been released**.
+  A caller that must not act on partial content (for example parsing a whole document) has to buffer until the stream
+  ends, or treat an errored stream as a failed read.
+- **Ranges** (`planChunkedRange`, `decryptChunkedRange`): a plaintext range maps to the stored bytes of exactly the
+  chunks it touches, fetched with one call, and every touched chunk is authenticated before any of its bytes are
+  returned. The range path needs the 48 header bytes; where they come from (a copy in object metadata or a separate
+  small read) is decided when this is wired in. Because the header is authenticated in every chunk's additional data,
+  a tampered copy makes decryption fail. A range read only proves the chunks it touched; it does not prove that the
+  rest of the object is intact.
+
+Limits:
+
+- Authenticity is per data key: anyone holding the workspace data key can produce valid objects for that workspace.
+- The format hides content, not size: the stored length reveals the plaintext length exactly.
+- Encryption is pull-driven and holds about two chunks (one input chunk plus its ciphertext); it errors if the input
+  is shorter or longer than declared, withholding the final chunk, so a mis-sized upload is never a valid object.
+- Version 1 fixes the chunk size; a different size needs a new exponent or version, which this parser refuses.
+- The test-only fixed-salt function exists only for the known-answer test and is not exported.
