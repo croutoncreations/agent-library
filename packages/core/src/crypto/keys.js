@@ -165,7 +165,9 @@ async function createDataKey(env, workspaceId) {
 
 /**
  * The workspace's active row, creating the first key if there is none. Refuses a shredded workspace. Every call does
- * its own reads; only the creation is shared between concurrent callers in one request, and each re-selects after it.
+ * its own reads; only the creation is shared between overlapping callers in one request, and each re-selects after it.
+ * A caller whose reads finish after that creation has settled may wrap a second candidate; its insert does nothing and
+ * the candidate is discarded. Exactly one key is stored and returned in every case.
  */
 async function activeOrCreatedRow(env, workspaceId) {
   const row = await activeRow(env, workspaceId);
@@ -182,8 +184,9 @@ async function activeOrCreatedRow(env, workspaceId) {
 /**
  * The workspace's active data key for encrypting: { workspaceId, keyId, masterVersion, key }, creating it on first use.
  * Every call does its own read of the active row, so a call that starts after a completed shred is refused (only the
- * unwrap is memoized per request, keyed by the whole row); concurrent first use in one request shares one creation,
- * so it wraps one candidate key and yields one key for every caller. Refuses unless the keyProvider is
+ * unwrap is memoized per request, keyed by the whole row). Overlapping first use in one request shares one creation; a
+ * caller whose reads finish later may wrap a second candidate, which is discarded. Exactly one key is stored and
+ * returned to every caller in every case. Refuses unless the keyProvider is
  * configured and well-formed, even if the workspace already has a row (500 encryption_not_configured, or the
  * configuration's own error), and refuses a shredded workspace (410 key_shredded).
  */

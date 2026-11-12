@@ -407,6 +407,41 @@ test("a lookup that starts after a completed shred is refused, even while an ear
   assertDataKey(a.key);
 });
 
+test("a delayed empty read in one request: the late caller wraps a second candidate, which is discarded; one key is stored and returned", async () => {
+  const { sql, DB } = mkDB();
+  const { calls, keyProvider } = countingProvider();
+  // The test database holds back the result of one active-row SELECT: the statement has executed (it found no active
+  // row), but its promise resolves only when the test releases it.
+  const ACTIVE_ROW_SELECT = /FROM workspace_keys WHERE workspace_id = \? AND shredded_at IS NULL$/;
+  let hold = false, heldReached, release;
+  const reached = new Promise((res) => { heldReached = res; });
+  const gate = new Promise((res) => { release = res; });
+  const heldDB = { prepare(q) {
+    const s = DB.prepare(q);
+    const wrapFirst = (st) => ({ ...st, async first(c) {
+      const result = await st.first(c);
+      if (hold && ACTIVE_ROW_SELECT.test(q)) { hold = false; heldReached(result); await gate; }
+      return result;
+    } });
+    return { ...wrapFirst(s), bind: (...p) => wrapFirst(s.bind(...p)) };
+  } };
+  const r = request(configuredBase(heldDB), { keyProvider });
+  hold = true;
+  const callB = lib.workspaceDataKey(r, WS_A);
+  assert.equal(await reached, null, "B found no active row; its result is held back");
+  const a = await lib.workspaceDataKey(r, WS_A);
+  assert.equal(calls.wrap, 1, "A created the key");
+  assert.equal(rows(sql, WS_A).length, 1);
+  release();
+  const b = await callB;
+  assert.equal(calls.wrap, 2, "B, released after A's creation was forgotten, wrapped a second candidate");
+  const stored = rows(sql, WS_A);
+  assert.equal(stored.length, 1, "B's insert did nothing");
+  assert.equal(a.keyId, stored[0].key_id);
+  assert.equal(b.keyId, a.keyId, "B re-selected the stored key; its candidate was discarded");
+  assert.equal(b.key, a.key);
+});
+
 test("encryptionEnabled does not cache 'no key rows': a row created by another request during this one is seen", async () => {
   const { sql, DB } = mkDB();
   const r = request({ DB });
