@@ -37,7 +37,7 @@ test("60- and 200-character filters return 200 with the right rows (project list
   assert.deepEqual(await list(LONG200.toUpperCase()), [ids.l200]);
   assert.deepEqual(await list(LONG200.slice(0, 199) + "y"), []);
   assert.deepEqual(await list(LONG60, "&trashed=1"), [ids.trashed]);
-  assert.equal((await owner.req("GET", `/api/projects/filter-long/artifacts?q=${"x".repeat(201)}`)).status, 400);
+  assert.equal((await owner.req("GET", `/api/projects/filter-long/artifacts?q=${"x".repeat(201)}`)).status, 413); // existing str() limit: too_large
 });
 
 test("/v1 and legacy MCP list calls accept long filters", async () => {
