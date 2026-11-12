@@ -401,8 +401,13 @@ test("key and plaintext fences fail with the exact constraint text on real local
     await DB.prepare("INSERT INTO workspace_keys (workspace_id, key_id, master_version, wrapped, created_at, shredded_at) VALUES ('wsp_a', 'wk_a', 1, 'c3ludGhldGlj', 1, NULL)").run();
     const plain = await rejection(DB.batch([probe("plain-no"), plaintextFence(env)]));
     assert.match(plain.message, /NOT NULL constraint failed: content_fences\.no_real_key(?![\w.])/);
-    assert.equal(fenceRefusal(plain).code, "encryption_started");
+    assert.deepEqual([fenceRefusal(plain).status, fenceRefusal(plain).code, fenceRefusal(plain).message], [409, "encryption_started", "Encryption was turned on while this was being saved; send it again"]);
     assert.equal(isTextWriteFenceError(plain), false);
+    // runBatch with this D1 as ctx.env.DB answers the refusal as its HttpError and rolls the batch back.
+    const { runBatch } = await loadWorker({ "service.js": ["runBatch"] });
+    const ctx = { env, requestId: "req_s", principal: { id: "hum_s", kind: "human", label: "Owner" } };
+    const viaRunBatch = await rejection(runBatch(ctx, [probe("plain-run"), plaintextFence(env)], { projectId: "proj-s", op: "synthetic", key: "k", digest: "d" }));
+    assert.deepEqual([viaRunBatch.status, viaRunBatch.code, viaRunBatch.message], [409, "encryption_started", "Encryption was turned on while this was being saved; send it again"]);
 
     const passed = await DB.batch([probe("key-ok"), keyFence(env, { keyId: "wk_a", workspaceId: "wsp_a" })]);
     assert.equal(passed[0].meta.changes, 1);
@@ -413,7 +418,13 @@ test("key and plaintext fences fail with the exact constraint text on real local
     await shredWorkspaceKeys(env, "wsp_a");
     const key = await rejection(DB.batch([probe("key-no-shredded"), keyFence(env, { keyId: "wk_a", workspaceId: "wsp_a" })]));
     assert.match(key.message, /NOT NULL constraint failed: content_fences\.key_active(?![\w.])/);
-    assert.equal(fenceRefusal(key).status, 410);
+    assert.deepEqual([fenceRefusal(key).status, fenceRefusal(key).code], [410, "key_shredded"]);
+    const keyViaRunBatch = await rejection(runBatch(ctx, [probe("key-run"), keyFence(env, { keyId: "wk_a", workspaceId: "wsp_a" })], { projectId: "proj-s", op: "synthetic", key: "k", digest: "d" }));
+    assert.deepEqual([keyViaRunBatch.status, keyViaRunBatch.code], [410, "key_shredded"]);
+    // The CHECK refuses non-NULL rows; the NOT NULL messages above are unchanged by it.
+    const checked = await rejection(DB.prepare("INSERT INTO content_fences (key_active, no_real_key) VALUES (1, 1)").run());
+    assert.match(checked.message, /CHECK constraint failed/);
+    assert.equal(fenceRefusal(checked), null);
 
     assert.deepEqual(await probes(), ["key-ok", "plain-ok"]);
     assert.equal(await DB.prepare("SELECT COUNT(*) AS n FROM content_fences").first("n"), 0);
