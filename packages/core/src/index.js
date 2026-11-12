@@ -13,6 +13,7 @@ import { RENDER_CSP, htmlRefs, renderHtmlDocument } from "./html.js";
 import { WEB_ROUTE } from "./links.js";
 import { requireWorkspaceRole, visibleProjects } from "./tenancy.js";
 import { withRequestMemo, workspaceUsage } from "./limits.js";
+import { withDataKeyMemo } from "./crypto/keys.js";
 import { RESERVED_HANDLES, addressLinksResponse, resolveProjectRef } from "./paths.js";
 import { imageRefs, renderMarkdown } from "./markdown.js";
 import { getRenderSource } from "./render-source.js";
@@ -366,7 +367,7 @@ function createWorker(adapterConfig = {}) {
   const refuse = () => new Response(JSON.stringify({ error: { code: "misconfigured", message: "This build has no sign-in provider but Access is configured" } }), { status: 500, headers: { "content-type": "application/json" } });
   return {
     scheduled: (ev, env, ctx) => coreWorker.scheduled(ev, withAdapters(env, A), ctx),
-    fetch: async (req, env, ctx) => misconfigured(env) ? refuse() : coreWorker.fetch(req, withRequestMemo(withAdapters(env, A)), ctx)
+    fetch: async (req, env, ctx) => misconfigured(env) ? refuse() : coreWorker.fetch(req, withDataKeyMemo(withRequestMemo(withAdapters(env, A))), ctx)
   };
 }
 var coreWorker = {

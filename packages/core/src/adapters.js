@@ -3,6 +3,8 @@
 // life, extra routes, and mail. createWorker() attaches the adapters to env under a Symbol, so every module reads
 // them from the env it already has (spreads such as {...env} keep Symbol keys).
 
+import { workerSecretKeyProvider } from "./crypto/worker-secret-keys.js";
+
 const ADAPTERS = Symbol.for("agent-library.adapters");
 
 /** Identity with no external sign-in (local dev or tests): browser sign-in only through LOCAL_DEV_LOGIN. */
@@ -67,7 +69,14 @@ export const noLifecycle = {
 
 export const logMailer = { async send(m) { console.log("mail_not_sent", JSON.stringify({ to_domain: String(m?.to ?? "").split("@")[1] ?? null, subject: m?.subject ?? null })); } };
 
-const DEFAULTS = Object.freeze({ identity: noIdentity, entitlements: unlimited, lifecycle: noLifecycle, mailer: logMailer, routes: [] });
+/**
+ * keyProvider (workspace data keys for content encryption; docs/encryption.md#workspace-keys): wraps and unwraps a
+ * data key for ctx { workspaceId, keyId, masterVersion }. configured(env) -> bool (throws if malformed),
+ * currentVersion(env) -> positive integer, wrap(env, raw32Bytes, ctx) -> string, unwrap(env, wrapped, ctx) -> a
+ * non-extractable HKDF CryptoKey with usages ["deriveKey"]. The default reads Worker secrets
+ * (crypto/worker-secret-keys.js); a hosted installation may supply a KMS-backed one.
+ */
+const DEFAULTS = Object.freeze({ identity: noIdentity, entitlements: unlimited, lifecycle: noLifecycle, mailer: logMailer, keyProvider: workerSecretKeyProvider, routes: [] });
 
 /** Fill unset adapters (and unset methods) with the defaults. */
 export function resolveAdapters(a = {}) {
@@ -78,7 +87,7 @@ export function resolveAdapters(a = {}) {
     if (r.path instanceof RegExp && (r.path.global || r.path.sticky)) throw new Error("adapter route RegExp must not use the g or y flag");
   }
   const out = { routes: Object.freeze(routes.map((r) => Object.freeze({ ...r }))) };
-  for (const k of ["identity", "entitlements", "lifecycle", "mailer"]) out[k] = Object.freeze({ ...DEFAULTS[k], ...(a[k] ?? {}) });
+  for (const k of ["identity", "entitlements", "lifecycle", "mailer", "keyProvider"]) out[k] = Object.freeze({ ...DEFAULTS[k], ...(a[k] ?? {}) });
   return Object.freeze(out);
 }
 const RESOLVED_DEFAULTS = resolveAdapters();
