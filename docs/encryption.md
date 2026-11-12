@@ -109,17 +109,27 @@ For the slices that wire this into reads and writes:
   configuration. Whether to **encrypt** is decided by `encryptionEnabled(env)`, never by `encryptionConfigured()`
   alone.
 - **A write under a key.** A key shredded during a request may still be held by that request. The statement or
-  `batch` that publishes the write must itself carry the condition that the key row `WHERE key_id = ? AND
-  workspace_id = ?` still satisfies `ACTIVE_KEY_SQL` (exported from `keys.js`; never a hand-written copy). A separate
-  check before the publishing statement is not enough.
+  `batch` that publishes the write must itself carry the condition
+  `EXISTS (SELECT 1 FROM workspace_keys WHERE key_id = ? AND workspace_id = ? AND ${ACTIVE_KEY_SQL})`.
+  `ACTIVE_KEY_SQL` is exported from `keys.js` (never a hand-written copy) and names columns of `workspace_keys`
+  without a table prefix, so use it only inside such a subquery. A separate check before the publishing statement is
+  not enough.
 - Ask `encryptionEnabled` again immediately before each write decision; never carry its answer across awaits that
   could span a configuration or rollout change.
 - **A plaintext write.** The statement or `batch` that publishes it must itself carry `NO_REAL_KEY_SQL` (exported
   from `keys.js`; the same test `encryptionEnabled` makes), for the same reason: encryption may start in the meantime.
-- If either condition refuses, nothing is published, and the object already staged in storage is removed by the
-  existing staging cleanup (the text-write intent sweep, upload cleanup). The caller gets an error and may retry.
+- **A refused condition must abort the whole publication.** A D1 `batch` rolls back only when a statement fails, and
+  a guarded statement that matches no rows does not fail: the rest of the batch would still commit. In a batch,
+  write the condition as an assertion that fails its statement, the way the
+  [text write deadline](#text-write-deadline-and-orphan-safety) deliberately violates a NOT NULL constraint. For a
+  single publishing statement, check that it changed exactly the expected rows and treat anything else as an error.
+  Nothing may be published in part, and the caller gets a retryable error.
+- **A refusal must leave the staged object reclaimable.** The row that lets cleanup find the object (the text-write
+  intent, the upload row) must survive the refusal, and an upload must end failed, so that the existing cleanup (the
+  intent sweep, upload cleanup) removes the object.
 - Worker versions from before these conditions existed do not honour them, so encryption may be configured only
-  after a Worker that fences its writes is fully deployed.
+  after a Worker that fences its writes is fully deployed. Set `CONTENT_ENCRYPTION_REQUIRED="1"` in the same deploy
+  as the master-key settings: set earlier, it refuses every request until they arrive.
 - Only the operator purge of a deleted workspace (a later slice) may call `shredWorkspaceKeys`. It is safe on an
   installation without encryption: its tombstone does not make `encryptionEnabled` refuse.
 - A project's content is under the key of the workspace it belonged to when it was written. Nothing moves projects
