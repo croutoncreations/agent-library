@@ -6,7 +6,7 @@ import { appOrigin, artifactWebUrl, previewWebUrl } from "../links.js";
 import { addressLinksResponse } from "../paths.js";
 import { explainLimit, projectLimitGuard, projectWorkspaceId } from "../limits.js";
 import { SCOPES, clientAllows, livePublisher } from "../oauth/server.js";
-import { appFilesSlotsInUse, baseParams, baseSql, isAppFileContentPath, isAppFilesPath, routeAppFiles } from "./app-files.js";
+import { appFilesDrainsInUse, appFilesSlotsInUse, baseParams, baseSql, isAppFileContentPath, isAppFilesPath, routeAppFiles } from "./app-files.js";
 import { LIMITS, connectionInfo, idemLookup } from "../service.js";
 import { memberRoleSql, readOnlyError } from "../tenancy.js";
 import { HttpError, errorBody, idemKey, int, json, nowIso, randomId, sha256Hex, str } from "../util.js";
@@ -990,7 +990,10 @@ async function handlePublisherApi(req, env, ctx) {
   };
   // Test hook: every App Files answer reports the isolate's held body slots.
   const slotsHeader = (r) => {
-    if (testHooksOn(env, req) && isAppFilesPath(new URL(req.url).pathname)) r.headers.set("x-test-slots-in-use", String(appFilesSlotsInUse()));
+    if (testHooksOn(env, req) && isAppFilesPath(new URL(req.url).pathname)) {
+      r.headers.set("x-test-slots-in-use", String(appFilesSlotsInUse()));
+      r.headers.set("x-test-drains-in-use", String(appFilesDrainsInUse()));
+    }
     return r;
   };
   try {

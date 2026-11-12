@@ -41,6 +41,16 @@ export const APP_FILES_SLOTS_PER_CREATOR = 2;
 /** A slot held this long is taken to be dead; at most APP_FILES_OVERRUN_MAX such slots stop counting isolate-wide. */
 export const APP_FILES_SLOT_RECLAIM_MS = 6e5;
 export const APP_FILES_OVERRUN_MAX = 2;
+/**
+ * Drains (reading and discarding a refused body, so its answer reaches a client still sending) have their own budget,
+ * independent of the upload slots: 8 per isolate, at most 2 per workspace and 2 per creator. A drain that is not
+ * admitted cancels the body and the answer is sent anyway (the client may see a closed connection).
+ */
+export const APP_FILES_DRAINS_MAX = 8;
+export const APP_FILES_DRAINS_PER_WORKSPACE = 2;
+export const APP_FILES_DRAINS_PER_CREATOR = 2;
+/** app_files_drain_skipped is logged at most once per this interval per isolate, with the skips since the last line. */
+export const APP_FILES_DRAIN_SKIP_LOG_MS = 60e3;
 const tooLarge = () => new HttpError(413, "file_too_large", "A file sent to this API can be at most 1 MiB (1,048,576 bytes)");
 
 /**
@@ -85,6 +95,85 @@ export function createSlotTable({ now = () => Date.now(), log = (e) => console.w
   return { admit, release, inUse: () => slots.size + overrun.size, sizes: () => ({ slots: slots.size, overrun: overrun.size, workspaces: perWs.size, creators: perCreator.size }) };
 }
 const SLOTS = createSlotTable();
+
+/**
+ * Drain admission (one table per isolate), in the slot table's style: admit() checks and reserves synchronously and
+ * returns a token, or null when a bound is reached; release() is idempotent. No reclaim: a drain ends by its own
+ * deadlines (15 s total from the body's start, 5 s idle, and a cancelled or failed read), and it runs under
+ * execCtx.waitUntil (drainWithBudget's caller), so its `finally` runs even if the client goes away.
+ */
+export function createDrainTable({ now = () => Date.now(), log = (e) => console.warn(JSON.stringify(e)) } = {}) {
+  const held = new Map(), perWs = new Map(), perCreator = new Map();
+  let loggedAt = -Infinity, pending = 0;
+  const bump = (m, k, d) => { const v = (m.get(k) ?? 0) + d; if (v > 0) m.set(k, v); else m.delete(k); };
+  const skip = (scope) => {
+    pending++;
+    const t = now();
+    if (t - loggedAt < APP_FILES_DRAIN_SKIP_LOG_MS) return null;
+    loggedAt = t;
+    log({ event: "app_files_drain_skipped", scope, count: pending });
+    pending = 0;
+    return null;
+  };
+  function admit(ws, creator) {
+    if (held.size >= APP_FILES_DRAINS_MAX) return skip("isolate");
+    if ((perWs.get(ws) ?? 0) >= APP_FILES_DRAINS_PER_WORKSPACE) return skip("workspace");
+    if ((perCreator.get(creator) ?? 0) >= APP_FILES_DRAINS_PER_CREATOR) return skip("creator");
+    const token = randomId("afd");
+    held.set(token, { ws, creator });
+    bump(perWs, ws, 1); bump(perCreator, creator, 1);
+    return token;
+  }
+  function release(token) {
+    const d = held.get(token);
+    if (!d) return;
+    held.delete(token);
+    bump(perWs, d.ws, -1); bump(perCreator, d.creator, -1);
+  }
+  return { admit, release, inUse: () => held.size, skipped: () => pending };
+}
+const DRAINS = createDrainTable();
+/** Drains currently running in this isolate (for the x-test-drains-in-use test header). */
+export const appFilesDrainsInUse = () => DRAINS.inUse();
+/** drainBody under the drain budget: not admitted means cancel and return "skipped" at once. Released exactly once. */
+export async function drainWithBudget(table, { ws, creator }, reader, seen, deadlines, start) {
+  const token = table.admit(ws, creator);
+  if (token === null) { await reader.cancel().catch(() => {}); return "skipped"; }
+  try { return await drainBody(reader, seen, deadlines, start); }
+  finally { table.release(token); }
+}
+/**
+ * Run a PUT's work (after step 1), then drain what its body left, so an answer given before the body was received
+ * reaches a client that is still sending. This is the one place: no early return in the work can skip it. The work may
+ * hand over a reader it stopped keeping (an undeclared body past the limit) through `handoff`, which this wrapper owns:
+ * that reader is drained here, after the work and so after its upload slot was released. Otherwise a body the work never
+ * touched is drained. The drain never replaces the work's answer or error: every failure in it is swallowed.
+ *
+ * Replay window: an answer decided before the drain is sent up to the receive's total deadline later. If a request with
+ * the same Idempotency-Key commits in between, the client gets this (older) refusal; a retry with the same key then
+ * replays the committed answer.
+ */
+export async function withDrain(req, deadlines, who, execCtx, work, table = DRAINS) {
+  const handoff = {};
+  const drain = async () => {
+    try {
+      let run;
+      if (handoff.reader) run = drainWithBudget(table, who, handoff.reader, handoff.seen, deadlines, handoff.start);
+      // `locked` means currently locked (receiveBody took a reader and still holds it). Code that ever calls
+      // releaseLock() on this body must revisit this check, or a received body could be drained a second time.
+      else if (req.body && !req.body.locked) run = drainWithBudget(table, who, req.body.getReader(), 0, deadlines);
+      else return;
+      // Under waitUntil, like an upload slot: if the client goes away the runtime still runs the drain to its finally.
+      execCtx?.waitUntil?.(run.catch(() => {}));
+      await run;
+    } catch {}
+  };
+  let res;
+  try { res = await work(handoff); }
+  catch (e) { await drain(); throw e; }
+  await drain();
+  return res;
+}
 /** Bodies currently held by this isolate (for the x-test-slots-in-use test header). */
 export const appFilesSlotsInUse = () => SLOTS.inUse();
 
@@ -120,7 +209,7 @@ async function withSlot(execCtx, ws, creator, reclaimMs, work) {
  * Read the whole body (at most `limit` bytes) with a total and an idle deadline. Timers only cancel the read; the
  * slot is released by withSlot. Returns { bytes, sha256 }.
  */
-async function receiveBody(req, limit, declared, { receiveMs, idleMs }) {
+async function receiveBody(req, limit, declared, { receiveMs, idleMs }, handoff) {
   const start = Date.now();
   const reader = req.body?.getReader();
   const chunks = [];
@@ -139,9 +228,10 @@ async function receiveBody(req, limit, declared, { receiveMs, idleMs }) {
       if (r.done) break;
       n += r.value.byteLength;
       if (n > limit) {
-        // Keep nothing more, drop what was kept, and drain the rest (same deadlines, counted from this body's start).
+        // Keep nothing more and drop what was kept. The still-locked reader goes to the PUT wrapper (withDrain), which
+        // drains it after this request's upload slot is released, within what is left of the same total deadline.
         chunks.length = 0; clearTimeout(total); clearTimeout(idle);
-        await drainBody(reader, n, { receiveMs, idleMs }, start);
+        Object.assign(handoff, { reader, seen: n, start });
         throw tooLarge();
       }
       chunks.push(r.value);
@@ -157,14 +247,17 @@ async function receiveBody(req, limit, declared, { receiveMs, idleMs }) {
   return { bytes, sha256: await sha256Hex(bytes) };
 }
 /**
- * Read and discard the rest of a body so an early answer reaches a client that is still sending: at most DRAIN_BYTES
- * counted from the body's first byte (`seen` already received), within the receive's total (from `start`) and idle
+ * Read and discard the rest of a body so an early answer reaches a client that is still sending: about DRAIN_BYTES
+ * (passed by at most the one chunk that crosses it) counted from the body's first byte (`seen` already received), within the receive's total (from `start`) and idle
  * deadlines. Past either bound the body is cancelled (the client may then see a closed connection). Nothing is kept.
  * Returns "done" (read to its end), "bytes" or "time".
  */
 export async function drainBody(reader, seen, { receiveMs, idleMs }, start = Date.now()) {
   let n = seen, why = null;
   const stop = (w) => { why ??= w; reader.cancel().catch(() => {}); };
+  // Bounds first: an expired deadline or an excessive count reads nothing.
+  if (Date.now() - start >= receiveMs) { stop("time"); return why; }
+  if (n > DRAIN_BYTES) { stop("bytes"); return why; }
   const total = setTimeout(() => stop("time"), Math.max(0, start + receiveMs - Date.now()));
   let idle = setTimeout(() => stop("time"), idleMs);
   try {
@@ -173,7 +266,10 @@ export async function drainBody(reader, seen, { receiveMs, idleMs }, start = Dat
       if (why) return why;
       if (done) return "done";
       n += value.byteLength;
+      // The byte bound can be passed by the one chunk that crosses it (about 16 MiB, not an exact ceiling).
       if (n > DRAIN_BYTES) { stop("bytes"); return why; }
+      // Re-checked here too: a source that is always readable at once could outrun the timer callbacks.
+      if (Date.now() - start >= receiveMs) { stop("time"); return why; }
       clearTimeout(idle); idle = setTimeout(() => stop("time"), idleMs);
     }
   } finally { clearTimeout(total); clearTimeout(idle); }
@@ -396,14 +492,11 @@ async function put(req, env, execCtx, p, requestId, wsId, rest) {
   // 1. Authorization (route() already checked the token and the rate limit). A refusal here is not drained.
   await assertStillAuthorized(env, p);
   const h = appHooks(env, req);
-  const drain = async () => { if (req.body && !req.body.locked) await drainBody(req.body.getReader(), 0, h); };
-  let res;
-  try { res = await putAuthorized(req, env, execCtx, p, requestId, wsId, rest, h); }
-  catch (e) { await drain(); throw e; }
-  await drain();
-  return res;
+  const who = { ws: wsId, creator: p.created_by ?? p.owner_principal_id };
+  // See withDrain: the refusal may reach the client up to the receive deadline after it was decided (replay window).
+  return withDrain(req, h, who, execCtx, (handoff) => putAuthorized(req, env, execCtx, p, requestId, wsId, rest, h, handoff));
 }
-async function putAuthorized(req, env, execCtx, p, requestId, wsId, rest, h) {
+async function putAuthorized(req, env, execCtx, p, requestId, wsId, rest, h, handoff) {
   // 2. Parse: nothing below reads the body.
   const { path, kind } = parseAppPath(rest);
   contentKind(req, kind);
@@ -424,7 +517,7 @@ async function putAuthorized(req, env, execCtx, p, requestId, wsId, rest, h) {
   // The body is received at most once, under one slot; everything after a receive runs inside that slot's work.
   let received = null;
   const receive = async () => {
-    const r = await receiveBody(req, declared ?? APP_FILE_MAX_BYTES, declared, h);
+    const r = await receiveBody(req, declared ?? APP_FILE_MAX_BYTES, declared, h, handoff);
     if (claimed !== null && claimed !== r.sha256)
       throw new HttpError(422, "integrity_mismatch", "Byte length or SHA-256 does not match declaration", { received_size: r.bytes.byteLength, received_sha256: r.sha256 });
     return received = r;

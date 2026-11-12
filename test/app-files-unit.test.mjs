@@ -123,7 +123,8 @@ test("path conflicts: exact and ancestor names are bound lowercased (at most 8 v
 
 // The App Files drain (early answers, and an undeclared body past 1 MiB): read and discard, at most DRAIN_BYTES from the
 // body's first byte, within the receive deadlines; cancel past either bound; keep nothing.
-const D = await loadWorker({ "api/app-files.js": ["drainBody", "APP_FILES_RECEIVE_MS", "APP_FILES_IDLE_MS"], "util.js": ["DRAIN_BYTES"] });
+const D = await loadWorker({ "api/app-files.js": ["drainBody", "APP_FILES_RECEIVE_MS", "APP_FILES_IDLE_MS", "createDrainTable", "drainWithBudget", "withDrain",
+  "APP_FILES_DRAINS_MAX", "APP_FILES_DRAINS_PER_WORKSPACE", "APP_FILES_DRAINS_PER_CREATOR", "APP_FILES_DRAIN_SKIP_LOG_MS"], "util.js": ["DRAIN_BYTES", "HttpError"] });
 /** A synthetic body: `count` chunks of `size` bytes, each after `gapMs`; records reads, cancels and WeakRefs to the chunks. */
 function body({ size = 65536, count = Infinity, gapMs = 0 } = {}) {
   const s = { pulled: 0, cancelled: false, refs: [] };
@@ -189,4 +190,104 @@ test("drain: keeps no chunk (every chunk read is collectable afterwards)", async
   const alive = b.refs.filter((r) => r.deref() !== undefined).length;
   assert.equal(b.refs.length, 17);
   assert.ok(alive <= 1, `${alive} of ${b.refs.length} chunks still reachable after the drain`);
+});
+
+test("drain: bounds are checked before reading: an expired total deadline or an excessive seen reads nothing and cancels", async () => {
+  const late = body();
+  assert.equal(await D.drainBody(late.reader, 0, { receiveMs: 300, idleMs: 200 }, Date.now() - 301), "time");
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(late.pulled, 0, "zero reads"); assert.equal(late.cancelled, true);
+  const big = body();
+  assert.equal(await D.drainBody(big.reader, D.DRAIN_BYTES + 1, LONG), "bytes");
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(big.pulled, 0, "zero reads"); assert.equal(big.cancelled, true);
+});
+
+test("drain: an always-readable endless source stops at the total deadline (elapsed time is re-checked in the loop)", async () => {
+  // Tiny chunks, so the byte bound is far away; reads resolve as microtasks, so timers alone would never fire.
+  const s = { pulled: 0, cancelled: false };
+  const reader = new ReadableStream({ pull(ctl) { s.pulled++; ctl.enqueue(new Uint8Array(1)); }, cancel() { s.cancelled = true; } }).getReader();
+  const t = Date.now();
+  assert.equal(await D.drainBody(reader, 0, { receiveMs: 200, idleMs: 200 }), "time");
+  const took = Date.now() - t;
+  assert.ok(took >= 190 && took < 600, `stopped at the total deadline (${took} ms, ${s.pulled} reads)`); assert.equal(s.cancelled, true);
+});
+
+/** A drain table with an injectable clock and log. */
+function drains() {
+  let t = 1_000_000;
+  const events = [];
+  return { T: D.createDrainTable({ now: () => t, log: (e) => events.push(e) }), events, advance: (ms) => { t += ms; } };
+}
+
+test("drain budget: 8 per isolate, 2 per workspace, 2 per creator; independent constants; release is idempotent", () => {
+  assert.deepEqual([D.APP_FILES_DRAINS_MAX, D.APP_FILES_DRAINS_PER_WORKSPACE, D.APP_FILES_DRAINS_PER_CREATOR, D.APP_FILES_DRAIN_SKIP_LOG_MS], [8, 2, 2, 60e3]);
+  const { T, events } = drains();
+  const a = T.admit("w1", "alice"); T.admit("w1", "bob");
+  assert.equal(T.admit("w1", "carol"), null, "third in one workspace");
+  assert.deepEqual(events.at(-1), { event: "app_files_drain_skipped", scope: "workspace", count: 1 });
+  T.admit("w2", "carol"); T.admit("w3", "carol");
+  assert.equal(T.admit("w4", "carol"), null, "third for one creator across workspaces");
+  for (let i = 0; i < 4; i++) assert.notEqual(T.admit(`x${i}`, `p${i}`), null);
+  assert.equal(T.inUse(), 8);
+  assert.equal(T.admit("w9", "dave"), null, "isolate full");
+  assert.equal(T.skipped(), 2, "the two skips after the logged one are counted, not logged yet");
+  T.release(a); T.release(a);
+  assert.equal(T.inUse(), 7, "release is idempotent");
+  assert.notEqual(T.admit("w1", "erin"), null);
+});
+
+test("drain budget: the skip line is logged at most once per minute with the skips since the last line; no ids", () => {
+  const { T, events, advance } = drains();
+  T.admit("w", "a"); T.admit("w", "b");
+  for (let i = 0; i < 5; i++) { assert.equal(T.admit("w", `c${i}`), null); advance(1000); }
+  assert.equal(events.length, 1, "once within a minute");
+  advance(60e3);
+  assert.notEqual(T.admit("z", "a"), null, "creator a's second drain");
+  assert.equal(T.admit("z2", "a"), null, "creator a's third");
+  assert.equal(events.length, 2);
+  assert.deepEqual(events[1], { event: "app_files_drain_skipped", scope: "creator", count: 5 }, "4 unlogged plus this one");
+  for (const e of events) assert.deepEqual(Object.keys(e), ["event", "scope", "count"]);
+});
+
+test("drain budget: released when the drain ends, on the byte bound, on a time bound and on a read error; a skipped drain cancels the body", async () => {
+  const { T } = drains();
+  const who = { ws: "w", creator: "c" };
+  const done = body({ count: 2 });
+  const p = D.drainWithBudget(T, who, done.reader, 0, LONG);
+  assert.equal(T.inUse(), 1, "held while draining");
+  assert.equal(await p, "done"); assert.equal(T.inUse(), 0);
+  assert.equal(await D.drainWithBudget(T, who, body().reader, 0, LONG), "bytes"); assert.equal(T.inUse(), 0);
+  assert.equal(await D.drainWithBudget(T, who, body({ gapMs: 400 }).reader, 0, { receiveMs: 5000, idleMs: 100 }), "time"); assert.equal(T.inUse(), 0);
+  const broken = new ReadableStream({ pull(ctl) { ctl.error(new Error("synthetic read error")); } }).getReader();
+  await D.drainWithBudget(T, who, broken, 0, LONG); assert.equal(T.inUse(), 0, "released on a read error");
+  // Fill the creator's two drains; a third is skipped: its body is cancelled at once and nothing is read.
+  const h1 = body({ gapMs: 300, count: 1 }), h2 = body({ gapMs: 300, count: 1 }), third = body();
+  const p1 = D.drainWithBudget(T, who, h1.reader, 0, LONG), p2 = D.drainWithBudget(T, who, h2.reader, 0, LONG);
+  assert.equal(await D.drainWithBudget(T, who, third.reader, 0, LONG), "skipped");
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(third.cancelled, true); assert.equal(third.pulled, 0); assert.equal(T.skipped(), 0, "the first skip is logged at once");
+  await Promise.all([p1, p2]); assert.equal(T.inUse(), 0);
+});
+
+test("withDrain: the drain never replaces the answer (getReader throws); a handed-over reader is drained after the work", async () => {
+  const { T } = drains();
+  const who = { ws: "w", creator: "c" };
+  const refusal = new D.HttpError(412, "precondition_failed", "A file already exists at this path");
+  const throwing = { body: { locked: false, getReader() { throw new TypeError("synthetic: stream errored"); } } };
+  await assert.rejects(D.withDrain(throwing, LONG, who, null, async () => { throw refusal; }, T), (e) => e === refusal);
+  const answer = { synthetic: "answer" };
+  assert.equal(await D.withDrain(throwing, LONG, who, null, async () => answer, T), answer);
+  // A body already locked (receiveBody took it) and not handed over: nothing is drained.
+  const locked = { body: { locked: true, getReader() { throw new Error("must not be called"); } } };
+  assert.equal(await D.withDrain(locked, LONG, who, null, async () => answer, T), answer);
+  // Handed over (an undeclared body past the limit): drained after the work settles, under the budget.
+  const rest = body({ count: 3, gapMs: 50 });
+  let heldDuringWork = null;
+  const tooLarge = new D.HttpError(413, "file_too_large", "synthetic");
+  const run = D.withDrain(locked, LONG, who, null, async (handoff) => { heldDuringWork = T.inUse(); Object.assign(handoff, { reader: rest.reader, seen: 10, start: Date.now() }); throw tooLarge; }, T);
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(T.inUse(), 1, "the handed-over reader is being drained");
+  await assert.rejects(run, (e) => e === tooLarge);
+  assert.equal(heldDuringWork, 0); assert.equal(rest.pulled, 3); assert.equal(T.inUse(), 0);
 });
