@@ -934,16 +934,22 @@ test("early answers drain the body: over-cap declared and chunked 413 N14, stale
 test("early answers drain the body: a full isolate answers 503 with Retry-After to a 1 MiB PUT, 30 times, every answer arrives", async () => {
   const w = await slotWorld();
   // Four slow uploads hold the isolate's four slots; a byte every 500 ms keeps each within its idle deadline.
-  // A holder that ends (its 15 s receive deadline) is re-armed before the next request, so every request meets a full isolate.
-  const arm = (i) => { const x = partialPut(w.holders[i].tok, uniq(`hold${i}`) + ".md", { length: 100000, send: 3 }); x.ended = false; x.response.then(() => { x.ended = true; }); return x; };
+  // Holders are refreshed before they near their 15 s receive deadline: one older than 10 s is replaced (its slot is freed
+  // within milliseconds of the disconnect) before the next request, and the count is checked at 4 again. So when a request
+  // is sent every holder has at least 5 s left, far more than one request takes: none can expire between the check and it.
+  const FRESH_MS = 10e3;
+  const arm = (i) => { const x = partialPut(w.holders[i].tok, uniq(`hold${i}`) + ".md", { length: 100000, send: 3 }); x.armedAt = Date.now(); x.ended = false; x.response.then(() => { x.ended = true; }); return x; };
   const open = w.holders.map((_, i) => arm(i));
   const trickle = setInterval(() => { for (const o of open) if (!o.ended) o.socket.write("a"); }, 500);
   try {
     await untilSlots(w.fifth.tok, 4);
     await thirty("isolate full", async (i) => {
       let rearmed = false;
-      for (let k = 0; k < open.length; k++) if (open[k].ended) { open[k].socket.destroy(); open[k] = arm(k); rearmed = true; }
-      if (rearmed) await untilSlots(w.fifth.tok, 4);
+      for (let k = 0; k < open.length; k++) {
+        if (!open[k].ended && Date.now() - open[k].armedAt < FRESH_MS) continue;
+        open[k].socket.destroy(); await untilSlots(w.fifth.tok, 3); open[k] = arm(k); await untilSlots(w.fifth.tok, 4); rearmed = true;
+      }
+      assert.ok(open.every((o) => !o.ended), `precondition before request ${i}: every holder is still open${rearmed ? " (after a refresh)" : ""}`);
       assert.equal(await slotsInUse(w.fifth.tok), 4, `precondition before request ${i}: the four holders hold the isolate's four slots`);
       return put(w.fifth.tok, `busy${i}.md`, MiB, { create: true });
     }, (r) => {
@@ -965,7 +971,8 @@ test("early answers drain the body only after authorization: an unauthenticated 
     x.socket.destroy();
     return [a, Date.now() - t0];
   };
-  // Authorized and refused after step 1 (N6): drained until the idle deadline ends the drain.
+  // Authorized and refused after step 1 (N6): drained until the idle deadline ends the drain. This is the baseline the
+  // undrained answers below are measured against: each must come at least 500 ms sooner (a third of the 1.5 s drain).
   const [b, authMs] = await half(c.tok);
   assert.match(b, /^HTTP\/1\.1 412 /, b.slice(0, 200));
   assert.ok(authMs >= 1400, `412 came after ${authMs} ms: an authorized early answer drains until the (shortened) idle deadline`);
@@ -991,21 +998,35 @@ test("drain budget: three concurrent refused 1 MiB PUTs from one creator: at lea
   ok(await put(c.tok, "held.md", "v1", { create: true }), 201);
   const skipsBefore = readFileSync(h.logPath, "utf8").split("app_files_drain_skipped").length;
   // Three refusals (N6), each with half its body sent: two are drained (the creator's two drains), one is skipped.
+  // Baseline: the same upload with no drain running.
+  const tb = Date.now();
+  ok(await put(other.tok, uniq("baseline") + ".md", "x".repeat(1000), { create: true }), 201);
+  const baseMs = Date.now() - tb;
   const xs = [0, 1, 2].map(() => partialPut(c.tok, "held.md", { length: 1048576, send: 524288 }));
   try {
-    const t0 = Date.now();
-    let drainsSeen = 0;
-    while (Date.now() - t0 < 800) {
+    // Event-driven: sample until two drains are in flight and the third has been skipped (its log line), with a deadline;
+    // no sample may show an upload slot or more than two drains.
+    const sample = async () => {
       const r = await files(c.tok);
       assert.equal(r.headers.get("x-test-slots-in-use"), "0", "drains take no upload slot");
-      drainsSeen = Math.max(drainsSeen, Number(r.headers.get("x-test-drains-in-use")));
-      await new Promise((r2) => setTimeout(r2, 100));
+      const d = Number(r.headers.get("x-test-drains-in-use"));
+      assert.ok(d <= 2, `${d} drains for one creator`);
+      return d;
+    };
+    const skipped = () => readFileSync(h.logPath, "utf8").split("app_files_drain_skipped").length > skipsBefore;
+    const t0 = Date.now();
+    let d = 0;
+    while (!((d = await sample()) === 2 && skipped())) {
+      assert.ok(Date.now() - t0 < 5000, `after 5 s: ${d} drains in flight, skip logged ${skipped()}`);
+      await new Promise((r2) => setTimeout(r2, 25));
     }
-    assert.equal(drainsSeen, 2, "the creator's two drains run; the third was not admitted");
-    // An upload while two drains run: admitted and answered at once.
+    assert.equal(await sample(), 2, "the creator's two drains run; the third was not admitted");
+    // An upload while two drains run: admitted and answered like the baseline (margin 1 s for a loaded machine).
     const t1 = Date.now();
     const up = await put(other.tok, uniq("during-drains") + ".md", "x".repeat(1000), { create: true });
-    assert.equal(up.status, 201, up.text); assert.ok(Date.now() - t1 < 2000, `upload took ${Date.now() - t1} ms`);
+    const upMs = Date.now() - t1;
+    assert.equal(up.status, 201, up.text); assert.ok(upMs < baseMs + 1000, `upload took ${upMs} ms during drains against ${baseMs} ms before`);
+    assert.equal(await sample(), 2, "the drains were still in flight during the upload");
     for (const x of xs) x.socket.write(Buffer.alloc(524288, 0x61), () => {});
     const answers = await Promise.all(xs.map((x) => Promise.race([x.response, new Promise((r) => setTimeout(() => r(""), 6000))])));
     const intact = answers.filter((a) => /^HTTP\/1\.1 412 /.test(a) && /A file already exists at this path/.test(a)).length;

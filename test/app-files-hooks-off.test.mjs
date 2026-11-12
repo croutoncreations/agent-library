@@ -26,9 +26,15 @@ test("hooks off: hook headers cause no delay, no x-test-slots-in-use header and 
   const ms = Date.now() - t0;
   assert.equal(r.status, 201, await r.text());
   assert.equal(r.headers.get("x-test-slots-in-use"), null);
+  assert.equal(r.headers.get("x-test-drains-in-use"), null, "no drain count is exposed");
   assert.ok(ms < 2000, `no hook delay (${ms} ms)`);
   const g = await fetch(`${h.api}/app/files`, { headers: { authorization: `Bearer ${tok}`, ...HOOKS } });
-  assert.equal(g.status, 200); assert.equal(g.headers.get("x-test-slots-in-use"), null);
+  assert.equal(g.status, 200); assert.equal(g.headers.get("x-test-slots-in-use"), null); assert.equal(g.headers.get("x-test-drains-in-use"), null);
+  // A refused PUT (N6) that would be drained: no drain count either, and a client-sent x-test-drains-in-use changes nothing.
+  const refused = await fetch(`${h.api}/app/files/off.md`, { method: "PUT", body: "synthetic again",
+    headers: { authorization: `Bearer ${tok}`, "content-type": "text/markdown", "if-none-match": "*", "idempotency-key": "hooks-off-key-3", "x-test-drains-in-use": "99", ...HOOKS } });
+  assert.equal(refused.status, 412, await refused.text());
+  assert.equal(refused.headers.get("x-test-drains-in-use"), null); assert.equal(refused.headers.get("x-test-slots-in-use"), null);
   const t1 = Date.now();
   const snap = await fetch(`${h.api}/publisher/snapshots`, { method: "POST", body: JSON.stringify({ source_revision: 1, files: [{ name: "e.json", kind: "json", content: "{}" }] }),
     headers: { authorization: `Bearer ${tok}`, "content-type": "application/json", "idempotency-key": "hooks-off-key-2", ...HOOKS } });

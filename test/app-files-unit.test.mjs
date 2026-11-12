@@ -124,7 +124,7 @@ test("path conflicts: exact and ancestor names are bound lowercased (at most 8 v
 // The App Files drain (early answers, and an undeclared body past 1 MiB): read and discard, at most DRAIN_BYTES from the
 // body's first byte, within the receive deadlines; cancel past either bound; keep nothing.
 const D = await loadWorker({ "api/app-files.js": ["drainBody", "APP_FILES_RECEIVE_MS", "APP_FILES_IDLE_MS", "createDrainTable", "drainWithBudget", "withDrain",
-  "APP_FILES_DRAINS_MAX", "APP_FILES_DRAINS_PER_WORKSPACE", "APP_FILES_DRAINS_PER_CREATOR", "APP_FILES_DRAIN_SKIP_LOG_MS"], "util.js": ["DRAIN_BYTES", "HttpError"] });
+  "APP_FILES_DRAINS_MAX", "APP_FILES_DRAINS_PER_WORKSPACE", "APP_FILES_DRAINS_PER_CREATOR", "APP_FILES_DRAIN_SKIP_LOG_MS", "APP_FILES_DRAIN_RECLAIM_MS"], "util.js": ["DRAIN_BYTES", "HttpError"] });
 /** A synthetic body: `count` chunks of `size` bytes, each after `gapMs`; records reads, cancels and WeakRefs to the chunks. */
 function body({ size = 65536, count = Infinity, gapMs = 0 } = {}) {
   const s = { pulled: 0, cancelled: false, refs: [] };
@@ -243,11 +243,15 @@ test("drain budget: the skip line is logged at most once per minute with the ski
   for (let i = 0; i < 5; i++) { assert.equal(T.admit("w", `c${i}`), null); advance(1000); }
   assert.equal(events.length, 1, "once within a minute");
   advance(60e3);
-  assert.notEqual(T.admit("z", "a"), null, "creator a's second drain");
+  // A minute on, the two drains admitted first are reclaimed at this admission (that has its own log line); creator a
+  // gets two fresh drains and the third is skipped.
+  const skips = () => events.filter((e) => e.event === "app_files_drain_skipped");
+  assert.notEqual(T.admit("z", "a"), null, "creator a's first drain");
+  assert.notEqual(T.admit("y", "a"), null, "creator a's second drain");
   assert.equal(T.admit("z2", "a"), null, "creator a's third");
-  assert.equal(events.length, 2);
-  assert.deepEqual(events[1], { event: "app_files_drain_skipped", scope: "creator", count: 5 }, "4 unlogged plus this one");
-  for (const e of events) assert.deepEqual(Object.keys(e), ["event", "scope", "count"]);
+  assert.equal(skips().length, 2);
+  assert.deepEqual(skips()[1], { event: "app_files_drain_skipped", scope: "creator", count: 5 }, "4 unlogged plus this one");
+  for (const e of skips()) assert.deepEqual(Object.keys(e), ["event", "scope", "count"]);
 });
 
 test("drain budget: released when the drain ends, on the byte bound, on a time bound and on a read error; a skipped drain cancels the body", async () => {
@@ -290,4 +294,43 @@ test("withDrain: the drain never replaces the answer (getReader throws); a hande
   assert.equal(T.inUse(), 1, "the handed-over reader is being drained");
   await assert.rejects(run, (e) => e === tooLarge);
   assert.equal(heldDuringWork, 0); assert.equal(rest.pulled, 3); assert.equal(T.inUse(), 0);
+});
+
+test("drain budget: a token older than 60 s is reclaimed at admission (logged once each); its late release changes nothing; never negative", () => {
+  assert.equal(D.APP_FILES_DRAIN_RECLAIM_MS, 60e3);
+  const { T, events, advance } = drains();
+  const held = [];
+  for (let i = 0; i < 8; i++) held.push(T.admit(`w${i}`, `p${i}`));
+  assert.equal(T.inUse(), 8);
+  advance(59_999);
+  assert.equal(T.admit("x", "q"), null, "before 60 s nothing is reclaimed");
+  assert.equal(events.filter((e) => e.event === "app_files_drain_reclaimed").length, 0);
+  advance(1);
+  const fresh = T.admit("w0", "p0");
+  assert.notEqual(fresh, null, "a full table admits again after 60 s");
+  assert.equal(events.filter((e) => e.event === "app_files_drain_reclaimed").length, 8, "one line per dropped token");
+  for (const e of events.filter((x) => x.event === "app_files_drain_reclaimed")) assert.deepEqual(e, { event: "app_files_drain_reclaimed" });
+  assert.equal(T.inUse(), 1);
+  // Late releases of the reclaimed tokens are no-ops: w0/p0 still counts the fresh drain, and nothing goes negative.
+  for (const t of held) T.release(t);
+  assert.equal(T.inUse(), 1);
+  assert.notEqual(T.admit("w0", "p0b"), null, "w0 has one drain (the fresh one): a second is allowed");
+  assert.equal(T.admit("w0", "p0c"), null, "and a third is not: the count did not go negative");
+  T.release(fresh); T.release(fresh);
+  assert.equal(T.inUse(), 1);
+});
+
+test("drain budget: a skipped drain does not wait for cancel(); the answer comes at once and the skip is logged", async () => {
+  const { T, events } = drains();
+  const who = { ws: "w", creator: "c" };
+  T.admit("w", "c"); T.admit("w", "c");
+  let cancelCalled = false;
+  const stuck = { cancel() { cancelCalled = true; return new Promise(() => {}); }, read() { throw new Error("must not read"); } };
+  const r = await Promise.race([D.drainWithBudget(T, who, stuck, 0, LONG), new Promise((res) => setImmediate(() => res("waited for cancel")))]);
+  assert.equal(r, "skipped");
+  assert.equal(cancelCalled, true);
+  assert.equal(events.at(-1).event, "app_files_drain_skipped");
+  // A cancel() that rejects is not an unhandled rejection.
+  const rejecting = { cancel: () => Promise.reject(new Error("synthetic cancel failure")) };
+  assert.equal(await D.drainWithBudget(T, who, rejecting, 0, LONG), "skipped");
 });

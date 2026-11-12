@@ -51,6 +51,11 @@ export const APP_FILES_DRAINS_PER_WORKSPACE = 2;
 export const APP_FILES_DRAINS_PER_CREATOR = 2;
 /** app_files_drain_skipped is logged at most once per this interval per isolate, with the skips since the last line. */
 export const APP_FILES_DRAIN_SKIP_LOG_MS = 60e3;
+/**
+ * A drain token older than this is dropped at the next admission (logged app_files_drain_reclaimed). No drain lives
+ * longer than the 15 s receive deadline, so this never frees a live one; it recovers a token whose finally never ran.
+ */
+export const APP_FILES_DRAIN_RECLAIM_MS = 60e3;
 const tooLarge = () => new HttpError(413, "file_too_large", "A file sent to this API can be at most 1 MiB (1,048,576 bytes)");
 
 /**
@@ -98,9 +103,10 @@ const SLOTS = createSlotTable();
 
 /**
  * Drain admission (one table per isolate), in the slot table's style: admit() checks and reserves synchronously and
- * returns a token, or null when a bound is reached; release() is idempotent. No reclaim: a drain ends by its own
- * deadlines (15 s total from the body's start, 5 s idle, and a cancelled or failed read), and it runs under
- * execCtx.waitUntil (drainWithBudget's caller), so its `finally` runs even if the client goes away.
+ * returns a token, or null when a bound is reached; release() is idempotent. A drain ends by its own deadlines (15 s
+ * total from the body's start, 5 s idle, and a cancelled or failed read) and runs under execCtx.waitUntil, so its
+ * `finally` normally runs even if the client goes away. If the runtime cuts it short anyway, its token is reclaimed at
+ * an admission after APP_FILES_DRAIN_RECLAIM_MS (a late release of a reclaimed token is a no-op).
  */
 export function createDrainTable({ now = () => Date.now(), log = (e) => console.warn(JSON.stringify(e)) } = {}) {
   const held = new Map(), perWs = new Map(), perCreator = new Map();
@@ -116,11 +122,17 @@ export function createDrainTable({ now = () => Date.now(), log = (e) => console.
     return null;
   };
   function admit(ws, creator) {
+    const t0 = now();
+    for (const [token, d] of held) {
+      if (d.admittedAt + APP_FILES_DRAIN_RECLAIM_MS > t0) continue;
+      release(token);
+      log({ event: "app_files_drain_reclaimed" });
+    }
     if (held.size >= APP_FILES_DRAINS_MAX) return skip("isolate");
     if ((perWs.get(ws) ?? 0) >= APP_FILES_DRAINS_PER_WORKSPACE) return skip("workspace");
     if ((perCreator.get(creator) ?? 0) >= APP_FILES_DRAINS_PER_CREATOR) return skip("creator");
     const token = randomId("afd");
-    held.set(token, { ws, creator });
+    held.set(token, { ws, creator, admittedAt: t0 });
     bump(perWs, ws, 1); bump(perCreator, creator, 1);
     return token;
   }
@@ -138,7 +150,8 @@ export const appFilesDrainsInUse = () => DRAINS.inUse();
 /** drainBody under the drain budget: not admitted means cancel and return "skipped" at once. Released exactly once. */
 export async function drainWithBudget(table, { ws, creator }, reader, seen, deadlines, start) {
   const token = table.admit(ws, creator);
-  if (token === null) { await reader.cancel().catch(() => {}); return "skipped"; }
+  // Not admitted: cancel without waiting for it (a cancel that never settles must not hold the answer back).
+  if (token === null) { Promise.resolve().then(() => reader.cancel()).catch(() => {}); return "skipped"; }
   try { return await drainBody(reader, seen, deadlines, start); }
   finally { table.release(token); }
 }
