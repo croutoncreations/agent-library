@@ -34,6 +34,21 @@ test("only packages/core/src/content-store.js touches the R2 binding", () => {
   assert.deepEqual(offenders, []);
 });
 
+// Publication conditions are written once (docs/encryption.md#rules-for-code-that-uses-this): crypto/keys.js defines
+// them, content-store.js builds the fences from them, and nothing else hand-writes or touches the fence table.
+test("only content-store.js and crypto/keys.js use ACTIVE_KEY_SQL and NO_REAL_KEY_SQL", () => {
+  const users = jsFiles(join(ROOT, "packages", "core", "src"))
+    .filter((f) => /\b(?:ACTIVE_KEY_SQL|NO_REAL_KEY_SQL)\b/.test(readFileSync(f, "utf8")))
+    .map((f) => f.slice(ROOT.length + 1)).sort();
+  assert.deepEqual(users, ["packages/core/src/content-store.js", "packages/core/src/crypto/keys.js"]);
+});
+test("content_fences appears in no source file other than content-store.js", () => {
+  const users = jsFiles(join(ROOT, "packages"))
+    .filter((f) => readFileSync(f, "utf8").includes("content_fences"))
+    .map((f) => f.slice(ROOT.length + 1));
+  assert.deepEqual(users, ["packages/core/src/content-store.js"]);
+});
+
 // Legacy fallback SELECTs still fetch inline bodies, but SQL must not match against them. The temporary FTS
 // bridge and publisher generation copies remain plaintext until later slices (docs/encryption.md).
 test("SQL never matches revision or comment body columns", () => {
