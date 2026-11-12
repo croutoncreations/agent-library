@@ -13,7 +13,8 @@ let server, owner;
 const ok = (r, status = 200) => { assert.equal(r.status, status, JSON.stringify(r.body)); return r.body; };
 const create = async (p, title, body) => ok(await owner.req("POST", `/api/projects/${p}/artifacts`, { title, body }), 201).artifact_id;
 const timed = async (fn) => { const t = performance.now(); const r = await fn(); return { r, ms: performance.now() - t }; };
-const search = (a) => timed(() => owner.req("GET", "/api/search?" + new URLSearchParams(a)));
+// Aborts at the bound, so the old quadratic code fails here rather than after the client's own timeout.
+const search = (a) => timed(() => owner.req("GET", "/api/search?" + new URLSearchParams(a), undefined, { signal: AbortSignal.timeout(BOUND_MS) }));
 const words = (p, n, sep = " ") => Array.from({ length: n }, (_, i) => p + i).join(sep);
 // One two-byte word repeated to fill exactly 1 MiB (1,048,576 bytes), the size of the indexed prefix.
 const mibOf = (w) => (w + " ").repeat(1048576 / (w.length + 1));
@@ -88,7 +89,7 @@ test("a full page of 1 MiB repeated-word documents stays bounded; legacy MCP use
   const g = await grant(owner, "excerpt-page", "excerpt page reader", false), m = await mcpClient(APP, g.token);
   try {
     const t = performance.now();
-    const res = await m.call("search_artifacts", { query: "qy", limit: 20 });
+    const res = await m.client.callTool({ name: "search_artifacts", arguments: { query: "qy", limit: 20 } }, undefined, { timeout: BOUND_MS }).then((r) => ({ isError: !!r.isError, data: r.structuredContent }));
     const mcpMs = performance.now() - t;
     console.log("BIG_PAGE_MCP_MS", Math.round(mcpMs));
     assert.equal(res.isError, false, JSON.stringify(res));

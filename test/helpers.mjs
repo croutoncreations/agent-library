@@ -113,7 +113,7 @@ export async function humanLogin(base, passphrase, user) {
     if (opts.raw !== undefined) payload = opts.raw;
     else if (body !== undefined) { headers["content-type"] = "application/json"; payload = JSON.stringify(body); }
     if (opts.idem !== false && ["POST", "PUT", "PATCH"].includes(method)) headers["idempotency-key"] ??= opts.idem ?? key("h");
-    const res = await fetch(base + path, { method, headers, body: payload });
+    const res = await fetch(base + path, { method, headers, body: payload, signal: opts.signal });
     const buf = opts.binary ? Buffer.from(await res.arrayBuffer()) : null;
     return { status: res.status, headers: res.headers, body: buf ?? (await parse(res)) };
   };
@@ -128,7 +128,7 @@ export function agentHttp(base, token) {
     if (opts.raw !== undefined) payload = opts.raw;
     else if (body !== undefined) { headers["content-type"] = "application/json"; payload = JSON.stringify(body); }
     if (opts.idem !== false && ["POST", "PUT", "PATCH"].includes(method) && !path.startsWith("/api/transfers/")) headers["idempotency-key"] ??= opts.idem ?? key("a");
-    const res = await fetch(base + path, { method, headers, body: payload });
+    const res = await fetch(base + path, { method, headers, body: payload, signal: opts.signal });
     const buf = opts.binary ? Buffer.from(await res.arrayBuffer()) : null;
     return { status: res.status, headers: res.headers, body: buf ?? (await parse(res)) };
   };

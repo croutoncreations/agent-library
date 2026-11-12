@@ -95,6 +95,18 @@ test('OAuth searches multiple live projects; publisher tokens never gain general
  for(const hit of found.body.results){assert.equal(hit.revision,1);assert.equal(hit.sha256,sha256('concurrentoldword'));assert.match(hit.preview_url,/v=1$/);}
  assert.equal((await search({query:'concurrentoldword'})).body.results.length,0);
 });
+test('a large document has the same excerpt through the app API, /v1 search and OAuth MCP',async()=>{
+ const body='Opening of the large record. '+Array.from({length:6000},(_,i)=>'w'+i).join(' ')+' largeexcerptword closing.';
+ const id=await create('search-notes','Large excerpt fixture',body);
+ const app=(await search({query:'largeexcerptword',project_ids:'search-notes'})).body.results.find(x=>x.artifact_id===id);
+ assert.ok(app);assert.match(app.snippet,/^Opening of the large record\. w0 /);
+ const key=(await owner.req('POST','/api/api-keys',{label:'large excerpt reader',lifetime_days:1,projects:[{project_id:'search-notes',access:'read'}]})).body;
+ const v1=await (await fetch(API+'/v1/search?query=largeexcerptword',{headers:{authorization:'Bearer '+key.secret}})).json();
+ assert.equal(v1.results.find(x=>x.artifact_id===id).snippet,app.snippet);
+ const c=await server.connectMcpAgent({'search-notes':'read'});
+ const r=await c.call('search_artifacts',{query:'largeexcerptword'});assert.equal(r.isError,false,JSON.stringify(r));
+ assert.equal(r.data.results.find(x=>x.artifact_id===id).snippet,app.snippet);
+});
 test('browser keyboard search, project filter, safe highlighting, loading/empty/error states and screenshots',async()=>{
  const require=createRequire(import.meta.url),puppeteer=require(process.env.HOME+'/.npm-packages/lib/node_modules/puppeteer');
  const browser=await puppeteer.launch({executablePath:process.env.CHROME_PATH??'/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',headless:true,args:['--no-first-run']});

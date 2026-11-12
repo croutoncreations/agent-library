@@ -112,3 +112,16 @@ test("a prefix with no complete word gives an empty excerpt", () => {
   assert.equal(rsExcerpt("w".repeat(20000), ["x"]), "", "one word longer than the prefix");
   assert.equal(rsExcerpt("w".repeat(20000) + " x", ["x"]), "", "the match lies beyond the prefix");
 });
+
+// Pinned against snippet(): a window starting at a mid-text sentence, and a better window beyond the prefix.
+test("mid-text sentence starts and matches beyond the prefix", () => {
+  const words = (p, n) => Array.from({ length: n }, (_, i) => p + i).join(" ");
+  const sentence = words("w", 60) + ". Then pinzz " + words("v", 60);
+  assert.equal(rsExcerpt(sentence, ["pinzz"]), sqliteSnippet(sentence, ["pinzz"]).plain);
+  assert.match(rsExcerpt(sentence, ["pinzz"]), /^ … Then pinzz v0 /);
+  // An early match of one word; both words together only beyond 16,384 characters, where snippet() would centre.
+  const late = "Intro pinaa " + words("w", 3000) + " pinaa pinbb end";
+  const row = sqliteSnippet(late, ["pinaa", "pinbb"]);
+  assert.match(row.plain, /pinaa pinbb end$/);
+  assert.equal(rsExcerpt(late, ["pinaa", "pinbb"]), "Intro pinaa " + words("w", 38) + " … ");
+});
