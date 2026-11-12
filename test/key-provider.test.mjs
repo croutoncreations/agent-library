@@ -654,6 +654,28 @@ test("the NOT EXISTS guard: a shred landing after the pre-check but before the i
   assert.equal(rows(sql, WS_A).length, 1, "only the tombstone");
 });
 
+test("shred statement order: a complete first use between the shred's two statements leaves no active key", async () => {
+  const { sql, DB } = mkDB();
+  const base = configuredBase(DB);
+  let statements = 0, between;
+  // The shred's database: after its first statement has run, a whole first use (another request) runs to completion.
+  const shredDB = { prepare(q) {
+    const s = DB.prepare(q);
+    const hook = (st) => ({ ...st, async run() {
+      const out = await st.run();
+      if (++statements === 1) between = await lib.workspaceDataKey(request(base), WS_A).then((k) => k, (e) => e);
+      return out;
+    } });
+    return { ...hook(s), bind: (...p) => hook(s.bind(...p)) };
+  } };
+  await lib.shredWorkspaceKeys(request({ ...base, DB: shredDB }), WS_A);
+  assert.equal(statements, 2);
+  assert.ok(between, "the first use ran between the statements");
+  assert.equal(activeRows(sql, WS_A).length, 0, "no active row");
+  assert.ok(rows(sql, WS_A).length >= 1 && rows(sql, WS_A).every((r) => r.wrapped === ""), "no unblanked row");
+  await assert.rejects(lib.workspaceDataKey(request(base), WS_A), (e) => e.code === "key_shredded");
+});
+
 test("an INSERT failure other than losing the race is reported as such, not as a missing key", async () => {
   const { sql, DB } = mkDB();
   // Rebuild the table with a CHECK that rejects one synthetic workspace (INSERT OR IGNORE would silently skip it).
