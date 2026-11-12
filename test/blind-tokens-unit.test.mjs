@@ -1645,3 +1645,106 @@ test("pieces: timing (reported): 1 MiB prose and a capped 10 MiB document", asyn
   const out = { prose_1mib_ms: time(() => lib.extractSearchTerms(prose, 1e9)), capped_10mib_ms: time(() => lib.extractSearchTermsFlat(big, 20000)) };
   console.log("PIECES_TIMING " + JSON.stringify(out));
 });
+
+// --- A flat handle is used once; every way a job lets go of it drops its storage ------------------------------------
+const flatJob = (a, text, rev = `rev_${a}`) => ({ artifactId: a, projectId: "proj_a", revisionId: rev, flat: lib.extractSearchTermsFlat(text, 20000),
+  textBytes: Buffer.byteLength(text), textUnits: text.length });
+const refusedFlat = (env, r, jobs, why) => {
+  const before = adm.searchAdmissionState(), payload = r.payload, held = r.holder.jobs.length;
+  assert.throws(() => adm.admitSearchJobs(env, r, jobs), (e) => e.code === "search_job_invalid" && /flat container/.test(e.message), why);
+  assert.deepEqual(adm.searchAdmissionState(), before, why);
+  assert.equal(r.payload, payload, why);
+  assert.equal(r.holder.jobs.length, held, why);
+};
+
+test("review R6-1: one flat handle given to two jobs (in one call, or in two calls) is refused before anything is reserved", async () => {
+  const world = world1(["h1", "h2"]);
+  const env = aenv(world);
+  const base = lib.searchFlatHeld();
+  const one = flatJob("h1", "alpha beta");
+  // The same handle for two artifacts in one call.
+  const r1 = adm.openSearchRun();
+  refusedFlat(env, r1, [one, { ...one, artifactId: "h2", revisionId: "rev_h2" }], "one handle, two artifacts, one call");
+  r1.settle();
+  assertRecovered();
+  assert.throws(() => lib.searchFlatTerms(one.flat), (e) => e.code === "search_job_invalid", "the refused call dropped that handle's storage");
+  // The same handle in two calls: the first admits it, the second (any live run) is refused.
+  const r2run = adm.openSearchRun();
+  const two = flatJob("h1", "alpha beta");
+  adm.admitSearchJobs(env, r2run, [two]);
+  refusedFlat(env, r2run, [{ ...two, artifactId: "h2", revisionId: "rev_h2" }], "same run, second call");
+  const other = adm.openSearchRun();
+  refusedFlat(env, other, [{ ...two, artifactId: "h2", revisionId: "rev_h2" }], "another live run");
+  assert.deepEqual(lib.searchFlatTerms(two.flat), ["alpha", "beta"], "a refused reuse leaves the admitted job's storage");
+  other.settle();
+  // The first job still indexes exactly.
+  const { result } = await logs(() => adm.runSearchIndexing(env, r2run));
+  void result;
+  assert.deepEqual(W.tokensOf(world, "h1"), expectedTokens(secretOf(world, "wsp_a"), ["alpha", "beta"]));
+  assert.equal(W.docRow(world, "h2"), undefined, "the refused second job wrote nothing");
+  assertExact(world);
+  assertIdle();
+  assert.equal(lib.searchFlatHeld(), base, "every storage dropped");
+});
+
+test("review R6-1: an off job and a job refused at validation drop the handle's storage", () => {
+  const world = world1(["o1"]);
+  const base = lib.searchFlatHeld();
+  // Off: SEARCH_TERMS_MAX = 0.
+  const off = adm.openSearchRun();
+  adm.admitSearchJobs(aenv(world, { SEARCH_TERMS_MAX: "0" }), off, [flatJob("o1", "alpha beta")]);
+  assert.equal(lib.searchFlatHeld(), base, "an off job keeps no storage");
+  off.settle();
+  // Refused at validation: bytes beyond 3 × textUnits, and a count above the cap.
+  const r = adm.openSearchRun();
+  const big = flatJob("o1", "x".repeat(100));
+  assert.throws(() => adm.admitSearchJobs(aenv(world), r, [{ ...big, textBytes: 10, textUnits: 10 }]), (e) => e.code === "search_job_invalid");
+  assert.equal(lib.searchFlatHeld(), base, "a job refused at validation drops its storage");
+  const many = flatJob("o1", "a b c d e f");
+  assert.throws(() => adm.admitSearchJobs(aenv(world, { SEARCH_TERMS_MAX: "2" }), r, [many]), (e) => e.code === "search_job_invalid");
+  assert.equal(lib.searchFlatHeld(), base);
+  // A call refused because of another descriptor still drops the valid one's storage.
+  const fine = flatJob("o1", "alpha");
+  assert.throws(() => adm.admitSearchJobs(aenv(world), r, [fine, { artifactId: "o2", projectId: "proj_a", revisionId: "rev_o2", text: 5, textBytes: 1 }]),
+    (e) => e.code === "search_job_invalid");
+  assert.equal(lib.searchFlatHeld(), base, "nothing admitted, nothing held");
+  r.settle();
+  assertIdle();
+});
+
+test("review R6-1: storage is dropped on replacement, de-duplication within a call, admission refusal and detach", () => {
+  const world = world1(["d1"]);
+  const env = aenv(world);
+  const base = lib.searchFlatHeld();
+  // Replacement by a later job of the same artifact (a second call).
+  const r = adm.openSearchRun();
+  adm.admitSearchJobs(env, r, [flatJob("d1", "alpha")]);
+  assert.equal(lib.searchFlatHeld(), base + 1);
+  adm.admitSearchJobs(env, r, [flatJob("d1", "beta", "rev_d1b")]);
+  assert.equal(lib.searchFlatHeld(), base + 1, "the replaced job's storage is dropped");
+  // De-duplication within one call: only the last is kept.
+  adm.admitSearchJobs(env, r, [flatJob("d1", "c1", "rev_c1"), flatJob("d1", "c2", "rev_c2"), flatJob("d1", "c3", "rev_c3")]);
+  assert.equal(lib.searchFlatHeld(), base + 1, "earlier jobs of the same artifact in one call are dropped");
+  // Admission refusal (the run's document limit).
+  const many = Array.from({ length: adm.SEARCH_RUN_LIMITS.docs + 3 }, (_, i) => flatJob(`m${i}`, "w" + i));
+  assert.equal(lib.searchFlatHeld(), base + 1 + many.length);
+  adm.admitSearchJobs(env, r, many);
+  assert.equal(lib.searchFlatHeld(), base + adm.SEARCH_RUN_LIMITS.docs, "refused jobs drop their storage");
+  // Detach drops what the holder held.
+  r.detach();
+  assert.equal(lib.searchFlatHeld(), base, "detach drops every held storage");
+  r.settle();
+  assertIdle();
+});
+
+test("review R6-1: a job with neither text nor flat that is not off is an error, not a complete empty row", async () => {
+  const world = world1(["nn"]);
+  const env = aenv(world);
+  const r = adm.openSearchRun();
+  adm.admitSearchJobs(env, r, [job("nn", "alpha")]);
+  r.holder.jobs[0].text = null;   // an internal bug: the job lost its input
+  const { events } = await logs(() => adm.runSearchIndexing(env, r));
+  assert.equal(W.docRow(world, "nn")?.revision_id ?? "", "", "no complete row");
+  assert.ok(events.some((e) => e.event === "search_index_failed" && e.code === "search_terms_invalid"), JSON.stringify(events));
+  assertIdle();
+});

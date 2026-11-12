@@ -275,10 +275,16 @@ function extractSearchTermsUnits(text, cap) {
 const FLAT_STORE = new WeakMap();
 /** Entries put in FLAT_STORE and not yet dropped (an entry whose handle is collected without a job is not counted down). */
 let flatHeld = 0;
+/** Handles held by an admitted job of any live run: a handle is used by one job only. */
+const FLAT_ADMITTED = new WeakSet();
 /** Deletes a handle's private storage (no-op for an unknown or already dropped handle). */
 function dropFlat(handle) {
-  if (handle && FLAT_STORE.delete(handle)) flatHeld--;
+  if (!handle) return;
+  FLAT_ADMITTED.delete(handle);
+  if (FLAT_STORE.delete(handle)) flatHeld--;
 }
+/** Drops a handle that no admitted job holds (a refused or never-admitted job's own storage). */
+const dropUnadmittedFlat = (handle) => { if (handle && !FLAT_ADMITTED.has(handle)) dropFlat(handle); };
 /** Test-only: the number of flat storages created and not yet dropped. */
 export const searchFlatHeld = () => flatHeld;
 /** Test-only: the terms behind a live handle, decoded into new strings (the arrays are never exposed). */
@@ -762,6 +768,11 @@ export function searchJob(env, input) {
   const invalid = (why) => new HttpError(500, "search_job_invalid", "A search job is invalid: " + why);
   // Each descriptor property is read exactly once, here.
   const { artifactId, projectId, revisionId, text = null, flat = null, textBytes, textUnits } = input ?? {};
+  // A descriptor refused here drops its flat handle's storage (unless an admitted job holds that handle).
+  try { return validJob(env, invalid, { artifactId, projectId, revisionId, text, flat, textBytes, textUnits }); }
+  catch (e) { dropUnadmittedFlat(flat); throw e; }
+}
+function validJob(env, invalid, { artifactId, projectId, revisionId, text, flat, textBytes, textUnits }) {
   if (typeof artifactId !== "string" || typeof projectId !== "string" || typeof revisionId !== "string") throw invalid("ids");
   const count = (n) => Number.isSafeInteger(n) && n >= 0;
   if ((text === null) === (flat === null)) throw invalid("exactly one of text and flat");
@@ -783,13 +794,14 @@ export function searchJob(env, input) {
     for (let i = 0; i < n; i++) if (offsets[i + 1] < offsets[i]) throw invalid("flat offsets");
     if (n > cap && cap > 0) throw invalid("flat count");
   }
-  // SEARCH_TERMS_MAX = 0: no extraction; the text is never kept (the row is written complete as `off`).
+  // SEARCH_TERMS_MAX = 0: no extraction; the text is never kept (the row is written complete as `off`). An off job's
+  // handle was still validated above (its offsets are inspected); admitSearchJobs drops its storage once the call's
+  // handles are known to be distinct.
   const off = cap === 0;
   return {
-    // The handle (nothing the caller attached to the descriptor is carried into the job). With SEARCH_TERMS_MAX = 0 the
-    // job keeps no handle; its storage is then released when the caller drops the handle (FLAT_STORE is weak).
+    // The handle (nothing the caller attached to the descriptor is carried into the job).
     meta: { artifactId, projectId, revisionId }, text: off ? null : text,
-    flat: off ? null : flat, terms: null, tokens: null, removes: null, adds: null,
+    flat, terms: null, tokens: null, removes: null, adds: null,
     cap, units: off ? 0 : units, charge: 0, reason: "", digest: "",
     kind: null, row: null, scope: null, done: false, replanned: false,
   };
@@ -857,8 +869,11 @@ async function prepareTokens(db, run, job) {
     job.terms = { bytes: store.bytes, offsets: store.offsets, count: handle.count, truncated: handle.truncated };
     job.reason = job.terms.truncated ? capReason(db, job.cap) : "";
     run.lower(job, packedBytes(job.terms) + SEARCH_TOKEN_BYTES * job.cap);
-  } else {
+  } else if (job.cap === 0) {
     job.terms = { units: new Uint16Array(0), offsets: Uint32Array.of(0), count: 0, truncated: false };
+  } else {
+    // Neither text nor flat and not off: the job lost its input (a bug). Never index it as complete and empty.
+    throw new HttpError(500, "search_terms_invalid", "A search job has no terms to index");
   }
   if (job.cap === 0) job.reason = "off";
   phase(run, "extract_done");
@@ -1370,8 +1385,24 @@ export function admitSearchJobs(env, run, jobs) {
   // Only a run that has not started may take jobs: once started, the writer iterates holder.jobs.
   if (!run || run.startedAt || run.settled || run.detached || run.running)
     throw new HttpError(500, "search_run_invalid", "Search jobs can only be added to a run that has not started");
-  // Every descriptor is checked before anything is reserved, so a bad one changes no counter.
-  const all = jobs.map((input) => searchJob(env, input));
+  // Every descriptor is checked before anything is reserved, so a bad one changes no counter. A flat handle is used by
+  // one job only: one already held by an admitted job (of any live run) or given twice in this call is refused. A
+  // refused call drops the storage of every handle it read that no admitted job holds.
+  const all = [];
+  try {
+    for (const input of jobs) all.push(searchJob(env, input));
+    const inCall = new Set();
+    for (const j of all) {
+      if (j.flat === null) continue;
+      if (FLAT_ADMITTED.has(j.flat) || inCall.has(j.flat)) throw new HttpError(500, "search_job_invalid", "A search job is invalid: flat container");
+      inCall.add(j.flat);
+    }
+  } catch (e) {
+    for (const j of all) dropUnadmittedFlat(j.flat);
+    throw e;
+  }
+  // Off jobs (SEARCH_TERMS_MAX = 0) keep no storage.
+  for (const j of all) if (j.cap === 0 && j.flat !== null) { dropFlat(j.flat); j.flat = null; }
   // Within one call, only the last job of each artifact is admitted.
   const last = new Map(all.map((j, i) => [j.meta.artifactId, i]));
   // An earlier job of the same artifact in this call is never admitted: its flat storage is dropped now.
@@ -1398,6 +1429,7 @@ export function admitSearchJobs(env, run, jobs) {
     }
     job.charge = charge;
     run.textUnits += job.units;
+    if (job.flat !== null) FLAT_ADMITTED.add(job.flat);
     run.holder.jobs.push(job);
   }
 }
