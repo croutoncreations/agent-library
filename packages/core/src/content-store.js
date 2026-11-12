@@ -220,7 +220,11 @@ export function fenceRefusal(error) {
   return null;
 }
 
-/** Atomic publication fence and best-effort disposal of objects known not to have published. */
+/**
+ * Atomic publication fence and best-effort disposal of objects known not to have published. A `commit` callback should
+ * throw key_shredded / encryption_started only when nothing was published; either way the cleanup deletes only keys
+ * that no revision or comment refers to. A slice that publishes text or objects some other way must extend that check.
+ */
 export async function commitTextWrites(env, keys, commit) {
   keys = keys.filter(Boolean);
   let settled = false;
@@ -239,7 +243,7 @@ export async function commitTextWrites(env, keys, commit) {
     settled = true;
     return keys.length && Array.isArray(result) ? result.slice(1) : result;
   } catch (error) {
-    // A recognised refusal means the batch rolled back, like the text deadline below: clean up at once.
+    // A recognised refusal: clean up at once, like the text deadline below (only unreferenced keys go).
     const refusal = fenceRefusal(error);
     if (refusal) { settled = true; throw refusal; }
     if (!isTextWriteFenceError(error)) throw error;
