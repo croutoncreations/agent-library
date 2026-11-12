@@ -33,11 +33,14 @@ stored exactly as described under [Today](#today).
   `master_key_invalid`, `master_key_missing`), never "off". Error messages name no secret, since they can reach a
   client; the server log names the secret, never its value.
 - **Fail closed.** The var `CONTENT_ENCRYPTION_REQUIRED="1"` makes encryption required: while the master key settings
-  are missing or malformed, `createWorker` refuses every request with a 500 `encryption_misconfigured` ("Content
-  encryption is required but not configured"). Unset, `""` or `"0"`, nothing changes; any other value (`"true"`, a
-  TOML boolean, `" 1"`) is refused the same way (logged as `required_value_invalid`), never read as "off". `encryptionEnabled(env)` is the one
-  decision for writing: true when configured; false only when not configured, not required and `workspace_keys` has
-  no real key row (`master_version > 0`, shredded or not; a shred's tombstone does not count); otherwise the same 500, so losing the configuration after keys exist never turns into plaintext.
+  are missing or malformed, `createWorker` refuses every HTTP request with a 500 `encryption_misconfigured` ("Content
+  encryption is required but not configured") and logs the reason. Scheduled (cron) work is not behind this refusal:
+  it relies on `encryptionEnabled` and `workspaceDataKey` refusing on their own. Unset, `""` or `"0"`, nothing
+  changes; any other value (`"true"`, a TOML boolean, `" 1"`) is refused the same way (logged as
+  `required_value_invalid`), never read as "off". `encryptionEnabled(env)` is the one decision for writing: true when
+  configured; false only when not configured, not required and `workspace_keys` has no real key row
+  (`master_version > 0`, shredded or not; a shred's tombstone does not count); otherwise the same 500, so losing the
+  configuration after keys exist never turns into plaintext.
   `workspaceDataKey` also refuses unless the configuration is present and well-formed, even for a workspace that
   already has a key.
 - **Table** `workspace_keys` (migration `0029_workspace_keys.sql`): `workspace_id`, `key_id` (`wk_…`, primary key),
@@ -98,7 +101,21 @@ For the slices that wire this into reads and writes:
   configuration. Whether to **encrypt** is decided by `encryptionEnabled(env)`, never by `encryptionConfigured()`
   alone.
 - A key shredded during a request may still be held by that request. A write must be made conditional on the key
-  still being active, or writes must be blocked while a workspace is shredded.
+  still being active, or writes must be blocked while a workspace is shredded. The condition is that the key's row
+  (`WHERE key_id = ?`) still satisfies `ACTIVE_KEY_SQL`, exported from `keys.js` (`shredded_at IS NULL AND
+  wrapped <> ''`); use that export, never a hand-written copy.
+- Ask `encryptionEnabled` again immediately before each write decision; never carry its answer across awaits that
+  could span a configuration or rollout change.
+- A plaintext write must be fenced against encryption having started in the meantime: the publishing statement must
+  be conditional (no real key row exists, the same test `encryptionEnabled` makes), just as a write under a key is
+  conditional on the key still being active.
+- Only the operator purge of a deleted workspace (a later slice) may call `shredWorkspaceKeys`. It is safe on an
+  installation without encryption: its tombstone does not make `encryptionEnabled` refuse.
+- A project's content is under the key of the workspace it belonged to when it was written. Nothing moves projects
+  between workspaces today; if that is ever added, the moved content must be re-encrypted.
+- **Rollback.** A Worker from before decryption existed would serve stored ciphertext as if it were content. Once
+  anything is written encrypted, the Worker must not be rolled back past the slice that reads it; that slice must
+  say so in its deploy notes.
 - A decrypt stream that errors is a failed read, even though earlier chunks were delivered: nothing may act on
   partial plaintext.
 - Range reads authenticate only the chunks they touch.
