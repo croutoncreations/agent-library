@@ -219,6 +219,27 @@ test("Turnstile fails closed on configuration mistakes (never silently off)", as
   assert.ok(logs.some((l) => /turnstile_not_configured bad_site_key/.test(l)));
 });
 
+test("keyProvider: the default reads Worker secrets; a custom provider (and each unset method) is merged like other adapters", async () => {
+  const K = await loadWorker({ "adapters.js": ["resolveAdapters", "defaultAdapters", "withAdapters", "adapters"], "crypto/worker-secret-keys.js": ["workerSecretKeyProvider"], "crypto/keys.js": ["encryptionConfigured"] });
+  const d = K.defaultAdapters().keyProvider;
+  assert.equal(d.name, "worker-secret");
+  for (const m of ["configured", "currentVersion", "wrap", "unwrap"]) assert.equal(d[m], K.workerSecretKeyProvider[m]);
+  assert.equal(d.configured({}), false);
+  assert.ok(Object.isFrozen(d));
+  const custom = { name: "synthetic-kms", configured: () => true };
+  const A = K.resolveAdapters({ keyProvider: custom });
+  assert.equal(A.keyProvider.name, "synthetic-kms");
+  assert.equal(A.keyProvider.configured, custom.configured);
+  assert.equal(A.keyProvider.unwrap, d.unwrap, "unset methods fall back to the default");
+  assert.equal(K.encryptionConfigured(K.withAdapters({}, A)), true, "core asks the installation's provider, not the default");
+  assert.equal(K.encryptionConfigured(K.withAdapters({}, K.defaultAdapters())), false);
+  // createWorker attaches the same resolved provider to every request's env.
+  let seen;
+  const w = W.createWorker({ keyProvider: custom, routes: [{ method: "GET", path: "/kp", handler: async (_r, env) => { seen = W.adapters(env).keyProvider; return new Response("ok"); } }] });
+  assert.equal((await call(w, "/kp")).status, 200);
+  assert.equal(seen.name, "synthetic-kms");
+});
+
 test("Turnstile: the test-key hostname exception needs local dev AND a Cloudflare test secret", async () => {
   const T = await loadWorker({ "identity/turnstile.js": ["requireHuman"] });
   const realFetch = globalThis.fetch;
