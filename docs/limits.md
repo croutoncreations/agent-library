@@ -128,7 +128,7 @@ App API, `/v1` and legacy MCP bodies are counted in UTF-8 bytes as they arrive a
 
 The three-step upload path also accepts Markdown, HTML, JSON and CSV as raw UTF-8, up to 10 MiB per version, independent of `file_bytes`. Document content is validated at finish. These versions are ordinary text and count against workspace storage; they do not consume the project binary-byte allowance. Upload reservations count before publication. The JSON routes still have their existing request caps, so JSON escaping can make a valid document too large for those routes; use a raw upload from an HTTP-capable client instead. OAuth upload tools still require file-enabled consent; JSON/CSV still require App Connect.
 
-For app API and legacy MCP, an over-cap body is read and discarded (up to 16 MiB) before the `413` is sent, so a client that sends the whole body still sees
+For app API, legacy MCP and OAuth MCP, an over-cap body is read and discarded (up to 16 MiB) before the `413` is sent, so a client that sends the whole body still sees
 the error instead of a reset connection.
 
 ## Import & export

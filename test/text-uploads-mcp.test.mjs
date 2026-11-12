@@ -296,6 +296,8 @@ function writeAllThenRead(base, token, body, chunked) {
     sock.pause();
     const got = [];
     sock.on("error", reject);
+    // A server that stops reading without closing must fail here, not hang until the runner gives up.
+    sock.setTimeout(30_000, () => sock.destroy(new Error("no complete response within 30 s")));
     sock.on("data", (d) => got.push(d));
     sock.on("end", () => resolve(Buffer.concat(got)));
     sock.on("connect", () => {
