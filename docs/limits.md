@@ -97,10 +97,10 @@ will return through the blind index in slice 4b. The separate ranked search sear
 
 The app API and `/v1` upload endpoints accept Markdown, HTML, JSON and CSV text up to 10 MiB (10,485,760 bytes).
 Normally one text finish runs at a time per isolate. The slot covers reading, validating and publishing the document.
-Another finish receives retryable `503 text_finish_busy` with `retry_after_seconds: 1`; retry with the same idempotency key.
+Another text finish (of a different upload) receives retryable `503 text_finish_busy` with `retry_after_seconds: 1`; retry with the same idempotency key.
 The slot expires with the 60-second finalize lease. A finish that stalls past its lease can overlap with the next one.
 The slot does not bound other operations on large text.
-MCP tools do not accept text uploads yet. `/v1` uploads accept text only.
+MCP `upload_begin` (legacy and OAuth) accepts text as well as binary files; OAuth upload tools still require file-enabled consent, and JSON/CSV still require App Connect. `upload_file` stays binary-only. `/v1` uploads accept text only.
 
 Before rolling the Worker back to a version from before text uploads, let text uploads finish or expire.
 The older Worker returns `500` when finishing one and does not clean up its text placeholder or temporary object.
@@ -119,10 +119,12 @@ is no longer found by cleanup and remains until the project is purged.
 | Request body: app API | 11 MiB (11,534,336 bytes) for document/data create and save; 2 MiB for every other route (including backup import/restore) | request | fixed | `413 too_large`; message names the request-size limit |
 | Request body: legacy MCP (`/mcp` with a grant token) | 2 MiB | request | fixed | `413` JSON-RPC `-32600` |
 | Request body: OAuth MCP | 1 MiB; 3 MiB for connections with file access | request | fixed | `413` JSON-RPC `-32600` |
-| Request body: `/v1` API and publisher snapshots | 11 MiB for `/v1` file create and save; 6.5 MB (6,500,000 bytes) for other `/v1` routes and publisher snapshots | request | fixed | `413 too_large`; message names the request-size limit |
+| Request body: `/v1` API and publisher snapshots | 11 MiB for `/v1` file create and save; the `/v1` upload PUT takes raw bytes up to the declared size (10 MiB for text); 6.5 MB (6,500,000 bytes) for other `/v1` routes and publisher snapshots | request | fixed | `413 too_large`; message names the request-size limit |
 | Request body: publisher generation parts | 256 KiB | request | fixed | `413` |
 
-App API, `/v1` and legacy MCP bodies are counted in UTF-8 bytes as they arrive and never buffered past the cap. `Content-Length` is checked before buffering. The 10 MiB storage limit depends on the transport: JSON escaping can push a smaller document above the 11 MiB request cap, producing `413`. MCP caps are unchanged; not every transport can write a 10 MiB document.
+App API, `/v1` and legacy MCP bodies are counted in UTF-8 bytes as they arrive and never buffered past the cap. `Content-Length` is checked before buffering. The 10 MiB storage limit depends on the transport: JSON escaping can push a smaller document above the 11 MiB request cap, producing `413`. MCP caps are unchanged; not every transport can write a 10 MiB document inline.
+
+The three-step upload path also accepts Markdown, HTML, JSON and CSV as raw UTF-8, up to 10 MiB per version, independent of `file_bytes`. Document content is validated at finish. These versions are ordinary text and count against workspace storage; they do not consume the project binary-byte allowance. Upload reservations count before publication. The JSON routes still have their existing request caps, so JSON escaping can make a valid document too large for those routes; use a raw upload from an HTTP-capable client instead. OAuth upload tools still require file-enabled consent; JSON/CSV still require App Connect.
 
 For app API and legacy MCP, an over-cap body is read and discarded (up to 16 MiB) before the `413` is sent, so a client that sends the whole body still sees
 the error instead of a reset connection.

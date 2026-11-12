@@ -57,7 +57,7 @@ Then [connect your agents](docs/agent-setup.md).
 Agent Library is a personal library: one owner, many agents.
 
 - There are no other human users, public links or real-time co-editing. Agents edit one revision at a time, and conflicting saves are rejected rather than merged.
-- Limits: 10 MiB per text document (subject to transport request caps), 25 MiB per file (PNG, JPEG, WebP, GIF, PDF, MP4, WebM; up to 90 MiB with `FILE_MAX_BYTES`), 100 MiB of files per project (`PROJECT_BINARY_BYTES`) and 10,000 documents and files per project (`PROJECT_ITEMS_MAX`). Every limit, its setting and the error you see are in [Limits](docs/limits.md).
+- Limits: 10 MiB per text document (inline writes are subject to transport request caps; raw UTF-8 uploads support the full text limit), 25 MiB per file (PNG, JPEG, WebP, GIF, PDF, MP4, WebM; up to 90 MiB with `FILE_MAX_BYTES`), 100 MiB of files per project (`PROJECT_BINARY_BYTES`) and 10,000 documents and files per project (`PROJECT_ITEMS_MAX`). Every limit, its setting and the error you see are in [Limits](docs/limits.md).
 - Backups are per project and exclude App Connect projects. See [Operations](docs/operations.md).
 - Cloudflare's free tiers cover a typical personal library, but usage beyond them is billed to your account.
 

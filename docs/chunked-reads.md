@@ -4,7 +4,7 @@ Status: implemented. Sources in `packages/core/src/reads/`, tests in `test/chunk
 
 ## Why
 
-Text documents (Markdown, HTML, JSON, CSV) can be up to 10 MiB (writes remain subject to each transport's request cap). `read_artifact` returns the whole body in one result, and MCP results carry it twice (as JSON text in `content[0].text` and again in `structuredContent`), so a long document can be several MiB on the wire and larger than many clients accept. A caller can now read any text version in bounded chunks and put it back together exactly.
+Text documents (Markdown, HTML, JSON, CSV) can be up to 10 MiB (JSON/tool-inline writes remain subject to transport request caps; HTTP-capable clients can upload raw UTF-8 through upload_begin → PUT → upload_finish). `read_artifact` returns the whole body in one result, and MCP results carry it twice (as JSON text in `content[0].text` and again in `structuredContent`), so a long document can be several MiB on the wire and larger than many clients accept. A caller can now read any text version in bounded chunks and put it back together exactly.
 
 ## Contract
 
