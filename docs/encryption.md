@@ -96,8 +96,11 @@ Binary file versions use the key layer below ([Files](#files)); text versions an
   can put back a key row they saved earlier. Nor does it reach database restore points, D1 Time Travel (about 30
   days) or exported backups, which still hold the wrapped key. Content is beyond recovery only once those have aged
   out, or once the master key version that wrapped its key has been retired and its secret deleted.
-- **Each write is authenticated, not that it is the latest.** Someone who can write to object storage can put back an
-  older complete write of the same storage key, and it decrypts.
+- **Each write is authenticated, not that it is the latest.** This is a property of the format: a whole older
+  object written under the same storage key with the same data key authenticates on its own, so the codec alone
+  would decrypt it. For files the application closes this: the header recorded in the database at publication pins
+  the one write a version reads, so an older or different write put back under the key is refused as `blob_corrupt`
+  (unavailable, never different content). Someone who can write to the database as well can change that header.
 - **`encryptionEnabled` trusts the database.** It decides "encryption was in use" from rows in the database, so
   someone who can write to the database (deleting key rows or setting their `master_version` to 0) could make an
   installation whose master-key settings are later removed fall back to plaintext. Therefore **every installation
@@ -219,7 +222,9 @@ before encryption was configured with encrypted ones after.
   version's own project and document, that the header's plaintext length equals the version's size, and then looks up
   the key (`410 key_shredded` once it is shredded). It then checks the object's metadata and stored size, and
   authenticates the first chunk before any header or byte is sent (`500 blob_corrupt` otherwise). A chunk that fails
-  later errors the response body, so the client sees a failed or short transfer, never a complete one. Range reads
+  later errors the response body, so the client sees a failed or short transfer, never a complete one. This was
+  verified with the local runtime only; it must be confirmed on a deployed Worker before a production key is
+  configured (see the checklist below). Range reads
   fetch and authenticate only the chunks they cover. `read_file` (inline images) and backup export authenticate the
   whole object before returning anything.
 - **Restoring a plaintext version.** Restoring an older file version that was stored before encryption was turned on publishes a new revision that refers to the existing plaintext object; no plaintext is written. It therefore carries no plaintext condition. The restored version stays plaintext (and is not covered by shredding) until it is re-encrypted, which is not built yet.
@@ -233,7 +238,9 @@ before encryption was configured with encrypted ones after.
   import was authorized for, never anything named in the file) at the new project's keys. Restore re-encrypts under
   the restoring owner's personal workspace key, and every restored file key carries a per-attempt suffix
   (`_restore_<16 characters>`), so a retried restore never overwrites an earlier attempt's objects. Both publish with
-  the fences last. Before the batch is sent, a failure deletes every object the attempt wrote. If the batch itself
+  the fences last. Before the batch is sent, a failure deletes the file objects this attempt wrote (best effort: a
+  failed delete is logged as `backup_cleanup_skipped`), and leaves text already staged for the attempt, with its
+  write intents, to the content-writes sweep ([below](#text-write-deadline-and-orphan-safety)). If the batch itself
   was refused (a fence, the text deadline, a constraint), only objects no version refers to are deleted. Any other
   failure may have committed with its acknowledgement lost: nothing is deleted and the server logs
   `backup_cleanup_skipped` (a count and a reason). **Such unreferenced objects are not reclaimed by this release.**
@@ -258,6 +265,20 @@ before encryption was configured with encrypted ones after.
   encryption columns were written leaves a plaintext-shaped row next to an encrypted object, which fails closed as
   `blob_corrupt`. Do not use restore points from before encryption was configured once encrypted content exists,
   except to recover unencrypted data deliberately.
+- **Before configuring a key in production.** An operator checklist; every item must hold:
+  1. The release that encrypts every content kind (files, text versions, comments, text-upload input) is fully
+     deployed to the environment.
+  2. `CONTENT_ENCRYPTION_REQUIRED="1"` is set in the same deploy that adds the master-key settings.
+  3. CI passed for the exact commit that is deployed.
+  4. On a staging environment with a key and synthetic data only:
+     - a corrupted first, middle and final chunk each answer a failed or short transfer, never a complete one, on
+       full downloads and on Range reads;
+     - CPU time, wall time and memory are measured for the largest file the environment allows: upload, finish, a
+       full download and a Range read near its end;
+     - real object storage is checked for overwrite ordering when an earlier upload's put arrives late.
+  5. The decision on late writes (below) is made.
+  6. The operator knows the two floors: never run an older Worker, and never restore the database to a point before
+     encrypted content was written.
 - **Late writes.** An R2 put the Worker stopped waiting for can still commit later. Before publication, finish
   catches it (chunk 0 does not authenticate under the recorded header: `500 publish_failed`, upload failed). After
   publication it would make that version read as `blob_corrupt` (unavailable, never wrong content). Closing this is a

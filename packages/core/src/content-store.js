@@ -141,7 +141,7 @@ const readFailure = (ref, e, codecReason) => e instanceof HttpError ? e : blobCo
 
 /** Checks that need no object, in order: storage-key prefix, header shape and plaintext length; then the data key. */
 async function encryptedReadSetup(env, ref) {
-  if (typeof ref.key !== "string" || !ref.key.startsWith(`blobs/${ref.projectId}/${ref.artifactId}/`)) throw blobCorrupt(ref, "prefix");
+  if (typeof ref.key !== "string" || !ref.key.startsWith(blobPrefix(ref.projectId, ref.artifactId))) throw blobCorrupt(ref, "prefix");
   const header = fromB64url(ref.header);
   if (!header || header.length !== CHUNKED_HEADER_BYTES) throw blobCorrupt(ref, "header_invalid");
   let parsed;
@@ -408,6 +408,17 @@ export async function writeBlobBytes(env, { key, bytes, contentType, workspaceId
   if (at !== stored.length) throw new HttpError(500, "publish_failed", "The encrypted object has the wrong length");
   await env.BLOBS.put(key, stored, { httpMetadata: { contentType: ENCRYPTED_CONTENT_TYPE }, customMetadata: ENCRYPTED_METADATA(keyId) });
   return { keyId, header: b64url(stored.subarray(0, CHUNKED_HEADER_BYTES)) };
+}
+
+/**
+ * The storage-key prefix of one document's file objects. Each segment is URI-encoded, as textKey does, so no
+ * document's prefix is a prefix of another's ("a" and "a/b", or "a/b" and a literal "a%2Fb"). Ids the app creates
+ * ([A-Za-z0-9_-], every project id) are unchanged by encoding; only a document id kept by restore can differ. A lone
+ * surrogate becomes U+FFFD first, so encoding never throws.
+ */
+export function blobPrefix(projectId, artifactId) {
+  const seg = (v) => encodeURIComponent(String(v).replace(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, "\ufffd"));
+  return `blobs/${seg(projectId)}/${seg(artifactId)}/`;
 }
 
 /** Can an object be written under this storage key? UTF-8 length at most CHUNKED_OBJECT_KEY_MAX_BYTES (1,015). */

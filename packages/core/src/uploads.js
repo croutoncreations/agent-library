@@ -1,4 +1,4 @@
-import { blobRef, deleteBlob, fenceRefusal, inspectUploadedBlob, isBlobWriteError, keyFence, plaintextFence, putBlobStream, getText, getTextRange, getUploadedText, readBlob, writeUploadBlob } from "./content-store.js";
+import { blobPrefix, blobRef, deleteBlob, fenceRefusal, getText, getTextRange, getUploadedText, inspectUploadedBlob, isBlobWriteError, keyFence, plaintextFence, putBlobStream, readBlob, writeUploadBlob } from "./content-store.js";
 import { authenticate, authorizeProject, authzSql, contentWriteSql, enforceRate, limitsFor, requireCsrf } from "./auth.js";
 import { PUT_MARGIN_MS, reconcileUploads } from "./cleanup.js";
 import { CONTENT_TYPE, MEASUREMENTS, checkFile, spreadsheetSafeCsv } from "./formats.js";
@@ -63,7 +63,7 @@ function uploadBeginFields(appConnect) {
   };
 }
 // Upload-owned bytes: immutable published binary content, or temporary raw input for text publication.
-var finalKeyFor = (projectId, artifactId) => `blobs/${projectId}/${artifactId}/${randomId("rev")}`;
+var finalKeyFor = (projectId, artifactId) => blobPrefix(projectId, artifactId) + randomId("rev");
 // Options are transport-owned, never request fields. transfer(uploadId) gives the transport's own { put_url, instructions }.
 async function uploadBegin(ctx, projectId, input, key, { allowText = false, allowBinary = true, transfer } = {}) {
   await authorizeProject(ctx, projectId, true);
@@ -397,8 +397,10 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
   try {
     const held = await current();
     const finalKey = held?.final_key;
-    const prefix = `blobs/${projectId}/${u.artifact_id}/`;
-    if (held?.finalize_token !== token || typeof finalKey !== "string" || !finalKey.startsWith(prefix) || !/^rev_[A-Za-z0-9_-]+$/.test(finalKey.slice(prefix.length)))
+    // An upload begun by an earlier Worker holds the unencoded form, which differs only for a restored document's id.
+    const prefix = [blobPrefix(projectId, u.artifact_id), `blobs/${projectId}/${u.artifact_id}/`]
+      .find((p) => typeof finalKey === "string" && finalKey.startsWith(p) && /^rev_[A-Za-z0-9_-]+$/.test(finalKey.slice(p.length)));
+    if (held?.finalize_token !== token || !prefix)
       throw new HttpError(500, "publish_failed", "Upload finalization state is inconsistent");
     const kind = Object.hasOwn(TEXT_UPLOAD_KINDS, u.mime) ? TEXT_UPLOAD_KINDS[u.mime] : null;
     const revId = kind ? randomId("rev") : finalKey.slice(prefix.length);

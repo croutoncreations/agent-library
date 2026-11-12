@@ -55,7 +55,8 @@ export function world({ encryption = false } = {}) {
   });
   const DB = {
     withSession() { return DB; },
-    prepare(q) { return { bind: (...p) => stmt(q, p), ...stmt(q, []) }; },
+    // As D1's bind does, a list of byte values binds as a BLOB (node:sqlite would refuse it).
+    prepare(q) { return { bind: (...p) => stmt(q, p.map((v) => Array.isArray(v) ? Uint8Array.from(v) : v)), ...stmt(q, []) }; },
     async batch(ss) {
       if (hooks.beforeBatch) { const h = hooks.beforeBatch; hooks.beforeBatch = null; await h(); }
       sql.exec("BEGIN");

@@ -516,3 +516,101 @@ test("review fix (part 3): after a pre-send file-write failure, staged text obje
   assert.equal(s.w.sql.prepare("SELECT COUNT(*) AS n FROM content_writes").get().n, 0, "intents removed by the sweep");
   for (const k of intents) assert.equal(s.w.blobs.has(k), false, "text object reclaimed");
 });
+
+// ---- Review Lows for part 4: restore stores exactly what the restore at b2d81c8 stored ----
+
+const commentBodies = (s, pid) => Promise.all(s.w.sql.prepare("SELECT id, body_key FROM comments WHERE project_id = ? ORDER BY id").all(pid).map(async (c) => [c.id, Buffer.from(s.w.blobs.get(c.body_key)).toString("utf8")]));
+
+for (const encryption of [false, true]) {
+  test(`review Lows (part 4): a comment body that is not a string is stored as its string form, as before (encryption ${encryption ? "on" : "off"}); import still refuses it`, async () => {
+    const s = setup({ encryption, project: false });
+    const bk = makeBackup();
+    const base = bk.comments[0];
+    bk.comments = [{ ...base, id: "cmt_obj", body: { odd: true } }, { ...base, id: "cmt_num", body: 5 }, { ...base, id: "cmt_list", body: [1, 2] }, { ...base, id: "cmt_bool", body: false }];
+    await lib.restoreBackup(s.ctx, bk);
+    // b2d81c8 wrote each comment with putText(new TextEncoder().encode(c.body)): the value's string form.
+    assert.deepEqual(await commentBodies(s, "src-proj"), [["cmt_bool", "false"], ["cmt_list", "1,2"], ["cmt_num", "5"], ["cmt_obj", "[object Object]"]]);
+    const t = setup({ encryption });
+    await assert.rejects(lib.importBackup(t.ctx, WS, { backup: structuredClone(bk) }, "cbody"), status(400, "bad_backup"));
+  });
+
+  test(`review Lows (part 4): document references match as the database stores ids: a number and a string match exactly when their stored text is equal (encryption ${encryption ? "on" : "off"})`, async () => {
+    // A TEXT column stores a bound number as its REAL text form (D1 binds every number as REAL; node:sqlite binds a
+    // JS number as REAL too): 7 is stored "7.0". So the reference 7 matched a document "7.0" before (the foreign key
+    // compares stored values) and never matched "7" (the old batch failed on the foreign key, after writing files).
+    const s = setup({ encryption, project: false });
+    const bytes = pngOf(5000);
+    const bk = makeBackup({ files: [bytes] });
+    bk.artifacts[0].id = "7.0";
+    Object.assign(bk.revisions[0], { artifact_id: 7, blob_key: "blobs/src-proj/seven/rev_f1" });
+    bk.blobs = { "blobs/src-proj/seven/rev_f1": bk.blobs["blobs/src-proj/art_file/rev_f1"] };
+    bk.meta_versions.push({ id: "mv7", artifact_id: 7, version: 1, title: "t", folder: "", tags: "[]", trashed: 0, author_id: OWNER, created_at: at() });
+    bk.comments[0].artifact_id = 8;
+    bk.artifacts[1].id = 8; // the text document's id is a number (stored "8.0"); its version names it as "8.0"
+    bk.revisions[1].artifact_id = "8.0";
+    await lib.restoreBackup(s.ctx, bk);
+    assert.deepEqual(s.w.sql.prepare("SELECT id, typeof(id) AS t FROM artifacts WHERE project_id = 'src-proj' ORDER BY id").all().map((r) => ({ ...r })), [{ id: "7.0", t: "text" }, { id: "8.0", t: "text" }]);
+    assert.equal(s.w.sql.prepare("SELECT COUNT(*) AS n FROM revisions WHERE artifact_id = '7.0'").get().n, 1);
+    assert.equal(s.w.sql.prepare("SELECT COUNT(*) AS n FROM meta_versions WHERE artifact_id = '7.0'").get().n, 1);
+    assert.equal(s.w.sql.prepare("SELECT COUNT(*) AS n FROM comments WHERE artifact_id = '8.0'").get().n, 1);
+    assert.ok((await download(s, "src-proj", "7.0")).equals(bytes), "the file reads under its document's stored id");
+    assert.equal((await lib.getArtifact(s.ctx, "src-proj", "8.0")).body, "# synthetic text\n");
+    // 7 against "7" (and "8" against 8) never matched: refused before any write, where the old batch failed.
+    for (const mutate of [(b) => { b.artifacts[0].id = "7"; for (const r of b.revisions.filter((r) => r.blob_key)) r.artifact_id = 7; }, (b) => { b.artifacts[1].id = 8; b.revisions.find((r) => !r.blob_key).artifact_id = "8"; b.comments[0].artifact_id = 8; }]) {
+      const t = setup({ encryption, project: false });
+      const bad = makeBackup();
+      mutate(bad);
+      const puts = [];
+      const put = t.w.env.BLOBS.put;
+      t.w.env.BLOBS.put = (k, b, o) => { puts.push(k); return put(k, b, o); };
+      await assert.rejects(lib.restoreBackup(t.ctx, bad), (e) => e.status === 400 && e.message === "Revision for an unknown document");
+      assert.deepEqual(puts, []);
+    }
+    // Import keeps comparing ids exactly.
+    const u = setup({ encryption });
+    await assert.rejects(lib.importBackup(u.ctx, WS, { backup: structuredClone(bk) }, "numid"), status(400, "bad_backup"));
+  });
+
+  test(`review Lows (part 4): a list of byte values binds as a BLOB, as D1 bound it before; restore keeps it, import refuses it (encryption ${encryption ? "on" : "off"})`, async () => {
+    const s = setup({ encryption, project: false });
+    const bk = makeBackup();
+    bk.revisions[0].via_label = [104, 105];
+    await lib.restoreBackup(s.ctx, bk);
+    const row = s.w.sql.prepare("SELECT typeof(via_label) AS t, hex(via_label) AS h FROM revisions WHERE id = 'rev_f1'").get();
+    assert.deepEqual({ ...row }, { t: "blob", h: "6869" });
+    const t = setup({ encryption });
+    await assert.rejects(lib.importBackup(t.ctx, WS, { backup: structuredClone(bk) }, "bytes"), status(400, "bad_backup"));
+  });
+
+  test(`review Lows (part 4): document ids holding "/" or "%" restore with their files under URI-encoded prefixes that read back, and no document's prefix holds another's keys (encryption ${encryption ? "on" : "off"})`, async () => {
+    const s = setup({ encryption, project: false });
+    const ids = ["a", "a/b", "a%2Fb", "50%"];
+    const files = new Map(ids.map((id) => [id, pngOf(3000 + id.length)]));
+    const bk = makeBackup({ files: [] });
+    bk.artifacts = bk.artifacts.filter((a) => a.id !== "art_file");
+    bk.blobs = {};
+    ids.forEach((id, i) => {
+      const bytes = files.get(id), key = `blobs/src-proj/seg${i}/rev_${i}`;
+      bk.artifacts.push({ ...bk.artifacts[0], id, kind: "binary", title: `F${i}.png`, head_rev: 1, head_revision_id: `rev_${i}` });
+      bk.revisions.push({ id: `rev_${i}`, artifact_id: id, rev_no: 1, author_id: OWNER, body: null, blob_key: key, size: bytes.length, sha256: sha(bytes), mime: "image/png", restored_from: null, created_at: at(), via_kind: "browser", via_id: null, via_label: null, client_info: null, change_note: null });
+      bk.blobs[key] = { sha256: sha(bytes), data: bytes.toString("base64") };
+    });
+    await lib.restoreBackup(s.ctx, bk);
+    const rows = fileRows(s, "src-proj");
+    assert.equal(rows.length, ids.length);
+    const prefix = (id) => `blobs/src-proj/${encodeURIComponent(id)}/`;
+    for (const r of rows) {
+      assert.ok(r.blob_key.startsWith(prefix(r.artifact_id)), `${r.artifact_id}: ${r.blob_key}`);
+      for (const other of ids) if (other !== r.artifact_id) assert.ok(!r.blob_key.startsWith(prefix(other)), `${r.blob_key} not under ${other}`);
+      const full = s.w.sql.prepare("SELECT blob_key, size, blob_key_id, blob_header FROM revisions WHERE id = ?").get(r.id);
+      assert.ok(Buffer.from(await lib.readBlobBytes(s.env, await lib.blobRef(s.env, full, { projectId: "src-proj", artifactId: r.artifact_id }))).equals(files.get(r.artifact_id)), r.artifact_id);
+      assert.ok((await download(s, "src-proj", r.artifact_id)).equals(files.get(r.artifact_id)), `download ${r.artifact_id}`);
+      // Another document's id never passes this object's prefix check.
+      if (encryption) for (const other of ids) if (other !== r.artifact_id)
+        await assert.rejects(silent(async () => { const x = await lib.blobRef(s.env, full, { projectId: "src-proj", artifactId: other }); return lib.readBlobBytes(s.env, x); }).then((o) => { if (o.error) throw o.error; }), status(500, "blob_corrupt"));
+    }
+    // Export reads every file back.
+    const exported = await lib.exportBackup(s.ctx, "src-proj");
+    for (const r of exported.revisions.filter((r) => r.blob_key)) assert.ok(Buffer.from(exported.blobs[r.blob_key].data, "base64").equals(files.get(r.artifact_id)));
+  });
+}
