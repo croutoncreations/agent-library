@@ -16,7 +16,7 @@ import * as W from "./blind-tokens-world.mjs";
 
 const lib = await loadWorker({
   "project-deletion.js": ["purgeDueProjects"],
-  "search/tokens.js": ["sweepSearchTokenOrphans", "indexSearchJobs", "sweepReadSql", "SEARCH_SQL", "lifecycleStatements", "PURGE_ELIGIBLE", "stableReadSql", "named"],
+  "search/tokens.js": ["sweepSearchTokenOrphans", "indexSearchJobs", "sweepReadSql", "SEARCH_SQL", "lifecycleStatements", "PURGE_ELIGIBLE", "stableReadSql", "named", "PURGE_SELECT_SQL"],
   "adapters.js": ["withAdapters", "resolveAdapters"],
 });
 const AT = "2026-11-11T00:00:00.000Z";
@@ -522,4 +522,166 @@ test("server log: the cron logs search_sweep with counts only, never content", (
     const j = JSON.parse(l.slice(l.indexOf("{")));
     assert.deepEqual(Object.keys(j).sort(), ["calls", "docs", "event", "rows", "tokens"]);
   }
+});
+
+// --- Review fixes: purge and sweep cost, purge errors (commit B items 7, 8) ------------------------------------------
+test("review B7 (i): a dead writer's row whose term_count understates its tokens is fully purged", async () => {
+  const world = world0();
+  project(world, "p_dw", { due: true });
+  // A writer's row: inserted with term_count 0, 7,000 tokens added, the writer died holding the lease.
+  const [a] = seedTokens(world, { project: "p_dw", workspace: "wsp_a", owner: "hum_a", docs: 1, tokens: 7000 });
+  W.run(world, "UPDATE search_token_docs SET revision_id = '', writer = 'sw_dead', term_count = 0 WHERE artifact_id = ?", a);
+  let runs = 0;
+  while (!purgedAt(world, "p_dw") && runs < 10) {
+    const before = W.one(world, "SELECT (SELECT COUNT(*) FROM search_tokens) + (SELECT COUNT(*) FROM search_token_docs) AS n").n;
+    await quiet(() => lib.purgeDueProjects(envOf(world), { projectId: "p_dw", rowBudget: 3000 }));
+    const after = W.one(world, "SELECT (SELECT COUNT(*) FROM search_tokens) + (SELECT COUNT(*) FROM search_token_docs) AS n").n;
+    assert.ok(after < before || purgedAt(world, "p_dw"), `run ${runs} made progress`);
+    assertExact(world);
+    runs++;
+  }
+  assert.ok(purgedAt(world, "p_dw"));
+  assert.equal(docCount(world, "p_dw"), 0);
+});
+
+/**
+ * Watches lifecycle batches: every L that takes a row still held by a writer counts that row's tokens (once); every
+ * other read of tokens is in K, proportional to what K deletes. Returns per-doc count tallies and per-batch figures.
+ */
+function watchCounts(world) {
+  const counted = new Map(), batchesSeen = [];
+  let selectionReads = 0;
+  // A selection that reads search_tokens (its plan names it) costs, per row it returns, that row's tokens up to 5,001.
+  const readsTokens = (q) => W.all(world, "EXPLAIN QUERY PLAN " + q.replace(/\?1/g, "'x'")).some((r) => /search_tokens\b| s USING/.test(r.detail));
+  world.after = ({ kind, q, qs, out }) => {
+    const sels = kind === "all" && /FROM search_token_docs d WHERE/.test(q) ? [[q, out.results]]
+      : kind === "batch" ? qs.map((x, i) => [x, out[i]?.results ?? []]).filter(([x]) => /FROM search_token_docs d WHERE/.test(x)) : [];
+    for (const [sq, rows] of sels) if (rows.length && readsTokens(sq))
+      for (const r of rows) selectionReads += Math.min(5001, W.one(world, "SELECT COUNT(*) AS n FROM search_tokens WHERE doc_id = ?", r.doc_id).n);
+  };
+  world.before = ({ kind, qs, ps }) => {
+    if (kind !== "batch" || !qs.some((q) => /^UPDATE search_token_docs SET revision_id = '', writer = \?/.test(q))) return;
+    let reads = 0;
+    qs.forEach((q, i) => {
+      if (!/^UPDATE search_token_docs SET revision_id = '', writer = \?/.test(q)) return;
+      const d = ps[i][1];   // L: ?1 = PN, ?2 = D
+      const r = W.one(world, "SELECT revision_id, writer FROM search_token_docs WHERE doc_id = ?", d);
+      if (r && r.revision_id === "" && !r.writer.startsWith("purge:")) {
+        counted.set(d, (counted.get(d) ?? 0) + 1);
+        reads += W.one(world, "SELECT COUNT(*) AS n FROM search_tokens WHERE doc_id = ?", d).n;
+      }
+    });
+    batchesSeen.push({ countReads: reads, tokensBefore: W.one(world, "SELECT COUNT(*) AS n FROM search_tokens").n });
+  };
+  return { counted, batchesSeen, selectionReads: () => selectionReads, stop: () => { world.before = null; world.after = null; } };
+}
+
+test("review B7 (ii): the purge reads no tokens to select; each writer-held row is counted once, at its first lease", async () => {
+  const world = world0();
+  project(world, "p_big", { due: true });
+  const ids = seedTokens(world, { project: "p_big", workspace: "wsp_a", owner: "hum_a", docs: 20, tokens: 5000 });
+  // Half the rows are at '' under dead writers (term_count understated), half complete.
+  for (const a of ids.slice(0, 10)) W.run(world, "UPDATE search_token_docs SET revision_id = '', writer = 'sw_dead', term_count = 0 WHERE artifact_id = ?", a);
+  const w = watchCounts(world);
+  let rounds = 0;
+  for (let i = 0; i < 40 && !purgedAt(world, "p_big"); i++) { await quiet(() => lib.purgeDueProjects(envOf(world), { projectId: "p_big" })); rounds++; }
+  w.stop();
+  assert.ok(purgedAt(world, "p_big"));
+  assert.equal(w.counted.size, 10, "every dead writer's row counted");
+  assert.ok([...w.counted.values()].every((n) => n === 1), "each exactly once");
+  // Count reads total exactly the dead rows' tokens (each counted once); the selections read none, and K reads what it
+  // deletes. So rows read over the whole purge stay within 1.5 × the 100,000 tokens deleted (plus document rows).
+  assert.equal(w.batchesSeen.reduce((n, b) => n + b.countReads, 0), 50000);
+  assert.equal(w.selectionReads(), 0, "the selections read no token entry");
+  assert.ok(w.batchesSeen.every((b) => b.countReads <= 20001), "one row's bounded count at most per round");
+  // Per round, after a row's first lease: index entries read (counts + K's own entries) ≤ 2 × tokens deleted + 20.
+  for (let i = 1; i < w.batchesSeen.length; i++) {
+    const deleted = w.batchesSeen[i - 1].tokensBefore - w.batchesSeen[i].tokensBefore;
+    const reads = w.batchesSeen[i - 1].countReads + deleted;
+    if (w.batchesSeen[i - 1].countReads === 0) assert.ok(reads <= 2 * deleted + 20, `round ${i}: ${reads} read for ${deleted} deleted`);
+  }
+  assert.ok(rounds >= 20, `${rounds} rounds`);
+  assertExact(world);
+});
+
+test("review B7 (iii): the sweep on a deleting workspace counts each writer-held row once and reads no tokens to select", async () => {
+  const world = world0();
+  W.seedWorkspace(world, { principal: "hum_x", workspace: "wsp_x", project: "proj_x" });
+  const ids = seedTokens(world, { project: "proj_x", workspace: "wsp_x", owner: "hum_x", docs: 20, tokens: 5000 });
+  for (const a of ids.slice(0, 5)) W.run(world, "UPDATE search_token_docs SET revision_id = '', writer = 'sw_dead', term_count = 0 WHERE artifact_id = ?", a);
+  W.run(world, "UPDATE workspaces SET status = 'deleting' WHERE id = 'wsp_x'");
+  const w = watchCounts(world);
+  let runs = 0;
+  for (; runs < 60 && W.one(world, "SELECT COUNT(*) AS n FROM search_token_docs WHERE workspace_id = 'wsp_x'").n; runs++) {
+    const t = (await quiet(() => lib.sweepSearchTokenOrphans(envOf(world), { scheduledTime: 0 }))).result;
+    assert.ok(t.tokens + t.docs > 0, `run ${runs} made progress`);
+    assertExact(world);
+  }
+  w.stop();
+  assert.equal(W.one(world, "SELECT COUNT(*) AS n FROM search_token_docs WHERE workspace_id = 'wsp_x'").n, 0);
+  assert.equal(w.counted.size, 5);
+  assert.ok([...w.counted.values()].every((n) => n === 1), "each exactly once");
+  assert.equal(w.batchesSeen.reduce((n, b) => n + b.countReads, 0), 25000, "count reads total the dead rows' tokens, once");
+  assert.equal(w.selectionReads(), 0, "the sweep's reads read no token entry");
+});
+
+test("review B7: the purge and sweep selections read no search_tokens entry (query plan)", () => {
+  const world = world0();
+  const plan = (q) => W.all(world, "EXPLAIN QUERY PLAN " + q.replace(/\?1/g, "'x'")).map((r) => r.detail).join("\n");
+  const sw = lib.sweepReadSql();
+  for (const [name, q] of [["purge", lib.PURGE_SELECT_SQL], ["sweep A", sw.aDocs], ["sweep C", sw.cDocs], ["sweep B", sw.bDocs]])
+    assert.doesNotMatch(plan(q), /search_tokens\b|\bs USING/, name);
+});
+
+test("review B7 (iv): purge, restore, a writer takes over a row holding the lifecycle's upper bound, and ends exact", async () => {
+  const world = world0();
+  project(world, "p_iv", { due: true });
+  W.seedDoc(world, { project: "p_iv", artifact: "iv_1" });
+  const env = envOf(world);
+  W.run(world, "UPDATE projects SET deleted_at = NULL, purge_at = NULL WHERE id = 'p_iv'");
+  const text = Array.from({ length: 300 }, (_, i) => "w" + i).join(" ");
+  await quiet(() => lib.indexSearchJobs(env, [{ artifactId: "iv_1", projectId: "p_iv", revisionId: "rev_iv_1", text, textBytes: text.length }]));
+  W.run(world, "UPDATE projects SET deleted_at = 1, purge_at = 1 WHERE id = 'p_iv'");
+  await quiet(() => lib.purgeDueProjects(env, { projectId: "p_iv", rowBudget: 100 }));
+  const leased = W.docRow(world, "iv_1");
+  assert.match(leased.writer, /^purge:/);
+  assert.ok(leased.term_count >= W.tokensOf(world, "iv_1").length, "an upper bound");
+  W.run(world, "UPDATE projects SET deleted_at = NULL, purge_at = NULL WHERE id = 'p_iv'");
+  const { result } = await quiet(() => lib.indexSearchJobs(env, [{ artifactId: "iv_1", projectId: "p_iv", revisionId: "rev_iv_1", text, textBytes: text.length }]));
+  assert.equal(result.completed, 1);
+  const row = W.docRow(world, "iv_1");
+  assert.equal(row.term_count, 300);
+  assert.equal(W.tokensOf(world, "iv_1").length, 300);
+  assertExact(world); assertClaims(world);
+});
+
+test("review B8: an error in the token purge step logs search_purge_failed and moves to the next project", async () => {
+  const world = world0();
+  project(world, "p_e1", { due: true });
+  project(world, "p_e2", { due: true });
+  W.run(world, "UPDATE projects SET purge_at = 0 WHERE id = 'p_e1'");
+  seedTokens(world, { project: "p_e1", workspace: "wsp_a", owner: "hum_a", docs: 2, tokens: 3 });
+  seedTokens(world, { project: "p_e2", workspace: "wsp_a", owner: "hum_a", docs: 2, tokens: 3 });
+  let failed = false;
+  world.before = ({ kind, q }) => { if (!failed && kind === "all" && /WHERE d\.project_id = \?1/.test(q)) { failed = true; throw Object.assign(new Error("synthetic"), { code: "synthetic_failure" }); } };
+  const { result, events } = await quiet(() => lib.purgeDueProjects(envOf(world), { scheduledTime: 0 }));
+  world.before = null;
+  assert.deepEqual(events.filter((e) => e.event === "search_purge_failed"), [{ event: "search_purge_failed", projectId: "p_e1", code: "synthetic_failure" }]);
+  assert.deepEqual(result.finished, ["p_e2"]);
+  assert.equal(purgedAt(world, "p_e1"), null, "not marked purged");
+  assert.equal(W.one(world, "SELECT COUNT(*) AS n FROM artifacts WHERE project_id = 'p_e1'").n, 2, "its STEPS did not run");
+  // The next run retries it.
+  await quiet(() => lib.purgeDueProjects(envOf(world), { scheduledTime: 0 }));
+  assert.ok(purgedAt(world, "p_e1"));
+  assertExact(world);
+});
+
+test("review B8: the immediate purge of one project still throws", async () => {
+  const world = world0();
+  project(world, "p_e3", { due: true });
+  seedTokens(world, { project: "p_e3", workspace: "wsp_a", owner: "hum_a", docs: 1, tokens: 3 });
+  world.before = ({ kind, q }) => { if (kind === "all" && /WHERE d\.project_id = \?1/.test(q)) throw Object.assign(new Error("synthetic"), { code: "synthetic_failure" }); };
+  await assert.rejects(quiet(() => lib.purgeDueProjects(envOf(world), { projectId: "p_e3" })), (e) => e.code === "synthetic_failure");
+  world.before = null;
+  assert.equal(purgedAt(world, "p_e3"), null);
 });

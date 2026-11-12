@@ -39,7 +39,7 @@ export function mkWorld() {
   });
   world.DB = {
     prepare: (q) => stmt(q),
-    batch: (list) => call("batch", { qs: list.map((s) => s.q), n: list.length, tokenValues: list.reduce((n, s) => n + tokenValues(s.p), 0) }, () => {
+    batch: (list) => call("batch", { qs: list.map((s) => s.q), ps: list.map((s) => s.p), n: list.length, tokenValues: list.reduce((n, s) => n + tokenValues(s.p), 0) }, () => {
       sql.exec("BEGIN");
       try { const out = list.map((s) => execOne(s.q, s.p)); sql.exec("COMMIT"); return out; } catch (e) { sql.exec("ROLLBACK"); throw e; }
     }),

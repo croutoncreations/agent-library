@@ -222,7 +222,15 @@ export async function purgeDueProjects(env, { projectId, rowBudget = 5000, blobB
     for (;;) {
       if (rowBudget <= 0) return out;
       if (!await stillDue()) return out;
-      const r = await purgeSearchTokensRound(env, id, { now, purgeNonce: searchNonce, rowBudget });
+      let r;
+      try { r = await purgeSearchTokensRound(env, id, { now, purgeNonce: searchNonce, rowBudget }); }
+      catch (e) {
+        // The immediate purge of one project reports its error; the cron moves on (this project stays due, untouched
+        // by STEPS, and is retried next run).
+        if (projectId) throw e;
+        console.error(JSON.stringify({ event: "search_purge_failed", projectId: id, code: e?.code ?? "error" }));
+        continue projects;
+      }
       if (!r.selected) break;
       const k = r.tokens + r.docs;
       rowBudget -= k; out.rows += k;

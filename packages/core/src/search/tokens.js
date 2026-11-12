@@ -376,6 +376,8 @@ export function stableReadSql(n) {
   WHERE ${pairs} ORDER BY d.doc_id, s.token LIMIT ?${2 * n + 1}`;
 }
 
+/** A row at '' held by a writer (not a lifecycle lease): its term_count says nothing about its tokens. */
+const WRITER_HELD = "revision_id = '' AND substr(writer, 1, 6) <> 'purge:'";
 // Lifecycle deletes (purge, sweep paths, and K/Kc for a writer's oversize path). `eligible` is a named fragment.
 const lifecycleCache = new Map();
 /** { L, K, Kc, X, Xc } for one eligibility fragment (named placeholders). */
@@ -384,7 +386,12 @@ export function lifecycleStatements(eligible) {
   if (!s) {
     const held = "AND revision_id = '' AND writer = ?PN";
     s = Object.freeze({
-      L: named(`UPDATE search_token_docs SET revision_id = '', writer = ?PN, gen = gen + 1
+      // L counts a row's tokens once, when it takes the row from a writer (a dead writer may have added tokens beyond
+      // term_count). Complete rows carry an exact term_count and purge-held rows an upper bound (tokens only shrink
+      // under a lifecycle lease, and term_count is never lowered), so the selections never read search_tokens.
+      L: named(`UPDATE search_token_docs SET revision_id = '', writer = ?PN, gen = gen + 1,
+  term_count = CASE WHEN ${WRITER_HELD} THEN (SELECT COUNT(*) FROM (SELECT 1 FROM search_tokens WHERE doc_id = ?D LIMIT ${SET_READ_LIMIT}))
+                    ELSE term_count END
   WHERE doc_id = ?D AND workspace_id = ?W AND owner_id = ?O AND ${eligible}`),
       K: named(`DELETE FROM search_tokens WHERE doc_id = ?D AND token IN (SELECT token FROM search_tokens WHERE doc_id = ?D LIMIT ?CHUNK)
   AND EXISTS (SELECT 1 FROM search_token_docs WHERE doc_id = ?D AND workspace_id = ?W AND owner_id = ?O
@@ -1232,14 +1239,15 @@ export const runTally = (run) => ({ run: run.id, calls: run.calls, completed: ru
 const PURGE_DOCS_PER_ROUND = 20;
 const LIFECYCLE_CHUNK_MAX = 5000;
 /**
- * Tokens left in a selected row: exact (term_count) for a complete row, whose tokens cannot change; for a row at ''
- * (a purge lease, a dead writer) a count bounded by ?CAP, read only for those rows (CASE is evaluated lazily).
+ * Tokens left in a selected row, read from the row alone: term_count (exact for a complete row, an upper bound for a
+ * purge-held row), or NULL (unknown) for a row a writer holds, which L counts when it takes it.
  */
-const tokensLeftSql = (cap) => `CASE WHEN d.revision_id <> '' THEN d.term_count
-  ELSE (SELECT COUNT(*) FROM (SELECT 1 FROM search_tokens s WHERE s.doc_id = d.doc_id LIMIT ${cap})) END`;
+const TOKENS_LEFT = `CASE WHEN d.revision_id = '' AND substr(d.writer, 1, 6) <> 'purge:' THEN NULL ELSE d.term_count END`;
+/** A selected row's token count, or Infinity when unknown (a writer's row: its chunk is what is left of the share). */
+const tokensLeft = (d) => d.n === null || d.n === undefined ? Infinity : Number(d.n);
 const DOC_FIELDS = "d.doc_id, d.workspace_id, d.owner_id, d.project_id, d.artifact_id";
 /** The purge's per-round selection (search_token_docs_project). */
-export const PURGE_SELECT_SQL = `SELECT ${DOC_FIELDS}, ${tokensLeftSql(LIFECYCLE_CHUNK_MAX + 1)} AS n FROM search_token_docs d WHERE d.project_id = ?1 LIMIT ${PURGE_DOCS_PER_ROUND}`;
+export const PURGE_SELECT_SQL = `SELECT ${DOC_FIELDS}, ${TOKENS_LEFT} AS n FROM search_token_docs d WHERE d.project_id = ?1 LIMIT ${PURGE_DOCS_PER_ROUND}`;
 /** The purge step's eligibility: purge.js STILL_DUE with ?P (project) and ?NOW. */
 export const PURGE_ELIGIBLE = "EXISTS (SELECT 1 FROM projects d WHERE d.id = ?P AND d.deleted_at IS NOT NULL AND d.purged_at IS NULL AND d.purge_at <= ?NOW)";
 
@@ -1252,7 +1260,7 @@ function chunkInOrder(docs, total, values) {
   const out = [];
   let left = total;
   for (const d of docs) {
-    const n = Number(d.n) || 0;
+    const n = tokensLeft(d);
     if (n > 0 && left <= 0) continue;
     const chunk = Math.min(n, left);
     left -= chunk;
@@ -1299,8 +1307,8 @@ const A_WINDOW = `SELECT purged_at, id FROM projects WHERE purged_at IS NOT NULL
 const C_WINDOW = `SELECT id FROM workspaces WHERE status = 'deleting' AND id > ${st("sweep_workspace_after")} ORDER BY id LIMIT ${SWEEP_WINDOW.C}`;
 const B_WINDOW = `SELECT doc_id FROM search_token_docs WHERE doc_id > ${st("sweep_doc_after")} ORDER BY doc_id LIMIT ${SWEEP_WINDOW.B}`;
 /** The sweep's one read batch (exported for the query-plan test). Every window statement returns exactly one row. */
-export function sweepReadSql(cap) {
-  const docs = (where) => `SELECT ${DOC_FIELDS}, ${tokensLeftSql(cap)} AS n FROM search_token_docs d WHERE ${where} LIMIT ${SWEEP_PATH_DOCS + 1}`;
+export function sweepReadSql() {
+  const docs = (where) => `SELECT ${DOC_FIELDS}, ${TOKENS_LEFT} AS n FROM search_token_docs d WHERE ${where} LIMIT ${SWEEP_PATH_DOCS + 1}`;
   return {
     state: "SELECT sweep_doc_after, sweep_purged_after, sweep_workspace_after FROM search_tokens_state WHERE id = 1",
     aWindow: `WITH w AS (${A_WINDOW}) SELECT (SELECT purged_at FROM w ORDER BY purged_at DESC, id DESC LIMIT 1) AS end_t,
@@ -1324,9 +1332,7 @@ export async function sweepSearchTokenOrphans(env, { scheduledTime, writes = sea
   if (writes <= 0) return tally;
   const t = typeof scheduledTime === "number" && Number.isFinite(scheduledTime) ? scheduledTime : Date.now();
   const order = SWEEP_ORDERS[Math.floor(t / SWEEP_ROTATION_MS) % 3];
-  // Tokens a document can lose in one batch at this budget, plus one to tell "more" apart.
-  const cap = Math.max(1, Math.min(LIFECYCLE_CHUNK_MAX, Math.floor((writes - SWEEP_CURSOR_ROWS - SWEEP_DOC_ROWS) / 2))) + 1;
-  const q = sweepReadSql(cap);
+  const q = sweepReadSql();
   const names = ["state", "aWindow", "aDocs", "cWindow", "cDocs", "bWindow", "bDocs"];
   const res = await env.DB.batch(names.map((n) => env.DB.prepare(q[n])));
   tally.calls++;
@@ -1355,7 +1361,7 @@ export async function sweepSearchTokenOrphans(env, { scheduledTime, writes = sea
     const path = paths[p];
     const calls = Math.max(0, callsLeft - 2 * later);
     let rowShare = Math.floor(rowsLeft / (later + 1));
-    const queue = path.work.map((d) => ({ ...d, left: Number(d.n) || 0, done: false }));
+    const queue = path.work.map((d) => ({ ...d, left: tokensLeft(d), done: false }));
     let used = 0, stop = false;
     while (!stop && used < calls && queue.some((d) => !d.done)) {
       const batch = [];
