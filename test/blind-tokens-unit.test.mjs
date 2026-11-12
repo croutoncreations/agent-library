@@ -140,6 +140,9 @@ test("test 7: heap: a 10 MiB text extracted flat and dropped is released (child 
   const child = spawnSync(process.execPath, ["--expose-gc", "--input-type=module", "-e", `
     import { loadWorker } from "./test/load-worker.mjs";
     const lib = await loadWorker({ "search/tokens.js": ["extractSearchTermsFlat"] });
+    // Warm the scanner on the same kind of text first: the first large scan in an isolate keeps a fixed ~1.3 MiB (the
+    // same for 2, 10, 20 and 40 MiB texts, and nothing on a second scan), which is per isolate, not the text.
+    { const p = []; for (let i = 0; p.length < 20000; i++) p.push("t" + i.toString(36).padStart(6, "0") + " "); lib.extractSearchTermsFlat(p.join(""), 20000); }
     let text = "";
     { const parts = []; for (let i = 0; parts.length * 8 < 10 * 1048576; i++) parts.push("t" + (i % 50000).toString(36).padStart(6, "0") + " "); text = parts.join(""); }
     if (text.length !== 10 * 1048576) throw new Error("fixture is not 10 MiB");
@@ -1187,7 +1190,7 @@ test("review R2-1: lone surrogates split words lazily: 300,000 short words with 
   // Count the pieces the scanner consumes by counting folds (one per candidate piece).
   let folds = 0;
   const fold = lib.u61FoldTokenBounded;
-  const counting = (w) => { folds++; return fold(w); };
+  const counting = (w, max) => { folds++; return fold(w, max); };   // short words: one piece, so one fold per word
   const r = lib.extractSearchTermsWith(text, 10, counting);
   assert.equal(r.terms.length, 10);
   assert.equal(r.truncated, true);
@@ -1382,4 +1385,118 @@ test("review R2-5: a re-plan whose T1u and T1r change nothing: unchanged when an
     void before;
     assertIdle();
   }
+});
+
+// --- Words scanned in bounded pieces (no unbounded regular-expression match) -------------------------------------------
+let piecesLib = null;
+const pieces = async () => (piecesLib ??= await loadWorker({ "search/tokens.js": ["U61_TOKEN_WELLFORMED", "extractSearchTerms", "scanSearchWords", "SEARCH_SCAN_PIECE_UNITS"] }));
+/** Word boundaries [start, end) by the unbounded pattern (fixtures small enough for it). */
+const unboundedWords = (lib, text) => Array.from(text.matchAll(lib.U61_TOKEN_WELLFORMED), (m) => [m.index, m.index + m[0].length]);
+
+test("pieces: one unbroken 10 Mi-unit word (Ω, 日, astral pairs) scans without a throw and yields no term, packed and flat", async () => {
+  const lib = await r2();
+  for (const [label, text] of [["omega", "\u03a9".repeat(10 * MiB)], ["cjk", "\u65e5".repeat(10 * MiB)], ["astral", "\u{20000}".repeat(5 * MiB)]]) {
+    assert.equal(text.length, 10 * MiB, label);
+    const plain = lib.extractSearchTerms(text, 20000);
+    assert.deepEqual([plain.terms.length, plain.truncated], [0, false], label);
+    const flat = lib.extractSearchTermsFlat(text, 20000);
+    assert.deepEqual([flat.count, flat.truncated], [0, false], label);
+  }
+});
+
+test("pieces: memory of scanning one unbroken 2 Mi-unit word stays within a small fixed amount (child, --expose-gc)", () => {
+  const child = spawnSync(process.execPath, ["--expose-gc", "--input-type=module", "-e", `
+    import { loadWorker } from "./test/load-worker.mjs";
+    const lib = await loadWorker({ "search/tokens.js": ["extractSearchTermsWith", "u61FoldTokenBounded"] });
+    const text = "\\u03a9".repeat(2 * 1048576); text.charCodeAt(0);
+    global.gc(); const rss0 = process.memoryUsage().rss, heap0 = process.memoryUsage().heapUsed;
+    let peakRss = rss0, peakHeap = heap0;
+    const sample = () => { const m = process.memoryUsage(); peakRss = Math.max(peakRss, m.rss); peakHeap = Math.max(peakHeap, m.heapUsed); };
+    const fold = (w, max) => { sample(); return lib.u61FoldTokenBounded(w, max); };
+    const r = lib.extractSearchTermsWith(text, 20000, fold);
+    sample();
+    console.log("LONGWORD " + JSON.stringify({ terms: r.terms.length, rss: peakRss - rss0, heap: peakHeap - heap0, maxRSS: process.resourceUsage().maxRSS * 1024 - rss0 }));
+  `], { cwd: ROOT, encoding: "utf8", timeout: 120000 });
+  assert.equal(child.status, 0, child.stderr);
+  const r = JSON.parse(child.stdout.split("LONGWORD ")[1]);
+  console.log("LONGWORD_MEMORY " + JSON.stringify(r));
+  assert.equal(r.terms, 0);
+  assert.ok(r.rss < 8 * MiB, `peak RSS while scanning grew by ${r.rss} bytes`);
+  assert.ok(r.heap < 8 * MiB, `peak heap while scanning grew by ${r.heap} bytes`);
+});
+
+test("pieces: folding piece by piece equals folding the whole word; dead words stay dead", async () => {
+  const lib = await r2();
+  // 100 letters then 3 Mi dropped marks: the marks fold to nothing, the term is the 100 letters.
+  const letters = "Ab".repeat(50);
+  assert.deepEqual(lib.extractSearchTerms(letters + "\u0301".repeat(3 * MiB), 10).terms, [letters.toLowerCase()]);
+  assert.deepEqual(lib.extractSearchTerms("a".repeat(201) + " ok", 10).terms, ["ok"]);
+  assert.deepEqual(lib.extractSearchTerms("a".repeat(200) + " ok", 10).terms, ["a".repeat(200), "ok"]);
+  // Folding that shrinks across a piece boundary (marks dropped) and folding to 200 exactly at a boundary.
+  const mixed = ("e\u0301").repeat(150);            // 300 units folding to 150
+  assert.deepEqual(lib.extractSearchTerms(mixed, 10).terms, ["e".repeat(150)]);
+  assert.deepEqual(lib.extractSearchTerms("\u00c9".repeat(4096) + " x", 10).terms, ["x"], "folds past 200: no term");
+});
+
+test("pieces: word boundaries equal the unbounded pattern at and around the piece size, including astral pairs at the cut", async () => {
+  const lib = await pieces();
+  const P = lib.SEARCH_SCAN_PIECE_UNITS;
+  assert.ok(Number.isInteger(P) && P > 0 && P <= 4096, `piece ${P}`);
+  const fixtures = [];
+  for (const n of [P - 1, P, P + 1, 2 * P - 1, 2 * P, 2 * P + 1, 4095, 4096, 4097]) {
+    fixtures.push("a".repeat(n), "\u03a9".repeat(n) + " z", "x " + "\u65e5".repeat(n));
+    // An astral pair straddling where a naive cut at P units would fall.
+    fixtures.push("b".repeat(n - 1) + "\u{1d400}" + "c".repeat(3), "q" + "\u{1d400}".repeat(n) + ". r");
+  }
+  // A word ending exactly at a piece boundary, then a separator, then a word.
+  fixtures.push("w".repeat(P) + " next", "w".repeat(2 * P) + "\u0301" + " next", "\u0301".repeat(P + 3) + "lead");
+  for (const t of fixtures) {
+    const got = [];
+    lib.scanSearchWords(t, (s, e) => { got.push([s, e]); return true; });
+    assert.deepEqual(got, unboundedWords(lib, t), `fixture of length ${t.length}`);
+  }
+});
+
+test("pieces: seeded random strings have the same word boundaries piecewise as with the unbounded pattern", async () => {
+  const lib = await pieces();
+  let seed = 4242;
+  const rnd = (n) => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return (seed >>> 8) % n; };
+  const alphabet = [" ", ".", "\n", "\u3002", "\u0301", "\u0323", "\u0331", "\u0332", "a", "Z", "\u00e9", "\u03a9", "\u65e5", "\u05e9\u05b8", "7",
+    "\u{1d400}", "\u{1f600}", "\u{20000}", "\uD800", "\uDC00", "\uDBFF"];
+  for (let i = 0; i < 4000; i++) {
+    let t = "";
+    for (let k = 0, n = 1 + rnd(40); k < n; k++) t += alphabet[rnd(alphabet.length)];
+    const got = [];
+    lib.scanSearchWords(t, (s, e) => { got.push([s, e]); return true; });
+    assert.deepEqual(got, unboundedWords(lib, t), JSON.stringify(t));
+  }
+});
+
+test("pieces: a scan inside another scan (re-entrant, shared patterns) gives independent, correct results", async () => {
+  const lib = await pieces();
+  const outer = "alpha beta gamma delta", inner = "one two three";
+  const outerWords = [], innerRuns = [];
+  lib.scanSearchWords(outer, (s, e) => {
+    outerWords.push(outer.slice(s, e));
+    const w = [];
+    lib.scanSearchWords(inner, (s2, e2) => { w.push(inner.slice(s2, e2)); return true; });
+    innerRuns.push(w.join(","));
+    return true;
+  });
+  assert.deepEqual(outerWords, ["alpha", "beta", "gamma", "delta"]);
+  assert.deepEqual(innerRuns, Array(4).fill("one,two,three"));
+  // Back to back, after a scan that stopped early (cap), the next scan starts at the beginning of its own text.
+  assert.deepEqual(lib.extractSearchTerms("x1 x2 x3 x4", 2).terms, ["x1", "x2"]);
+  assert.deepEqual(lib.extractSearchTerms("y1 y2", 5).terms, ["y1", "y2"]);
+});
+
+test("pieces: timing (reported): 1 MiB prose and a capped 10 MiB document", async () => {
+  const lib = await r2();
+  const vocab = ["alpha", "Beta", "café", "naïve", "Zürich", "straße", "日本", "テスト", "мой", "λόγος", "x1", "2026"];
+  let prose = "", s = 7;
+  while (prose.length < MiB) { s = (s * 1103515245 + 12345) & 0x7fffffff; prose += vocab[(s >>> 8) % vocab.length] + " " + ((s >>> 3) % 9973).toString(36) + " "; }
+  const big = words(1300000, "t").join(" ").slice(0, 10 * MiB);
+  const time = (fn) => { const t = performance.now(); fn(); return Math.round(performance.now() - t); };
+  const out = { prose_1mib_ms: time(() => lib.extractSearchTerms(prose, 1e9)), capped_10mib_ms: time(() => lib.extractSearchTermsFlat(big, 20000)) };
+  console.log("PIECES_TIMING " + JSON.stringify(out));
 });

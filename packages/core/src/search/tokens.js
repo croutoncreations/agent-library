@@ -127,8 +127,9 @@ function scanTerms(text, cap, add, fold = u61FoldTokenBounded) {
  * The index's token rule (unicode61.js U61_TOKEN) with surrogate code units added to both of its excluded classes, so
  * a match never contains a surrogate unit. With the "u" flag a valid surrogate pair is one code point, matched as a
  * whole by the classes (a supplementary code point is never a surrogate unit), so on well-formed text every match is
- * unchanged. A lone surrogate is neither: it separates tokens, as SQLite's U+FFFD replacement does. No copy, no
- * sub-match array and no well-formedness helper: matching is lazy, so the cap stops the work.
+ * unchanged. A lone surrogate is neither: it separates tokens, as SQLite's U+FFFD replacement does. The scanner never
+ * runs this pattern itself (one unbounded match costs regex stack in proportion to the word, and overflows on a few Mi
+ * units): it runs the bounded head and continuation patterns below, made of this pattern's own two classes.
  */
 export const U61_TOKEN_WELLFORMED = new RegExp(U61_TOKEN.source.replaceAll("[^", "[^\\u{d800}-\\u{dfff}"), U61_TOKEN.flags);
 /**
@@ -136,23 +137,91 @@ export const U61_TOKEN_WELLFORMED = new RegExp(U61_TOKEN.source.replaceAll("[^",
  * after scanning a large text the text itself would stay reachable. One match on an empty string replaces them.
  */
 const EMPTY_MATCH = /(?:)/;
-const forgetLastMatch = () => { EMPTY_MATCH.exec(""); };
+const forgetLastMatch = () => {
+  EMPTY_MATCH.exec("");
+  WORD_HEAD.lastIndex = 0;
+  WORD_MORE.lastIndex = 0;
+};
+/**
+ * Longest regular-expression match the scanner runs, in code points: at most 2,048 code units (a piece of astral
+ * pairs). Time and peak memory were
+ * the same for 256 to 4,096 units (Node 24: 1 MiB of prose about 26 ms, one 10 Mi-unit word about 160 ms); the regex
+ * engine's stack grows with the match, so the smaller end of that flat range is taken.
+ */
+export const SEARCH_SCAN_PIECE_UNITS = 1024;
+/** The token pattern's two classes, as written in U61_TOKEN_WELLFORMED: `[^…first][^…rest]*`. */
+function tokenClasses(source) {
+  const cut = source.indexOf("][^");
+  if (!source.startsWith("[^") || !source.endsWith("]*") || cut < 0 || source.indexOf("][^", cut + 1) >= 0)
+    throw new Error("search token pattern is not one first class followed by one repeated class");
+  return { first: source.slice(0, cut + 1), rest: source.slice(cut + 1, -1) };
+}
+const TOKEN_CLASSES = tokenClasses(U61_TOKEN_WELLFORMED.source);
+/** A word's first piece: the next word start, then at most one piece. Global: it searches forward from lastIndex. */
+const WORD_HEAD = new RegExp(`${TOKEN_CLASSES.first}${TOKEN_CLASSES.rest}{0,${SEARCH_SCAN_PIECE_UNITS - 1}}`, "gu");
+/** A continuation piece of the same word: sticky, so it matches only exactly where the previous piece ended. */
+const WORD_MORE = new RegExp(`${TOKEN_CLASSES.rest}{1,${SEARCH_SCAN_PIECE_UNITS}}`, "yu");
+/**
+ * Calls onWord(start, end, term) for each word in text order, where [start, end) is exactly a U61_TOKEN_WELLFORMED
+ * match: the greedy run `first rest*` is the head piece followed by continuation pieces while the rest class goes on,
+ * and with the "u" flag no piece ends inside a surrogate pair. onWord returning false stops the scan.
+ *
+ * With `fold`, term is the folded word or null: fold(piece, max) folds one piece, or returns null if its result would
+ * be longer than max. Folding is per code point (each one is folded, or dropped as a mark, on its own), so folding the
+ * pieces and joining equals folding the whole word. The word is never concatenated: the term grows to at most
+ * SEARCH_TERM_UNITS_MAX units, and once it would pass that the word is dead and its remaining pieces are only matched
+ * and skipped. Memory per word: one piece plus 200 units. Without fold, term is null.
+ *
+ * Every match sets lastIndex itself first: the patterns are shared by every scan in the isolate (and a scan may run
+ * inside another's onWord), so their position is never trusted. The caller resets the RegExp statics afterwards.
+ */
+function scanWordsIn(text, fold, onWord) {
+  let pos = 0;
+  for (;;) {
+    WORD_HEAD.lastIndex = pos;
+    const head = WORD_HEAD.exec(text);
+    if (!head) return;
+    const start = head.index;
+    let end = WORD_HEAD.lastIndex;
+    let term = fold ? fold(head[0], SEARCH_TERM_UNITS_MAX) : null;
+    for (;;) {
+      WORD_MORE.lastIndex = end;
+      if (term === null) {
+        if (!WORD_MORE.test(text)) break;
+        end = WORD_MORE.lastIndex;
+        continue;
+      }
+      const more = WORD_MORE.exec(text);
+      if (!more) break;
+      end = WORD_MORE.lastIndex;
+      const folded = fold(more[0], SEARCH_TERM_UNITS_MAX - term.length);
+      term = folded === null ? null : term + folded;
+    }
+    pos = end;
+    if (onWord(start, end, term) === false) return;
+  }
+}
+/** Word boundaries: onWord(start, end) for each word of the index's token rule, in order; false stops (tests). */
+export function scanSearchWords(text, onWord) {
+  try { scanWordsIn(text, null, onWord); } finally { forgetLastMatch(); }
+}
 function scanTermsIn(text, cap, add, fold) {
   const seen = new Set();
-  for (const m of text.matchAll(U61_TOKEN_WELLFORMED)) {
-    const t = fold(m[0]);
-    if (!t || seen.has(t)) continue;
-    if (seen.size >= cap) return true;
+  let truncated = false;
+  scanWordsIn(text, fold, (_start, _end, t) => {
+    if (!t || seen.has(t)) return true;
+    if (seen.size >= cap) { truncated = true; return false; }
     seen.add(t);
     add(t);
-  }
-  return false;
+    return true;
+  });
+  return truncated;
 }
 /** Distinct index terms of a text, at most `cap` (tests and small callers; runs use the packed forms). */
 export function extractSearchTerms(text, cap) {
   return extractSearchTermsWith(text, cap, u61FoldTokenBounded);
 }
-/** extractSearchTerms with the fold function given (tests count the pieces the scanner consumes through it). */
+/** extractSearchTerms with the piece fold given (fold(piece, max), as u61FoldTokenBounded; tests count through it). */
 export function extractSearchTermsWith(text, cap, fold) {
   const terms = [];
   const truncated = scanTerms(text, cap, (t) => terms.push(t), fold);
