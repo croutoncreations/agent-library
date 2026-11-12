@@ -245,12 +245,16 @@ test("shredded workspaces get no new key; lookup by id refuses a shredded row, a
   const base = { DB, CONTENT_MASTER_KEY_VERSION: "1", CONTENT_MASTER_KEY_V1: masterSecret() };
   const a = await lib.workspaceDataKey(request(base), WS_A);
   const b = await lib.workspaceDataKey(request(base), WS_B);
-  await assert.rejects(lib.dataKeyById(request(base), WS_B, a.keyId), (e) => e.code === "key_workspace_mismatch");
+  // Another workspace's key id and an unknown key id give the client the same answer; the log tells them apart.
+  const notFound = (e) => e.status === 500 && e.code === "key_not_found" && e.message === "The workspace key does not exist";
+  let logs = await captureErrors(() => assert.rejects(lib.dataKeyById(request(base), WS_B, a.keyId), notFound));
+  assert.ok(logs.some((l) => JSON.parse(l).event === "key_workspace_mismatch"), "the log keeps the mismatch");
   // Also when the key is already in this request's memo.
   const r = request(base);
   await lib.dataKeyById(r, WS_A, a.keyId);
-  await assert.rejects(lib.dataKeyById(r, WS_B, a.keyId), (e) => e.code === "key_workspace_mismatch");
-  await assert.rejects(lib.dataKeyById(request(base), WS_A, "wk_unknown"), (e) => e.code === "key_not_found");
+  await assert.rejects(lib.dataKeyById(r, WS_B, a.keyId), notFound);
+  logs = await captureErrors(() => assert.rejects(lib.dataKeyById(request(base), WS_A, "wk_unknown"), notFound));
+  assert.ok(logs.some((l) => JSON.parse(l).event === "key_not_found") && !logs.some((l) => l.includes("key_workspace_mismatch")));
 
   sql.prepare("UPDATE workspace_keys SET shredded_at = ? WHERE key_id = ?").run(Date.now(), a.keyId);
   await assert.rejects(lib.dataKeyById(request(base), WS_A, a.keyId), (e) => e.code === "key_shredded");

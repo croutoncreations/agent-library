@@ -184,20 +184,22 @@ export async function workspaceDataKey(env, workspaceId) {
 
 /**
  * The data key a stored object names, for decrypting: { workspaceId, keyId, masterVersion, key }. workspaceId must
- * come from the server-side project, never from the stored object. Refuses an unknown key id (500 key_not_found), a
- * key of another workspace than expected (500 key_workspace_mismatch) and a shredded key (410 key_shredded). Needs no
+ * come from the server-side project, never from the stored object. Refuses an unknown key id and a key of another
+ * workspace than expected with the same client answer (500 key_not_found, so a client cannot tell whether a key id
+ * exists elsewhere; the log tells them apart), and a shredded key (410 key_shredded). Needs no
  * current configuration beyond the row's master key: whether to decrypt is decided by the stored object.
  */
 export async function dataKeyById(env, workspaceId, keyId) {
   if (typeof workspaceId !== "string" || !workspaceId || typeof keyId !== "string" || !keyId) throw new HttpError(500, "invalid_key_id", "A workspace id and key id are required");
   const row = await env.DB.prepare(`SELECT ${ROW_COLUMNS} FROM workspace_keys WHERE key_id = ?`).bind(keyId).first();
+  const notFound = () => new HttpError(500, "key_not_found", "The workspace key does not exist");
   if (!row) {
     logKeyEvent("key_not_found", { workspaceId, keyId });
-    throw new HttpError(500, "key_not_found", "The workspace key does not exist");
+    throw notFound();
   }
   if (row.workspace_id !== workspaceId) {
     logKeyEvent("key_workspace_mismatch", { workspaceId, keyId, rowWorkspaceId: row.workspace_id });
-    throw new HttpError(500, "key_workspace_mismatch", "The workspace key does not belong to this workspace");
+    throw notFound();
   }
   return unwrapRow(env, row);
 }
