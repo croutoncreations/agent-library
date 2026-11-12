@@ -98,6 +98,12 @@ function servers(origin, appConnect = false) {
   cache.set(cacheKey, s);
   return s;
 }
+// What disabling an app client stops for its existing publishers: "writes" (recommended) or "all". Owner decision.
+const DISABLED_CLIENT_BLOCKS = "writes";
+/** Does the publisher row's app client allow this request? (A disabled client blocks writes, or everything under "all".) */
+function clientAllows(p, write) { return p.client_disabled === null || (DISABLED_CLIENT_BLOCKS === "writes" && !write); }
+/** The same rule as SQL over the app_clients row aliased `ac`. */
+function clientLiveSql(write) { return write || DISABLED_CLIENT_BLOCKS === "all" ? "ac.disabled_at IS NULL" : "1"; }
 async function livePublisher(env, p) {
   if (!p || typeof p.publisher_id !== "string" || !/^pub_[A-Za-z0-9_-]{10,64}$/.test(p.publisher_id)) return null;
   const row = await env.DB.prepare(
@@ -108,6 +114,7 @@ async function livePublisher(env, p) {
   if (!row) return null;
   if (row.revoked_at !== null) return { ...row, revoked: true };
   if (row.token_epoch !== p.epoch) return null;
+  if (!clientAllows(row, false)) return null;
   return row;
 }
 function toClient(location, headers, clientHost) {
@@ -1081,4 +1088,4 @@ function statusPage(title, msg, { status = 200, icon = "alert", actions = [], he
     .map((a) => `<a class="btnlink${a.primary ? " primary" : ""}" href="${esc(a.href)}">${esc(a.label)}</a>`).join("");
   return page(title, cxShell(`<div class="state${icon === "alert" ? " off" : icon === "check" ? " on" : " neutral"}"><span class="big" aria-hidden="true">${cxIcon(icon)}</span><h1>${esc(title)}</h1><p class="lede">${esc(msg)}</p></div>${links ? `<div class="bar">${links}</div>` : ""}`, false), headers, status);
 }
-export { SCOPES, _servers, handleOAuthHost, liveConnection, livePublisher, originFor, servers, statusPage };
+export { DISABLED_CLIENT_BLOCKS, SCOPES, _servers, clientAllows, clientLiveSql, handleOAuthHost, liveConnection, livePublisher, originFor, servers, statusPage };

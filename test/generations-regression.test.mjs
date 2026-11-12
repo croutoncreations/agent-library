@@ -5,6 +5,11 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { startAppConnectServer } from "./fixtures/app-connect-harness.mjs";
 import { SERVER_PORTS } from "./ports.mjs";
+import { execFileSync } from "node:child_process";
+import { ROOT, LOCAL_CONFIG } from "./helpers.mjs";
+
+const sqlRows = (h, q) => JSON.parse(execFileSync("wrangler", ["d1", "--config", LOCAL_CONFIG, "execute", "DB", "--local", "--persist-to", h.dir, "--json", "--command", q],
+  { cwd: ROOT, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], env: { ...process.env, CI: "1", NO_COLOR: "1" } }))[0].results;
 
 const sha = (s) => createHash("sha256").update(s).digest("hex");
 const bytes = (s) => Buffer.byteLength(s, "utf8");
@@ -261,6 +266,9 @@ test("generation regressions: TTL scope, committed retention, auth/epoch, closur
     assert.equal(revoke.status, 200, JSON.stringify(revoke.body));
     assert.equal((await commit(tokA, "g_reg_three")).status, 401, "revoked publisher");
     assert.equal((await begin(tokA, gen("g_reg_after_revoke", 5, null))).status, 401);
+    // Abandon is a fenced write too: refused after revoke, and the staged generation is left as it was.
+    assert.equal((await call(tokA, "DELETE", "/publisher/generations/g_reg_three")).status, 401, "abandon after revoke");
+    assert.equal(sqlRows(h, "SELECT state FROM publisher_generations WHERE id = 'g_reg_three'")[0].state, "staged", "generation stays staged");
     // B unaffected and its generation still committable (scope independent).
     await putAll(B.access_token, bg, { headers: H25 });
     const cb1 = await commit(B.access_token, "g_reg_b1", { headers: H25 });

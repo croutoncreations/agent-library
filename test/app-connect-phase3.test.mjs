@@ -427,17 +427,37 @@ test("revocation: publisher revoked -> 401 publisher_revoked, refresh invalid_gr
   assert.ok(!blocked.code && /disabled/.test(blocked.html));
 });
 
-test("review F1: disabling an app client stops NEW connections only; its existing publisher keeps working", async () => {
+test("review F1: disabling an app client stops new connections and all writes; reads and refresh continue", async () => {
   const app3 = await h.registerApp({ display_name: "Disable probe", redirect_uris: ["http://127.0.0.1:5175/cb"], origins: ["http://127.0.0.1:5175"] });
   const D = await h.connectPublisher(app3, { project_id: "other-test", destination: "root" });
+  assert.equal((await commit(D.access_token, snapBody(1, synthMeasurements(2, { seed: 80 })))).status, 201);
   assert.equal((await owner.req("POST", `/api/app-clients/${app3.app_client_id}/disable`, {})).status, 200);
   assert.equal((await h.pub(D.access_token, "GET", "/publisher/me")).status, 200);
-  assert.equal((await commit(D.access_token, snapBody(1, synthMeasurements(2, { seed: 80 })))).status, 201);
+  assert.equal((await h.pub(D.access_token, "GET", "/publisher/files")).status, 200, "reads continue");
+  assert.equal((await h.pub(D.access_token, "GET", "/publisher/snapshots/current")).status, 200, "reads continue");
+  const w = await commit(D.access_token, snapBody(2, synthMeasurements(2, { seed: 81 })));
+  assert.equal(w.status, 401, w.text); assert.equal(w.json.error.code, "unauthenticated");
+  assert.equal((await h.pub(D.access_token, "GET", "/publisher/me")).json.current_source_revision, 1, "nothing written");
   const t = await h.token({ grant_type: "refresh_token", refresh_token: D.refresh_token, client_id: app3.client_id });
   assert.equal(t.status, 200, JSON.stringify(t.body));
   const pre = await fetch(`${h.api}/publisher/me`, { method: "OPTIONS", headers: { origin: "http://127.0.0.1:5175", "access-control-request-method": "GET" } });
   assert.equal(pre.status, 204, "CORS kept for a disabled app's live publisher");
   assert.ok(!(await h.authorize(app3, { project_id: "other-test", destination: "root" })).code, "no new connection");
+});
+
+test("review F1: a snapshot commit in flight when the app client is disabled answers 401 and writes nothing", async () => {
+  const app5 = await h.registerApp({ display_name: "Disable in flight", redirect_uris: ["http://127.0.0.1:5177/cb"], origins: [] });
+  const D = await h.connectPublisher(app5, { project_id: "other-test", destination: "root" });
+  assert.equal((await commit(D.access_token, snapBody(1, synthMeasurements(2, { seed: 82 })))).status, 201);
+  const revCount = async () => (await rows(`SELECT COUNT(*) AS n FROM revisions WHERE artifact_id IN (SELECT id FROM artifacts WHERE publisher_id = '${D.publisher_id}')`))[0].n;
+  const r0 = await revCount();
+  const slow = h.pub(D.access_token, "POST", "/publisher/snapshots", { body: snapBody(2, synthMeasurements(2, { seed: 83 })), idem: key("dis"), headers: { "x-test-pause-before-batch-ms": "2000" } });
+  await new Promise((r) => setTimeout(r, 500));
+  assert.equal((await owner.req("POST", `/api/app-clients/${app5.app_client_id}/disable`, {})).status, 200);
+  const s = await slow;
+  assert.equal(s.status, 401, s.text); assert.equal(s.json.error.code, "unauthenticated");
+  assert.equal(await revCount(), r0, "no revisions written");
+  assert.equal((await h.pub(D.access_token, "GET", "/publisher/me")).json.current_source_revision, 1, "pointer unchanged");
 });
 
 test("review F2: per-publisher quota -> 413 quota_exceeded, nothing written; exports don't use the project file quota", async () => {

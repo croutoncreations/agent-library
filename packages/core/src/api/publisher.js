@@ -5,7 +5,8 @@ import { CONTENT_TYPE, MIME, byteLength, checkFile } from "../formats.js";
 import { appOrigin, artifactWebUrl, previewWebUrl } from "../links.js";
 import { addressLinksResponse } from "../paths.js";
 import { explainLimit, projectLimitGuard, projectWorkspaceId } from "../limits.js";
-import { SCOPES, livePublisher } from "../oauth/server.js";
+import { SCOPES, clientAllows, livePublisher } from "../oauth/server.js";
+import { baseParams, baseSql } from "./app-files.js";
 import { LIMITS, connectionInfo, idemLookup } from "../service.js";
 import { memberRoleSql, readOnlyError } from "../tenancy.js";
 import { HttpError, errorBody, idemKey, int, json, nowIso, randomId, sha256Hex, str } from "../util.js";
@@ -168,17 +169,22 @@ var beginView = (g) => ({
   expires_at: g.state === "staged" ? new Date(g.expires_at).toISOString() : null,
   snapshot_id: g.snapshot_id ?? null
 });
-async function assertStillAuthorized(env, p) {
+/**
+ * The publisher's current authorization, re-read now. Write mode (default): an active workspace, the creator a member,
+ * an enabled app client. Read mode ({ read: true }): a suspended workspace stays readable and a disabled client may
+ * read (DISABLED_CLIENT_BLOCKS). Both: not revoked, same token epoch, the destination unchanged and valid.
+ */
+async function assertStillAuthorized(env, p, { read = false } = {}) {
   const row = await env.DB.prepare(`SELECT pb.token_epoch,pb.revoked_at,pb.project_id,pb.folder_id,ac.disabled_at AS client_disabled,
     (SELECT w.status FROM workspaces w WHERE w.id = COALESCE(pj.workspace_id, 'wsp_' || pj.owner_id)) AS ws_status,
     ${memberRoleSql("pj.id", "member", "COALESCE(pb.created_by, pb.owner_principal_id)")} AS creator_ok,
     ${memberRoleSql("pj.id", "member", "COALESCE(pb.created_by, pb.owner_principal_id)", true)} AS creator_ok_suspended,CASE WHEN pb.folder_id IS NULL THEN 1 ELSE EXISTS(SELECT 1 FROM folders f WHERE f.id=pb.folder_id AND f.project_id=pb.project_id) END AS folder_valid
     FROM publishers pb JOIN app_clients ac ON ac.id=pb.app_client_id JOIN projects pj ON pj.id=pb.project_id WHERE pb.id=?`).bind(p.id).first();
-  if (!row || row.revoked_at !== null || row.client_disabled !== null || row.token_epoch !== p.token_epoch) throw new HttpError(401, "unauthenticated", "Publisher/client revoked or token superseded; reconnect required");
+  if (!row || row.revoked_at !== null || !clientAllows(row, !read) || row.token_epoch !== p.token_epoch) throw new HttpError(401, "unauthenticated", "Publisher/client revoked or token superseded; reconnect required");
   const scopeOk = row.project_id === p.project_id && (row.folder_id ?? null) === (p.folder_id ?? null) && row.folder_valid;
   // Only a publisher that would otherwise be allowed learns the workspace is suspended.
-  if (row.ws_status === "suspended" && scopeOk && row.creator_ok_suspended) throw readOnlyError();
-  if (row.project_id !== p.project_id || (row.folder_id ?? null) !== (p.folder_id ?? null) || !row.creator_ok || !row.folder_valid) throw new HttpError(403, "scope_mismatch", "Publisher destination unavailable or changed");
+  if (!read && row.ws_status === "suspended" && scopeOk && row.creator_ok_suspended) throw readOnlyError();
+  if (!scopeOk || !(read ? row.creator_ok_suspended : row.creator_ok)) throw new HttpError(403, "scope_mismatch", "Publisher destination unavailable or changed");
 }
 async function begin(env, p, req) {
   idemKey(req.headers.get("idempotency-key"));
@@ -506,10 +512,19 @@ async function abandon(env, p, id, req) {
   const g = await generation(env, p, id);
   if (g.state === "committed")
     conflict("Committed generations cannot be deleted", { snapshot_id: g.snapshot_id });
-  await env.DB.prepare("UPDATE publisher_generations SET state = 'abandoned', abandoned_at = ? WHERE publisher_id = ? AND id = ? AND state = 'staged'").bind(nowIso(), p.id, id).run();
+  // Abandoning is a write: the publisher's current authorization is checked first and again inside the UPDATE.
+  await assertStillAuthorized(env, p);
+  const az = authzSql(context(env, p, "generation-abandon"), p.project_id);
+  await testPause(env, req);
+  const r = await env.DB.prepare(`UPDATE publisher_generations SET state = 'abandoned', abandoned_at = ? WHERE publisher_id = ? AND id = ? AND state = 'staged'
+    AND ${baseSql(true)} AND ${az.sql}`).bind(nowIso(), p.id, id, ...baseParams(p), ...az.params).run();
+  if (!(r.meta.changes ?? 0)) await assertStillAuthorized(env, p);
   const after = await generation(env, p, id);
   if (after.state === "committed")
     conflict("Committed generations cannot be deleted", { snapshot_id: after.snapshot_id });
+  // Still staged although authorized again now: the authorization changed and changed back during the request.
+  if (after.state === "staged")
+    conflict("The publisher's authorization changed during the request; nothing was abandoned", { state: after.state });
   await cleanup(env, p, h.now);
   return json({ generation_id: id, state: "abandoned", deleted_staging: true });
 }
@@ -709,6 +724,7 @@ var PUB_QUOTA = { files: 32, bytes: 256 * 1024 * 1024 };
 async function commitSnapshot(env, p, req, requestId) {
   const key = idemKey(req.headers.get("idempotency-key"));
   const body2 = await readJsonBody(req);
+  await assertStillAuthorized(env, p);
   const ctx = pubCtx(env, p, requestId);
   const digest = await sha256Hex(JSON.stringify(body2));
   const i = { op: "snapshot.commit", key, projectId: p.project_id, digest };
@@ -753,8 +769,8 @@ async function commitSnapshot(env, p, req, requestId) {
   const noNew = newNames.length ? `NOT EXISTS (SELECT 1 FROM artifacts WHERE publisher_id = ? AND export_name IN (${newNames.map(() => "?").join(",")}))` : "1";
   const noNewParams = newNames.length ? [p.id, ...newNames] : [];
   stmts.push(env.DB.prepare(`UPDATE publishers SET current_snapshot_id = ?, current_source_revision = ?
-    WHERE id = ? AND token_epoch = ? AND (current_source_revision IS NULL OR current_source_revision < ?) AND current_snapshot_id IS ? AND ${az.sql}
-      AND ${filesStill} AND ${noNew} AND ${quota} AND ${lg.sql}`).bind(snapshotId, snap.source_revision, p.id, p.token_epoch, snap.source_revision, p.current_snapshot_id ?? null, ...az.params, ...filesParams, ...noNewParams, ...quotaParams, ...lg.params));
+    WHERE id = ? AND token_epoch = ? AND (current_source_revision IS NULL OR current_source_revision < ?) AND current_snapshot_id IS ? AND ${az.sql} AND ${baseSql(true)}
+      AND ${filesStill} AND ${noNew} AND ${quota} AND ${lg.sql}`).bind(snapshotId, snap.source_revision, p.id, p.token_epoch, snap.source_revision, p.current_snapshot_id ?? null, ...az.params, ...baseParams(p), ...filesParams, ...noNewParams, ...quotaParams, ...lg.params));
   const gate = "EXISTS (SELECT 1 FROM publishers WHERE id = ? AND current_snapshot_id = ?)";
   const gp = [p.id, snapshotId];
   await testPause(env, req);
@@ -837,6 +853,7 @@ async function commitSnapshot(env, p, req, requestId) {
     throw e;
   }
   if (!res[0].meta.changes) {
+    await assertStillAuthorized(env, p);
     const fresh = await livePublisher(env, { publisher_id: p.id, epoch: p.token_epoch });
     if (fresh?.revoked) throw new HttpError(401, "publisher_revoked", "This publisher has been revoked by the owner");
     if (!fresh) throw new HttpError(401, "unauthenticated", "Token is no longer valid; reconnect the app");
@@ -952,7 +969,7 @@ async function handlePublisherApi(req, env, ctx) {
     const h = { "x-request-id": requestId };
     if (e.status === 401) h["www-authenticate"] = `Bearer error="invalid_token"${e.code === "publisher_revoked" ? ', error_description="revoked"' : ""}`;
     if (e.status === 403 && e.code === "insufficient_scope") h["www-authenticate"] = `Bearer error="insufficient_scope", scope="${SCOPES.publish}"`;
-    if (e.status === 429 && e.extra?.retry_after_seconds) h["retry-after"] = String(e.extra.retry_after_seconds);
+    if ((e.status === 429 || e.status === 503) && e.extra?.retry_after_seconds) h["retry-after"] = String(e.extra.retry_after_seconds);
     const b = errorBody(e);
     b.error.request_id = requestId;
     return json(b, e.status, h);
