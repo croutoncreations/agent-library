@@ -1,4 +1,4 @@
-import { getBlob } from "../content-store.js";
+import { blobRef, readBlobBytes } from "../content-store.js";
 import { insufficientScope } from "@cloudflare/workers-oauth-provider";
 import { agentRate, limitsFor, rateLimit } from "../auth.js";
 import { byteLength } from "../formats.js";
@@ -9,7 +9,7 @@ import { __name } from "../runtime.js";
 import { FILE_BYTES_CEILING } from "../limits.js";
 import { BINARY_TYPES, IMAGE_TYPES, RS_SCHEMA, RT_ID_TOO_LONG, RT_KINDS_ALL, RT_KINDS_DOCS, appConnectEnabled, connectionInfo, createMarkdown, db, diffRevisions, getArtifact, history, listArtifacts, listChanges, loadArtifact, provenance, readRecords, readTextChunk, restoreMetadata, restoreRevision, rsToolReady, rtChunkLimit, rtFit, rtIdBytes, saveMarkdown, searchArtifacts, tplTools } from "../service.js";
 import { TEXT_UPLOAD_KINDS, UPLOAD_BEGIN_DESCRIPTION, UPLOAD_FINISH_DESCRIPTION, serveContent, uploadBegin, uploadBeginFields, uploadFinish, uploadPut } from "../uploads.js";
-import { CHANGE_NOTE_SCHEMA, HttpError, errorBody, idemKey, json, mcpClientInfo, nowIso, nowMs, randomId, rememberClientInfo, sha256Hex, str } from "../util.js";
+import { CHANGE_NOTE_SCHEMA, HttpError, errorBody, idemKey, json, mcpClientInfo, nowIso, nowMs, randomId, readTextCapped, rememberClientInfo, sha256Hex, str } from "../util.js";
 
 function truncateUtf8(s, max) {
   if (byteLength(s) <= max) return { text: s, truncated: false };
@@ -54,10 +54,9 @@ async function handleOAuthMcp(req, env, ctx) {
   const projectWrite = (p) => tokenWrite && p.can_write === 1;
   const anyWrite = conn.projects.some(projectWrite);
   if (!canRead) return insufficientScope(ctx.auth, [SCOPES.read]);
-  const len = Number(req.headers.get("content-length") ?? "0");
-  const bodyMax = ftMcpBodyMax(conn);
-  if (len > bodyMax) return reply(rpcErr(null, -32600, ftTooLarge(conn)), 413);
-  const text = await ftReadCapped(req, bodyMax);
+  // readTextCapped refuses a Content-Length over the cap and counts the stream; an over-cap body is read and discarded
+  // (up to its DRAIN_BYTES) before the 413, so a client that writes the whole body first still gets the answer.
+  const text = await readTextCapped(req, ftMcpBodyMax(conn));
   if (text === null) return reply(rpcErr(null, -32600, ftTooLarge(conn)), 413);
   let msg;
   try {
@@ -354,32 +353,6 @@ function ftTooLarge(conn) {
 function ftMcpBodyMax(conn) {
   return conn?.file_access === 1 ? FT_MCP_BODY_MAX : 1024 * 1024;
 }
-// Reads at most max bytes of a request body (counted while streaming, so a body without Content-Length cannot make
-// the Worker buffer more); null when it is larger.
-async function ftReadCapped(req, max) {
-  if (!req.body) return "";
-  const reader = req.body.getReader();
-  const chunks = [];
-  let n = 0;
-  for (; ; ) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    n += value.byteLength;
-    if (n > max) {
-      await reader.cancel().catch(() => {
-      });
-      return null;
-    }
-    chunks.push(value);
-  }
-  const all = new Uint8Array(n);
-  let off = 0;
-  for (const c of chunks) {
-    all.set(c, off);
-    off += c.byteLength;
-  }
-  return new TextDecoder().decode(all);
-}
 // Rate limits answered as a tool result the model can read (limit, budget, seconds to wait), not a bare HTTP 429.
 function ftRateLimited(msg, tool, write, e, lim, limit) {
   const wait = Math.max(1, Math.min(60, Number(e?.extra?.retry_after_seconds) || 60));
@@ -431,10 +404,11 @@ async function ftReadFile(c, p, a) {
   const wantInline = canInline && a.include_image !== false;
   const blocks = [];
   if (wantInline) {
-    const row = await db(c).prepare("SELECT blob_key FROM revisions WHERE id = ? AND project_id = ?").bind(rev.id, p).first();
-    const obj2 = row?.blob_key ? await getBlob(c.env, row.blob_key) : null;
-    if (!obj2) throw new HttpError(500, "blob_missing", "Stored bytes missing");
-    blocks.push({ type: "image", data: ftBase64(new Uint8Array(await obj2.arrayBuffer())), mimeType: rev.mime });
+    const row = await db(c).prepare("SELECT blob_key, blob_key_id, blob_header, size FROM revisions WHERE id = ? AND project_id = ?").bind(rev.id, p).first();
+    if (!row?.blob_key) throw new HttpError(500, "blob_missing", "Stored bytes missing");
+    // Buffered (at most FT_INLINE_IMAGE_BYTES) and fully authenticated before any of it is output.
+    const bytes = await readBlobBytes(c.env, await blobRef(c.env, row, { projectId: p, artifactId: a.artifact_id }));
+    blocks.push({ type: "image", data: ftBase64(bytes), mimeType: rev.mime });
   }
   blocks.push({ type: "resource_link", uri: url, name: r.artifact.title, mimeType: rev.mime, size: rev.size, description: "Short-lived download link for this version (expires in minutes; not a share link)" });
   const result = {
@@ -717,4 +691,5 @@ async function handleFileTransfer(req, env, url) {
   }
 }
 
-export { handleFileTransfer, handleOAuthMcp };
+// ftReadFile is exported for the World test of the encrypted read_file path (test/encrypted-blobs.test.mjs).
+export { ftReadFile, handleFileTransfer, handleOAuthMcp };

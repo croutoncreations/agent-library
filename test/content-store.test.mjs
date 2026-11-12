@@ -34,6 +34,48 @@ test("only packages/core/src/content-store.js touches the R2 binding", () => {
   assert.deepEqual(offenders, []);
 });
 
+// Slice 3b seam (design test 25, the rules that apply once the read side exists): only content-store.js uses the
+// object codec, the data keys and R2 object metadata, and the raw R2 readers stay inside it.
+const rel = (f) => f.slice(ROOT.length + 1);
+test("only content-store.js (and crypto/ itself) imports crypto/chunked.js, workspaceDataKey or dataKeyById", () => {
+  const users = jsFiles(join(ROOT, "packages"))
+    .filter((f) => !rel(f).startsWith("packages/core/src/crypto/"))
+    .filter((f) => /crypto\/chunked\.js|\b(?:workspaceDataKey|dataKeyById)\b/.test(readFileSync(f, "utf8")))
+    .map(rel);
+  assert.deepEqual(users, ["packages/core/src/content-store.js"]);
+});
+test("customMetadata appears in no source file other than content-store.js", () => {
+  const users = jsFiles(join(ROOT, "packages")).filter((f) => /\bcustomMetadata\b/.test(readFileSync(f, "utf8"))).map(rel);
+  assert.deepEqual(users, ["packages/core/src/content-store.js"]);
+});
+test("the raw R2 readers (getBlob, getBlobHead, getBlobBytes, headBlob, blobSha256Hex) are module-internal to content-store.js", () => {
+  const store = readFileSync(join(ROOT, "packages", "core", "src", "content-store.js"), "utf8");
+  assert.doesNotMatch(store, /export\s+(?:async\s+)?function\s+(?:getBlob|getBlobHead|getBlobBytes|headBlob|blobSha256Hex)\b/);
+  const importers = jsFiles(join(ROOT, "packages"))
+    .filter((f) => !f.endsWith("content-store.js"))
+    .filter((f) => [...readFileSync(f, "utf8").matchAll(/import\s*\{([^}]*)\}\s*from\s*["'][^"']*content-store\.js["']/g)].some((m) => /\b(?:getBlob|getBlobHead|getBlobBytes|headBlob|blobSha256Hex)\b/.test(m[1])))
+    .map(rel);
+  assert.deepEqual(importers, []);
+});
+test("backup.js writes and cleans up files only through writeBlobBytes and the phase-based cleanup: no putBlob, deleteBlob or raw reader", () => {
+  const src = readFileSync(join(ROOT, "packages", "core", "src", "backup.js"), "utf8");
+  const imported = [...src.matchAll(/import\s*\{([^}]*)\}\s*from\s*["'][^"']*content-store\.js["']/g)].flatMap((m) => m[1].split(",").map((x) => x.trim()));
+  for (const name of ["putBlob", "deleteBlob", "getBlob", "getBlobBytes", "getBlobHead", "headBlob", "blobSha256Hex", "putBlobStream"]) assert.ok(!imported.includes(name), name);
+  assert.ok(imported.includes("writeBlobBytes") && imported.includes("dropUnreferencedBlobs") && imported.includes("deleteBlobs"));
+});
+test("ACTIVE_KEY_SQL and NO_REAL_KEY_SQL are imported only by content-store.js (crypto/keys.js defines them)", () => {
+  const importers = jsFiles(join(ROOT, "packages"))
+    .filter((f) => !rel(f).startsWith("packages/core/src/crypto/"))
+    .filter((f) => [...readFileSync(f, "utf8").matchAll(/import\s*\{([^}]*)\}\s*from/g)].some((m) => /\b(?:ACTIVE_KEY_SQL|NO_REAL_KEY_SQL)\b/.test(m[1])))
+    .map(rel);
+  assert.deepEqual(importers, ["packages/core/src/content-store.js"]);
+});
+test("exactly one writeUploadBlob( call site and one putBlobStream( call site outside content-store.js", () => {
+  const count = (re) => jsFiles(join(ROOT, "packages")).filter((f) => !f.endsWith("content-store.js")).reduce((n, f) => n + [...readFileSync(f, "utf8").matchAll(re)].length, 0);
+  assert.equal(count(/\bwriteUploadBlob\(/g), 1);
+  assert.equal(count(/\bputBlobStream\(/g), 1);
+});
+
 // Publication conditions are written once (docs/encryption.md#rules-for-code-that-uses-this): crypto/keys.js defines
 // them, content-store.js builds the fences from them, and nothing else hand-writes or touches the fence table.
 test("only content-store.js and crypto/keys.js use ACTIVE_KEY_SQL and NO_REAL_KEY_SQL", () => {

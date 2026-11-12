@@ -113,6 +113,7 @@ is no longer found by cleanup and remains until the project is purged.
 |---|---|---|---|---|
 | Upload reservation | 15 minutes, at most 24 hours | upload | `UPLOAD_TTL_SECONDS` (larger values are capped at 86400) | `410 upload_expired` |
 | Uploads at once | 1 | agent or person | fixed | `429 upload_in_progress` |
+| Encrypted files (when encryption is configured) | first chunk authenticated at finish and before a download starts; later chunks when read | file | — | finish: `500 publish_failed` (upload ends); read: `500 blob_corrupt`, or a body that fails part-way; `410 key_shredded` once the workspace key is shredded |
 | Upload body | exactly the declared size and SHA-256, checked at the PUT (a `Content-Length` other than the declared size is refused before anything is stored) | upload | fixed | `413 too_large` (longer) or `400 incomplete_body` (shorter): the upload stays writable, PUT the whole file again; `422 integrity_mismatch` (other bytes): the upload ends, start a new one with `upload_begin` |
 | MCP `upload_file` (inline base64) | 2 MiB decoded | call | fixed | `413 too_large`: use `upload_begin` + PUT |
 | MCP inline image in `read_file` | 1 MiB | call | fixed | only a download link |
@@ -134,7 +135,7 @@ App API, `/v1` and legacy MCP bodies are counted in UTF-8 bytes as they arrive a
 
 The three-step upload path also accepts Markdown, HTML, JSON and CSV as raw UTF-8, up to 10 MiB per version, independent of `file_bytes`. Document content is validated at finish. These versions are ordinary text and count against workspace storage; they do not consume the project binary-byte allowance. Upload reservations count before publication. The JSON routes still have their existing request caps, so JSON escaping can make a valid document too large for those routes; use a raw upload from an HTTP-capable client instead. OAuth upload tools still require file-enabled consent; JSON/CSV still require App Connect.
 
-For app API and legacy MCP, an over-cap body is read and discarded (up to 16 MiB) before the `413` is sent, so a client that sends the whole body still sees
+For app API, legacy MCP and OAuth MCP, an over-cap body is read and discarded (up to 16 MiB) before the `413` is sent, so a client that sends the whole body still sees
 the error instead of a reset connection.
 
 ## Import & export
@@ -148,6 +149,9 @@ the error instead of a reset connection.
 | Imported versions, comments, details versions | 2,000 each | import | fixed | `400 bad_backup` |
 | Imported file bytes | `PROJECT_BINARY_BYTES` (`"0"` = no cap) | import | `PROJECT_BINARY_BYTES` | `400 bad_backup` |
 | Workspace limits on import | `projects`, `storage_bytes` | workspace | plan | `402 limit_reached` |
+| File storage keys on import and restore | at most 1,015 UTF-8 bytes per resulting key | key | fixed (the encrypted format's limit) | `400 bad_backup` "A file key is too long", before anything is written |
+| A file version's key on import | must lie in the version's own document | version | fixed | `400 bad_backup` "A file key does not match its document" |
+| Encryption during import or restore | the workspace key must stay active; encryption must not start mid-import for plaintext writes | batch | — | `410 key_shredded` or `409 encryption_started`; nothing is published and the written files are removed |
 
 Comments are not counted in the 32 MiB backup export text budget.
 

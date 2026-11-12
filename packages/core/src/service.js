@@ -1,5 +1,5 @@
 import { TEXT_MAX_BYTES } from "./text-limits.js";
-import { commitTextWrites, fenceRefusal, getText, isTextWriteFenceError, mapContent, stageTextWrite, textWriteComplete } from "./content-store.js";
+import { commitTextWrites, fenceRefusal, getText, isTextWriteFenceError, keyFence, mapContent, stageTextWrite, textWriteComplete } from "./content-store.js";
 import { authorizeProject, authzSql, contentWriteSql, credentialGate, protectSql, requireHuman } from "./auth.js";
 import { chQuery, cleanupChanges, listChanges } from "./changes/service.js";
 import { MEASUREMENTS, MIME, checkFile, isCalendarDate, measurementRecords } from "./formats.js";
@@ -11,7 +11,7 @@ import { createFromTemplate, listTemplates, previewTemplate, saveAsTemplate, tpl
 import { ROLE_RANK, memberRoleSql, personalWorkspaceId, projectRole, workspaceRoleSql, requireProjectRole, requireWorkspaceRole, visibleProjects } from "./tenancy.js";
 import { HttpError, b64url, cutLists, int, nowIso, nowMs, randomId, sha256Hex, str } from "./util.js";
 import { checkSlug, ensureHandle, ensureSlug, projectPaths, slugify } from "./paths.js";
-import { explainLimit, limitGuard, projectLimitGuard } from "./limits.js";
+import { explainLimit, limitGuard, projectLimitGuard, projectWorkspaceId } from "./limits.js";
 
 function requireAppConnect(ctx) {
   if (!appConnectEnabled(ctx.env)) throw new HttpError(404, "not_found", "Not found");
@@ -379,8 +379,8 @@ async function publishRevision(ctx, projectId, artifactId, expected, i, rev, ext
   const body2 = { artifact_id: artifactId, revision: next, revision_id: revId, sha256: rev.sha256, ...reserved ? { size: rev.size } : {} };
   const bodyKey = rev.body == null ? null : await stageTextWrite(ctx.env, projectId, artifactId, revId, rev.body);
   const out2 = await commitTextWrites(ctx.env, [bodyKey], (guarded) => runBatch(ctx, guarded([
-    db(ctx).prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, body_key, blob_key, size, sha256, mime, restored_from, created_at, via_kind, via_id, via_label, client_info, change_note)
-      SELECT ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+    db(ctx).prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, body_key, blob_key, blob_key_id, blob_header, size, sha256, mime, restored_from, created_at, via_kind, via_id, via_label, client_info, change_note)
+      SELECT ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
       WHERE EXISTS (SELECT 1 FROM artifacts WHERE id = ? AND project_id = ? AND head_rev = ? AND trashed_at IS NULL) AND ${az.sql}`).bind(
       revId,
       artifactId,
@@ -389,6 +389,8 @@ async function publishRevision(ctx, projectId, artifactId, expected, i, rev, ext
       ctx.principal.id,
       bodyKey,
       rev.blobKey ?? null,
+      rev.blobKeyId ?? null,
+      rev.blobHeader ?? null,
       rev.size,
       rev.sha256,
       rev.mime,
@@ -404,8 +406,10 @@ async function publishRevision(ctx, projectId, artifactId, expected, i, rev, ext
     idemInsert(ctx, i, 200, body2, gate, [revId]),
     audit(ctx, projectId, action, artifactId, next, "ok", gate, [revId]),
     ...extra.map((s) => s),
-    ...bodyKey ? [textSearchBridge(ctx.env, artifactId, revId, rev.body), textWriteComplete(ctx.env, bodyKey)] : []
+    ...bodyKey ? [textSearchBridge(ctx.env, artifactId, revId, rev.body), textWriteComplete(ctx.env, bodyKey)] : [],
     // callers gate their own extra statements on the same predicate
+    // Publication fences (keyFence / plaintextFence) go LAST: out2[0] stays the revision INSERT.
+    ...rev.contentFences ?? []
   ]), i));
   if (!Array.isArray(out2)) return out2;
   if (!out2[0].meta.changes) {
@@ -480,13 +484,16 @@ async function restoreRevision(ctx, projectId, artifactId, input, key) {
   assertWritable(ctx, await loadArtifact(ctx, projectId, artifactId), "content");
   const old = await db(ctx).prepare("SELECT * FROM revisions WHERE artifact_id = ? AND project_id = ? AND rev_no = ?").bind(artifactId, projectId, from).first();
   if (!old) throw new HttpError(404, "not_found", "Revision not found");
+  // An encrypted file version is republished under its key only while that key is active. A legacy plaintext version
+  // refers to an existing plaintext object (nothing is written) and carries no fence (docs/encryption.md).
+  const contentFences = old.blob_key && old.blob_key_id ? [keyFence(ctx.env, { keyId: old.blob_key_id, workspaceId: await projectWorkspaceId(ctx.env, projectId) })] : [];
   return publishRevision(
     ctx,
     projectId,
     artifactId,
     expected,
     i,
-    { body: old.blob_key ? void 0 : await getText(ctx.env, old), blobKey: old.blob_key ?? void 0, size: old.size, sha256: old.sha256, mime: old.mime, restoredFrom: from, change_note: input.change_note ?? "Restored version " + from },
+    { body: old.blob_key ? void 0 : await getText(ctx.env, old), blobKey: old.blob_key ?? void 0, blobKeyId: old.blob_key ? old.blob_key_id ?? null : null, blobHeader: old.blob_key ? old.blob_header ?? null : null, contentFences, size: old.size, sha256: old.sha256, mime: old.mime, restoredFrom: from, change_note: input.change_note ?? "Restored version " + from },
     [],
     "artifact.restore_revision"
   );
