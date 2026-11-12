@@ -80,6 +80,8 @@ The text limit is a storage bound, not a memory guarantee. Server CSV validation
 
 The owner's document-list filter matches titles only, for both legacy inline and R2-backed documents. Body matching
 will return through the blind index in slice 4b. The separate ranked search searches titles and the first 1 MiB of stored text until the blind-index slice.
+Its excerpts are computed in the Worker from the first 16,384 characters of each result; on Workers Free (10 ms of CPU
+per request) a page of long documents can exceed the CPU limit ([ranked search](ranked-search.md)).
 
 | Limit | Default | Scope | Configure | When you hit it |
 |---|---|---|---|---|

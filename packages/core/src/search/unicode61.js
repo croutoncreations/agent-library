@@ -66,7 +66,10 @@ for (const run of U61_LOWER.split(",")) {
   for (let i = 0; i < n; i++) u61Fold.set(String.fromCodePoint(s + i * step), String.fromCodePoint(s + i * step + d));
 }
 const u61Separators = U61_SEPARATORS.split(",").map((r) => r.split("-").map((x) => "\\u{" + parseInt(x, 36).toString(16) + "}").join("-")).join("");
-/** One token: a token character, then token characters or dropped marks (dropped marks before it belong to no token). */
+/**
+ * One token: a token character, then token characters or dropped marks (dropped marks before it belong to no token).
+ * Global: use it only with matchAll, match or replace, which start from lastIndex 0; never with test() or exec().
+ */
 const U61_TOKEN = new RegExp("[^" + u61Separators + U61_DROPPED + "][^" + u61Separators + "]*", "gu");
 const U61_DROPPED_RE = new RegExp("[" + U61_DROPPED + "]", "gu");
 
