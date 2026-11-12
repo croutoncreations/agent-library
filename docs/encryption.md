@@ -21,6 +21,41 @@ touches `env.BLOBS`. Per-workspace envelope encryption replaces those functions 
 Objects are immutable and keyed per version, so existing objects can be re-encrypted in the background by writing a
 new key and updating the revision's `blob_key` in a revision-guarded statement.
 
+## Workspace keys
+
+**Nothing is encrypted yet.** The key layer below exists and is tested, but no read or write calls it, and content is
+stored exactly as described under [Today](#today).
+
+- **Master keys.** Worker secrets `CONTENT_MASTER_KEY_V<n>` (n a positive integer), each the base64 or base64url
+  encoding of exactly 32 random bytes; the var `CONTENT_MASTER_KEY_VERSION` names the current n. Encryption is
+  configured when that var is set and its secret decodes to 32 bytes. Unset means not configured; a malformed version
+  or secret is an error (`master_key_version_invalid`, `master_key_invalid`, `master_key_missing`), never "off".
+  Errors name the secret, never its value.
+- **Table** `workspace_keys` (migration `0029_workspace_keys.sql`): `workspace_id`, `key_id` (`wk_…`, primary key),
+  `master_version`, `wrapped`, `created_at` and `shredded_at` (epoch milliseconds). A partial unique index allows one
+  unshredded key per workspace.
+- **Data keys.** 32 bytes from `crypto.getRandomValues`, wrapped with AES-256-GCM under the current master key with a
+  fresh random 96-bit IV. The additional data binds the wrapped key to its row: `al-dek/1`, workspace id, key id and
+  master version, each as a 4-byte big-endian length followed by its UTF-8 bytes. `wrapped` is base64url of
+  IV ‖ ciphertext ‖ tag. A wrapped value copied to another workspace, key id or master version does not unwrap.
+- **In memory** a data key is only a non-extractable HKDF `CryptoKey` (usages `["deriveKey"]`), unwrapped directly to
+  HKDF. The raw bytes exist only while a key is created and are zeroed afterwards. Content keys are derived from it,
+  never the data key itself.
+- **First use** (`workspaceDataKey(env, workspaceId)` in `packages/core/src/crypto/keys.js`): `INSERT OR IGNORE`, then
+  re-select the active row, so concurrent first use yields one key for every caller. A workspace with any shredded
+  key row gets no new key (`key_shredded`).
+- **Decryption lookup** (`dataKeyById(env, workspaceId, keyId)`): refuses an unknown key id, a shredded key and a key
+  of another workspace than the caller expects.
+- **Rotation.** New keys are wrapped under the current version; an older row unwraps as long as its
+  `CONTENT_MASTER_KEY_V<n>` is still set. If it is not, the error names the missing secret. Rewrapping old rows is
+  not built yet.
+- **One unwrap per request.** `createWorker` gives each request its own memo (`withDataKeyMemo`, like
+  `withRequestMemo`); nothing is cached across requests.
+- **Seam.** The `keyProvider` adapter (`packages/core/src/adapters.js`) wraps and unwraps a data key for
+  `{ workspaceId, keyId, masterVersion }`; the default (`crypto/worker-secret-keys.js`) uses the Worker secrets above
+  and a hosted installation may replace it with an external KMS. Row storage, first use and the memo stay in core.
+  Workspace ids are the usual ones (`projectWorkspaceId`, including legacy `wsp_` + owner).
+
 ## Text versions and inline compatibility
 
 New Markdown, HTML, JSON and CSV versions live in immutable R2 objects at `text/{project}/{artifact}/{revision}`.

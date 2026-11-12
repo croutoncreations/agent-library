@@ -105,6 +105,9 @@ APP_CONNECT_ENABLED = "1"
 # Worker secret (never in this file):
 #   ACCESS_OIDC_CLIENT_SECRET  (wrangler secret put ACCESS_OIDC_CLIENT_SECRET --env hosted)
 #   OIDC_CLIENT_SECRET         (only with OIDC_ISSUER)
+# Content encryption keys (docs/encryption.md#workspace-keys; nothing is encrypted yet, leave both unset):
+#   CONTENT_MASTER_KEY_V1      (secret: base64 of 32 random bytes; later versions V2, V3, ... for rotation)
+#   CONTENT_MASTER_KEY_VERSION (var: the current version number, e.g. 1)
 
 [[env.hosted.kv_namespaces]]
 binding = "OAUTH_KV"
