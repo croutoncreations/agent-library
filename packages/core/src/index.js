@@ -13,6 +13,7 @@ import { RENDER_CSP, htmlRefs, renderHtmlDocument } from "./html.js";
 import { WEB_ROUTE } from "./links.js";
 import { requireWorkspaceRole, visibleProjects } from "./tenancy.js";
 import { withRequestMemo, workspaceUsage } from "./limits.js";
+import { ENCRYPTION_MISCONFIGURED_MESSAGE, encryptionConfigured, encryptionRequired, withDataKeyMemo } from "./crypto/keys.js";
 import { RESERVED_HANDLES, addressLinksResponse, resolveProjectRef } from "./paths.js";
 import { imageRefs, renderMarkdown } from "./markdown.js";
 import { getRenderSource } from "./render-source.js";
@@ -364,9 +365,27 @@ function createWorker(adapterConfig = {}) {
   // Fail closed: Cloudflare Access is configured but this entry has no sign-in provider, so it would not be enforced.
   const misconfigured = (env) => A.identity.name === "none" && !!(env?.ACCESS_TEAM_DOMAIN || env?.ACCESS_AUD);
   const refuse = () => new Response(JSON.stringify({ error: { code: "misconfigured", message: "This build has no sign-in provider but Access is configured" } }), { status: 500, headers: { "content-type": "application/json" } });
+  // Fail closed: CONTENT_ENCRYPTION_REQUIRED=1 but the key provider is not configured or its configuration is
+  // malformed. Only applies when that var is set. The response names no secret; the log line has the reason and, for
+  // an error, only its code (HttpError) or constructor name, never its message.
+  // An invalid CONTENT_ENCRYPTION_REQUIRED value is refused the same way (reason required_value_invalid, never the value).
+  const encryptionMissing = (env) => {
+    const log = (detail) => console.error(JSON.stringify({ event: "encryption_misconfigured", ...detail }));
+    try { if (!encryptionRequired(env)) return false; }
+    catch { log({ reason: "required_value_invalid" }); return true; }
+    try {
+      if (encryptionConfigured(withAdapters(env, A))) return false;
+      log({ reason: "not_configured" });
+    } catch (e) {
+      log({ reason: "configuration_error", error: e instanceof HttpError ? e.code : String(e?.constructor?.name ?? typeof e) });
+    }
+    return true;
+  };
+  const refuseEncryption = () => new Response(JSON.stringify({ error: { code: "encryption_misconfigured", message: ENCRYPTION_MISCONFIGURED_MESSAGE } }), { status: 500, headers: { "content-type": "application/json" } });
   return {
     scheduled: (ev, env, ctx) => coreWorker.scheduled(ev, withAdapters(env, A), ctx),
-    fetch: async (req, env, ctx) => misconfigured(env) ? refuse() : coreWorker.fetch(req, withRequestMemo(withAdapters(env, A)), ctx)
+    fetch: async (req, env, ctx) => misconfigured(env) ? refuse() : encryptionMissing(env) ? refuseEncryption()
+      : coreWorker.fetch(req, withDataKeyMemo(withRequestMemo(withAdapters(env, A))), ctx)
   };
 }
 var coreWorker = {

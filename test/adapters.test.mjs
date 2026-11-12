@@ -219,6 +219,44 @@ test("Turnstile fails closed on configuration mistakes (never silently off)", as
   assert.ok(logs.some((l) => /turnstile_not_configured bad_site_key/.test(l)));
 });
 
+test("keyProvider: the default reads Worker secrets; a custom provider replaces it whole and must define all four methods", async () => {
+  const K = await loadWorker({ "adapters.js": ["resolveAdapters", "defaultAdapters", "withAdapters", "adapters"], "crypto/worker-secret-keys.js": ["workerSecretKeyProvider"], "crypto/keys.js": ["encryptionConfigured"] });
+  const d = K.defaultAdapters().keyProvider;
+  assert.equal(d.name, "worker-secret");
+  for (const m of ["configured", "currentVersion", "wrap", "unwrap"]) assert.equal(d[m], K.workerSecretKeyProvider[m]);
+  assert.equal(d.configured({}), false);
+  assert.ok(Object.isFrozen(d));
+  const custom = { name: "synthetic-kms", configured: () => true, currentVersion: () => 7, wrap: async () => "synthetic", unwrap: async () => null };
+  const A = K.resolveAdapters({ keyProvider: custom });
+  assert.equal(A.keyProvider.name, "synthetic-kms");
+  // Each method is the supplied one bound to the supplied object (so class instances work), and nothing else is copied.
+  const thisSeen = [];
+  const tracking = Object.fromEntries(["configured", "currentVersion", "wrap", "unwrap"].map((m) => [m, function (...args) { thisSeen.push(this); return custom[m](...args); }]));
+  const T = K.resolveAdapters({ keyProvider: { name: "synthetic-kms", extra: 1, ...tracking } });
+  assert.deepEqual(Object.keys(T.keyProvider).sort(), ["configured", "currentVersion", "name", "unwrap", "wrap"]);
+  assert.equal(T.keyProvider.configured(), true);
+  assert.equal(T.keyProvider.currentVersion(), 7);
+  assert.equal(await T.keyProvider.wrap(), "synthetic");
+  assert.equal(await T.keyProvider.unwrap(), null);
+  assert.equal(thisSeen.length, 4);
+  assert.ok(thisSeen.every((t) => t !== T.keyProvider && t.name === "synthetic-kms" && t.extra === 1), "bound to the supplied object");
+  assert.ok(Object.isFrozen(A.keyProvider));
+  // No method-by-method fallback to the Worker-secret provider: a partial provider is refused at resolution.
+  for (const m of ["configured", "currentVersion", "wrap", "unwrap"]) {
+    const partial = { ...custom, [m]: undefined };
+    assert.throws(() => K.resolveAdapters({ keyProvider: partial }), new RegExp(`keyProvider.*${m}`), m);
+    assert.throws(() => W.createWorker({ keyProvider: partial }), /keyProvider/, `createWorker: ${m}`);
+  }
+  assert.throws(() => K.resolveAdapters({ keyProvider: { name: "synthetic-kms", configured: () => true } }), /keyProvider/);
+  assert.equal(K.encryptionConfigured(K.withAdapters({}, A)), true, "core asks the installation's provider, not the default");
+  assert.equal(K.encryptionConfigured(K.withAdapters({}, K.defaultAdapters())), false);
+  // createWorker attaches the same resolved provider to every request's env.
+  let seen;
+  const w = W.createWorker({ keyProvider: custom, routes: [{ method: "GET", path: "/kp", handler: async (_r, env) => { seen = W.adapters(env).keyProvider; return new Response("ok"); } }] });
+  assert.equal((await call(w, "/kp")).status, 200);
+  assert.equal(seen.name, "synthetic-kms");
+});
+
 test("Turnstile: the test-key hostname exception needs local dev AND a Cloudflare test secret", async () => {
   const T = await loadWorker({ "identity/turnstile.js": ["requireHuman"] });
   const realFetch = globalThis.fetch;

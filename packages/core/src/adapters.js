@@ -3,6 +3,8 @@
 // life, extra routes, and mail. createWorker() attaches the adapters to env under a Symbol, so every module reads
 // them from the env it already has (spreads such as {...env} keep Symbol keys).
 
+import { workerSecretKeyProvider } from "./crypto/worker-secret-keys.js";
+
 const ADAPTERS = Symbol.for("agent-library.adapters");
 
 /** Identity with no external sign-in (local dev or tests): browser sign-in only through LOCAL_DEV_LOGIN. */
@@ -67,9 +69,18 @@ export const noLifecycle = {
 
 export const logMailer = { async send(m) { console.log("mail_not_sent", JSON.stringify({ to_domain: String(m?.to ?? "").split("@")[1] ?? null, subject: m?.subject ?? null })); } };
 
-const DEFAULTS = Object.freeze({ identity: noIdentity, entitlements: unlimited, lifecycle: noLifecycle, mailer: logMailer, routes: [] });
+/**
+ * keyProvider (workspace data keys for content encryption; docs/encryption.md#workspace-keys): wraps and unwraps a
+ * data key for ctx { workspaceId, keyId, masterVersion }. configured(env) -> bool (throws if malformed),
+ * currentVersion(env) -> positive integer, wrap(env, raw32Bytes, ctx) -> string, unwrap(env, wrapped, ctx) -> a
+ * non-extractable HKDF CryptoKey with usages ["deriveKey"]. configured and currentVersion are synchronous; core checks
+ * every result (crypto/keys.js). The default reads Worker secrets (crypto/worker-secret-keys.js); a hosted installation
+ * may supply a KMS-backed one, which replaces the default whole: it must define all four methods.
+ */
+const KEY_PROVIDER_METHODS = ["configured", "currentVersion", "wrap", "unwrap"];
+const DEFAULTS = Object.freeze({ identity: noIdentity, entitlements: unlimited, lifecycle: noLifecycle, mailer: logMailer, keyProvider: workerSecretKeyProvider, routes: [] });
 
-/** Fill unset adapters (and unset methods) with the defaults. */
+/** Fill unset adapters (and unset methods) with the defaults. A supplied keyProvider is used whole, never merged. */
 export function resolveAdapters(a = {}) {
   const routes = Array.isArray(a.routes) ? a.routes : [];
   for (const r of routes) {
@@ -79,6 +90,16 @@ export function resolveAdapters(a = {}) {
   }
   const out = { routes: Object.freeze(routes.map((r) => Object.freeze({ ...r }))) };
   for (const k of ["identity", "entitlements", "lifecycle", "mailer"]) out[k] = Object.freeze({ ...DEFAULTS[k], ...(a[k] ?? {}) });
+  // Never mixed with the Worker-secret provider: half of one and half of the other would wrap and unwrap under
+  // different keys, or quietly use Worker secrets an installation meant to replace.
+  if (a.keyProvider) {
+    const missing = KEY_PROVIDER_METHODS.filter((m) => typeof a.keyProvider[m] !== "function");
+    if (missing.length) throw new Error(`adapter keyProvider must define ${KEY_PROVIDER_METHODS.join(", ")}; missing: ${missing.join(", ")}`);
+    // The four methods bound to the supplied object (prototype methods and #private fields of a class instance work),
+    // plus its name; nothing else is copied.
+    const p = a.keyProvider;
+    out.keyProvider = Object.freeze({ name: p.name, ...Object.fromEntries(KEY_PROVIDER_METHODS.map((m) => [m, p[m].bind(p)])) });
+  } else out.keyProvider = Object.freeze({ ...DEFAULTS.keyProvider });
   return Object.freeze(out);
 }
 const RESOLVED_DEFAULTS = resolveAdapters();
