@@ -80,7 +80,7 @@ export async function encryptionEnabled(env) {
   try { required = encryptionRequired(env); }
   catch (e) { logKeyEvent("encryption_misconfigured", { reason: "required_value_invalid" }); throw e; }
   if (encryptionConfigured(env)) return true;
-  const inUse = !required && !!(await env.DB.prepare("SELECT 1 AS x FROM workspace_keys WHERE master_version > 0 LIMIT 1").first("x"));
+  const inUse = !required && !(await env.DB.prepare(`SELECT ${NO_REAL_KEY_SQL} AS none`).first("none"));
   if (required || inUse) {
     logKeyEvent("encryption_misconfigured", { reason: required ? "required_not_configured" : "key_rows_exist_not_configured" });
     throw new HttpError(500, "encryption_misconfigured", ENCRYPTION_MISCONFIGURED_MESSAGE);
@@ -96,6 +96,12 @@ const SHREDDED_SQL = "(shredded_at IS NOT NULL OR wrapped = '')";
  * by its key_id, is still active. The negation of SHREDDED_SQL; use it, never a hand-written copy.
  */
 export const ACTIVE_KEY_SQL = "(shredded_at IS NULL AND wrapped <> '')";
+/**
+ * The condition a plaintext write must carry (docs/encryption.md#rules-for-code-that-uses-this): no real key row exists
+ * (master_version > 0, shredded or not; tombstones do not count). encryptionEnabled probes exactly this; use the export,
+ * never a hand-written copy.
+ */
+export const NO_REAL_KEY_SQL = "NOT EXISTS (SELECT 1 FROM workspace_keys WHERE master_version > 0)";
 const activeRow = (env, workspaceId) =>
   env.DB.prepare(`SELECT ${ROW_COLUMNS} FROM workspace_keys WHERE workspace_id = ? AND shredded_at IS NULL`).bind(workspaceId).first();
 const hasShreddedRow = async (env, workspaceId) =>
