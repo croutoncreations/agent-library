@@ -425,33 +425,81 @@ function clearHolder(holder) {
   holder.jobs = null; holder.plan = null; holder.set = null; holder.pending = null;
 }
 
+// --- Admission per isolate ---------------------------------------------------------------------------------------
+/** Active total (envelopes and payloads of unsettled, undetached runs), active-run ceiling, detached set, horizon. */
+export const SEARCH_ACTIVE_MAX_BYTES = 32 * MiB;
+export const SEARCH_ACTIVE_RUNS_MAX = 16;
+export const SEARCH_DETACHED_MAX = 4;
+export const SEARCH_DETACH_AFTER_MS = 120000;
+/**
+ * This isolate's indexing reservations. A run leaves `active` only by settling or by detachment; a detached run keeps
+ * its envelope counted in `detached` until it settles (exactly once). No timer frees capacity. Counted bytes are at
+ * most SEARCH_ACTIVE_MAX_BYTES + SEARCH_DETACHED_MAX × SEARCH_CALL_ENVELOPE_BYTES (48 MiB).
+ */
+const isolate = { active: new Set(), activeBytes: 0, detached: new Set(), refused: 0 };
+/** Started runs, for drainSearchIndexing. */
+const running = new Map();
+/** A snapshot of this isolate's admission state (counts and bytes only). */
+export function searchAdmissionState() {
+  return { active: isolate.active.size, activeBytes: isolate.activeBytes, detached: isolate.detached.size,
+    detachedBytes: isolate.detached.size * SEARCH_CALL_ENVELOPE_BYTES, refused: isolate.refused, running: running.size };
+}
+/** Detach every unsettled run admitted at least SEARCH_DETACH_AFTER_MS ago, while the detached set has room. */
+function detachExpired(now, except = null) {
+  for (const run of [...isolate.active]) {
+    if (isolate.detached.size >= SEARCH_DETACHED_MAX) return;
+    if (run !== except && now - run.admittedAt >= SEARCH_DETACH_AFTER_MS) run.detach(now);
+  }
+}
+/**
+ * Open a run reservation (envelope + base) if this isolate has room, after detaching expired runs; null if not. A
+ * refusal while the detached set is full logs search_admission_stuck (the caller logs it at most once per request).
+ */
+export function openSearchRun({ declaredCalls = 0 } = {}) {
+  const now = Date.now();
+  detachExpired(now);
+  const bytes = SEARCH_CALL_ENVELOPE_BYTES + SEARCH_RUN_BASE_BYTES;
+  if (isolate.active.size >= SEARCH_ACTIVE_RUNS_MAX || isolate.activeBytes + bytes > SEARCH_ACTIVE_MAX_BYTES) { isolate.refused++; return null; }
+  return new SearchRun({ declaredCalls, now });
+}
+
 /**
  * One indexing run: its holder (everything large), its payload reservation and its budgets. The envelope (the largest
- * single call in flight with its result) is held from creation to settlement.
+ * single call in flight with its result) is held from admission to settlement. Create runs with openSearchRun.
  */
 export class SearchRun {
-  constructor({ declaredCalls = 0 } = {}) {
+  constructor({ declaredCalls = 0, now = Date.now() } = {}) {
     this.id = randomId("sr", 6);
-    this.holder = { jobs: [], plan: null, set: null, pending: null };
+    this.holder = { jobs: [], plan: null, set: null, pending: null, detached: false };
     this.envelope = SEARCH_CALL_ENVELOPE_BYTES;
     this.payload = SEARCH_RUN_BASE_BYTES;
+    isolate.active.add(this);
+    isolate.activeBytes += this.envelope + this.payload;
     this.callBudget = Math.max(0, Math.min(SEARCH_RUN_LIMITS.calls, 1000 - declaredCalls - 20));
     this.calls = 0; this.tokenOps = 0; this.textUnits = 0; this.removeValues = 0; this.maxRemoveValues = 0;
-    this.admittedAt = Date.now(); this.startedAt = 0; this.deadline = Infinity;
+    this.admittedAt = now; this.startedAt = 0; this.deadline = Infinity;
     this.detached = false; this.settled = false;
     this.nonce = randomId("sw", 9);
     this.phases = new Set();
     this.skipped = {};
     this.completed = 0;
   }
-  /** Add `bytes` to the payload if the run stays within its limit; false (nothing reserved) otherwise. */
+  /** Add `bytes` to the payload if the run (26 MiB) and the isolate (32 MiB) stay within their limits; else false. */
   reserve(bytes) {
     if (this.detached || this.settled) return false;
     if (this.envelope + this.payload + bytes > SEARCH_RUN_MAX_BYTES) return false;
+    detachExpired(Date.now(), this);
+    if (isolate.activeBytes + bytes > SEARCH_ACTIVE_MAX_BYTES) return false;
     this.payload += bytes;
+    isolate.activeBytes += bytes;
     return true;
   }
-  release(bytes) { this.payload = Math.max(0, this.payload - bytes); }
+  release(bytes) {
+    if (this.detached || this.settled) return;
+    const n = Math.min(bytes, this.payload);
+    this.payload -= n;
+    isolate.activeBytes -= n;
+  }
   /** Lower (never raise) a job's charge to `bytes`. */
   lower(job, bytes) { if (bytes < job.charge) { this.release(job.charge - bytes); job.charge = bytes; } }
   skip(reason, n = 1) { this.skipped[reason] = (this.skipped[reason] ?? 0) + n; }
@@ -469,13 +517,36 @@ export class SearchRun {
     if (this.detached) throw new RunStop("detached");
     if (Date.now() > this.deadline) throw new RunStop("deadline");
   }
-  /** Settle once: nulls every holder field and releases the reservation. */
+  /**
+   * At the horizon: null the holder, release the payload, keep the envelope counted in the detached set. The run's
+   * next step after any await stops (before/after), storing nothing.
+   */
+  detach(now = Date.now()) {
+    if (this.detached || this.settled) return;
+    this.detached = true;
+    this.holder.detached = true;
+    clearHolder(this.holder);
+    isolate.active.delete(this);
+    isolate.activeBytes -= this.envelope + this.payload;
+    this.payload = 0;
+    isolate.detached.add(this);
+    phase(this, "detached");
+    logError("search_run_detached", { run: this.id, age: now - this.admittedAt });
+  }
+  /** Settle once: nulls every holder field and releases the reservation (or frees its detached entry). */
   settle() {
     if (this.settled) return;
     clearHolder(this.holder);
-    this.settled = true;
+    if (this.detached) isolate.detached.delete(this);
+    else {
+      isolate.active.delete(this);
+      isolate.activeBytes -= this.envelope + this.payload;
+    }
     this.payload = 0;
+    this.settled = true;
   }
+  /** Bytes this run holds in the isolate's accounting (envelope + payload; the envelope only once detached). */
+  get counted() { return this.settled ? 0 : this.detached ? this.envelope : this.envelope + this.payload; }
 }
 
 /** The env a run uses: every D1 call is counted and checked (deadline, budget, detachment) before and after. */
@@ -504,9 +575,12 @@ export function searchJob(env, { artifactId, projectId, revisionId, text = null,
   if (typeof artifactId !== "string" || typeof projectId !== "string" || typeof revisionId !== "string")
     throw new HttpError(500, "search_job_invalid", "A search job needs artifact, project and revision ids");
   const bytes = textBytes ?? (text === null ? 0 : utf8Length(text));
+  const cap = searchDocCap(env, bytes);
+  // SEARCH_TERMS_MAX = 0: no extraction; the text is never kept (the row is written complete as `off`).
+  if (cap === 0) { text = null; flat = null; }
   return {
     meta: { artifactId, projectId, revisionId }, text, flat, terms: null, tokens: null, removes: null, adds: null,
-    cap: searchDocCap(env, bytes), units: textUnits ?? (text === null ? 0 : text.length), charge: 0, reason: "", digest: "",
+    cap, units: cap === 0 ? 0 : textUnits ?? (text === null ? 0 : text.length), charge: 0, reason: "", digest: "",
     kind: null, row: null, scope: null, done: false, replanned: false,
   };
 }
@@ -518,14 +592,14 @@ export function searchJobCharge(job, { upload = false } = {}) {
 
 /** Plan rows and counts for every job, in batches of at most 100 statements (one call for a run's 100 jobs). */
 async function planRun(db, run) {
-  const jobs = run.holder.jobs;
-  for (let i = 0; i < jobs.length; i += SEARCH_BATCH_STATEMENTS_MAX) {
-    const part = jobs.slice(i, i + SEARCH_BATCH_STATEMENTS_MAX);
-    const results = await db.DB.batch(part.map((j) => bindNamed(db, SEARCH_SQL.PLAN, { A: j.meta.artifactId, P: j.meta.projectId, R: j.meta.revisionId })));
-    part.forEach((j, k) => { j.row = results[k]?.results?.[0] ?? null; });
+  // The jobs array is reached only through run.holder (never a local across an await), so detaching releases it.
+  for (let i = 0; i < run.holder.jobs.length; i += SEARCH_BATCH_STATEMENTS_MAX) {
+    const stmts = run.holder.jobs.slice(i, i + SEARCH_BATCH_STATEMENTS_MAX).map((j) => bindNamed(db, SEARCH_SQL.PLAN, { A: j.meta.artifactId, P: j.meta.projectId, R: j.meta.revisionId }));
+    const results = await db.DB.batch(stmts);
+    run.holder.jobs.slice(i, i + SEARCH_BATCH_STATEMENTS_MAX).forEach((j, k) => { j.row = results[k]?.results?.[0] ?? null; });
   }
   run.holder.plan = { workspaces: new Map(), installationFullLogged: false };
-  for (const j of jobs) {
+  for (const j of run.holder.jobs) {
     const r = j.row;
     if (!r || !r.head || !r.live) { j.done = true; run.skip("refused"); continue; }
     const W = r.doc_id == null ? r.ws : r.row_ws, O = r.doc_id == null ? r.owner : r.row_owner;
@@ -541,7 +615,7 @@ async function workspaceSetup(db, run, job) {
   let ws = plan.workspaces.get(W);
   if (!ws) {
     const key = await step(run, () => searchTokenKey(db, W));
-    const bounds = searchScopeBounds(db, await workspaceLimits(db, W));
+    const bounds = searchScopeBounds(db, await step(run, () => workspaceLimits(db, W)));
     ws = { key, bounds };
     plan.workspaces.set(W, ws);
   }
@@ -562,7 +636,7 @@ async function prepareTokens(db, run, job) {
     job.text = null;
     job.terms = p;
     job.reason = p.truncated ? capReason(db, job.cap) : "";
-    run.lower(job, 2 * (p.units.length + p.offsets.length) + SEARCH_TOKEN_BYTES * job.cap);
+    run.lower(job, packedBytes(p) + SEARCH_TOKEN_BYTES * job.cap);
   } else if (job.flat !== null) {
     job.terms = job.flat;
     job.flat = null;
@@ -863,15 +937,16 @@ async function writeStableGroup(db, run, group, queue) {
 /** Process every planned job in order: new, stable groups, unstable; then the re-plans, once each. */
 async function writeRun(db, run) {
   const queue = [];
-  const jobs = run.holder.jobs;
-  for (let i = 0; i < jobs.length;) {
-    const job = jobs[i];
+  // Jobs are read through run.holder at each step (never a local array across an await), so detaching releases them.
+  const at = (i) => run.holder.jobs[i];
+  for (let i = 0; i < run.holder.jobs.length;) {
+    const job = at(i);
     if (job.done) { i++; continue; }
     if (job.kind === "stable") {
       const group = [];
       let tokens = 0;
-      while (i < jobs.length && group.length < STABLE_GROUP_DOCS) {
-        const j = jobs[i];
+      while (i < run.holder.jobs.length && group.length < STABLE_GROUP_DOCS) {
+        const j = at(i);
         if (j.done) { i++; continue; }
         if (j.kind !== "stable") break;
         if (group.length && tokens + j.row.term_count > STABLE_GROUP_TOKENS) break;
@@ -947,13 +1022,102 @@ export async function runSearchIndexing(env, run) {
  * 26 MiB) are skipped. Returns the run's tally.
  */
 export async function indexSearchJobs(env, jobs, { declaredCalls = 0 } = {}) {
-  const run = new SearchRun({ declaredCalls });
-  admitJobs(env, run, jobs);
-  await runSearchIndexing(env, run);
+  const run = openSearchRun({ declaredCalls });
+  if (!run) return { run: null, calls: 0, completed: 0, skipped: { admission: jobs.length }, tokenOps: 0, maxRemoveValues: 0 };
+  admitSearchJobs(env, run, jobs);
+  await track(run, runSearchIndexing(env, run));
   return runTally(run);
 }
-/** Admit jobs into a run's holder within its limits; rejected jobs never enter the holder. */
-function admitJobs(env, run, jobs) {
+/** Keep a started run's promise until it settles (drainSearchIndexing). */
+function track(run, promise) {
+  const p = promise.catch(() => {}).finally(() => running.delete(run));
+  running.set(run, p);
+  return p;
+}
+
+// --- Deferral (createWorker's fetch wrapper and the publishing paths use these; wired in a later commit) -----------
+const DEFERRED = Symbol("agent-library.deferred-work");
+/** A request's env with its own deferred-work queue. createWorker attaches one per fetch. */
+export const withDeferredWork = (env) => ({ ...env, [DEFERRED]: { run: null, started: false, discarded: false, skipped: {}, stuckLogged: false } });
+const skipCount = (skipped) => Object.values(skipped).reduce((a, b) => a + b, 0);
+/**
+ * Hand index jobs ({ artifactId, projectId, revisionId, text } or, for upload finish, { …, flat, textBytes, textUnits })
+ * of a successful publication to this request's run. The request's first job opens the run reservation; each job is
+ * admitted if it fits, else dropped and counted. Never awaited, never throws, returns nothing; the work starts only
+ * after the handler's Response (startDeferredWork).
+ */
+export function deferSearchIndexing(env, jobs) {
+  const q = env?.[DEFERRED];
+  try {
+    if (!Array.isArray(jobs) || !jobs.length) return;
+    if (!q) { logEvent("search_index_skipped", { skipped: jobs.length, reasons: { unwired: jobs.length } }); return; }
+    if (q.started || q.discarded) { q.skipped.late = (q.skipped.late ?? 0) + jobs.length; return; }
+    if (!q.run) {
+      q.run = openSearchRun();
+      if (!q.run) {
+        q.skipped.admission = (q.skipped.admission ?? 0) + jobs.length;
+        if (!q.stuckLogged && isolate.detached.size >= SEARCH_DETACHED_MAX) {
+          q.stuckLogged = true;
+          logError("search_admission_stuck", { active: isolate.active.size, activeBytes: isolate.activeBytes, detached: isolate.detached.size, refused: isolate.refused });
+        }
+        return;
+      }
+    }
+    admitSearchJobs(env, q.run, jobs);
+  } catch (e) {
+    if (q) q.skipped.error = (q.skipped.error ?? 0) + (Array.isArray(jobs) ? jobs.length : 1);
+    logError("search_index_failed", { code: e?.code ?? "error" });
+  }
+}
+/** Log the request's skipped jobs when it has no run (a run logs its own, once, when it ends). */
+function logRequestSkips(q) {
+  const n = skipCount(q.skipped);
+  if (n) logEvent("search_index_skipped", { skipped: n, reasons: q.skipped });
+  q.skipped = {};
+}
+/**
+ * After the handler's Response has resolved: start the request's run with ctx.waitUntil (one promise that never
+ * rejects). The run begins with `await scheduler.wait(0)`.
+ */
+export function startDeferredWork(env, ctx) {
+  const q = env?.[DEFERRED];
+  if (!q || q.started || q.discarded) return;
+  q.started = true;
+  const run = q.run;
+  q.run = null;
+  if (!run || !run.holder.jobs?.length) {
+    if (run) { for (const [k, n] of Object.entries(run.skipped)) q.skipped[k] = (q.skipped[k] ?? 0) + n; run.settle(); }
+    logRequestSkips(q);
+    return;
+  }
+  for (const [k, n] of Object.entries(q.skipped)) run.skip(k, n);
+  q.skipped = {};
+  phase(run, "handler_done");
+  ctx.waitUntil(track(run, runSearchIndexing(env, run)));
+}
+/** In the fetch wrapper's `finally`: a run that was not started is dropped (holder nulled, reservation released). */
+export function discardDeferredWork(env) {
+  const q = env?.[DEFERRED];
+  if (!q || q.started || q.discarded) return;
+  q.discarded = true;
+  const run = q.run;
+  q.run = null;
+  if (run) {
+    for (const [k, n] of Object.entries(run.skipped)) q.skipped[k] = (q.skipped[k] ?? 0) + n;
+    q.skipped.discarded = (q.skipped.discarded ?? 0) + (run.holder.jobs?.length ?? 0);
+    run.settle();
+  }
+  logRequestSkips(q);
+}
+/** Resolves when every run started in this isolate so far has settled (tests and local tools). */
+export async function drainSearchIndexing() {
+  while (running.size) await Promise.all([...running.values()]);
+}
+/**
+ * Admit jobs into a run's holder, in order, while it stays within its limits (100 documents, 10 Mi code units, 26 MiB,
+ * the isolate's free bytes); the rest are counted as skipped (admission). Rejected jobs never enter the holder.
+ */
+export function admitSearchJobs(env, run, jobs) {
   for (const input of jobs) {
     const job = searchJob(env, input);
     const charge = searchJobCharge(job, { upload: job.flat !== null });
@@ -963,4 +1127,4 @@ function admitJobs(env, run, jobs) {
     run.holder.jobs.push(job);
   }
 }
-const runTally = (run) => ({ run: run.id, calls: run.calls, completed: run.completed, skipped: { ...run.skipped }, tokenOps: run.tokenOps, maxRemoveValues: run.maxRemoveValues });
+export const runTally = (run) => ({ run: run.id, calls: run.calls, completed: run.completed, skipped: { ...run.skipped }, tokenOps: run.tokenOps, maxRemoveValues: run.maxRemoveValues });
