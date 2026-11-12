@@ -650,25 +650,35 @@ test("PUT replace: etag and rev:N forms; stale 412 with current_*; early and lat
   const c3 = await put(c.tok, "r.md", v3, { match: "rev:2" });
   assert.equal(c3.status, 200, c3.text); assert.equal(c3.json.file.revision, 3);
   assert.deepEqual(counters(c.P.publisher_id), [1, 3, v1.length + v2.length + v3.length]);
+  // The quoted form "rev:N" (HTTP clients quote entity tags) is accepted like rev:N.
+  err(await put(c.tok, "r.md", "x", { match: '"rev:2"' }), 412, "precondition_failed", N.N5);
   const st = await put(c.tok, "r.md", "x", { match: `"${sha(v1)}"` });
   err(st, 412, "precondition_failed", N.N5); assert.equal(st.json.error.current_revision, 3); assert.equal(st.json.error.current_etag, `"${sha(v3)}"`);
-  err(await put(c.tok, "r.md", "x", { match: "rev:1" }), 412, "precondition_failed", N.N5); // ABA: rev:1 against head 3
+  // ABA: the bytes return to an earlier version (A -> B -> A). The etag then matches the head again (the head holds A),
+  // but rev:1 is judged by revision and is stale: 412 against head 4.
+  const back = await put(c.tok, "r.md", v1, { match: "rev:3" });
+  assert.equal(back.status, 200, back.text); assert.equal(back.json.file.revision, 4); assert.equal(back.json.file.etag, a.json.file.etag);
+  const aba = await put(c.tok, "r.md", "x", { match: "rev:1" });
+  err(aba, 412, "precondition_failed", N.N5); assert.equal(aba.json.error.current_revision, 4);
+  const byTag = await put(c.tok, "r.md", "after aba", { match: a.json.file.etag });
+  assert.equal(byTag.status, 200, "the first etag names the current bytes again"); assert.equal(byTag.json.file.revision, 5);
+  ok(await put(c.tok, "r.md", v3, { match: "rev:5" }), 200);
   const revs = revCount(c.P.publisher_id), cnt = counters(c.P.publisher_id);
   // Early unchanged: a matching X-Content-SHA256 answers before any byte is read, even at a cap.
   setCounters(c.P.publisher_id, cnt[0], 100000, cnt[2]);
-  const x = partialPut(c.tok, "r.md", { length: v3.length, send: 0, headers: { "If-Match": "rev:3", "X-Content-SHA256": sha(v3) } });
+  const x = partialPut(c.tok, "r.md", { length: v3.length, send: 0, headers: { "If-Match": "rev:6", "X-Content-SHA256": sha(v3) } });
   const early = await Promise.race([x.response, new Promise((r) => setTimeout(() => r(null), 4000))]);
   x.socket.destroy();
   assert.ok(early && /^HTTP\/1\.1 200/.test(early), `early unchanged answered without the body: ${early?.slice(0, 200)}`);
   assert.match(early, /"unchanged":true/);
   setCounters(c.P.publisher_id, ...cnt);
   // Late unchanged: same bytes without the header; nothing written.
-  const late = await put(c.tok, "r.md", v3, { match: "rev:3" });
-  assert.equal(late.status, 200, late.text); assert.equal(late.json.unchanged, true); assert.equal(late.json.file.revision, 3);
+  const late = await put(c.tok, "r.md", v3, { match: '"rev:6"' });
+  assert.equal(late.status, 200, late.text); assert.equal(late.json.unchanged, true); assert.equal(late.json.file.revision, 6);
   assert.equal(revCount(c.P.publisher_id), revs); assert.deepEqual(counters(c.P.publisher_id), cnt);
   // Late identical at a cap without the header: refused like any write.
   setCounters(c.P.publisher_id, cnt[0], 100000, cnt[2]);
-  const capped = await put(c.tok, "r.md", v3, { match: "rev:3" });
+  const capped = await put(c.tok, "r.md", v3, { match: "rev:6" });
   err(capped, 413, "quota_exceeded"); assert.equal(capped.json.error.max_revisions, 100000);
   setCounters(c.P.publisher_id, ...cnt);
 });
@@ -914,7 +924,9 @@ test("slots: per workspace 429, per creator 429, per isolate 503 (Retry-After 1)
     err(fifth, 503, "app_files_busy", N.N12); assert.equal(fifth.headers.get("retry-after"), "1"); assert.equal(fifth.json.error.retry_after_seconds, 1);
     // One finishes (its last 7 bytes arrive): 201, and its slot is free; carol's retry is admitted.
     open[0].socket.write("aaaaaaa");
-    assert.match(await Promise.race([open[0].response, new Promise((r) => setTimeout(() => r(""), 1500)).then(() => open[0].socket.destroy() ?? "")]) || "", /^(HTTP\/1\.1 201|)/);
+    const finished = await Promise.race([open[0].response, new Promise((r) => setTimeout(() => r("(no answer in 3 s)"), 3000))]);
+    assert.match(finished, /^HTTP\/1\.1 201 /, finished.slice(0, 200));
+    assert.match(finished, /"path":"a1\.md"/); assert.match(finished, /"revision":1/);
     await untilSlots(w.fifth.tok, 3);
     assert.equal((await put(w.fifth.tok, "e.md", "x", { create: true })).status, 201);
   } finally { for (const x of open) x.socket.destroy(); }
@@ -970,7 +982,7 @@ test("slots (g): with a 1 s reclaim horizon, a held publish is reclaimed by the 
   for (const l of lines) assert.doesNotMatch(l, /reclaim-held|pub_|afs_|files-own/);
 });
 
-test("test hooks: x-test-hold-publish-ms is clamped to 5 s (the A4 negative cases are in app-files-unit and the flag-off server test)", async () => {
+test("test hooks: x-test-hold-publish-ms is clamped to 5 s", async () => {
   const c = await connect("files-own");
   const t0 = Date.now();
   const r = await put(c.tok, "clamp.md", "x", { create: true, headers: { "x-test-hold-publish-ms": "60000" } });
@@ -1026,16 +1038,19 @@ test("counters: each cap answers 413 with its max_*; exact under concurrent repl
 // Design test 19.
 test("rate limit: App Files writes share the publisher write budget (429 with Retry-After)", async () => {
   const c = await connect("files-own");
+  // The budget is per minute window: exhaust this window and the next, so the request is over budget whichever
+  // window it lands in.
   const win = Math.floor(Date.now() / 60000);
-  sql(`INSERT INTO rate_counters (k, win, n) VALUES ('w:${sql(`SELECT principal_id AS p FROM publishers WHERE id = '${c.P.publisher_id}'`)[0].p}', ${win}, 99999999)
+  const principal = sql(`SELECT principal_id AS p FROM publishers WHERE id = '${c.P.publisher_id}'`)[0].p;
+  sql(`INSERT INTO rate_counters (k, win, n) VALUES ('w:${principal}', ${win}, 99999999), ('w:${principal}', ${win + 1}, 99999999)
     ON CONFLICT (k, win) DO UPDATE SET n = 99999999`);
   const r = await put(c.tok, "rl.md", "x", { create: true });
-  if (Math.floor(Date.now() / 60000) !== win) return; // the minute rolled over between the two statements
   err(r, 429, "rate_limited"); assert.ok(Number(r.headers.get("retry-after")) >= 1);
+  assert.equal(appRows(c.P.publisher_id), 0);
 });
 
 // Design test 21.
-test("encryption: App Files text is stored like every other text write", { todo: "slice 3b (workspace encryption) is not on this branch; until it lands, content-store stores text as plaintext" }, async () => {
+test("encryption: App Files text is stored like every other text write", { todo: "App Files are text; text is encrypted by slice 3c, which is not built yet; until then text is stored as plaintext" }, async () => {
   const c = await connect("files-own");
   ok(await put(c.tok, "enc.md", "synthetic secret", { create: true }), 201);
   const key = sql(`SELECT r.body_key FROM artifacts a JOIN revisions r ON r.id = a.head_revision_id WHERE a.publisher_id = '${c.P.publisher_id}'`)[0].body_key;
@@ -1112,7 +1127,7 @@ test("DELETE: stale 412 then 200; trashed with publisher_id kept and export_name
   assert.deepEqual(ok(await files(c.tok)).files, [], "a restored file has no path: invisible to the app");
 });
 
-test("DELETE refusals: owner-trashed 409; generation row 409; manifest 400; owner trash racing a create 409", async () => {
+test("DELETE refusals: owner-trashed 409; generation row 409; manifest 400; owner trash racing a replace 409", async () => {
   const c = await connect("files-own");
   const a = await put(c.tok, "o.md", "x", { create: true });
   const fid = a.json.file.file_id;
@@ -1132,6 +1147,19 @@ test("DELETE refusals: owner-trashed 409; generation row 409; manifest 400; owne
   });
   err(r, 409, "destination_file_trashed");
   assert.equal(sql(`SELECT head_rev FROM artifacts WHERE id = '${b.json.file.file_id}'`)[0].head_rev, 1);
+});
+
+test("owner trash racing a create: the app deletes its file, then while its re-create is paused the owner restores and trashes the old one; 409", async () => {
+  // A create at a path can only meet an owner-trashed file of that path if the row appears during the request. The
+  // old (released) row comes back to the path: the owner restores it (no path, read-only), and in D1 the test gives it
+  // back its export name and trashes it, as an owner trash of a live file leaves it.
+  const c = await connect("files-own");
+  const a = await put(c.tok, "cr.md", "old", { create: true });
+  ok(await del(c.tok, "cr.md", { match: "rev:1" }), 200);
+  const r = await during((hd) => put(c.tok, "cr.md", "new", { create: true, headers: hd }), async () =>
+    sql(`UPDATE artifacts SET export_name = 'cr.md', trashed_at = '${new Date().toISOString()}' WHERE id = '${a.json.file.file_id}'`));
+  err(r, 409, "destination_file_trashed");
+  assert.equal(sql(`SELECT COUNT(*) AS n FROM artifacts WHERE publisher_id = '${c.P.publisher_id}'`)[0].n, 1, "no second row");
 });
 
 // Design test 5d.
@@ -1180,4 +1208,134 @@ test("concurrent replay (d): a DELETE loser that would see no file replays the w
   const l = await loser;
   assert.equal(winner.status, 200); assert.equal(l.status, 200, l.text); assert.equal(l.json.idempotent_replay, true);
   assert.deepEqual(l.json.file, winner.json.file);
+});
+
+// ---- Part 2 review fixes (commit D) ----
+test("path conflicts ignore case for the ancestor and descendant checks too, both ways", async () => {
+  const c = await connect("files-own");
+  ok(await put(c.tok, "Notes.md", "x", { create: true }), 201);
+  err(await put(c.tok, "notes.md/x.md", "y", { create: true }), 409, "path_conflict");
+  err(await put(c.tok, "NOTES.MD/deep/x.md", "y", { create: true }), 409, "path_conflict");
+  // Folder names may contain dots: with Dir.md/Sub.md/a.md stored, a file named dir.md or DIR.MD/sub.md is where a
+  // folder is needed.
+  ok(await put(c.tok, "Dir.md/Sub.md/a.md", "x", { create: true }), 201);
+  for (const p of ["dir.md", "DIR.MD/sub.md", "dir.md/SUB.MD"]) err(await put(c.tok, p, "y", { create: true }), 409, "path_conflict");
+  ok(await put(c.tok, "dir.md/other.md", "x", { create: true }), 201);
+  // A folder where a file is needed: an existing Dir/Sub/... makes "dir/sub" unusable as a file of any case.
+  insertFiles(c.P.publisher_id, [{ path: "Up/Low.json", kind: "json", content: "{}" }]);
+  for (const p of ["up/low.json/x.md", "UP/LOW.JSON/y/z.csv"]) err(await put(c.tok, p, "a,b", { create: true, type: typeOf(p) }), 409, "path_conflict");
+  // Exactly the prefix plus '/': "dir/sub0.md" or "dir/sub-x.md" share a prefix but are not under the folder.
+  ok(await put(c.tok, "notes.md-x/a.md", "x", { create: true }), 201);
+  ok(await put(c.tok, "notes.md0.md", "x", { create: true }), 201);
+  assert.equal(appRows(c.P.publisher_id), 6);
+});
+
+test("the manifest name is reserved by meaning on PUT and DELETE (400); GET and the list never show it", async () => {
+  const c = await connect("files-own");
+  ok(await snapshot(c.tok, 1), 201);
+  for (const p of ["manifest.json", "Manifest.json", "MANIFEST.JSON", "manifest.json/x.md", "Manifest.Json/a/b.csv"]) {
+    err(await put(c.tok, p, "x", { create: true, type: typeOf(p) }), 400, "invalid_input", "manifest.json is reserved for the server");
+    err(await del(c.tok, p, { match: "rev:1" }), 400, "invalid_input", "manifest.json is reserved for the server");
+    const g = await file(c.tok, p);
+    assert.equal(g.status, 404, p); assert.equal(g.json.error.message, "File not found");
+  }
+  assert.deepEqual(ok(await files(c.tok)).files.map((f) => f.path), ["export.json"]);
+  ok(await put(c.tok, "sub/manifest.json", "{}", { create: true }), 201);
+});
+
+test("concurrent creates that differ only by case, or where one is the other's mixed-case ancestor: exactly one succeeds, the other 409", async () => {
+  for (const [first, second] of [["Case.md", "case.md"], ["Folder.md", "folder.md/inner.md"], ["outer.md/Inner.md", "OUTER.md"]]) {
+    const c = await connect("files-own");
+    const b = h.pauseBarrier();
+    const paused = put(c.tok, first, "a", { create: true, headers: { "x-test-pause-before-batch-ms": "3000", "x-test-pause-tag": b.tag } });
+    await b.entered;
+    const quick = await put(c.tok, second, "b", { create: true });
+    const slow = await paused;
+    assert.equal(quick.status, 201, `${second}: ${quick.text}`);
+    err(slow, 409, "path_conflict");
+    assert.equal(appRows(c.P.publisher_id), 1, `${first} / ${second}`);
+  }
+});
+
+test("query plans: the path-conflict check and the list use an index on publisher_id (no full scan of artifacts)", async () => {
+  const c = await connect("files-own");
+  const pub = c.P.publisher_id;
+  const plan = (q) => sql(`EXPLAIN QUERY PLAN ${q}`).map((r) => r.detail);
+  // The statements as app-files.js builds them (conflictCheck and the list), with literal values.
+  const W = await import("./load-worker.mjs").then((m) => m.loadWorker({ "api/app-files.js": ["conflictCheck", "LIST_SQL"] }));
+  const cc = W.conflictCheck(pub, "Notes/Day/A.md");
+  let i = 0;
+  const lit = (sqlText, params) => sqlText.replace(/\?/g, () => { const v = params[i++]; return v === null ? "NULL" : `'${String(v).replace(/'/g, "''")}'`; });
+  const conflictPlan = plan(`SELECT ${lit(cc.sql, cc.params)} AS ok`);
+  i = 0;
+  const listPlan = plan(lit(W.LIST_SQL, [pub, "files-own", null, "", "~", "", 101]));
+  console.log(JSON.stringify({ conflictPlan, listPlan }));
+  for (const p of [conflictPlan, listPlan]) {
+    assert.ok(p.some((d) => /USING (COVERING )?INDEX artifacts_publisher_(lname|name)/.test(d)), JSON.stringify(p));
+    assert.ok(!p.some((d) => /^SCAN (a|c|artifacts)\b(?! USING)/.test(d)), `full scan: ${JSON.stringify(p)}`);
+  }
+  assert.ok(conflictPlan.some((d) => /artifacts_publisher_lname/.test(d)), JSON.stringify(conflictPlan));
+});
+
+test("If-Match accepts the quoted revision \"rev:N\" on PUT and DELETE", async () => {
+  const c = await connect("files-own");
+  ok(await put(c.tok, "q.md", "one", { create: true }), 201);
+  const r = await put(c.tok, "q.md", "two", { match: '"rev:1"' });
+  assert.equal(r.status, 200, r.text); assert.equal(r.json.file.revision, 2);
+  err(await del(c.tok, "q.md", { match: '"rev:1"' }), 412, "precondition_failed", N.N5);
+  ok(await del(c.tok, "q.md", { match: '"rev:2"' }), 200);
+  for (const bad of ['"rev:0"', '"rev:x"', "'rev:1'", '"rev:1'])
+    err(await put(c.tok, "q2.md", "x", { match: bad }), 400, "invalid_input", N.N8);
+});
+
+test("PUT replace in flight: client disabled, token superseded or workspace suspended during the pause: refused, head unchanged", async () => {
+  const pid = ok(await bob.req("POST", "/api/projects", { title: uniq("Replace mid"), workspace_id: WSA }), 201).id;
+  const cases = {
+    "client disabled": [401, (c) => owner.req("POST", `/api/app-clients/${c.app.app_client_id}/disable`, {})],
+    "token epoch superseded": [401, (c) => MID["token epoch superseded"](c.P.publisher_id)],
+    "workspace suspended": [403, () => sql(`UPDATE workspaces SET status = 'suspended' WHERE id = '${WSA}'`)],
+  };
+  for (const [label, [status, act]] of Object.entries(cases)) {
+    const c = await connect(pid, { destination: "new" });
+    const f = await put(c.tok, "rep.md", "head", { create: true });
+    const before = counters(c.P.publisher_id);
+    try {
+      const r = await during((hd) => put(c.tok, "rep.md", "changed", { match: "rev:1", headers: hd }), async () => act(c));
+      assert.equal(r.status, status, `${label}: ${r.text}`);
+    } finally { sql(`UPDATE workspaces SET status = 'active' WHERE id = '${WSA}'`); }
+    assert.equal(sql(`SELECT head_rev FROM artifacts WHERE id = '${f.json.file.file_id}'`)[0].head_rev, 1, label);
+    assert.equal(revCount(c.P.publisher_id), 1, label); assert.deepEqual(counters(c.P.publisher_id), before, label);
+  }
+});
+
+test("PUT and DELETE in flight: the creator removed from the workspace, or the project deleted, during the pause: refused, nothing written", async () => {
+  const rejoin = async () => {
+    const inv = ok(await bob.req("POST", `/api/workspaces/${WSA}/invites`, { email: "owner@example.test", role: "member" }), 201);
+    ok(await owner.req("POST", "/api/invites/accept", { token: inv.accept_url.split("/").pop() }));
+  };
+  for (const op of ["create", "replace", "delete"]) {
+    // Creator removed (owner leaves bob's workspace).
+    const pid = ok(await bob.req("POST", "/api/projects", { title: uniq("Creator mid"), workspace_id: WSA }), 201).id;
+    const c = await connect(pid);
+    const f = op === "create" ? null : await put(c.tok, "m.md", "head", { create: true });
+    const send = (hd) => op === "create" ? put(c.tok, "m.md", "x", { create: true, headers: hd })
+      : op === "replace" ? put(c.tok, "m.md", "x", { match: "rev:1", headers: hd }) : del(c.tok, "m.md", { match: "rev:1", headers: hd });
+    let r;
+    try { r = await during(send, async () => ok(await bob.req("DELETE", `/api/workspaces/${WSA}/members/${ownerId}`))); }
+    finally { await rejoin(); }
+    assert.equal(r.status, 403, `${op} creator removed: ${r.text}`); assert.equal(r.json.error.code, "scope_mismatch");
+    if (f) assert.deepEqual(sql(`SELECT head_rev, export_name, trashed_at FROM artifacts WHERE id = '${f.json.file.file_id}'`)[0], { head_rev: 1, export_name: "m.md", trashed_at: null });
+    else assert.equal(appRows(c.P.publisher_id), 0);
+    // Project deleted.
+    const title = uniq("Project mid");
+    const pid2 = ok(await owner.req("POST", "/api/projects", { title }), 201).id;
+    const d = await connect(pid2);
+    const g = op === "create" ? null : await put(d.tok, "m.md", "head", { create: true });
+    const send2 = (hd) => op === "create" ? put(d.tok, "m.md", "x", { create: true, headers: hd })
+      : op === "replace" ? put(d.tok, "m.md", "x", { match: "rev:1", headers: hd }) : del(d.tok, "m.md", { match: "rev:1", headers: hd });
+    const r2 = await during(send2, async () => ok(await owner.req("DELETE", `/api/projects/${pid2}`, { confirm_title: title })));
+    assert.equal(r2.status, 403, `${op} project deleted: ${r2.text}`);
+    if (g) assert.deepEqual(sql(`SELECT head_rev, export_name, trashed_at FROM artifacts WHERE id = '${g.json.file.file_id}'`)[0], { head_rev: 1, export_name: "m.md", trashed_at: null });
+    else assert.equal(appRows(d.P.publisher_id), 0);
+  }
 });

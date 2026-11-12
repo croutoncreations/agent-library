@@ -5,7 +5,7 @@ import { loadWorker } from "./load-worker.mjs";
 
 const W = await loadWorker({
   "oauth/server.js": ["DISABLED_CLIENT_BLOCKS", "clientAllows", "clientLiveSql"],
-  "api/app-files.js": ["parseAppPath", "etagMatches", "createSlotTable", "APP_FILES_SLOT_RECLAIM_MS", "APP_FILES_OVERRUN_MAX"],
+  "api/app-files.js": ["parseAppPath", "reservedAppPath", "conflictCheck", "etagMatches", "createSlotTable", "APP_FILES_SLOT_RECLAIM_MS", "APP_FILES_OVERRUN_MAX"],
   "api/publisher.js": ["testHooksOn"],
 });
 
@@ -31,6 +31,9 @@ test("parseAppPath: kinds come only from the four text extensions (no inherited 
   assert.deepEqual(W.parseAppPath("x.htm"), { path: "x.htm", kind: "html" });
   assert.deepEqual(W.parseAppPath("x.JSON"), { path: "x.JSON", kind: "json" });
   assert.deepEqual(W.parseAppPath("x.csv"), { path: "x.csv", kind: "csv" });
+  // The manifest name is reserved by meaning: any path whose first segment, lowercased, is manifest.json.
+  for (const r of ["manifest.json", "Manifest.json", "MANIFEST.JSON", "manifest.json/x.md", "Manifest.JSON/a/b.csv"]) assert.equal(W.reservedAppPath(r), true, r);
+  for (const r of ["x/manifest.json", "manifest.json.md", "manifests.json", "a.md"]) assert.equal(W.reservedAppPath(r), false, r);
   for (const bad of ["x.constructor", "x.toString", "x.__proto__", "x.hasOwnProperty", "x.valueOf", "x.txt", "x", "constructor"])
     assert.throws(() => W.parseAppPath(bad), (e) => e.status === 400 && e.code === "invalid_path", bad);
 });
@@ -91,9 +94,12 @@ test("slots: reclaim moves at most 2 stale slots to overrun; they still count fo
   assert.equal(T.inUse(), 6);
   assert.equal(code(() => T.admit("w7", "p7")), "503 app_files_busy 1", "4 active and overrun full");
   assert.equal(events.filter((e) => e.event === "app_files_slots_stuck").length, 1);
-  // Many more horizons with promises that never settle: never more than 6 bodies, stuck logged once per isolate.
+  // Within one reclaim horizon a stuck table logs once; each later horizon it is still stuck logs once more.
+  for (let k = 0; k < 5; k++) { advance(1000); assert.equal(code(() => T.admit(`y${k}`, `r${k}`)), "503 app_files_busy 1"); }
+  assert.equal(events.filter((e) => e.event === "app_files_slots_stuck").length, 1, "at most once per horizon");
+  // Many more horizons with promises that never settle: never more than 6 bodies; one stuck event per horizon.
   for (let k = 0; k < 10; k++) { advance(W.APP_FILES_SLOT_RECLAIM_MS); assert.equal(code(() => T.admit(`x${k}`, `q${k}`)), "503 app_files_busy 1"); assert.ok(T.inUse() <= 6); }
-  assert.equal(events.filter((e) => e.event === "app_files_slots_stuck").length, 1);
+  assert.equal(events.filter((e) => e.event === "app_files_slots_stuck").length, 11, "a later recurrence is logged again");
   assert.equal(events.filter((e) => e.event === "app_files_slot_reclaimed").length, 2);
   for (const e of events) assert.deepEqual(Object.keys(e), ["event"], "log events carry no ids or paths");
   // Overrun entries keep their workspace and creator counted: the moved ones were w1/p0 and w2/p1.
@@ -105,4 +111,12 @@ test("slots: reclaim moves at most 2 stale slots to overrun; they still count fo
   // Releasing an overrun entry frees it.
   T.release(held[0]);
   assert.equal(T.sizes().overrun, 1);
+});
+
+test("path conflicts: exact and ancestor names are bound lowercased (at most 8 values); descendants are a lowercased range", () => {
+  const c = W.conflictCheck("pub_x", "Notes/Day/A.md");
+  assert.match(c.sql, /lower\(c\.export_name\) IN \(\?, \?, \?\)/);
+  assert.deepEqual(c.params, ["pub_x", "notes/day/a.md", "notes", "notes/day", "pub_x", "notes/day/a.md/", "notes/day/a.md0"]);
+  const deep = W.conflictCheck("pub_x", "1/2/3/4/5/6/7/8.md");
+  assert.equal(deep.params.length, 1 + 8 + 1 + 2);
 });

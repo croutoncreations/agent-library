@@ -82,14 +82,16 @@ export async function startAppConnectServer({ port, oidcPort = port + OIDC_OFFSE
   const OWNER = "owner@example.invalid";
   const oidc = startOidc(oidcPort, { clientId: UP_CLIENT, secret: UP_SECRET, owner: OWNER });
   const issuer = `http://127.0.0.1:${port}`, appUi = `http://localhost:${port}`;
+  // A var given as null is left unset (e.g. { AC_TEST_HOOKS: null } for a server without test hooks).
+  const unset = (o) => Object.fromEntries(Object.entries(o).filter(([, v]) => v !== null));
   const s = await startServer(`ac-${port}`, port, {
-    vars: {
+    vars: unset({
       MCP_HOST: `127.0.0.1:${port}`, APP_HOST: `localhost:${port}`, APP_CONNECT_ENABLED: "1", AC_TEST_HOOKS: "1",
       ACCESS_OIDC_ISSUER: oidc.issuer, ACCESS_OIDC_CLIENT_ID: UP_CLIENT, ACCESS_OIDC_CLIENT_SECRET: UP_SECRET, OWNER_EMAIL: OWNER,
       OIDC_TEST_ENDPOINT_BASE: `http://127.0.0.1:${oidcPort}`,
       RATE_READS_PER_MIN: "100000", RATE_WRITES_PER_MIN: "100000", RATE_AUTHFAIL_PER_MIN: "100000", OAUTH_RATE_MULTIPLIER: "100",
       ...vars,
-    },
+    }),
     readyBase: appUi,
     fresh,
     worker,

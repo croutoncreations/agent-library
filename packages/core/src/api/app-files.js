@@ -3,7 +3,7 @@
 // invisible here. Every request re-checks the publisher's current authorization (assertStillAuthorized).
 import { authzSql } from "../auth.js";
 import { CONTENT_TYPE, MIME, checkFile } from "../formats.js";
-import { explainLimit, projectLimitGuard } from "../limits.js";
+import { explainLimit, limitGuard, projectLimitGuard } from "../limits.js";
 import { audit, createMarkdown, idemInsert, idemLookup, mdBody, publishRevision, runBatch } from "../service.js";
 import { metaBaselineInsert, metaVersionInsert } from "../history/service.js";
 import { nowIso } from "../util.js";
@@ -51,7 +51,7 @@ const tooLarge = () => new HttpError(413, "file_too_large", "A file sent to this
  */
 export function createSlotTable({ now = () => Date.now(), log = (e) => console.warn(JSON.stringify(e)) } = {}) {
   const slots = new Map(), overrun = new Map(), perWs = new Map(), perCreator = new Map();
-  let stuckLogged = false;
+  let stuckLoggedAt = -Infinity;
   const add = (m, k, t) => { let x = m.get(k); if (!x) m.set(k, x = new Set()); x.add(t); };
   const drop = (m, k, t) => { const x = m.get(k); if (!x) return; x.delete(t); if (!x.size) m.delete(k); };
   function admit(ws, creator, reclaimMs = APP_FILES_SLOT_RECLAIM_MS) {
@@ -61,8 +61,9 @@ export function createSlotTable({ now = () => Date.now(), log = (e) => console.w
       if (overrun.size < APP_FILES_OVERRUN_MAX) {
         slots.delete(token); overrun.set(token, slot);
         log({ event: "app_files_slot_reclaimed" });
-      } else if (!stuckLogged) {
-        stuckLogged = true;
+      } else if (t - stuckLoggedAt >= APP_FILES_SLOT_RECLAIM_MS) {
+        // At most once per reclaim horizon, so a later recurrence is visible too.
+        stuckLoggedAt = t;
         log({ event: "app_files_slots_stuck" });
       }
     }
@@ -153,6 +154,7 @@ const ROOT = "/v1/app/files";
 const SEGMENT = /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}$/;
 const KIND_BY_EXT = new Map([["md", "markdown"], ["markdown", "markdown"], ["html", "html"], ["htm", "html"], ["json", "json"], ["csv", "csv"]]);
 const MANIFEST = "manifest.json";
+const reserved = () => new HttpError(400, "invalid_input", "manifest.json is reserved for the server");
 const invalidPath = () => new HttpError(400, "invalid_path", "File path must be 1-8 segments of letters, digits, '.', '_' or '-' (1-64 characters each, not starting with '.'), at most 200 characters, ending in .md, .markdown, .html, .htm, .json or .csv");
 /**
  * Headers every App Files content answer carries, 304 included. A copy of serveContent's fixed set
@@ -182,6 +184,30 @@ export function appFilesRawPath(req) {
   return raw.slice(ROOT.length + 1);
 }
 
+/** Is this path the server's manifest by meaning (first segment, any case, is manifest.json)? */
+export const reservedAppPath = (path) => path.split("/", 1)[0].toLowerCase() === MANIFEST;
+
+/**
+ * SQL: no other file of this publisher conflicts with `path`, ignoring case. Considers every row of the publisher
+ * with an export name that is not a generation row, in any folder and whether trashed or not. Conflicts: the same
+ * name; an existing file at an ancestor of `path` (a file where a folder is needed); an existing file below `path`
+ * (a folder where a file is needed, as the range lower(path)/ .. lower(path)0, '0' following '/'). Written so the
+ * artifacts_publisher_lname index (publisher_id, lower(export_name)) answers it.
+ */
+export function conflictCheck(publisherId, path) {
+  const lp = path.toLowerCase();
+  const segs = lp.split("/");
+  const names = [lp, ...segs.slice(0, -1).map((_, i) => segs.slice(0, i + 1).join("/"))];
+  // Two seeks, each pinned to the index (without statistics SQLite would read the publisher's rows through
+  // artifacts_publisher_name instead); INDEXED BY also fails loudly if the index is missing.
+  const own = "c.publisher_id = ? AND c.export_name IS NOT NULL AND c.generation_id IS NULL";
+  return {
+    sql: `NOT EXISTS (SELECT 1 FROM artifacts c INDEXED BY artifacts_publisher_lname WHERE ${own} AND lower(c.export_name) IN (${names.map(() => "?").join(", ")}))
+      AND NOT EXISTS (SELECT 1 FROM artifacts c INDEXED BY artifacts_publisher_lname WHERE ${own} AND lower(c.export_name) >= ? AND lower(c.export_name) < ?)`,
+    params: [publisherId, ...names, publisherId, lp + "/", lp + "0"]
+  };
+}
+
 /** Validate an App Files path; returns { path, kind }. */
 export function parseAppPath(rest) {
   if (typeof rest !== "string" || rest.includes("%") || rest.length > APP_PATH_MAX_CHARS) throw invalidPath();
@@ -190,6 +216,7 @@ export function parseAppPath(rest) {
   const ext = /\.([A-Za-z]+)$/.exec(segments.at(-1))?.[1]?.toLowerCase();
   const kind = ext ? KIND_BY_EXT.get(ext) : void 0;
   if (!kind) throw invalidPath();
+  if (reservedAppPath(rest)) throw reserved();
   return { path: rest, kind };
 }
 
@@ -230,13 +257,18 @@ function listParams(url) {
   return { prefix, after, limit };
 }
 
+/**
+ * The list: keyset pagination on (publisher_id, export_name), the artifacts_publisher_name index; '~' sorts after every
+ * character a path may contain. The manifest is excluded by meaning, as everywhere.
+ */
+export const LIST_SQL = `SELECT a.id, a.project_id, a.export_name, a.kind, a.head_rev, a.created_at, a.updated_at, r.sha256, r.size, r.mime
+    FROM artifacts a JOIN revisions r ON r.id = a.head_revision_id
+    WHERE ${OWN} AND lower(a.export_name) <> '${MANIFEST}' AND lower(a.export_name) NOT LIKE '${MANIFEST}/%'
+      AND a.export_name >= ? AND a.export_name < ? AND a.export_name > ?
+    ORDER BY a.export_name LIMIT ?`;
 async function list(env, p, url) {
   const { prefix, after, limit } = listParams(url);
-  // Keyset pagination on (publisher_id, export_name); '~' sorts after every character a path may contain.
-  const rows = (await env.DB.prepare(`SELECT a.id, a.project_id, a.export_name, a.kind, a.head_rev, a.created_at, a.updated_at, r.sha256, r.size, r.mime
-    FROM artifacts a JOIN revisions r ON r.id = a.head_revision_id
-    WHERE ${OWN} AND a.export_name <> '${MANIFEST}' AND a.export_name >= ? AND a.export_name < ? AND a.export_name > ?
-    ORDER BY a.export_name LIMIT ?`).bind(...ownParams(p), prefix, prefix + "~", after, limit + 1).all()).results;
+  const rows = (await env.DB.prepare(LIST_SQL).bind(...ownParams(p), prefix, prefix + "~", after, limit + 1).all()).results;
   const page = rows.slice(0, limit);
   const next = rows.length > limit ? b64url(new TextEncoder().encode(page.at(-1).export_name)) : null;
   return json({ files: page.map((a) => fileItem(env, a)), next_cursor: next });
@@ -250,8 +282,8 @@ export function etagMatches(header, etag) {
 }
 
 async function read(req, env, p, requestId, rest) {
+  if (reservedAppPath(rest)) throw new HttpError(404, "not_found", "File not found");
   const { path } = parseAppPath(rest);
-  if (path === MANIFEST) throw new HttpError(404, "not_found", "File not found");
   const a = await env.DB.prepare(`SELECT a.id, r.sha256 FROM artifacts a JOIN revisions r ON r.id = a.head_revision_id WHERE ${OWN} AND a.export_name = ?`)
     .bind(...ownParams(p), path).first();
   if (!a) throw new HttpError(404, "not_found", "File not found");
@@ -288,7 +320,6 @@ const quotaExceeded = () => new HttpError(413, "quota_exceeded", "This app has r
   { max_files: APP_FILES_MAX, max_revisions: APP_REVISIONS_MAX, max_bytes: APP_FILES_MAX_BYTES });
 const TEXT_TYPES = new Map([["text/markdown", "markdown"], ["text/html", "html"], ["application/json", "json"], ["text/csv", "csv"]]);
 const unsupportedType = () => new HttpError(415, "unsupported_type", "Allowed: " + [...TEXT_TYPES.keys()].join(", "));
-const reserved = () => new HttpError(400, "invalid_input", "manifest.json is reserved for the server");
 const trashedErr = (path, id) => new HttpError(409, "destination_file_trashed", "The owner moved this app's file to trash; ask the owner to restore it", { name: path, file_id: id });
 const pathConflict = () => new HttpError(409, "path_conflict", "This path conflicts with another file of this app (the same path in another case, a file where a folder is needed, or a reserved export file)");
 const exists = () => new HttpError(412, "precondition_failed", "A file already exists at this path");
@@ -317,7 +348,7 @@ function parsePrecondition(req) {
   const v = im.trim();
   let m;
   if (m = /^"([0-9a-f]{64})"$/.exec(v)) return { create: false, etag: m[1], cond: v };
-  if ((m = /^rev:([1-9][0-9]{0,15})$/.exec(v)) && Number.isSafeInteger(Number(m[1]))) return { create: false, rev: Number(m[1]), cond: `rev:${Number(m[1])}` };
+  if ((m = /^"?rev:([1-9][0-9]{0,15})"?$/.exec(v)) && (v[0] === '"') === v.endsWith('"') && Number.isSafeInteger(Number(m[1]))) return { create: false, rev: Number(m[1]), cond: `rev:${Number(m[1])}` };
   throw bad();
 }
 const fileView = (path, id, kind, revision, sha256, size) => ({ path, file_id: id, kind, revision, etag: `"${sha256}"`, sha256, size });
@@ -334,7 +365,6 @@ async function put(req, env, execCtx, p, requestId, wsId, rest) {
   const h = appHooks(env, req);
   // 2. Parse: nothing below reads the body.
   const { path, kind } = parseAppPath(rest);
-  if (path === MANIFEST) throw reserved();
   contentKind(req, kind);
   const key = idemKey(req.headers.get("idempotency-key"));
   const pre = parsePrecondition(req);
@@ -372,9 +402,7 @@ async function put(req, env, execCtx, p, requestId, wsId, rest) {
   const readRow = () => env.DB.prepare(`SELECT a.id, a.kind, a.schema_id, a.head_rev, a.trashed_at, a.generation_id, r.sha256, r.size FROM artifacts a
     LEFT JOIN revisions r ON r.id = a.head_revision_id
     WHERE a.publisher_id = ? AND a.project_id = ? AND a.folder_id IS ? AND a.export_name = ? AND a.head_rev > 0`).bind(...ownParams(p), path).first();
-  const conflictSql = `NOT EXISTS (SELECT 1 FROM artifacts c WHERE c.publisher_id = ? AND c.export_name IS NOT NULL AND c.generation_id IS NULL
-    AND (lower(c.export_name) = lower(?) OR substr(?, 1, length(c.export_name) + 1) = c.export_name || '/' OR substr(c.export_name, 1, length(?) + 1) = ? || '/'))`;
-  const conflictParams = [p.id, path, path, path, path];
+  const { sql: conflictSql, params: conflictParams } = conflictCheck(p.id, path);
   /** Row and precondition checks (the design's table). Returns the row to replace, or null to create. */
   const rowChecks = async () => {
     const row = await readRow();
@@ -395,7 +423,8 @@ async function put(req, env, execCtx, p, requestId, wsId, rest) {
   const caps = async (addFiles, bytes) => {
     const c = await env.DB.prepare("SELECT app_files_created AS f, app_revisions_written AS r, app_bytes_written AS b FROM publishers WHERE id = ?").bind(p.id).first();
     if (!c || c.f + addFiles > APP_FILES_MAX || c.r + 1 > APP_REVISIONS_MAX || c.b + bytes > APP_FILES_MAX_BYTES) throw quotaExceeded();
-    const lg = await projectLimitGuard(env, p.project_id, { storage_bytes: bytes });
+    // The workspace route() already resolved for the rate limit.
+    const lg = wsId ? { ...await limitGuard(env, wsId, { storage_bytes: bytes }, p.project_id), workspaceId: wsId } : await projectLimitGuard(env, p.project_id, { storage_bytes: bytes });
     if (lg.workspaceId && !await env.DB.prepare(`SELECT ${lg.sql} AS ok`).bind(...lg.params).first("ok"))
       await explainLimit(env, lg.workspaceId, { storage_bytes: bytes }, lg.limits);
   };
@@ -506,7 +535,6 @@ async function put(req, env, execCtx, p, requestId, wsId, rest) {
 async function remove(req, env, p, requestId, rest) {
   await assertStillAuthorized(env, p);
   const { path } = parseAppPath(rest);
-  if (path === MANIFEST) throw reserved();
   const key = idemKey(req.headers.get("idempotency-key"));
   const pre = parsePrecondition(req);
   if (pre.create) throw new HttpError(400, "invalid_input", "If-Match must be one quoted SHA-256 ETag or rev:N; If-None-Match must be *; not both");
