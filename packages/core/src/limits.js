@@ -9,10 +9,11 @@ import { HttpError } from "./util.js";
 /**
  * The limit names an entitlements adapter may return (missing or null = unlimited, except where core has a default:
  * items_per_project, file_bytes and rate_multiplier). items_per_project is counted per project; rate_multiplier
- * multiplies the agent rate limits; max_key_lifetime_days caps API key lifetimes.
+ * multiplies the agent rate limits; max_key_lifetime_days caps API key lifetimes. search_terms is the workspace's
+ * blind-index allowance in charged units (search/tokens.js searchScopeBounds; absent = SEARCH_WORKSPACE_TERMS_MAX).
  */
 export const LIMIT_KEYS = ["storage_bytes", "projects", "members", "pending_invites", "agents", "owned_workspaces",
-  "items_per_project", "file_bytes", "rate_multiplier", "max_key_lifetime_days"];
+  "items_per_project", "file_bytes", "rate_multiplier", "max_key_lifetime_days", "search_terms"];
 const LABEL = {
   storage_bytes: "storage", projects: "projects", members: "members", pending_invites: "pending invitations",
   agents: "connected agents (apps, API keys and publishers)", owned_workspaces: "shared workspaces you own",
