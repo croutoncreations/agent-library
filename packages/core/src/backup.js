@@ -103,11 +103,17 @@ async function validateBackup(backup) {
 // is written must be bindable (null, string, finite number or boolean), and every row must name a document of the
 // backup. Restore gains only these (and the key-length check): no backup that restores today is refused, because a
 // value that cannot bind, or a row for an unknown document, made today's restore batch fail anyway.
+// The check is on the value as it WILL be bound, after the coercions the statements apply (meta_versions.trashed is
+// bound as `trashed ? 1 : 0`, so any value binds). strict (import only) adds import's own rules: restored_from an
+// integer and trashed a scalar. Restore must refuse nothing it accepted before (design Addendum 2).
 const bindable = (v) => v === null || v === void 0 || typeof v === "string" || typeof v === "boolean" || typeof v === "number" && Number.isFinite(v);
-function checkBindable(backup) {
+function checkBindable(backup, { strict = false } = {}) {
   const bad = (m) => { throw new HttpError(400, "bad_backup", m); };
   const fields = (row, names, what) => { for (const n of names) if (!bindable(row?.[n])) bad(`Invalid ${what} field ${n}`); };
-  const intOrNull = (v, what) => { if (v != null && !Number.isSafeInteger(v)) bad(`Invalid ${what} restored_from`); };
+  const intOrNull = (v, what) => {
+    if (!bindable(v)) bad(`Invalid ${what} field restored_from`);
+    if (strict && v != null && !Number.isSafeInteger(v)) bad(`Invalid ${what} restored_from`);
+  };
   if (typeof backup.project !== "object" || backup.project === null) bad("Missing project");
   fields(backup.project, ["title", "created_at"], "project");
   const ids = new Set();
@@ -121,7 +127,7 @@ function checkBindable(backup) {
     if (!ids.has(r.artifact_id)) bad("Revision for an unknown document");
   }
   for (const v of backup.meta_versions ?? []) {
-    fields(v, ["id", "artifact_id", "version", "title", "folder", "tags", "trashed", "author_id", "via_kind", "via_id", "via_label", "client_info", "change_note", "created_at", "template_description"], "details version");
+    fields(v, ["id", "artifact_id", "version", "title", "folder", "tags", ...strict ? ["trashed"] : [], "author_id", "via_kind", "via_id", "via_label", "client_info", "change_note", "created_at", "template_description"], "details version");
     intOrNull(v.restored_from, "details version");
     if (!ids.has(v.artifact_id)) bad("Details version for an unknown document");
   }
@@ -173,6 +179,9 @@ async function publishBackup(env, { objects, workspaceId, textKeys, build }) {
     return { res, settledNotPublished: dropSettled };
   } catch (error) {
     if (!sent) {
+      // Only file objects are deleted here. Text staged before this call (stageTextWrites) stays with its
+      // content_writes intents: unreferenced, it is reclaimed by the content-writes sweep (cleanup.js
+      // sweepContentWrites) once older than TEXT_WRITE_STALE_MS. Pinned by test/encrypted-backup.test.mjs.
       try { await deleteBlobs(env, written); } catch { log("delete_failed", written.length); }
     } else if (batchError && (fenceRefusal(batchError) || isTextWriteFenceError(batchError) || CONSTRAINT.test(String(batchError?.message ?? batchError)))) {
       await dropSettled();
@@ -199,11 +208,24 @@ async function restoreBackup(ctx, backup) {
   // IDs stay stable, but each attempt owns fresh immutable objects, even after a lost acknowledgement: text keys carry
   // the attempt segment, file keys end in _<attempt> (not stripped: stripping could make x and x_restore_… collide).
   const attempt = randomId("restore");
-  const restoreKey = (k) => `${k}_${attempt}`;
+  // Each file object is written under the revision's OWN document (blobs/<project>/<document>/…), which every read
+  // checks before decrypting. Export never pairs a revision with another document's key, but restore accepted such a
+  // hand-made pair before (its plaintext read did not check the prefix), so it must keep restoring it: the common
+  // case keeps today's name (`<key>_<attempt>`); a key naming another document is copied to a fresh name in the
+  // revision's own document, once per (source key, document).
+  const targets = new Map();
+  const restoreKey = (r) => {
+    const m = /^blobs\/[A-Za-z0-9_-]+\/([A-Za-z0-9_-]+)\/[A-Za-z0-9_-]+$/.exec(r.blob_key);
+    const pair = r.artifact_id + "\n" + r.blob_key;
+    if (!targets.has(pair)) targets.set(pair, m && m[1] === r.artifact_id ? `${r.blob_key}_${attempt}` : `blobs/${pid}/${r.artifact_id}/${randomId("rx")}_${attempt}`);
+    return targets.get(pair);
+  };
+  const fileRevisions = backup.revisions.filter((r) => r.blob_key);
+  for (const r of fileRevisions) restoreKey(r);
   // Validate every resulting key, including the attempt segment, before writing any bytes or intents.
   for (const r of backup.revisions) if (r.blob_key === null) textKey(pid, r.artifact_id, r.id, attempt);
   for (const c of backup.comments) textKey(pid, c.artifact_id, c.id, attempt);
-  checkKeysFit([...decoded.keys()].map(restoreKey));
+  checkKeysFit(new Set(targets.values()));
   // The restored project is the principal's personal workspace's, so its files go under that workspace's key.
   const workspaceId = personalWorkspaceId(ctx.principal.id);
   const authors = new Set([...backup.revisions, ...backup.comments, ...backup.meta_versions ?? []].map((x) => x.author_id));
@@ -236,14 +258,15 @@ async function restoreBackup(ctx, backup) {
   }
   tail.push(DB.prepare("INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id) VALUES (?, ?, ?, 'backup.restore', ?, 'ok', ?)").bind(nowIso(), ctx.principal.id, pid, pid, ctx.requestId));
   await stageTextWrites(ctx.env, textWrites);
-  const mimeOf = new Map(backup.revisions.filter((r) => r.blob_key).map((r) => [r.blob_key, r.mime]));
+  const objects = new Map();
+  for (const r of fileRevisions) if (!objects.has(restoreKey(r))) objects.set(restoreKey(r), [restoreKey(r), decoded.get(r.blob_key), r.mime]);
   const out = await publishBackup(ctx.env, {
-    objects: [...decoded].map(([k, bytes]) => [restoreKey(k), bytes, mimeOf.get(k)]), workspaceId, textKeys,
+    objects: [...objects.values()], workspaceId, textKeys,
     // Split revision loop, part 2: the revision INSERTs, binding each object's descriptor (never the backup's fields).
     build: (descriptors) => [...head, ...backup.revisions.map((r) => {
-      const d = r.blob_key ? descriptors.get(restoreKey(r.blob_key)) : null;
+      const d = r.blob_key ? descriptors.get(restoreKey(r)) : null;
       return DB.prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, body_key, blob_key, blob_key_id, blob_header, size, sha256, mime, restored_from, created_at, via_kind, via_id, via_label, client_info, change_note)
-      VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(r.id, r.artifact_id, pid, r.rev_no, r.author_id, bodyKeys.get(r.id) ?? null, r.blob_key ? restoreKey(r.blob_key) : null, d?.keyId ?? null, d?.header ?? null, r.size, r.sha256, r.mime, r.restored_from ?? null, r.created_at, r.via_kind ?? null, r.via_id ?? null, r.via_label ?? null, r.client_info ?? null, r.change_note ?? null);
+      VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(r.id, r.artifact_id, pid, r.rev_no, r.author_id, bodyKeys.get(r.id) ?? null, r.blob_key ? restoreKey(r) : null, d?.keyId ?? null, d?.header ?? null, r.size, r.sha256, r.mime, r.restored_from ?? null, r.created_at, r.via_kind ?? null, r.via_id ?? null, r.via_label ?? null, r.client_info ?? null, r.change_note ?? null);
     }), ...tail, ...bridges],
   });
   if (out.error) {
@@ -339,7 +362,7 @@ async function importBackup(ctx, workspaceId, input, idemKeyValue, digest = "") 
   };
   if (idemKeyValue) { const prior = await replay(); if (prior) return prior; }
   const { pid: oldPid, decoded } = await validateBackup(backup);
-  checkBindable(backup);
+  checkBindable(backup, { strict: true });
   checkImportRows(ctx.env, backup, decoded, await workspaceLimits(ctx.env, workspaceId));
   const DB = ctx.env.DB, me = ctx.principal.id, at = nowIso();
   const title = input?.title !== void 0 ? str(input.title, "title", 200, { min: 1 }) : str(String(backup.project?.title ?? "Imported project"), "title", 200, { min: 1 });
@@ -356,6 +379,10 @@ async function importBackup(ctx, workspaceId, input, idemKeyValue, digest = "") 
     return `blobs/${pid}/${artId.get(m[2])}/${m[3]}`;
   };
   const keyMap = new Map([...decoded.keys()].map((k) => [k, newKey(k)]));
+  // A file version's key must lie in its own document (reads check that prefix before decrypting). Export never
+  // produces another pairing; a hand-made backup that does is refused before anything is written.
+  for (const r of backup.revisions) if (r.blob_key !== null && !keyMap.get(r.blob_key).startsWith(`blobs/${pid}/${artId.get(r.artifact_id)}/`))
+    throw new HttpError(400, "bad_backup", "A file key does not match its document");
   checkKeysFit(keyMap.values());
   // Every check is done; re-check the role right before writing bytes (also checked inside the project INSERT).
   if (!await DB.prepare(`SELECT ${workspaceRoleSql("?", "admin")} AS ok`).bind(me, workspaceId).first("ok")) throw new HttpError(403, "forbidden", "Needs the admin role in an active workspace");

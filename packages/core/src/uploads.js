@@ -439,7 +439,8 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
     } catch (e) {
       if (e instanceof HttpError && e.code === "key_shredded") return await fail(e.status, e.code, e.message, "failed");
       // The recorded key id names no key of this workspace, or its row is malformed: retrying this upload cannot heal
-      // that, so it ends failed (publish_failed). Configuration and provider errors (encryption_misconfigured,
+      // that, so it ends failed (publish_failed). This assumes key rows are read from the primary database (a key
+      // created moments ago is always visible); revisit if D1 read replicas are ever enabled for this request. Configuration and provider errors (encryption_misconfigured,
       // encryption_not_configured, master_key_*, key_unwrap_failed, key_provider_invalid) can heal: the upload stays
       // sealed and retryable.
       if (e instanceof HttpError && (e.code === "key_not_found" || e.code === "key_row_invalid" || e.code === "invalid_key_id")) {

@@ -220,7 +220,8 @@ for (const op of ["import", "restore"]) {
     const s = fresh();
     s.hooks.beforePublish = async () => { await lib.shredWorkspaceKeys(s.env, WS); };
     const r = await silent(() => run(s, makeBackup(), `c410-${op}`));
-    assert.ok(status(410, "key_shredded")(r.error) || (op === "restore" && status(409, "store_not_empty")(r.error)) ? status(410, "key_shredded")(r.error) : false, String(r.error));
+    assert.equal(r.error?.status, 410, String(r.error));
+    assert.equal(r.error?.code, "key_shredded");
     assert.deepEqual(projectsOf(s), []);
     assert.equal([...s.w.blobs.keys()].filter((k) => k.startsWith("blobs/")).length, 0, "every written object deleted");
     assert.ok(s.w.r2.deletes.length >= 2);
@@ -406,3 +407,112 @@ for (const encryption of [false, true]) {
     if (encryption) for (const r of fileRows(dst, pid)) assert.match(r.blob_key_id, /^wk_/);
   });
 }
+
+// ---- Review fixes for part 3 ----
+
+// What the restore at b2d81c8 bound for these fields: revisions.restored_from raw (r.restored_from),
+// meta_versions.restored_from as `v.restored_from ?? null`, meta_versions.trashed as `v.trashed ? 1 : 0`. The stored
+// value is what SQLite keeps after the column's INTEGER affinity, so the expectation binds the old values into a
+// scratch table with the same column types.
+for (const encryption of [false, true]) {
+  test(`review fix (part 3): restore stores the same rows as before for restored_from "1" and 1.5 and an object-valued trashed (encryption ${encryption ? "on" : "off"})`, async () => {
+    const s = setup({ encryption, project: false });
+    const bk = makeBackup();
+    bk.revisions[0].restored_from = "1";
+    bk.revisions[1].restored_from = 1.5;
+    bk.meta_versions.push({ id: "mv1", artifact_id: "art_file", version: 1, title: "t", folder: "", tags: "[]", trashed: { odd: true }, author_id: OWNER, created_at: at(), restored_from: "2" });
+    bk.meta_versions.push({ id: "mv2", artifact_id: "art_file", version: 2, title: "t", folder: "", tags: "[]", trashed: 0, author_id: OWNER, created_at: at(), restored_from: 2.5 });
+    await lib.restoreBackup(s.ctx, bk);
+    s.w.sql.exec("CREATE TEMP TABLE old_bind (id TEXT, restored_from INTEGER, trashed INTEGER)");
+    const oldBind = s.w.sql.prepare("INSERT INTO old_bind (id, restored_from, trashed) VALUES (?, ?, ?)");
+    oldBind.run("rev_f1", bk.revisions[0].restored_from, null);
+    oldBind.run("rev_f2", bk.revisions[1].restored_from, null);
+    for (const v of bk.meta_versions) oldBind.run(v.id, v.restored_from ?? null, v.trashed ? 1 : 0);
+    const expected = (id) => ({ ...s.w.sql.prepare("SELECT restored_from, typeof(restored_from) AS t FROM old_bind WHERE id = ?").get(id) });
+    for (const id of ["rev_f1", "rev_f2"]) assert.deepEqual({ ...s.w.sql.prepare("SELECT restored_from, typeof(restored_from) AS t FROM revisions WHERE id = ?").get(id) }, expected(id), id);
+    for (const id of ["mv1", "mv2"]) {
+      assert.deepEqual({ ...s.w.sql.prepare("SELECT restored_from, typeof(restored_from) AS t FROM meta_versions WHERE id = ?").get(id) }, expected(id), id);
+      assert.equal(s.w.sql.prepare("SELECT trashed FROM meta_versions WHERE id = ?").get(id).trashed, s.w.sql.prepare("SELECT trashed FROM old_bind WHERE id = ?").get(id).trashed, id);
+    }
+    // Import keeps its stricter rules for the same values.
+    const t = setup({ encryption });
+    await assert.rejects(lib.importBackup(t.ctx, WS, { backup: structuredClone(bk) }, "strict-1"), status(400, "bad_backup"));
+  });
+}
+
+/** A backup whose file revision for document A names a key under document B (export never produces this). */
+function crossDocBackup() {
+  const bk = makeBackup({ files: [pngOf(4000)] });
+  bk.artifacts.push({ ...bk.artifacts[0], id: "art_other", title: "Other.png", head_revision_id: "rev_o1", head_rev: 1 });
+  const bytes = pngOf(3000);
+  const key = "blobs/src-proj/art_other/rev_o1";
+  bk.revisions.push({ ...bk.revisions[0], id: "rev_o1", artifact_id: "art_other", rev_no: 1, blob_key: key, size: bytes.length, sha256: sha(bytes) });
+  bk.blobs[key] = { sha256: sha(bytes), data: bytes.toString("base64") };
+  // rev_f1 (document art_file) now points at art_other's key and bytes.
+  Object.assign(bk.revisions[0], { blob_key: key, size: bytes.length, sha256: sha(bytes) });
+  delete bk.blobs["blobs/src-proj/art_file/rev_f1"];
+  return { bk, bytes };
+}
+
+test("review fix (part 3): import refuses a file version whose key lies in another document, before any write", async () => {
+  const s = setup();
+  const puts = [];
+  const put = s.w.env.BLOBS.put;
+  s.w.env.BLOBS.put = (k, b, o) => { puts.push(k); return put(k, b, o); };
+  await assert.rejects(lib.importBackup(s.ctx, WS, { backup: crossDocBackup().bk }, "xdoc"), (e) => e.status === 400 && e.code === "bad_backup" && e.message === "A file key does not match its document");
+  assert.deepEqual(puts, []);
+});
+
+for (const encryption of [false, true]) {
+  test(`review fix (part 3): restore of a version whose key lies in another document still restores, under a key in its own document, and both versions read (encryption ${encryption ? "on" : "off"})`, async () => {
+    const s = setup({ encryption, project: false });
+    const { bk, bytes } = crossDocBackup();
+    await lib.restoreBackup(s.ctx, bk);
+    const rows = fileRows(s, "src-proj");
+    for (const r of rows) assert.ok(r.blob_key.startsWith(`blobs/src-proj/${r.artifact_id}/`), `${r.id} under its own document`);
+    assert.ok((await download(s, "src-proj", "art_file", 1)).equals(bytes), "the cross-document version reads");
+    assert.ok((await download(s, "src-proj", "art_other", 1)).equals(bytes));
+    assert.notEqual(rows.find((r) => r.id === "rev_f1").blob_key, rows.find((r) => r.id === "rev_o1").blob_key, "two objects");
+  });
+}
+
+test("review fix (part 3): an exception from commitTextWrites after the batch resolved (constraint-looking text, batchError null) deletes no file and logs backup_cleanup_skipped", async () => {
+  for (const op of ["import", "restore"]) {
+    const s = setup({ project: op !== "restore" });
+    const bk = makeBackup();
+    const batch = s.w.env.DB.batch;
+    s.w.env.DB.batch = async (ss) => {
+      const r = await batch(ss);
+      if (!ss.some((x) => /INSERT INTO projects/.test(x.q))) return r;
+      // An array-like result whose slice (commitTextWrites strips its guard result with it) throws after the commit.
+      return new Proxy(r, { get: (t, k) => k === "slice" ? () => { throw new Error("UNIQUE constraint failed: synthetic.helper"); } : t[k] });
+    };
+    const out = await silent(() => op === "import" ? lib.importBackup(s.ctx, WS, { backup: bk }, "helper-1") : lib.restoreBackup(s.ctx, bk));
+    assert.ok(out.error, op);
+    assert.deepEqual(s.w.r2.deletes.filter((k) => k.startsWith("blobs/")), [], `${op}: no file object deleted`);
+    assert.ok(out.logs.some((l) => /"event":"backup_cleanup_skipped"/.test(l) && /outcome_unknown/.test(l)), out.logs.join("\n"));
+    const pid = s.w.sql.prepare("SELECT id FROM projects WHERE id <> ?").get(P).id;
+    for (const r of fileRows(s, pid)) {
+      const src = bk.revisions.filter((x) => x.blob_key)[r.rev_no - 1];
+      assert.ok((await download(s, pid, r.artifact_id, r.rev_no)).equals(Buffer.from(bk.blobs[src.blob_key].data, "base64")), `${op}: reads back`);
+    }
+  }
+});
+
+test("review fix (part 3): after a pre-send file-write failure, staged text objects and intents are left for the content-writes sweep, which reclaims them", async () => {
+  const s = setup();
+  const put = s.w.env.BLOBS.put;
+  s.w.env.BLOBS.put = async (k, b, o) => { if (k.startsWith("blobs/")) throw new Error("synthetic R2 put failure"); return put(k, b, o); };
+  await silent(() => lib.importBackup(s.ctx, WS, { backup: makeBackup() }, "pre-send-text"));
+  const intents = s.w.sql.prepare("SELECT key FROM content_writes").all().map((r) => r.key);
+  assert.ok(intents.length >= 2, "text and comment intents remain");
+  for (const k of intents) {
+    assert.ok(s.w.blobs.has(k), "the staged text object exists");
+    assert.equal(s.w.sql.prepare("SELECT 1 AS x FROM revisions WHERE body_key = ? UNION ALL SELECT 1 FROM comments WHERE body_key = ?").get(k, k), undefined, "unreferenced");
+  }
+  s.w.env.BLOBS.put = put;
+  s.w.sql.prepare("UPDATE content_writes SET created_at = 0").run();
+  await lib.reconcileUploads(s.env);
+  assert.equal(s.w.sql.prepare("SELECT COUNT(*) AS n FROM content_writes").get().n, 0, "intents removed by the sweep");
+  for (const k of intents) assert.equal(s.w.blobs.has(k), false, "text object reclaimed");
+});
