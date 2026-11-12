@@ -79,7 +79,7 @@ The exact request and response shapes are in `packages/core/src/api/publisher.js
 
 ## App Files (`https://MCP_HOST/v1/app/files...`)
 
-App Files lets an app keep ordinary text files by path, one request per file, like an app data folder. It uses the same publisher token as `/v1/publisher/*`. Every request checks the publisher's current authorization again: a revoked publisher, a superseded token, a removed creator, a deleted project or destination, or a suspended workspace stop it at once.
+App Files lets an app keep ordinary text files by path, one request per file, like an app data folder. It uses the same publisher token as `/v1/publisher/*`. Every request checks the publisher's current authorization again: a revoked publisher, a superseded token, a removed creator or a deleted project or destination stop it at once. A suspended workspace stops the app's writes (`403 workspace_read_only`); its reads continue.
 
 | Method and path | Needs | Answer |
 |---|---|---|
@@ -90,7 +90,7 @@ App Files lets an app keep ordinary text files by path, one request per file, li
 
 **Files are text.** Markdown (`.md`, `.markdown`), HTML (`.html`, `.htm`), JSON (`.json`) and CSV (`.csv`). The extension chooses the kind; `Content-Type` must be `text/markdown`, `text/html`, `application/json` or `text/csv` and match it, with `charset=utf-8` if a charset is given. Content is checked like any other document (strict UTF-8, valid JSON or CSV). Reads are always served as data: HTML and Markdown come back as `text/plain`, with `X-Content-Type-Options: nosniff` and a sandboxing `Content-Security-Policy`, so nothing an app stores ever runs on the library's origin. Stored content is returned byte for byte; links in it are never rewritten.
 
-**One request body is at most 1 MiB (1,048,576 bytes).** Larger files are not accepted here; use the three-step upload flow instead. A body must arrive within 15 seconds in total, with no gap longer than 5 seconds; that is about 70 KB/s for a full 1 MiB. Clients on weak links should send smaller files, or retry with the same `Idempotency-Key`.
+**One request body is at most 1 MiB (1,048,576 bytes).** Larger single files for apps are planned; the three-step upload flow does not accept an app's token today. Until then, an app's larger exports go through the staged export route (`/v1/publisher/generations`), or must be split into files of at most 1 MiB. A body must arrive within 15 seconds in total, with no gap longer than 5 seconds; that is about 70 KB/s for a full 1 MiB. Clients on weak links should send smaller files, or retry with the same `Idempotency-Key`.
 
 ### Paths
 
@@ -114,7 +114,7 @@ App Files lets an app keep ordinary text files by path, one request per file, li
 | Status | Code | When |
 |---|---|---|
 | 400 | `invalid_path` | The path breaks a rule above (N1) |
-| 409 | `path_conflict` | Another file of this app has the path in another case, a file is where a folder is needed or the reverse, or the path names a staged-generation file (N2) |
+| 409 | `path_conflict` | "This path conflicts with another file of this app (the same path in another case, a file where a folder is needed, or a reserved export file)" (N2): another file of this app has the path in another case, a file is where a folder is needed or the reverse, or the path is reserved for a file of the app's staged exports (generations) |
 | 415 | `unsupported_type` | `Content-Type` does not match the extension (N3), or is not one of the four types (`Allowed: …`) |
 | 428 | `precondition_required` | No `If-Match` / `If-None-Match` (N4) |
 | 412 | `precondition_failed` | `If-Match` does not match the current version (N5, with `current_revision` and `current_etag`); a file already exists (N6); no file exists (N7) |
@@ -134,7 +134,7 @@ App Files lets an app keep ordinary text files by path, one request per file, li
 
 ### Upload slots
 
-A server instance holds at most **4** request bodies at a time, at most **2 per workspace** and at most **2 per person** (the person who connected the app). A body holds its slot until its request finishes, whatever its size. These limits are **per server instance**, not a global guarantee: the same workspace can send more through other instances, and there is no fairness between callers. When all 4 slots of an instance are busy, uploads from anyone else on that instance answer `503 app_files_busy`; clients should wait for `Retry-After` and retry with the same `Idempotency-Key`. Reads, `DELETE` and an unchanged `PUT` with a matching `X-Content-SHA256` take no slot.
+A server instance admits at most **4** uploads at a time, at most **2 per workspace** and at most **2 per person** (the person who connected the app). A body holds its slot until its request finishes, whatever its size. An upload still holding its slot after 10 minutes is treated as stuck and stops counting toward the 4, but at most 2 such older uploads are tracked this way, so an instance holds at most 6 bodies. These limits are **per server instance**, not a global guarantee: the same workspace can send more through other instances, and there is no fairness between callers. When admission is full, new uploads from anyone on that instance are refused with `503 app_files_busy`; clients should wait for `Retry-After` and retry with the same `Idempotency-Key`. Reads, `DELETE` and an unchanged `PUT` with a matching `X-Content-SHA256` take no slot and keep working.
 
 ### Lifetime limits per app
 
@@ -146,7 +146,7 @@ A server instance holds at most **4** request bodies at a time, at most **2 per 
 
 These never go down: deleting a file does not give them back. They are separate from the workspace storage limit (`402`), which also applies.
 
-**App Files and snapshots share one file space and one quota.** An app's App Files, snapshot files and the snapshot manifest all count toward the publisher's snapshot quota of **32 files and 256 MiB**. After about 32 App Files, the app can no longer commit a snapshot. The case-insensitive and file-versus-folder rules are enforced for App Files only, not for snapshot file names. An app should use one of the two APIs, not both.
+**App Files and snapshots interact one way.** App Files has its own limits (above: 10,000 files, 100,000 versions and 1 GiB per app, for the app's lifetime). Snapshot commits are limited to **32 files and 256 MiB per app**, and that count includes the app's App Files rows (also ones the app deleted). So once an app holds about 32 App Files, it can no longer commit a snapshot (`413 quota_exceeded`). The reverse does not apply: snapshot files do not count toward the App Files limits. The case-insensitive and file-versus-folder rules are enforced for App Files only, not for snapshot file names. An app should use one of the two APIs, not both.
 
 ### What a disabled app can do
 
@@ -156,7 +156,8 @@ When you disable an app client, its existing connections can still **read** (App
 
 - Alert on the log events `app_files_slot_reclaimed` and `app_files_slots_stuck`. They mean a request held an upload slot for over 10 minutes; at most 2 such slots are set aside per instance, and if more stay stuck that instance answers `503 app_files_busy` to every upload until it is recycled. `app_files_slots_stuck` repeats at most every 10 minutes while it lasts. The events carry no ids, paths or content.
 - App Files are stored as text and are **not encrypted** in this release (text encryption is a later slice).
-- The memory used per upload (estimated at 6–10 MiB for a 1 MiB body) and the release of a slot when a client disconnects mid-upload have been verified in local development only.
+- The memory used per upload (6–10 MiB for a 1 MiB body) is an estimate; it has not been measured anywhere.
+- The release of an upload slot when a client disconnects mid-upload has been observed in local development only.
 
 ## Current limits
 

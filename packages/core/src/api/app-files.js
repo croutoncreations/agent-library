@@ -423,7 +423,9 @@ async function put(req, env, execCtx, p, requestId, wsId, rest) {
   const caps = async (addFiles, bytes) => {
     const c = await env.DB.prepare("SELECT app_files_created AS f, app_revisions_written AS r, app_bytes_written AS b FROM publishers WHERE id = ?").bind(p.id).first();
     if (!c || c.f + addFiles > APP_FILES_MAX || c.r + 1 > APP_REVISIONS_MAX || c.b + bytes > APP_FILES_MAX_BYTES) throw quotaExceeded();
-    // The workspace route() already resolved for the rate limit.
+    // An early refusal only: wsId is the workspace route() resolved for this project (it must equal the project's
+    // workspace). The guard inside the publishing batch (projectLimitGuard, in createMarkdown / publishRevision) is the
+    // authority.
     const lg = wsId ? { ...await limitGuard(env, wsId, { storage_bytes: bytes }, p.project_id), workspaceId: wsId } : await projectLimitGuard(env, p.project_id, { storage_bytes: bytes });
     if (lg.workspaceId && !await env.DB.prepare(`SELECT ${lg.sql} AS ok`).bind(...lg.params).first("ok"))
       await explainLimit(env, lg.workspaceId, { storage_bytes: bytes }, lg.limits);

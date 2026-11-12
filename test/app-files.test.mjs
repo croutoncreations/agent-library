@@ -1318,6 +1318,7 @@ test("PUT and DELETE in flight: the creator removed from the workspace, or the p
     const pid = ok(await bob.req("POST", "/api/projects", { title: uniq("Creator mid"), workspace_id: WSA }), 201).id;
     const c = await connect(pid);
     const f = op === "create" ? null : await put(c.tok, "m.md", "head", { create: true });
+    const cBefore = counters(c.P.publisher_id), cRevs = revCount(c.P.publisher_id);
     const send = (hd) => op === "create" ? put(c.tok, "m.md", "x", { create: true, headers: hd })
       : op === "replace" ? put(c.tok, "m.md", "x", { match: "rev:1", headers: hd }) : del(c.tok, "m.md", { match: "rev:1", headers: hd });
     let r;
@@ -1326,16 +1327,19 @@ test("PUT and DELETE in flight: the creator removed from the workspace, or the p
     assert.equal(r.status, 403, `${op} creator removed: ${r.text}`); assert.equal(r.json.error.code, "scope_mismatch");
     if (f) assert.deepEqual(sql(`SELECT head_rev, export_name, trashed_at FROM artifacts WHERE id = '${f.json.file.file_id}'`)[0], { head_rev: 1, export_name: "m.md", trashed_at: null });
     else assert.equal(appRows(c.P.publisher_id), 0);
+    assert.equal(revCount(c.P.publisher_id), cRevs, op); assert.deepEqual(counters(c.P.publisher_id), cBefore, op);
     // Project deleted.
     const title = uniq("Project mid");
     const pid2 = ok(await owner.req("POST", "/api/projects", { title }), 201).id;
     const d = await connect(pid2);
     const g = op === "create" ? null : await put(d.tok, "m.md", "head", { create: true });
+    const dBefore = counters(d.P.publisher_id), dRevs = revCount(d.P.publisher_id);
     const send2 = (hd) => op === "create" ? put(d.tok, "m.md", "x", { create: true, headers: hd })
       : op === "replace" ? put(d.tok, "m.md", "x", { match: "rev:1", headers: hd }) : del(d.tok, "m.md", { match: "rev:1", headers: hd });
     const r2 = await during(send2, async () => ok(await owner.req("DELETE", `/api/projects/${pid2}`, { confirm_title: title })));
     assert.equal(r2.status, 403, `${op} project deleted: ${r2.text}`);
     if (g) assert.deepEqual(sql(`SELECT head_rev, export_name, trashed_at FROM artifacts WHERE id = '${g.json.file.file_id}'`)[0], { head_rev: 1, export_name: "m.md", trashed_at: null });
     else assert.equal(appRows(d.P.publisher_id), 0);
+    assert.equal(revCount(d.P.publisher_id), dRevs, op); assert.deepEqual(counters(d.P.publisher_id), dBefore, op);
   }
 });
