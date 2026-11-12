@@ -11,14 +11,14 @@ const EXPORTS = [
   "CHUNKED_HEADER_BYTES", "CHUNKED_CHUNK_BYTES", "CHUNKED_TAG_BYTES", "CHUNKED_MAX_PLAINTEXT_BYTES",
   "chunkedStoredLength", "chunkedPlaintextLength", "encodeChunkedHeader", "parseChunkedHeader",
   "encryptChunkedStream", "encryptChunkedStreamWithSaltForTestOnly", "decryptChunkedStream",
-  "planChunkedRange", "decryptChunkedRange",
+  "planChunkedRange", "decryptChunkedRange", "chunkParams",
 ];
 const mod = new Function(`${moduleScript("packages/core/src/crypto/chunked.js")}\nreturn { ${EXPORTS.join(", ")} };`)();
 const {
   CHUNKED_HEADER_BYTES, CHUNKED_CHUNK_BYTES, CHUNKED_TAG_BYTES, CHUNKED_MAX_PLAINTEXT_BYTES,
   chunkedStoredLength, chunkedPlaintextLength, encodeChunkedHeader, parseChunkedHeader,
   encryptChunkedStream, encryptChunkedStreamWithSaltForTestOnly, decryptChunkedStream,
-  planChunkedRange, decryptChunkedRange,
+  planChunkedRange, decryptChunkedRange, chunkParams,
 } = mod;
 
 const C = 65536;
@@ -163,6 +163,24 @@ test("parseChunkedHeader rejects wrong magic, version, exponent, reserved bytes,
   assert.equal(parseChunkedHeader(max).plaintextLength, 2 ** 40);
 });
 
+test("parseChunkedHeader copies a Node Buffer that is a view into a larger pool, and reads the copy, not the pool", () => {
+  const salt = new Uint8Array(32).map((_, i) => 0x30 + i);
+  const good = encodeChunkedHeader({ plaintextLength: 0x0102030405, salt });
+  const pool = Buffer.alloc(256, 0xff);
+  Buffer.from(good).copy(pool, 100);
+  const view = pool.subarray(100, 148);
+  assert.equal(view.byteOffset, 100);
+  const parsed = parseChunkedHeader(view);
+  assert.equal(parsed.plaintextLength, 0x0102030405, "the length comes from the header's own bytes 8-15");
+  assert.equal(Object.getPrototypeOf(parsed.header), Uint8Array.prototype, "a native Uint8Array, not a Buffer");
+  assert.equal(Object.getPrototypeOf(parsed.salt), Uint8Array.prototype);
+  assert.equal(parsed.header.byteOffset, 0);
+  assert.equal(parsed.header.buffer.byteLength, 48);
+  pool.fill(0, 100, 148);
+  assert.deepEqual([...parsed.header], [...good], "changing the input afterwards does not change the parsed header");
+  assert.deepEqual([...parsed.salt], [...salt]);
+});
+
 // ---------------------------------------------------------------- round trips
 
 const LENGTHS = [0, 1, 65535, 65536, 65537, 3.5 * C];
@@ -198,7 +216,10 @@ test("two writes of the same plaintext to the same storage key use different sal
   const b = await encryptBytes(plain);
   assert.ok(!Buffer.from(a.slice(16, 48)).equals(b.slice(16, 48)), "salts differ");
   assert.deepEqual(a.slice(0, 16), b.slice(0, 16), "fixed header fields are equal");
-  for (let i = 0; i < 3; i++) assert.ok(!Buffer.from(chunkSlice(a, i, plain.length)).equals(chunkSlice(b, i, plain.length)), `chunk ${i} differs`);
+  // Ciphertext bodies without their tags: the tags would differ anyway (they cover the header), so comparing them
+  // would not catch a reused key and nonce.
+  const body = (stored, i) => { const c = chunkSlice(stored, i, plain.length); return c.slice(0, c.length - T); };
+  for (let i = 0; i < 3; i++) assert.ok(!Buffer.from(body(a, i)).equals(body(b, i)), `chunk ${i} ciphertext body differs`);
   assertSameBytes((await decryptBytes(a)).bytes, plain);
   assertSameBytes((await decryptBytes(b)).bytes, plain);
 });
@@ -230,6 +251,55 @@ test("encrypt refuses lengths above 2^40 and non-integer lengths, and requires a
   assert.throws(() => encryptChunkedStream(sourceOf(new Uint8Array(0)), { plaintextLength: 0, dataKey: aesKey, objectKey: OBJECT_KEY }));
 });
 
+test("every entry point refuses a data key that is extractable or has any usage besides deriveKey", async () => {
+  const wider = await crypto.subtle.importKey("raw", DATA_KEY_BYTES, "HKDF", false, ["deriveKey", "deriveBits"]);
+  const bitsOnly = await crypto.subtle.importKey("raw", DATA_KEY_BYTES, "HKDF", false, ["deriveBits"]);
+  // WebCrypto cannot import an extractable HKDF key, so an object shaped like one stands in for a provider's mistake.
+  const extractable = { algorithm: { name: "HKDF" }, extractable: true, usages: ["deriveKey"], type: "secret" };
+  const STORED_EMPTY = await encryptBytes(new Uint8Array(0));
+  const STORED_EMPTY_ONE = await encryptBytes(new Uint8Array([1]));
+  for (const [name, dataKey] of [["deriveKey and deriveBits", wider], ["deriveBits only", bitsOnly], ["extractable", extractable]]) {
+    assert.throws(() => encryptChunkedStream(sourceOf(new Uint8Array(0)), { plaintextLength: 0, dataKey, objectKey: OBJECT_KEY }), /data key/, `encrypt: ${name}`);
+    assert.throws(() => decryptChunkedStream(sourceOf(STORED_EMPTY), { dataKey, objectKey: OBJECT_KEY }), /data key/, `decrypt: ${name}`);
+    const { error } = await drain(decryptChunkedRange({ header: STORED_EMPTY_ONE.slice(0, H), dataKey, objectKey: OBJECT_KEY, start: 0, end: 0, fetchStored: async () => STORED_EMPTY_ONE.slice(H) }));
+    assert.match(String(error?.message), /data key/, `range: ${name}`);
+  }
+});
+
+test("an input stream that throws mid-read or at the final end-of-stream check errors the output, never ends it", async () => {
+  const plain = plaintextOf(2 * C, 5);
+  /** Delivers `bytes` in pieces of `piece`, then errors (instead of closing) once `failAt` bytes have been delivered. */
+  const failing = (bytes, failAt, piece = 1000) => {
+    let offset = 0;
+    return new ReadableStream({
+      pull(controller) {
+        if (offset >= failAt) { controller.error(new Error("synthetic source failure")); return; }
+        const end = Math.min(failAt, offset + piece);
+        controller.enqueue(bytes.slice(offset, end));
+        offset = end;
+      },
+    }, { highWaterMark: 0 });
+  };
+  const stored = await encryptBytes(plain);
+  for (const failAt of [C + 5, 2 * C]) { // during a chunk read; after exactly the declared bytes (the EOF check)
+    const enc = await drain(encryptChunkedStream(failing(plain, failAt), { plaintextLength: plain.length, dataKey: DATA_KEY, objectKey: OBJECT_KEY }));
+    assert.match(String(enc.error?.message), /synthetic source failure/, `encrypt, source fails at ${failAt}`);
+    assert.ok(enc.bytes.length < stored.length, "never a complete object");
+  }
+  for (const failAt of [H + SC + 5, stored.length]) {
+    const dec = await drain(decryptChunkedStream(failing(stored, failAt), { dataKey: DATA_KEY, objectKey: OBJECT_KEY }));
+    assert.match(String(dec.error?.message), /synthetic source failure/, `decrypt, source fails at ${failAt}`);
+    assert.ok(dec.bytes.length < plain.length, "the final chunk is never released");
+  }
+  // A range read whose fetched stream fails mid-read or at its end check.
+  for (const failAt of [SC + 5, 2 * SC]) {
+    const r = await drain(decryptChunkedRange({ header: stored.slice(0, H), dataKey: DATA_KEY, objectKey: OBJECT_KEY, start: 0, end: 2 * C - 1,
+      fetchStored: async (s, e) => failing(stored.slice(s, e + 1), failAt) }));
+    assert.match(String(r.error?.message), /synthetic source failure/, `range, source fails at ${failAt}`);
+    assert.ok(r.bytes.length < 2 * C);
+  }
+});
+
 test("encrypt is pull-driven: reading only the header does not drain the input", async () => {
   let pulled = 0;
   const source = new ReadableStream({ pull(c) { pulled += 1; c.enqueue(new Uint8Array(1024)); } }, { highWaterMark: 0 });
@@ -243,13 +313,18 @@ test("encrypt is pull-driven: reading only the header does not drain the input",
 
 // ---------------------------------------------------------------- known answer
 
-test("known answer: fixed key, salt and plaintext give the stored bytes node:crypto computes independently", async () => {
+for (const [label, length, prefix] of [
+  ["a partial final chunk", 2 * C + 100, "414c4531011000000000000000020064"],
+  ["an empty object", 0, "414c4531011000000000000000000000"],
+  ["an exact multiple of 65,536", 2 * C, "414c4531011000000000000000020000"],
+]) test(`known answer (${label}): fixed key, salt and plaintext give the stored bytes node:crypto computes independently`, async () => {
   const salt = new Uint8Array(32).map((_, i) => 0x10 + i);
-  const plain = plaintextOf(2 * C + 100, 77);
+  const plain = plaintextOf(length, 77);
   const { bytes: stored, error } = await drain(encryptChunkedStreamWithSaltForTestOnly(sourceOf(plain, [5000]), {
     plaintextLength: plain.length, dataKey: DATA_KEY, objectKey: OBJECT_KEY, salt,
   }));
   assert.equal(error, null);
+  assert.equal(stored.length, chunkedStoredLength(length));
 
   // Independent computation of version 1.
   const header = Buffer.alloc(48);
@@ -260,7 +335,7 @@ test("known answer: fixed key, salt and plaintext give the stored bytes node:cry
   const info = Buffer.concat([Buffer.from("al-obj/1", "utf8"), Buffer.from([0]), Buffer.from(OBJECT_KEY, "utf8")]);
   const key = Buffer.from(hkdfSync("sha256", Buffer.from(DATA_KEY_BYTES), Buffer.from(salt), info, 32));
   const parts = [header];
-  const n = Math.ceil(plain.length / C);
+  const n = Math.max(1, Math.ceil(plain.length / C));
   for (let i = 0; i < n; i++) {
     const index = Buffer.alloc(8); index.writeBigUInt64BE(BigInt(i));
     const nonce = Buffer.concat([Buffer.alloc(4), index]);
@@ -271,7 +346,7 @@ test("known answer: fixed key, salt and plaintext give the stored bytes node:cry
   const expected = Buffer.concat(parts);
   assert.equal(stored.length, expected.length);
   assert.ok(Buffer.from(stored).equals(expected), "stored bytes equal the independent computation");
-  assert.equal(Buffer.from(stored.slice(0, 16)).toString("hex"), "414c4531011000000000000000020064");
+  assert.equal(Buffer.from(stored.slice(0, 16)).toString("hex"), prefix);
   assertSameBytes((await decryptBytes(stored)).bytes, plain);
 });
 
@@ -468,6 +543,97 @@ test("range: a tampered header copy, the wrong keys, a short or long fetch, and 
   assert.ok((await readRange(STORED, 0, 0, { tamper: (b) => concat([b, new Uint8Array(1)]) })).error, "fetch one byte long");
   assert.ok((await readRange(STORED, C + 1, C + 1, { tamper: () => STORED.slice(H, H + SC) })).error, "chunk 0 served for chunk 1");
   assert.ok((await readRange(STORED, 0, 0, { header: STORED.slice(0, 47) })).error, "short header");
+});
+
+test("range: ending exactly at a chunk boundary, and touching the full final chunk of an exact-multiple object", async () => {
+  for (const k of [1, 2, 3]) {
+    const calls = [];
+    const { bytes, error } = await readRange(STORED, 10, k * C - 1, { calls });
+    assert.equal(error, null, `end = ${k} x 65536 - 1`);
+    assertSameBytes(bytes, PLAIN.slice(10, k * C));
+    assert.deepEqual(calls, [[H, H + k * SC - 1]], "no chunk past the boundary is fetched");
+  }
+  const exact = plaintextOf(3 * C, 8);
+  const stored = await encryptBytes(exact);
+  for (const [start, end] of [[2 * C, 3 * C - 1], [3 * C - 1, 3 * C - 1], [C + 7, 3 * C - 1]]) {
+    const calls = [];
+    const { bytes, error } = await readRange(stored, start, end, { calls });
+    assert.equal(error, null, `${start}-${end}`);
+    assertSameBytes(bytes, exact.slice(start, end + 1));
+    assert.deepEqual(calls[0][1], stored.length - 1, "the stored range ends at the final chunk's tag");
+  }
+});
+
+test("range: fetchStored rejecting errors the stream", async () => {
+  const { bytes, error } = await drain(decryptChunkedRange({ header: STORED.slice(0, H), dataKey: DATA_KEY, objectKey: OBJECT_KEY, start: 0, end: 10,
+    fetchStored: async () => { throw new Error("synthetic fetch failure"); } }));
+  assert.match(String(error?.message), /synthetic fetch failure/);
+  assert.equal(bytes.length, 0);
+});
+
+test("a consumer cancelling the output cancels the source (encrypt, decrypt and range)", async () => {
+  const watched = (bytes) => {
+    const seen = { cancelled: false };
+    const inner = sourceOf(bytes, [C]).getReader();
+    const stream = new ReadableStream({
+      async pull(c) { const { done, value } = await inner.read(); if (done) c.close(); else c.enqueue(value); },
+      cancel() { seen.cancelled = true; },
+    }, { highWaterMark: 0 });
+    return { seen, stream };
+  };
+  const enc = watched(PLAIN);
+  const r1 = encryptChunkedStream(enc.stream, { plaintextLength: LEN, dataKey: DATA_KEY, objectKey: OBJECT_KEY }).getReader();
+  await r1.read(); await r1.read();
+  await r1.cancel("done");
+  assert.equal(enc.seen.cancelled, true, "encrypt");
+  const dec = watched(STORED);
+  const r2 = decryptChunkedStream(dec.stream, { dataKey: DATA_KEY, objectKey: OBJECT_KEY }).getReader();
+  await r2.read();
+  await r2.cancel("done");
+  assert.equal(dec.seen.cancelled, true, "decrypt");
+  let range;
+  const r3 = decryptChunkedRange({ header: STORED.slice(0, H), dataKey: DATA_KEY, objectKey: OBJECT_KEY, start: 0, end: LEN - 1,
+    fetchStored: async (s, e) => { range = watched(STORED.slice(s, e + 1)); return range.stream; } }).getReader();
+  await r3.read();
+  await r3.cancel("done");
+  assert.equal(range.seen.cancelled, true, "range");
+});
+
+test("chunkParams writes all four low bytes of a large chunk index into the nonce and the additional data", () => {
+  const header = encodeChunkedHeader({ plaintextLength: 10, salt: new Uint8Array(32).fill(9) });
+  for (const final of [false, true]) {
+    const p = chunkParams(header, 0x01020304, final);
+    assert.equal(Buffer.from(p.iv).toString("hex"), "000000000000000001020304");
+    assert.equal(p.additionalData.length, 57);
+    assert.deepEqual([...p.additionalData.subarray(0, 48)], [...header]);
+    assert.equal(Buffer.from(p.additionalData.subarray(48, 56)).toString("hex"), "0000000001020304");
+    assert.equal(p.additionalData[56], final ? 1 : 0);
+  }
+  assert.throws(() => chunkParams(header, 2 ** 32, false), /index/);
+});
+
+test("accepted limit, not a bug: a complete older write of the same storage key, put back whole, still decrypts", async () => {
+  // docs/encryption.md#limits: the format authenticates each write, not that it is the latest one.
+  const older = await encryptBytes(plaintextOf(1000, 1));
+  await encryptBytes(plaintextOf(1000, 2)); // the newer write that the older one replaces
+  const { bytes, error } = await decryptBytes(older);
+  assert.equal(error, null);
+  assertSameBytes(bytes, plaintextOf(1000, 1));
+});
+
+// 1015 = 1024 (WebCrypto's HKDF info limit in Node) - 9 ("al-obj/1" and the 0x00 separator).
+test("storage object keys must be well-formed Unicode of at most 1015 UTF-8 bytes; a non-ASCII key round-trips", async () => {
+  const empty = new Uint8Array(0);
+  for (const [name, objectKey] of [["lone high surrogate", "blobs/a\uD800b"], ["lone low surrogate", "blobs/a\uDC00"], ["1016 bytes", "k".repeat(1016)], ["1016 bytes, 508 two-byte characters", "é".repeat(508)]]) {
+    assert.throws(() => encryptChunkedStream(sourceOf(empty), { plaintextLength: 0, dataKey: DATA_KEY, objectKey }), /object key/, `encrypt: ${name}`);
+    assert.throws(() => decryptChunkedStream(sourceOf(empty), { dataKey: DATA_KEY, objectKey }), /object key/, `decrypt: ${name}`);
+  }
+  const plain = plaintextOf(C + 3, 6);
+  for (const objectKey of ["blobs/prj_é/文書/ver_🙂", "k".repeat(1015), "é".repeat(507) + "k"]) {
+    const stored = await encryptBytes(plain, { objectKey });
+    assertSameBytes((await decryptBytes(stored, { objectKey })).bytes, plain);
+    assert.ok((await decryptBytes(stored, { objectKey: "j" + objectKey.slice(1) })).error, "a different key fails");
+  }
 });
 
 test("range: chunks from another write of the same plaintext and storage key are refused", async () => {

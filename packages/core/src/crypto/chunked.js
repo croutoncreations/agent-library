@@ -90,7 +90,9 @@ export function encodeChunkedHeader({ plaintextLength, salt }) {
 export function parseChunkedHeader(bytes) {
   const input = asBytes(bytes);
   if (input.length !== CHUNKED_HEADER_BYTES) throw chunkedError(`header must be ${CHUNKED_HEADER_BYTES} bytes`);
-  const header = input.slice();
+  // A fresh native copy: a Node Buffer's slice() aliases its pool, and a DataView must not see the pool's offset.
+  const header = new Uint8Array(CHUNKED_HEADER_BYTES);
+  header.set(input);
   for (let i = 0; i < MAGIC.length; i++) if (header[i] !== MAGIC[i]) throw chunkedError("wrong magic");
   if (header[4] !== FORMAT_VERSION) throw chunkedError(`unsupported format version ${header[4]}`);
   if (header[5] !== CHUNK_EXPONENT) throw chunkedError(`unsupported chunk-size exponent ${header[5]}`);
@@ -105,14 +107,21 @@ export function parseChunkedHeader(bytes) {
 }
 
 function checkDataKey(dataKey) {
-  const algorithm = /** @type {any} */ (dataKey)?.algorithm;
-  if (algorithm?.name !== "HKDF" || !dataKey.usages?.includes("deriveKey")) {
-    throw chunkedError("data key must be a WebCrypto HKDF key with usage deriveKey");
+  const key = /** @type {any} */ (dataKey);
+  const usages = key?.usages;
+  if (key?.algorithm?.name !== "HKDF" || key.extractable !== false || !Array.isArray(usages) || usages.length !== 1 || usages[0] !== "deriveKey") {
+    throw chunkedError("data key must be a non-extractable WebCrypto HKDF key whose only usage is deriveKey");
   }
 }
 
+// The HKDF info ("al-obj/1" ‖ 0x00 ‖ key) must stay within 1024 bytes, the limit Node's WebCrypto enforces.
+const OBJECT_KEY_MAX_BYTES = 1024 - INFO_PREFIX.length - 1;
+
+/** Well-formed (no lone surrogates, which UTF-8 encoding would collapse to U+FFFD) and at most 1015 UTF-8 bytes. */
 function checkObjectKey(objectKey) {
   if (typeof objectKey !== "string" || objectKey === "") throw chunkedError("storage object key must be a non-empty string");
+  if (!/** @type {any} */ (objectKey).isWellFormed()) throw chunkedError("storage object key must be well-formed Unicode");
+  if (new TextEncoder().encode(objectKey).length > OBJECT_KEY_MAX_BYTES) throw chunkedError(`storage object key must be at most ${OBJECT_KEY_MAX_BYTES} UTF-8 bytes`);
 }
 
 /** The per-write AES-256-GCM key: HKDF-SHA-256(data key, salt, "al-obj/1" ‖ 0x00 ‖ UTF-8(objectKey)). */
