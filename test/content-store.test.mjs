@@ -34,6 +34,30 @@ test("only packages/core/src/content-store.js touches the R2 binding", () => {
   assert.deepEqual(offenders, []);
 });
 
+// Slice 3b seam (design test 25, the rules that apply once the read side exists): only content-store.js uses the
+// object codec, the data keys and R2 object metadata, and the raw R2 readers stay inside it.
+const rel = (f) => f.slice(ROOT.length + 1);
+test("only content-store.js (and crypto/ itself) imports crypto/chunked.js, workspaceDataKey or dataKeyById", () => {
+  const users = jsFiles(join(ROOT, "packages"))
+    .filter((f) => !rel(f).startsWith("packages/core/src/crypto/"))
+    .filter((f) => /crypto\/chunked\.js|\b(?:workspaceDataKey|dataKeyById)\b/.test(readFileSync(f, "utf8")))
+    .map(rel);
+  assert.deepEqual(users, ["packages/core/src/content-store.js"]);
+});
+test("customMetadata appears in no source file other than content-store.js", () => {
+  const users = jsFiles(join(ROOT, "packages")).filter((f) => /\bcustomMetadata\b/.test(readFileSync(f, "utf8"))).map(rel);
+  assert.deepEqual(users, ["packages/core/src/content-store.js"]);
+});
+test("the raw whole-object readers getBlob and getBlobBytes are module-internal to content-store.js", () => {
+  const store = readFileSync(join(ROOT, "packages", "core", "src", "content-store.js"), "utf8");
+  assert.doesNotMatch(store, /export\s+(?:async\s+)?function\s+(?:getBlob|getBlobBytes)\b/);
+  const importers = jsFiles(join(ROOT, "packages"))
+    .filter((f) => !f.endsWith("content-store.js"))
+    .filter((f) => [...readFileSync(f, "utf8").matchAll(/import\s*\{([^}]*)\}\s*from\s*["'][^"']*content-store\.js["']/g)].some((m) => /\b(?:getBlob|getBlobBytes)\b/.test(m[1])))
+    .map(rel);
+  assert.deepEqual(importers, []);
+});
+
 // Publication conditions are written once (docs/encryption.md#rules-for-code-that-uses-this): crypto/keys.js defines
 // them, content-store.js builds the fences from them, and nothing else hand-writes or touches the fence table.
 test("only content-store.js and crypto/keys.js use ACTIVE_KEY_SQL and NO_REAL_KEY_SQL", () => {

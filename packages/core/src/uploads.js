@@ -1,4 +1,4 @@
-import { blobSha256Hex, deleteBlob, getBlob, getBlobHead, headBlob, putBlobStream, getText, getTextRange, getUploadedText } from "./content-store.js";
+import { blobRef, blobSha256Hex, deleteBlob, getBlobHead, headBlob, putBlobStream, getText, getTextRange, getUploadedText, readBlob } from "./content-store.js";
 import { authenticate, authorizeProject, authzSql, contentWriteSql, enforceRate, limitsFor, requireCsrf } from "./auth.js";
 import { PUT_MARGIN_MS, reconcileUploads } from "./cleanup.js";
 import { CONTENT_TYPE, MEASUREMENTS, checkFile, spreadsheetSafeCsv } from "./formats.js";
@@ -573,9 +573,10 @@ async function serveContent(ctx, req, projectId, artifactId, revParam) {
     const b = await getTextRange(ctx.env, r, start, end - start + 1);
     return new Response(b, { status, headers });
   }
-  const obj2 = await getBlob(ctx.env, r.blob_key, partial ? { offset: start, length: end - start + 1 } : void 0);
-  if (!obj2) throw new HttpError(500, "blob_missing", "Stored bytes missing");
-  return new Response(obj2.body, { status, headers });
+  // One R2 request; an encrypted version's first chunk is authenticated before the headers go out, and a later
+  // failure errors the body (docs/encryption.md#rules-for-code-that-uses-this).
+  const body = await readBlob(ctx.env, await blobRef(ctx.env, r, { projectId, artifactId }), partial ? { start, end } : null);
+  return new Response(body, { status, headers });
 }
 
 export { TEXT_UPLOAD_KINDS, UPLOAD_BEGIN_DESCRIPTION, UPLOAD_FINISH_DESCRIPTION, quotaUsedSql, serveContent, uploadBegin, uploadBeginFields, uploadFinish, uploadPut };

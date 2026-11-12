@@ -1,5 +1,7 @@
 import { HttpError } from "./util.js";
-import { ACTIVE_KEY_SQL, KEY_SHREDDED_MESSAGE, NO_REAL_KEY_SQL } from "./crypto/keys.js";
+import { ACTIVE_KEY_SQL, KEY_SHREDDED_MESSAGE, NO_REAL_KEY_SQL, dataKeyById } from "./crypto/keys.js";
+import { CHUNKED_HEADER_BYTES, chunkedStoredLength, decryptChunkedRange, decryptChunkedStream, parseChunkedHeader, planChunkedRange } from "./crypto/chunked.js";
+import { projectWorkspaceId } from "./limits.js";
 
 // ContentStore: the one place the Worker reads or writes stored file bytes (R2 `BLOBS`).
 //
@@ -10,12 +12,12 @@ import { ACTIVE_KEY_SQL, KEY_SHREDDED_MESSAGE, NO_REAL_KEY_SQL } from "./crypto/
 // staged immutable writes and getText; legacy inline bodies still pass through readText.
 
 /** Read a stored object, optionally a byte range ({ offset, length }). Returns an R2ObjectBody or null. */
-export async function getBlob(env, key, range) {
+async function getBlob(env, key, range) {
   return range ? env.BLOBS.get(key, { range }) : env.BLOBS.get(key);
 }
 
 /** Read a whole stored object as bytes, or null if missing. */
-export async function getBlobBytes(env, key) {
+async function getBlobBytes(env, key) {
   const o = await env.BLOBS.get(key);
   return o ? new Uint8Array(await o.arrayBuffer()) : null;
 }
@@ -72,6 +74,179 @@ export async function deleteBlob(env, key) {
 /** R2 accepts at most 1,000 keys in one delete call. Callers remove intents only after this succeeds. */
 export async function deleteBlobs(env, keys) {
   for (let i = 0; i < keys.length; i += 1000) await env.BLOBS.delete(keys.slice(i, i + 1000));
+}
+
+// Binary file versions (docs/encryption.md#rules-for-code-that-uses-this). Whether a version is encrypted is decided
+// from what is stored, never from configuration: its revision row (blob_key_id, blob_header) and its object's
+// customMetadata ("al-enc", "al-key") must agree. The row's header pins the read to the published write.
+
+/** @typedef {{ key: string, size: number, keyId: string|null, header: string|null, projectId: string, artifactId: string, workspaceId: string|null }} BlobRef */
+
+const BLOB_CORRUPT_MESSAGE = "Stored bytes failed verification";
+/** 500 blob_corrupt, logged with the reason and ids only (never a storage key, key material or bytes). */
+function blobCorrupt(ref, reason) {
+  console.error(JSON.stringify({ event: "blob_corrupt", reason, projectId: ref.projectId, artifactId: ref.artifactId }));
+  return new HttpError(500, "blob_corrupt", BLOB_CORRUPT_MESSAGE);
+}
+const blobMissing = () => new HttpError(500, "blob_missing", "Stored bytes missing");
+
+/**
+ * The read reference for a binary revision row { blob_key, size, blob_key_id, blob_header } of the authorized
+ * projectId/artifactId. The workspace (for the key lookup) comes from the server-side project and is resolved only
+ * for an encrypted row. A row with only one of blob_key_id/blob_header set is refused (500 blob_corrupt).
+ * @returns {Promise<BlobRef>}
+ */
+export async function blobRef(env, row, { projectId, artifactId }) {
+  const ref = { key: row.blob_key, size: row.size, keyId: row.blob_key_id ?? null, header: row.blob_header ?? null, projectId, artifactId, workspaceId: null };
+  if ((ref.keyId === null) !== (ref.header === null)) throw blobCorrupt(ref, "half_column_pair");
+  if (ref.keyId !== null) {
+    ref.workspaceId = await projectWorkspaceId(env, projectId);
+    if (!ref.workspaceId) throw blobCorrupt(ref, "no_workspace");
+  }
+  return ref;
+}
+
+function fromB64url(s) {
+  if (typeof s !== "string" || !/^[A-Za-z0-9_-]*$/.test(s)) return null;
+  const std = s.replace(/-/g, "+").replace(/_/g, "/");
+  try { return Uint8Array.from(atob(std + "=".repeat((4 - (std.length % 4)) % 4)), (c) => c.charCodeAt(0)); } catch { return null; }
+}
+
+/** Plaintext: the object must carry no encryption marker. Encrypted: the marker and key id must match the row. */
+function checkObjectMetadata(ref, object) {
+  const meta = object.customMetadata ?? {};
+  if (ref.keyId === null) {
+    if ("al-enc" in meta || "al-key" in meta) throw blobCorrupt(ref, "plaintext_row_encrypted_object");
+    return;
+  }
+  if (meta["al-enc"] !== "1") throw blobCorrupt(ref, "encrypted_row_plaintext_object");
+  if (meta["al-key"] !== ref.keyId) throw blobCorrupt(ref, "key_id_mismatch");
+  if (object.size !== chunkedStoredLength(ref.size)) throw blobCorrupt(ref, "stored_size_mismatch");
+}
+
+/** Checks that need no object, in order: storage-key prefix, header shape and plaintext length; then the data key. */
+async function encryptedReadSetup(env, ref) {
+  if (typeof ref.key !== "string" || !ref.key.startsWith(`blobs/${ref.projectId}/${ref.artifactId}/`)) throw blobCorrupt(ref, "prefix");
+  const header = fromB64url(ref.header);
+  if (!header || header.length !== CHUNKED_HEADER_BYTES) throw blobCorrupt(ref, "header_invalid");
+  let parsed;
+  try { parsed = parseChunkedHeader(header); } catch { throw blobCorrupt(ref, "header_invalid"); }
+  if (parsed.plaintextLength !== ref.size) throw blobCorrupt(ref, "header_length_mismatch");
+  const { key: dataKey } = await dataKeyById(env, ref.workspaceId, ref.keyId);
+  return { header: parsed.header, dataKey };
+}
+
+/** Passes a stored object through after requiring its first 48 bytes to equal the row's header. */
+function headerPin(stored, header, ref) {
+  const reader = stored.getReader();
+  let seen = 0;
+  return new ReadableStream({
+    async pull(controller) {
+      const { done, value } = await reader.read();
+      if (done) { controller.close(); return; }
+      const bytes = value instanceof Uint8Array ? value : new Uint8Array(value);
+      for (let i = 0; seen < CHUNKED_HEADER_BYTES && i < bytes.length; i++, seen++) {
+        if (bytes[i] !== header[seen]) { const e = blobCorrupt(ref, "header_pin"); controller.error(e); await reader.cancel(e).catch(() => {}); return; }
+      }
+      controller.enqueue(bytes);
+    },
+    cancel(reason) { return reader.cancel(reason); },
+  }, { highWaterMark: 0 });
+}
+
+/**
+ * Read the first chunk of a decrypting stream (so it is authenticated before anything is returned), then hand back a
+ * stream that yields it followed by the rest. A failure before the first chunk is 500 blob_corrupt; a later one errors
+ * the returned stream, which aborts a response body.
+ */
+async function firstChunkAuthenticated(plain, ref) {
+  const reader = plain.getReader();
+  let first;
+  try { first = await reader.read(); }
+  catch (e) { throw e instanceof HttpError ? e : blobCorrupt(ref, "first_chunk"); }
+  return new ReadableStream({
+    start(controller) {
+      if (first.done) controller.close();
+      else controller.enqueue(first.value);
+    },
+    async pull(controller) {
+      const { done, value } = await reader.read();
+      if (done) controller.close();
+      else controller.enqueue(value);
+    },
+    cancel(reason) { return reader.cancel(reason); },
+  }, { highWaterMark: 0 });
+}
+
+/**
+ * Read a binary version: the whole object, or the inclusive plaintext byte range { start, end }. One R2 request.
+ * Returns a ReadableStream of plaintext (an encrypted version's is exactly the requested length; its first chunk is
+ * authenticated before this returns, and a later failure errors the stream). Throws 500 blob_missing, 500
+ * blob_corrupt, 410 key_shredded (and the key layer's other errors).
+ * @param {BlobRef} ref
+ * @param {null | { start: number, end: number }} range
+ * @returns {Promise<ReadableStream<Uint8Array>>}
+ */
+export async function readBlob(env, ref, range) {
+  if (ref.keyId === null) {
+    const object = await getBlob(env, ref.key, range ? { offset: range.start, length: range.end - range.start + 1 } : undefined);
+    if (!object) throw blobMissing();
+    checkObjectMetadata(ref, object);
+    return object.body;
+  }
+  const { header, dataKey } = await encryptedReadSetup(env, ref);
+  let plain;
+  if (range) {
+    const plan = planChunkedRange(ref.size, range.start, range.end);
+    const object = await getBlob(env, ref.key, { offset: plan.storedStart, length: plan.storedEnd - plan.storedStart + 1 });
+    if (!object) throw blobMissing();
+    checkObjectMetadata(ref, object);
+    plain = decryptChunkedRange({
+      header, dataKey, objectKey: ref.key, start: range.start, end: range.end,
+      fetchStored: (storedStart, storedEnd) => {
+        if (storedStart !== plan.storedStart || storedEnd !== plan.storedEnd) throw blobCorrupt(ref, "range_plan");
+        return object.body;
+      },
+    });
+  } else {
+    const object = await getBlob(env, ref.key);
+    if (!object) throw blobMissing();
+    checkObjectMetadata(ref, object);
+    plain = decryptChunkedStream(headerPin(object.body, header, ref), { dataKey, objectKey: ref.key });
+  }
+  // A known length, so the response keeps its Content-Length (as R2's own body stream does for plaintext).
+  const length = range ? range.end - range.start + 1 : ref.size;
+  return (await firstChunkAuthenticated(plain, ref)).pipeThrough(new FixedLengthStream(length));
+}
+
+/**
+ * A whole binary version as bytes, every chunk authenticated before it returns. Same errors as readBlob; a failure
+ * after the first chunk is 500 blob_corrupt too.
+ * @param {BlobRef} ref
+ * @returns {Promise<Uint8Array>}
+ */
+export async function readBlobBytes(env, ref) {
+  if (ref.keyId === null) {
+    const object = await getBlob(env, ref.key);
+    if (!object) throw blobMissing();
+    checkObjectMetadata(ref, object);
+    return new Uint8Array(await object.arrayBuffer());
+  }
+  const stream = await readBlob(env, ref, null);
+  const out = new Uint8Array(ref.size);
+  let at = 0;
+  try {
+    const reader = stream.getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (at + value.byteLength > out.length) throw new Error("longer than recorded");
+      out.set(value, at);
+      at += value.byteLength;
+    }
+  } catch (e) { throw e instanceof HttpError ? e : blobCorrupt(ref, "later_chunk"); }
+  if (at !== out.length) throw blobCorrupt(ref, "short");
+  return out;
 }
 
 /** Up to `limit` object keys under a prefix (one page), for cleanup sweeps. */
