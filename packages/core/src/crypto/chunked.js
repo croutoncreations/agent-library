@@ -116,6 +116,8 @@ function checkDataKey(dataKey) {
 
 // The HKDF info ("al-obj/1" ‖ 0x00 ‖ key) must stay within 1024 bytes, the limit Node's WebCrypto enforces.
 const OBJECT_KEY_MAX_BYTES = 1024 - INFO_PREFIX.length - 1;
+/** The longest storage object key (UTF-8 bytes) an object can be written under: 1015. */
+export const CHUNKED_OBJECT_KEY_MAX_BYTES = OBJECT_KEY_MAX_BYTES;
 
 /** Well-formed (no lone surrogates, which UTF-8 encoding would collapse to U+FFFD) and at most 1015 UTF-8 bytes. */
 function checkObjectKey(objectKey) {

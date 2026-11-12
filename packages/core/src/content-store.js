@@ -1,6 +1,6 @@
-import { HttpError } from "./util.js";
-import { ACTIVE_KEY_SQL, KEY_SHREDDED_MESSAGE, NO_REAL_KEY_SQL, dataKeyById } from "./crypto/keys.js";
-import { CHUNKED_HEADER_BYTES, chunkedStoredLength, decryptChunkedRange, decryptChunkedStream, parseChunkedHeader, planChunkedRange } from "./crypto/chunked.js";
+import { HttpError, b64url } from "./util.js";
+import { ACTIVE_KEY_SQL, KEY_SHREDDED_MESSAGE, NO_REAL_KEY_SQL, dataKeyById, encryptionEnabled, workspaceDataKey } from "./crypto/keys.js";
+import { CHUNKED_HEADER_BYTES, CHUNKED_OBJECT_KEY_MAX_BYTES, chunkedStoredLength, decryptChunkedRange, decryptChunkedStream, encryptChunkedStream, parseChunkedHeader, planChunkedRange } from "./crypto/chunked.js";
 import { projectWorkspaceId } from "./limits.js";
 
 // ContentStore: the one place the Worker reads or writes stored file bytes (R2 `BLOBS`).
@@ -50,7 +50,7 @@ export async function putBlob(env, key, bytes, options) {
  * Write a stream of exactly `length` bytes under an immutable key without buffering it (R2 accepts a stream only
  * with a known length, hence FixedLengthStream). Rejects, storing nothing, if the stream errors or is not exactly
  * `length` bytes long, or if `options.sha256` is given and the stored bytes hash differently. Returns the R2 object
- * (size, checksums).
+ * (size, checksums). Plaintext only.
  */
 export async function putBlobStream(env, key, stream, length, options) {
   return env.BLOBS.put(key, stream.pipeThrough(new FixedLengthStream(length)), options);
@@ -260,6 +260,236 @@ export async function readBlobBytes(env, ref) {
   } catch (e) { throw readFailure(ref, e, "later_chunk"); }
   if (at !== out.length) throw blobCorrupt(ref, "short");
   return out;
+}
+
+// Binary writes (slice 3b). Whether to encrypt is asked of encryptionEnabled(env) immediately before each write; the
+// workspace is always passed in explicitly by the caller (from the server-side project or the restoring principal),
+// never taken from a request field or a stored object.
+
+const hexOf = (buf) => [...new Uint8Array(buf)].map((x) => x.toString(16).padStart(2, "0")).join("");
+const ENCRYPTED_METADATA = (keyId) => ({ "al-enc": "1", "al-key": keyId });
+const ENCRYPTED_CONTENT_TYPE = "application/octet-stream";
+
+/** A classified write failure: kind is "digest" | "too_long" | "too_short"; the original error is its cause. */
+function blobWriteError(kind, cause) {
+  const e = new Error(`blob write failed: ${kind}`, { cause });
+  /** @type {any} */ (e).blobWrite = kind;
+  return e;
+}
+
+/** The class of a failed writeUploadBlob: "digest" | "too_long" | "too_short", or null (any other failure). */
+export function isBlobWriteError(error) {
+  const k = error?.blobWrite;
+  return k === "digest" || k === "too_long" || k === "too_short" ? k : null;
+}
+
+/**
+ * The plaintext side of an encrypted upload PUT (probe item a): counts the bytes, passes each chunk on, then hashes
+ * a copy of it with crypto.DigestStream (copy, enqueue, then hash the copy, so the encryptor's input is never the
+ * buffer being hashed). It throws, before the encryptor can release its final chunk, when the body is longer
+ * (transform) or shorter (flush) than `size` or its SHA-256 differs from `sha256` (flush). The flags say which.
+ */
+function plainTap(size, sha256) {
+  const digest = new crypto.DigestStream("SHA-256");
+  const digestWriter = digest.getWriter();
+  const state = { count: 0, sha256: null, tooLong: false, tooShort: false, mismatch: false };
+  const stream = new TransformStream({
+    async transform(chunk, out) {
+      state.count += chunk.byteLength;
+      if (state.count > size) { state.tooLong = true; throw new Error("body is longer than declared"); }
+      const copy = chunk.slice();
+      out.enqueue(chunk);
+      await digestWriter.write(copy);
+    },
+    async flush() {
+      await digestWriter.close();
+      if (state.count < size) { state.tooShort = true; throw new Error("body is shorter than declared"); }
+      state.sha256 = hexOf(await digest.digest);
+      if (state.sha256 !== sha256) { state.mismatch = true; throw new Error("body SHA-256 differs from the declaration"); }
+    },
+  });
+  return { stream, state };
+}
+
+/** Copies the first 48 bytes that pass through (the encryptor's header) into `out.header`. */
+function headerTap() {
+  const header = new Uint8Array(CHUNKED_HEADER_BYTES);
+  const out = { header: null };
+  let seen = 0;
+  const stream = new TransformStream({
+    transform(chunk, controller) {
+      if (seen < CHUNKED_HEADER_BYTES) {
+        const take = Math.min(CHUNKED_HEADER_BYTES - seen, chunk.byteLength);
+        header.set(chunk.subarray(0, take), seen);
+        seen += take;
+        if (seen === CHUNKED_HEADER_BYTES) out.header = header;
+      }
+      controller.enqueue(chunk);
+    },
+  });
+  return { stream, out };
+}
+
+/**
+ * Write an upload's body (a byte stream of exactly `size` plaintext bytes with SHA-256 `sha256`, lowercase hex) to
+ * `key`, in one pass. Plaintext (encryptionEnabled false): exactly today's put, R2 checking length and SHA-256.
+ * Encrypted: workspaceDataKey(workspaceId), then body -> plainTap -> encryptChunkedStream -> headerTap ->
+ * FixedLengthStream(chunkedStoredLength(size)) -> one put with customMetadata { al-enc, al-key } and no R2 checksum.
+ * Returns { size, sha256, keyId, header } (keyId and header null for plaintext; header is the 48 header bytes as
+ * base64url without padding). A classified failure (isBlobWriteError) stores no complete object.
+ * @returns {Promise<{ size: number|null, sha256: string|null, keyId: string|null, header: string|null }>}
+ */
+export async function writeUploadBlob(env, { key, body, size, sha256, contentType, workspaceId }) {
+  if (!(await encryptionEnabled(env))) {
+    let stored;
+    try { stored = await putBlobStream(env, key, body, size, { sha256, httpMetadata: { contentType } }); }
+    catch (e) {
+      const m = String(/** @type {any} */ (e)?.message ?? e);
+      if (/SHA-256 checksum you specified did not match|10037/.test(m)) throw blobWriteError("digest", e);
+      if (/too many bytes/i.test(m)) throw blobWriteError("too_long", e);
+      if (/did not see all expected bytes/i.test(m)) throw blobWriteError("too_short", e);
+      throw e;
+    }
+    return { size: stored?.size ?? null, sha256: blobSha256Hex(stored), keyId: null, header: null };
+  }
+  if (typeof workspaceId !== "string" || !workspaceId) throw new HttpError(500, "invalid_workspace", "A workspace id is required");
+  const { keyId, key: dataKey } = await workspaceDataKey(env, workspaceId);
+  const tap = plainTap(size, sha256);
+  const head = headerTap();
+  const stored = encryptChunkedStream(body.pipeThrough(tap.stream), { plaintextLength: size, dataKey, objectKey: key })
+    .pipeThrough(head.stream)
+    .pipeThrough(new FixedLengthStream(chunkedStoredLength(size)));
+  let put;
+  try {
+    put = await env.BLOBS.put(key, stored, { httpMetadata: { contentType: ENCRYPTED_CONTENT_TYPE }, customMetadata: ENCRYPTED_METADATA(keyId) });
+  } catch (e) {
+    // Classified from the tap's own flags, never from storage's error text.
+    if (tap.state.mismatch) throw blobWriteError("digest", e);
+    if (tap.state.tooLong) throw blobWriteError("too_long", e);
+    if (tap.state.tooShort) throw blobWriteError("too_short", e);
+    throw e;
+  }
+  if (!head.out.header || tap.state.sha256 !== sha256 || tap.state.count !== size || put?.size !== chunkedStoredLength(size))
+    throw new HttpError(500, "publish_failed", "The stored object is inconsistent with what was written");
+  return { size: tap.state.count, sha256: tap.state.sha256, keyId, header: b64url(head.out.header) };
+}
+
+/**
+ * Write a whole object held in memory (backup import and restore, at most the backup's 16 MiB file cap) to `key`.
+ * Asks encryptionEnabled itself. Plaintext: today's put (no options, byte for byte). Encrypted under
+ * workspaceDataKey(workspaceId), with customMetadata { al-enc, al-key } and content type application/octet-stream
+ * (`contentType` is accepted for the caller's symmetry; content type is always served from revisions.mime). Returns { keyId, header } (both null for plaintext; header base64url, no padding).
+ * @returns {Promise<{ keyId: string|null, header: string|null }>}
+ */
+export async function writeBlobBytes(env, { key, bytes, contentType, workspaceId }) {
+  if (!(await encryptionEnabled(env))) {
+    await putBlob(env, key, bytes);
+    return { keyId: null, header: null };
+  }
+  if (typeof workspaceId !== "string" || !workspaceId) throw new HttpError(500, "invalid_workspace", "A workspace id is required");
+  const { keyId, key: dataKey } = await workspaceDataKey(env, workspaceId);
+  const input = new ReadableStream({ start(c) { if (bytes.byteLength) c.enqueue(bytes); c.close(); } });
+  const stored = new Uint8Array(chunkedStoredLength(bytes.byteLength));
+  let at = 0;
+  const reader = encryptChunkedStream(input, { plaintextLength: bytes.byteLength, dataKey, objectKey: key }).getReader();
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    stored.set(value, at);
+    at += value.byteLength;
+  }
+  if (at !== stored.length) throw new HttpError(500, "publish_failed", "The encrypted object has the wrong length");
+  await env.BLOBS.put(key, stored, { httpMetadata: { contentType: ENCRYPTED_CONTENT_TYPE }, customMetadata: ENCRYPTED_METADATA(keyId) });
+  return { keyId, header: b64url(stored.subarray(0, CHUNKED_HEADER_BYTES)) };
+}
+
+/** Can an object be written under this storage key? UTF-8 length at most CHUNKED_OBJECT_KEY_MAX_BYTES (1,015). */
+export function blobKeyFits(key) {
+  return typeof key === "string" && key !== "" && new TextEncoder().encode(key).length <= CHUNKED_OBJECT_KEY_MAX_BYTES;
+}
+
+/**
+ * Upload finish's check of what the PUT stored, without reading the whole object: one head and one ranged get (the
+ * first `headBytes` bytes of plaintext; for an encrypted object, chunk 0, decrypted with the database header).
+ * Returns { ok: true, size, sha256, head } or { ok: false, reason: "missing" | "no_checksum" | "mismatch" | "corrupt",
+ * size?, sha256? } (mismatch carries the received values). Throws 410 key_shredded (and the key layer's other errors).
+ */
+export async function inspectUploadedBlob(env, { key, projectId, artifactId, workspaceId, size, sha256, keyId, header, receivedSize, receivedSha256 }, headBytes) {
+  const ref = { key, size, keyId: keyId ?? null, header: header ?? null, projectId, artifactId, workspaceId };
+  const corrupt = (reason) => {
+    console.error(JSON.stringify({ event: "upload_blob_inconsistent", reason, projectId, artifactId }));
+    return { ok: false, reason: "corrupt" };
+  };
+  if ((ref.keyId === null) !== (ref.header === null)) return corrupt("half_column_pair");
+  if (ref.keyId === null) {
+    const stored = await headBlob(env, key);
+    if (!stored) return { ok: false, reason: "missing" };
+    if (stored.customMetadata && ("al-enc" in stored.customMetadata || "al-key" in stored.customMetadata)) return corrupt("plaintext_upload_encrypted_object");
+    const got = blobSha256Hex(stored);
+    if (got === null) return { ok: false, reason: "no_checksum" };
+    if (stored.size !== size || got !== sha256) return { ok: false, reason: "mismatch", size: stored.size, sha256: got };
+    const head = await getBlobHead(env, key, headBytes);
+    if (!head) return { ok: false, reason: "missing" };
+    return { ok: true, size, sha256: got, head };
+  }
+  // What the PUT's plainTap counted and hashed is the only plaintext check: R2 holds ciphertext.
+  if (receivedSize !== size || receivedSha256 !== sha256) return { ok: false, reason: "mismatch", size: receivedSize, sha256: receivedSha256 };
+  const stored = await headBlob(env, key);
+  if (!stored) return { ok: false, reason: "missing" };
+  const meta = stored.customMetadata ?? {};
+  if (meta["al-enc"] !== "1" || meta["al-key"] !== ref.keyId) return corrupt("metadata");
+  if (stored.size !== chunkedStoredLength(size)) return corrupt("stored_size");
+  if (typeof workspaceId !== "string" || !workspaceId) return corrupt("no_workspace");
+  let setup;
+  try { setup = await encryptedReadSetup(env, ref); }
+  catch (e) {
+    if (e instanceof HttpError && e.code === "blob_corrupt") return corrupt("setup");
+    throw e;
+  }
+  // size >= 1 here (finish refuses a 0-byte binary first); one ranged get of chunk 0, authenticated.
+  if (size < 1) return corrupt("empty");
+  const end = Math.min(headBytes, size) - 1;
+  const plan = planChunkedRange(size, 0, end);
+  const object = await getBlob(env, key, { offset: plan.storedStart, length: plan.storedEnd - plan.storedStart + 1 });
+  if (!object) return { ok: false, reason: "missing" };
+  // The ranged get carries the object's metadata too (probe item d): an object replaced since the head is refused.
+  if (object.customMetadata?.["al-key"] !== ref.keyId || object.size !== chunkedStoredLength(size)) { await object.body?.cancel().catch(() => {}); return corrupt("metadata"); }
+  try {
+    const plain = decryptChunkedRange({ header: setup.header, dataKey: setup.dataKey, objectKey: key, start: 0, end, fetchStored: () => object.body });
+    const head = new Uint8Array(end + 1);
+    let at = 0;
+    const reader = plain.getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      head.set(value, at);
+      at += value.byteLength;
+    }
+    if (at !== head.length) return corrupt("chunk0_short");
+    return { ok: true, size, sha256, head };
+  } catch (e) {
+    if (isCodecError(e)) return corrupt("chunk0");
+    throw e;
+  }
+}
+
+/**
+ * For an outcome settled as NOT published only: delete those of `keys` that no revisions.blob_key refers to. If the
+ * reference query (or a delete) fails it logs backup_cleanup_skipped and resolves; never throws.
+ */
+export async function dropUnreferencedBlobs(env, keys) {
+  keys = keys.filter(Boolean);
+  if (!keys.length) return;
+  let unreferenced;
+  try {
+    unreferenced = (await env.DB.prepare(`SELECT j.value AS key FROM json_each(?) j
+      WHERE NOT EXISTS (SELECT 1 FROM revisions WHERE blob_key = j.value)`).bind(JSON.stringify(keys)).all()).results.map((r) => r.key);
+  } catch {
+    console.error(JSON.stringify({ event: "backup_cleanup_skipped", count: keys.length, reason: "reference_query_failed" }));
+    return;
+  }
+  try { await deleteBlobs(env, unreferenced); }
+  catch { console.error(JSON.stringify({ event: "backup_cleanup_skipped", count: unreferenced.length, reason: "delete_failed" })); }
 }
 
 /** Up to `limit` object keys under a prefix (one page), for cleanup sweeps. */

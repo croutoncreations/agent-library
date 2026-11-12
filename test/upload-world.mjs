@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { ROOT } from "./helpers.mjs";
 import { loadWorker } from "./load-worker.mjs";
 
-export const lib = await loadWorker({ "uploads.js": ["quotaUsedSql", "uploadBegin", "uploadFinish", "uploadPut", "serveContent"], "cleanup.js": ["reconcileUploads"], "project-deletion.js": ["purgeDueProjects"], "adapters.js": ["withAdapters", "defaultAdapters"], "service.js": ["loadArtifact", "createMarkdown", "saveMarkdown", "saveFile", "restoreRevision", "getArtifact"], "backup.js": ["exportBackup", "restoreBackup", "importBackup"], "content-store.js": ["blobRef", "readBlob", "readBlobBytes"], "crypto/keys.js": ["workspaceDataKey", "shredWorkspaceKeys", "withDataKeyMemo"], "oauth/mcp.js": ["ftReadFile"] });
+export const lib = await loadWorker({ "uploads.js": ["quotaUsedSql", "uploadBegin", "uploadFinish", "uploadPut", "serveContent"], "cleanup.js": ["reconcileUploads"], "project-deletion.js": ["purgeDueProjects"], "adapters.js": ["withAdapters", "defaultAdapters"], "service.js": ["loadArtifact", "createMarkdown", "saveMarkdown", "saveFile", "restoreRevision", "getArtifact"], "backup.js": ["exportBackup", "restoreBackup", "importBackup"], "content-store.js": ["blobRef", "readBlob", "readBlobBytes", "writeUploadBlob", "writeBlobBytes", "isBlobWriteError", "inspectUploadedBlob", "blobKeyFits", "dropUnreferencedBlobs", "keyFence", "plaintextFence"], "crypto/keys.js": ["workspaceDataKey", "shredWorkspaceKeys", "withDataKeyMemo"], "oauth/mcp.js": ["ftReadFile"] });
 // The workerd stream class uploadPut uses, a minimal Node stand-in with workerd's messages: FixedLengthStream (errors
 // unless exactly n bytes).
 globalThis.FixedLengthStream ??= class extends TransformStream {
