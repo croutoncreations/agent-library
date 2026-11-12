@@ -142,12 +142,15 @@ async function createDataKey(env, workspaceId) {
   }
 }
 
-/** The workspace's active row, creating the first key if there is none. Refuses a shredded workspace. */
+/**
+ * The workspace's active row, creating the first key if there is none. Refuses a shredded workspace. Every call does
+ * its own reads; only the creation is shared between concurrent callers in one request, and each re-selects after it.
+ */
 async function activeOrCreatedRow(env, workspaceId) {
   const row = await activeRow(env, workspaceId);
   if (row) return row;
   if (await hasShreddedRow(env, workspaceId)) throw shredded();
-  await createDataKey(env, workspaceId);
+  await shared(env, "create:" + workspaceId, () => createDataKey(env, workspaceId));
   const created = await activeRow(env, workspaceId);
   if (created) return created;
   if (await hasShreddedRow(env, workspaceId)) throw shredded();
@@ -157,16 +160,16 @@ async function activeOrCreatedRow(env, workspaceId) {
 
 /**
  * The workspace's active data key for encrypting: { workspaceId, keyId, masterVersion, key }, creating it on first use.
- * Every call re-reads the active row (only the unwrap is memoized per request); concurrent calls in one request share
- * one in-flight lookup, so concurrent first use yields one key for every caller. Refuses unless the keyProvider is
+ * Every call does its own read of the active row, so a call that starts after a completed shred is refused (only the
+ * unwrap is memoized per request, keyed by the whole row); concurrent first use in one request shares one creation,
+ * so it wraps one candidate key and yields one key for every caller. Refuses unless the keyProvider is
  * configured and well-formed, even if the workspace already has a row (500 encryption_not_configured, or the
  * configuration's own error), and refuses a shredded workspace (410 key_shredded).
  */
 export async function workspaceDataKey(env, workspaceId) {
   if (typeof workspaceId !== "string" || !workspaceId) throw new HttpError(500, "invalid_workspace", "A workspace id is required");
   if (!encryptionConfigured(env)) throw new HttpError(500, "encryption_not_configured", "Content encryption is not configured");
-  const row = await shared(env, "active:" + workspaceId, () => activeOrCreatedRow(env, workspaceId));
-  return unwrapRow(env, row);
+  return unwrapRow(env, await activeOrCreatedRow(env, workspaceId));
 }
 
 /**

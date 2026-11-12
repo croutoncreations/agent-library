@@ -346,6 +346,40 @@ test("concurrent first use inside one request shares one creation, which is forg
   assert.equal(calls.wrap, 2);
 });
 
+test("a lookup that starts after a completed shred is refused, even while an earlier lookup in the same request is still in flight", async () => {
+  const { sql, DB } = mkDB();
+  const base = configuredBase(DB);
+  await lib.workspaceDataKey(request(base), WS_A);
+  // The test database holds back the result of one active-row SELECT: the statement has executed (it read the active
+  // row), but its promise resolves only when the test releases it.
+  const ACTIVE_ROW_SELECT = /FROM workspace_keys WHERE workspace_id = \? AND shredded_at IS NULL$/;
+  let hold = false, heldReached, release;
+  const reached = new Promise((res) => { heldReached = res; });
+  const gate = new Promise((res) => { release = res; });
+  const heldDB = { prepare(q) {
+    const s = DB.prepare(q);
+    const wrapFirst = (st) => ({ ...st, async first(c) {
+      const result = await st.first(c);
+      if (hold && ACTIVE_ROW_SELECT.test(q)) { hold = false; heldReached(); await gate; }
+      return result;
+    } });
+    return { ...wrapFirst(s), bind: (...p) => wrapFirst(s.bind(...p)) };
+  } };
+  const r = request({ ...base, DB: heldDB });
+  hold = true;
+  const callA = lib.workspaceDataKey(r, WS_A).then((k) => k, (e) => e);
+  await reached;
+  await lib.shredWorkspaceKeys(request(base), WS_A);
+  assert.equal(activeRows(sql, WS_A).length, 0, "the shred has completed");
+  const callB = lib.workspaceDataKey(r, WS_A).then((k) => k, (e) => e);
+  release();
+  const [a, b] = await Promise.all([callA, callB]);
+  assert.equal(b.code, "key_shredded", "a lookup started after the shred completed gets no key");
+  // Call A read the row before the shred: it gets the key (the documented allowance for a lookup already in flight).
+  assert.equal(a.workspaceId, WS_A);
+  assertDataKey(a.key);
+});
+
 test("encryptionRequired reads CONTENT_ENCRYPTION_REQUIRED; only \"1\" means required", () => {
   for (const [v, want] of [[undefined, false], ["", false], ["0", false], ["1", true], [1, true]]) {
     assert.equal(lib.encryptionRequired({ CONTENT_ENCRYPTION_REQUIRED: v }), want, String(v));
