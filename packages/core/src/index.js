@@ -366,11 +366,18 @@ function createWorker(adapterConfig = {}) {
   const misconfigured = (env) => A.identity.name === "none" && !!(env?.ACCESS_TEAM_DOMAIN || env?.ACCESS_AUD);
   const refuse = () => new Response(JSON.stringify({ error: { code: "misconfigured", message: "This build has no sign-in provider but Access is configured" } }), { status: 500, headers: { "content-type": "application/json" } });
   // Fail closed: CONTENT_ENCRYPTION_REQUIRED=1 but the key provider is not configured or its configuration is
-  // malformed. Only applies when that var is set. The response names no secret.
+  // malformed. Only applies when that var is set. The response names no secret; the log line has the reason and, for
+  // an error, only its code (HttpError) or constructor name, never its message.
   const encryptionMissing = (env) => {
     if (!encryptionRequired(env)) return false;
-    try { return !encryptionConfigured(withAdapters(env, A)); }
-    catch { return true; }
+    const log = (detail) => console.error(JSON.stringify({ event: "encryption_misconfigured", ...detail }));
+    try {
+      if (encryptionConfigured(withAdapters(env, A))) return false;
+      log({ reason: "not_configured" });
+    } catch (e) {
+      log({ reason: "configuration_error", error: e instanceof HttpError ? e.code : String(e?.constructor?.name ?? typeof e) });
+    }
+    return true;
   };
   const refuseEncryption = () => new Response(JSON.stringify({ error: { code: "encryption_misconfigured", message: ENCRYPTION_MISCONFIGURED_MESSAGE } }), { status: 500, headers: { "content-type": "application/json" } });
   return {

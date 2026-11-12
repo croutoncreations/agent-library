@@ -466,6 +466,37 @@ test("createWorker refuses every request when encryption is required but not con
   }
 });
 
+test("createWorker's encryption refusal logs one line with its reason, never an error message or a secret name", async () => {
+  const { DB } = mkDB();
+  const call = (env, adapters) => lib.createWorker(adapters).fetch(new Request("https://app.example.test/api/me"), { APP_HOST: "app.example.test", DB, ...env }, { waitUntil() {} });
+  const refusedBody = { error: { code: "encryption_misconfigured", message: "Content encryption is required but not configured" } };
+  const events = (logs) => logs.map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter((e) => e?.event === "encryption_misconfigured");
+  const d = lib.defaultAdapters().keyProvider;
+  const SYNTHETIC_MESSAGE = "synthetic provider failure text";
+  class SyntheticProviderError extends Error {}
+  const cases = [
+    [{ CONTENT_ENCRYPTION_REQUIRED: "1" }, undefined, { event: "encryption_misconfigured", reason: "not_configured" }],
+    [{ CONTENT_ENCRYPTION_REQUIRED: "1", CONTENT_MASTER_KEY_VERSION: "1", CONTENT_MASTER_KEY_V1: "not-32-bytes" }, undefined,
+      { event: "encryption_misconfigured", reason: "configuration_error", error: "master_key_invalid" }],
+    [{ CONTENT_ENCRYPTION_REQUIRED: "1" }, { keyProvider: { ...d, name: "synthetic-broken", configured: () => { throw new SyntheticProviderError(SYNTHETIC_MESSAGE); } } },
+      { event: "encryption_misconfigured", reason: "configuration_error", error: "SyntheticProviderError" }],
+    [{ CONTENT_ENCRYPTION_REQUIRED: "1" }, { keyProvider: { ...d, name: "synthetic-async", configured: async () => true } },
+      { event: "encryption_misconfigured", reason: "configuration_error", error: "key_provider_invalid" }],
+  ];
+  for (const [env, adapters, want] of cases) {
+    let res;
+    const logs = await captureErrors(async () => { res = await call(env, adapters); });
+    assert.equal(res.status, 500);
+    assert.deepEqual(await res.json(), refusedBody, "the client response is unchanged");
+    assert.deepEqual(events(logs), [want], JSON.stringify(want));
+    const line = logs.find((l) => l.includes('"event":"encryption_misconfigured"'));
+    assert.ok(!line.includes(SYNTHETIC_MESSAGE) && !/CONTENT_/.test(line), line);
+  }
+  // Not required: no refusal and no such line.
+  const logs = await captureErrors(() => call({}));
+  assert.deepEqual(events(logs), []);
+});
+
 test("provider results are validated: configured must be a synchronous boolean, currentVersion a positive safe integer, wrap a non-empty string", async () => {
   const { sql, DB } = mkDB();
   const d = lib.defaultAdapters().keyProvider;
