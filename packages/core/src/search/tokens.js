@@ -100,46 +100,62 @@ const capReason = (env, cap) => cap === 0 ? "off" : cap === searchTermsMax(env) 
 /**
  * u61FoldToken, stopping as soon as the folded result exceeds `max` code units (then null). Equal to u61FoldToken for
  * every result of `max` units or fewer: folding is per code point (dropped marks removed, case and accents folded).
+ * Self-contained: the regular-expression statics are reset before it returns, so it never keeps `word` reachable.
  */
 export function u61FoldTokenBounded(word, max = SEARCH_TERM_UNITS_MAX) {
-  if (/^[\x00-\x7f]*$/.test(word)) return word.length <= max ? word.toLowerCase() : null;
-  let out = "";
-  for (const ch of word) {
-    out += u61FoldToken(ch);
-    if (out.length > max) return null;
-  }
-  return out;
+  try {
+    if (isAscii(word)) return word.length <= max ? word.toLowerCase() : null;
+    let out = "";
+    for (const ch of word) {
+      out += u61FoldToken(ch);
+      if (out.length > max) return null;
+    }
+    return out;
+  } finally { forgetLastMatch(); }
+}
+/** True if every unit is below 0x80 (a loop, so no regular expression keeps the word reachable). */
+function isAscii(word) {
+  for (let i = 0; i < word.length; i++) if (word.charCodeAt(i) > 0x7f) return false;
+  return true;
 }
 /** Calls add(term) for each distinct folded term, in text order, up to `cap`. Returns true if a further one was cut. */
-function scanTerms(text, cap, add) {
+function scanTerms(text, cap, add, fold = u61FoldTokenBounded) {
   if (cap <= 0 || !text) return false;
-  try { return scanTermsIn(text, cap, add); } finally { forgetLastMatch(); }
+  try { return scanTermsIn(text, cap, add, fold); } finally { forgetLastMatch(); }
 }
+/**
+ * The index's token rule (unicode61.js U61_TOKEN) with surrogate code units added to both of its excluded classes, so
+ * a match never contains a surrogate unit. With the "u" flag a valid surrogate pair is one code point, matched as a
+ * whole by the classes (a supplementary code point is never a surrogate unit), so on well-formed text every match is
+ * unchanged. A lone surrogate is neither: it separates tokens, as SQLite's U+FFFD replacement does. No copy, no
+ * sub-match array and no well-formedness helper: matching is lazy, so the cap stops the work.
+ */
+export const U61_TOKEN_WELLFORMED = new RegExp(U61_TOKEN.source.replaceAll("[^", "[^\\u{d800}-\\u{dfff}"), U61_TOKEN.flags);
 /**
  * The legacy RegExp statics (RegExp.input, lastMatch, …) keep the last subject a regular expression matched alive, so
  * after scanning a large text the text itself would stay reachable. One match on an empty string replaces them.
  */
 const EMPTY_MATCH = /(?:)/;
 const forgetLastMatch = () => { EMPTY_MATCH.exec(""); };
-function scanTermsIn(text, cap, add) {
+function scanTermsIn(text, cap, add, fold) {
   const seen = new Set();
-  for (const m of text.matchAll(U61_TOKEN)) {
-    // A lone surrogate reaches SQLite as U+FFFD, a separator: re-tokenize just that match (rare; no whole-text copy).
-    const words = /** @type {any} */ (m[0]).isWellFormed() ? [m[0]] : Array.from(/** @type {any} */ (m[0]).toWellFormed().matchAll(U61_TOKEN), (x) => x[0]);
-    for (const w of words) {
-      const t = u61FoldTokenBounded(w);
-      if (!t || seen.has(t)) continue;
-      if (seen.size >= cap) return true;
-      seen.add(t);
-      add(t);
-    }
+  for (const m of text.matchAll(U61_TOKEN_WELLFORMED)) {
+    const t = fold(m[0]);
+    if (!t || seen.has(t)) continue;
+    if (seen.size >= cap) return true;
+    seen.add(t);
+    add(t);
   }
   return false;
 }
 /** Distinct index terms of a text, at most `cap` (tests and small callers; runs use the packed forms). */
 export function extractSearchTerms(text, cap) {
+  return extractSearchTermsWith(text, cap, u61FoldTokenBounded);
+}
+/** extractSearchTerms with the fold function given (tests count the pieces the scanner consumes through it). */
+export function extractSearchTermsWith(text, cap, fold) {
   const terms = [];
-  const truncated = scanTerms(text, cap, (t) => terms.push(t));
+  const truncated = scanTerms(text, cap, (t) => terms.push(t), fold);
   return { terms, truncated };
 }
 /**
@@ -389,6 +405,7 @@ export function lifecycleStatements(eligible) {
       // L counts a row's tokens once, when it takes the row from a writer (a dead writer may have added tokens beyond
       // term_count). Complete rows carry an exact term_count and purge-held rows an upper bound (tokens only shrink
       // under a lifecycle lease, and term_count is never lowered), so the selections never read search_tokens.
+      // The count runs at most once per row: after L the row is purge-held, so every later L keeps term_count.
       L: named(`UPDATE search_token_docs SET revision_id = '', writer = ?PN, gen = gen + 1,
   term_count = CASE WHEN ${WRITER_HELD} THEN (SELECT COUNT(*) FROM (SELECT 1 FROM search_tokens WHERE doc_id = ?D LIMIT ${SET_READ_LIMIT}))
                     ELSE term_count END
@@ -637,7 +654,10 @@ export function searchJob(env, input) {
   if (flat !== null) {
     // The flat terms must be what their charge covers: at most `cap` terms, consistent offsets, within 3 × units.
     const { bytes, offsets, count: n } = flat;
-    if (!(bytes instanceof Uint8Array) || !(offsets instanceof Uint32Array) || !count(n) || offsets.length !== n + 1
+    // Each array must own its whole backing buffer, so the job retains exactly what it is charged for.
+    const owned = (a) => a.byteOffset === 0 && a.byteLength === a.buffer.byteLength;
+    if (!(bytes instanceof Uint8Array) || !(offsets instanceof Uint32Array) || !owned(bytes) || !owned(offsets)) throw invalid("flat arrays");
+    if (!count(n) || offsets.length !== n + 1
       || offsets[0] !== 0 || offsets[n] !== bytes.byteLength || bytes.byteLength > Math.min(12000000, 3 * units)) throw invalid("flat");
     for (let i = 0; i < n; i++) if (offsets[i + 1] < offsets[i]) throw invalid("flat offsets");
     if (n > cap && cap > 0) throw invalid("flat count");
@@ -645,7 +665,9 @@ export function searchJob(env, input) {
   // SEARCH_TERMS_MAX = 0: no extraction; the text is never kept (the row is written complete as `off`).
   const off = cap === 0;
   return {
-    meta: { artifactId, projectId, revisionId }, text: off ? null : text, flat: off ? null : flat, terms: null, tokens: null, removes: null, adds: null,
+    // A fresh container with only the known fields: nothing else the caller attached is carried into the job.
+    meta: { artifactId, projectId, revisionId }, text: off ? null : text,
+    flat: off || flat === null ? null : { bytes: flat.bytes, offsets: flat.offsets, count: flat.count, truncated: flat.truncated === true }, terms: null, tokens: null, removes: null, adds: null,
     cap, units: off ? 0 : units, charge: 0, reason: "", digest: "",
     kind: null, row: null, scope: null, done: false, replanned: false,
   };
@@ -1075,10 +1097,13 @@ async function writeRun(db, run) {
  * is cleared and the run settled.
  */
 export async function runSearchIndexing(env, run) {
+  // A run settled before it started (dropped by startDeferredWork) logs nothing here: its skips were logged once.
+  let quiet = false;
+  run.running = true;   // from here on admitSearchJobs refuses this run (the writer owns holder.jobs)
   try {
     await nextTurn();
     if (run.detached) return;
-    if (run.stopped) throw new RunStop(run.stopped);
+    if (run.settled) { quiet = true; return; }
     run.startedAt = Date.now();
     run.deadline = run.startedAt + SEARCH_RUN_DEADLINE_MS;
     phase(run, "deferred_start");
@@ -1094,10 +1119,12 @@ export async function runSearchIndexing(env, run) {
       for (const job of run.holder.jobs ?? []) if (!job.done) run.skip("error");
     }
   } finally {
-    const skipped = Object.values(run.skipped).reduce((a, b) => a + b, 0);
-    if (skipped) logEvent("search_index_skipped", { run: run.id, skipped, reasons: run.skipped });
-    if (!run.detached) phase(run, "deferred_end");
-    run.settle();
+    if (!quiet) {
+      const skipped = Object.values(run.skipped).reduce((a, b) => a + b, 0);
+      if (skipped) logEvent("search_index_skipped", { run: run.id, skipped, reasons: run.skipped });
+      if (!run.detached) phase(run, "deferred_end");
+      run.settle();
+    }
   }
 }
 
@@ -1182,8 +1209,9 @@ export function startDeferredWork(env, ctx) {
   if (typeof ctx?.waitUntil !== "function") { dropRun(q, run, "unstarted"); return; }
   phase(run, "handler_done");
   const p = track(run, runSearchIndexing(env, run));
-  // The run has not done anything yet (it begins with scheduler.wait(0)): if waitUntil throws, it stops at once.
-  try { ctx.waitUntil(p); } catch { run.stopped = "unstarted"; }
+  // The run has not done anything yet (it begins with scheduler.wait(0)): if waitUntil throws, it is settled now, and
+  // runSearchIndexing returns quietly when it finds it settled after its first yield.
+  try { ctx.waitUntil(p); } catch { dropRun(q, run, "unstarted"); }
 }
 /** Settle a run that never started: count its jobs as skipped for `reason` and log the request's skips. */
 function dropRun(q, run, reason) {
@@ -1212,6 +1240,9 @@ export async function drainSearchIndexing() {
  * the isolate's free bytes); the rest are counted as skipped (admission). Rejected jobs never enter the holder.
  */
 export function admitSearchJobs(env, run, jobs) {
+  // Only a run that has not started may take jobs: once started, the writer iterates holder.jobs.
+  if (!run || run.startedAt || run.settled || run.detached || run.running)
+    throw new HttpError(500, "search_run_invalid", "Search jobs can only be added to a run that has not started");
   // Every descriptor is checked before anything is reserved, so a bad one changes no counter.
   const all = jobs.map((input) => searchJob(env, input));
   // Within one call, only the last job of each artifact is admitted.
@@ -1227,7 +1258,12 @@ export function admitSearchJobs(env, run, jobs) {
       old.text = null; old.flat = null;
     }
     const charge = searchJobCharge(job, { upload: job.flat !== null });
-    if (run.holder.jobs.length >= SEARCH_RUN_LIMITS.docs || run.textUnits + job.units > SEARCH_RUN_LIMITS.textUnits || !run.reserve(charge)) { run.skip("admission"); continue; }
+    if (run.holder.jobs.length >= SEARCH_RUN_LIMITS.docs || run.textUnits + job.units > SEARCH_RUN_LIMITS.textUnits || !run.reserve(charge)) {
+      // A job this one replaced is gone too: count it, not silently drop it.
+      if (prev >= 0) run.skip("replaced");
+      run.skip("admission");
+      continue;
+    }
     job.charge = charge;
     run.textUnits += job.units;
     run.holder.jobs.push(job);

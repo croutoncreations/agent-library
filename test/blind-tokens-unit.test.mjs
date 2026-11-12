@@ -5,6 +5,8 @@ import assert from "node:assert/strict";
 import { createHmac, hkdfSync, createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { loadWorker } from "./load-worker.mjs";
 import { ROOT } from "./helpers.mjs";
 import * as W from "./blind-tokens-world.mjs";
@@ -683,7 +685,9 @@ test("test 10: deferral: jobs wait for startDeferredWork, run under one waitUnti
 });
 
 /** A source text of about 6 MiB in two-byte storage (more than the 4 MiB envelope if retained): distinct words, then padding. */
-const bigSource = (prefix) => words(5000, prefix).join(" ") + " " + "\u00e9".repeat(3 * MiB);
+/** Two-byte padding: Ω (U+03A9) is not Latin-1, so V8 stores the string with two bytes per unit (asserted below). */
+const PAD_UNITS = 3 * MiB;
+const bigSource = (prefix) => words(5000, prefix).join(" ") + " " + "\u03a9".repeat(PAD_UNITS);
 /** Heap retained by a blocked call once the run is detached (holder nulled), relative to `baseline`. */
 async function retainedWhileBlocked(run, baseline) {
   run.detach();
@@ -758,6 +762,15 @@ test("test 27: blocked operations retain at most the 4 MiB envelope once the hol
     block.open(); await done;
   }
   for (const [k, n] of Object.entries(sizes)) assert.ok(n <= ENV, `${k}: ${n} bytes retained`);
+  // The fixture's footprint: creating (and flattening) one source costs about 2 bytes per unit, so retaining a source
+  // (≥ 6 MiB) would exceed the 4 MiB bound by a clear margin.
+  const h0 = await heap();
+  let probe = bigSource("fp");
+  probe.charCodeAt(probe.length - 1);
+  const footprint = (await heap()) - h0;
+  assert.ok(footprint >= 2 * PAD_UNITS * 0.95, `fixture footprint ${footprint} bytes`);
+  assert.ok(footprint > ENV * 1.4);
+  probe = null;
   console.log("BLOCKED_RETAINED " + JSON.stringify(sizes));
   assertIdle();
 });
@@ -790,29 +803,34 @@ test("test 28: whole-document charge, clearing of sent removes, ADD lifetime and
   await logs(() => indexJobs(env, [job("wd", textA), job("wd2", "small text here")]));
   for (const a of ["wd", "wd2"]) W.setHead(world, a, `rev_${a}b`);
   const samples = [];
-  let run, firstChunk = null;
-  world.before = async ({ kind, q, qs, tokenValues }) => {
+  // Captured synchronously at the top of the first write batch's hook. The first chunk has already left job.removes
+  // (spliced into batch 1 when packed): batch 1 must send the smallest removes, and no holder array may still hold its
+  // values. The chunk captured there is the next one: exactly what batch 2 sends, and unreachable once batch 2 is packed.
+  const storedBefore = W.tokensOf(world, "wd");
+  let firstSent = null, firstStillHeld = null;
+  let run, firstChunk = null, firstValue = null, writeBatches = 0;
+  world.before = async ({ kind, q, qs, ps, tokenValues }) => {
     const j = run.holder.jobs?.[0];
     if (kind === "batch" && qs.some((x) => /search_tokens/.test(x))) {
+      writeBatches++;
+      const rem = qs.findIndex((x) => /^DELETE FROM search_tokens WHERE doc_id/.test(x));
+      const sent = rem >= 0 ? JSON.parse(ps[rem].find((v) => typeof v === "string" && v.startsWith("["))) : [];
+      if (writeBatches === 1) {
+        firstChunk = new WeakRef(j.removes[0]); firstValue = j.removes[0][0];
+        firstSent = sent;
+        firstStillHeld = j.removes.some((c) => c.includes(sent[0]));
+      }
+      const sentFirst = sent[0] === firstValue;
       await settleGc();
-      samples.push({ payload: run.payload, removes: run.removeValues, chunks: j?.removes?.length ?? 0, firstGone: firstChunk ? firstChunk.deref() === undefined : null,
-        tokens: !!j?.tokens, tokenValues, final: qs.some((x) => /SET revision_id = \?/.test(x)) });
+      samples.push({ payload: run.payload, removes: run.removeValues, chunks: j?.removes?.length ?? 0, firstGone: firstChunk.deref() === undefined,
+        sendsFirst: sentFirst, tokens: !!j?.tokens, tokenValues, final: qs.some((x) => /SET revision_id = \?/.test(x)) });
     }
     if (kind === "all" && /ORDER BY d\.doc_id/.test(q) && samples.length) samples.push({ secondRead: true, remainder: j?.removes?.reduce((n, c) => n + c.length, 0) ?? 0 });
   };
-  world.after = ({ kind, q }) => {
-    if (kind === "all" && /ORDER BY d\.doc_id/.test(q)) {
-      // Called before the run builds its diff; the diff exists once the next batch is packed.
-      queueMicrotask(() => {});
-    }
-  };
   let done;
   ({ run, done } = start(env, [job("wd", words(20000, "wz").join(" "), "rev_wdb"), job("wd2", "other text now", "rev_wd2b")]));
-  // Capture the first remove chunk as soon as the diff is built (before its batch is sent).
-  const capture = setInterval(() => { const r = run.holder.jobs?.[0]?.removes; if (r?.length && !firstChunk) firstChunk = new WeakRef(r[0]); }, 0);
   await done;
-  clearInterval(capture);
-  world.before = null; world.after = null;
+  world.before = null;
   // wd fills a stable group (20,000 stored tokens), so wd2 is read in a second group; wd2's own batch is the fifth.
   const writes = samples.filter((x) => !x.secondRead);
   assert.equal(writes.length, 5, JSON.stringify(writes));
@@ -825,9 +843,10 @@ test("test 28: whole-document charge, clearing of sent removes, ADD lifetime and
   assert.deepEqual(writes.map((x) => x.removes), [20000, 15000, 10000, 5002, 2]);
   // Clearing: by the second batch the first chunk's array is gone (gc), while the unsent rest is held.
   assert.deepEqual(writes.slice(0, 4).map((x) => x.chunks), [3, 2, 1, 0]);
-  assert.ok(firstChunk, "the first remove chunk was captured before its batch was sent");
-  assert.equal(writes[0].firstGone, false, "held while unsent");
-  assert.equal(writes[1].firstGone, true);
+  assert.deepEqual(firstSent, storedBefore.slice(0, 5000), "batch 1 sends the FIRST chunk: the 5,000 smallest removes");
+  assert.equal(firstStillHeld, false, "the first chunk's values left the holder when packed");
+  assert.deepEqual(writes.slice(0, 3).map((x) => [x.sendsFirst, x.firstGone]), [[false, false], [true, true], [false, true]],
+    "the next chunk is held at batch 1, is what batch 2 sends, and is unreachable (gc) once batch 2 is packed");
   // ADD lifetime: while the last batch is in flight its token charge still counts.
   assert.equal(writes[3].final, true);
   assert.equal(writes[3].tokens, true);
@@ -1154,4 +1173,213 @@ test("review A6 (test 28): a stable group builds every member's diff before pack
   for (let i = 1; i <= 4; i++) assert.equal(W.docRow(world, `sg${i}`).revision_id, `rev_sg${i}b`);
   assertExact(world);
   assertIdle();
+});
+
+// --- Review fixes, round 2 -------------------------------------------------------------------------------------------
+/** The round-2 exports, loaded on first use (so the older tests still load against code that lacks them). */
+let r2lib = null;
+const r2 = async () => (r2lib ??= await loadWorker({ "search/tokens.js": ["extractSearchTermsWith", "U61_TOKEN_WELLFORMED", "u61FoldTokenBounded", "extractSearchTerms", "extractSearchTermsFlat"] }));
+test("review R2-1: lone surrogates split words lazily: 300,000 short words with cap 10 give 10 terms after bounded work", async () => {
+  const lib = await r2();
+  const parts = [];
+  for (let i = 0; i < 300000; i++) parts.push("s" + i.toString(36));
+  const text = parts.join("\uD800");
+  // Count the pieces the scanner consumes by counting folds (one per candidate piece).
+  let folds = 0;
+  const fold = lib.u61FoldTokenBounded;
+  const counting = (w) => { folds++; return fold(w); };
+  const r = lib.extractSearchTermsWith(text, 10, counting);
+  assert.equal(r.terms.length, 10);
+  assert.equal(r.truncated, true);
+  assert.ok(folds <= 11, `${folds} pieces consumed`);
+  assert.deepEqual(r.terms, parts.slice(0, 10));
+  // Packed and flat give the same terms on the malformed fixtures.
+  for (const t of [text, "ab\uD800cd", "x\uDC00y z", "\uD800", "a\uD800" + "b".repeat(300) + " c\uDBFF\uDFFFd"]) {
+    const plain = lib.extractSearchTerms(t, 50), flat = lib.extractSearchTermsFlat(t, 50), dec = new TextDecoder(), got = [];
+    for (let i = 0; i < flat.count; i++) got.push(dec.decode(flat.bytes.subarray(flat.offsets[i], flat.offsets[i + 1])));
+    assert.deepEqual(got, plain.terms, JSON.stringify(t.slice(0, 20)));
+  }
+});
+
+test("review R2-1: one 5 Mi-unit match with a lone surrogate in the middle yields no term and copies nothing", () => {
+  const child = spawnSync(process.execPath, ["--expose-gc", "--input-type=module", "-e", `
+    import { loadWorker } from "./test/load-worker.mjs";
+    const lib = await loadWorker({ "search/tokens.js": ["extractSearchTerms", "extractSearchTermsFlat"] });
+    const half = 5 * 1048576 / 2;
+    global.gc(); const empty = process.memoryUsage().heapUsed;
+    let text = "\\u03a9".repeat(half - 1) + "\\uD800" + "\\u03a9".repeat(half);
+    if (text.length !== 5 * 1048576) throw new Error("fixture");
+    text.charCodeAt(0);
+    const size = text.length * 2;
+    global.gc(); const base = process.memoryUsage().heapUsed;
+    // Peak: heap right after each extraction, before any gc (a copy of the match would still be there).
+    let peak = base;
+    const t0 = lib.extractSearchTerms(text, 20000);
+    peak = Math.max(peak, process.memoryUsage().heapUsed);
+    const t1 = lib.extractSearchTermsFlat(text, 20000);
+    peak = Math.max(peak, process.memoryUsage().heapUsed);
+    // Retained: once the caller drops the text, nothing of it may stay reachable.
+    text = null;
+    global.gc(); const after = process.memoryUsage().heapUsed;
+    console.log("SURR " + JSON.stringify({ terms: t0.terms.length, flat: t1.count, retained: after - empty, peak: peak - base, size, held: base - empty }));
+  `], { cwd: ROOT, encoding: "utf8", timeout: 120000 });
+  assert.equal(child.status, 0, child.stderr);
+  const r = JSON.parse(child.stdout.split("SURR ")[1]);
+  assert.deepEqual([r.terms, r.flat], [0, 0], "both pieces are over 200 units: no term");
+  // `retained`: heap after extraction and dropping the text, relative to before the text existed. A copy kept by the
+  // scanner (or the text itself through the RegExp statics) would be about `size`. `held` checks the fixture's own size.
+  assert.ok(r.held >= r.size * 0.95, `fixture held ${r.held} bytes`);
+  assert.ok(r.retained < r.size / 10, `retained ${r.retained} of a ${r.size}-byte match`);
+  assert.ok(r.peak < r.size / 2, `peak ${r.peak} of a ${r.size}-byte match (no copy)`);
+});
+
+test("review R2-1: the token pattern never matches across a lone surrogate and needs no isWellFormed/toWellFormed", async () => {
+  const src = readFileSync(join(ROOT, "packages/core/src/search/tokens.js"), "utf8");
+  assert.doesNotMatch(src, /\b(isWellFormed|toWellFormed)\b/);
+  const lib = await r2();
+  for (const t of ["ab\uD800cd", "x\uDC00y z", "\uD800", "a😀b \uD83D\uDE00c", "é\u0301x", "日本\uDFFF語"])
+    for (const m of t.matchAll(lib.U61_TOKEN_WELLFORMED)) assert.ok(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(m[0]), JSON.stringify(m[0]));
+});
+
+/** A flat descriptor with owned arrays for `terms`. */
+function flatOf(terms) {
+  const enc = new TextEncoder(), parts = terms.map((t) => enc.encode(t));
+  const bytes = new Uint8Array(parts.reduce((n, p) => n + p.length, 0)), offsets = new Uint32Array(parts.length + 1);
+  let at = 0;
+  parts.forEach((p, i) => { bytes.set(p, at); at += p.length; offsets[i + 1] = at; });
+  return { bytes, offsets, count: parts.length, truncated: false };
+}
+test("review R2-2: a flat view over a larger buffer is refused before any reservation", () => {
+  const world = world1([]);
+  const env = aenv(world);
+  const big = new Uint8Array(4 * MiB);
+  const own = flatOf(["alpha"]);
+  const views = [
+    { ...own, bytes: big.subarray(0, 5) },
+    { ...own, offsets: new Uint32Array(new ArrayBuffer(1 << 20), 0, 2) },
+    { ...own, bytes: new Uint8Array(big.buffer, 8, 5) },
+  ];
+  for (const v of views) {
+    v.offsets[0] = 0; v.offsets[1] = 5;
+    if (v.bytes !== own.bytes) v.bytes.set(own.bytes);
+    const r = adm.openSearchRun();
+    const before = adm.searchAdmissionState();
+    assert.throws(() => adm.admitSearchJobs(env, r, [{ artifactId: "fv", projectId: "proj_a", revisionId: "rev_fv", flat: v, textBytes: 5, textUnits: 5 }]),
+      (e) => e.code === "search_job_invalid");
+    assert.deepEqual(adm.searchAdmissionState(), before);
+    r.settle();
+    assertRecovered();
+  }
+});
+
+test("review R2-2: extra properties are not carried into the job; an owned flat job indexes exactly", async () => {
+  const world = world1(["fo"]);
+  const env = aenv(world);
+  const flat = flatOf(["alpha", "beta"]);
+  let extra = new Uint8Array(8 * MiB);
+  const extraRef = new WeakRef(extra);
+  flat.sidecar = extra;
+  const descriptor = { artifactId: "fo", projectId: "proj_a", revisionId: "rev_fo", flat, textBytes: 10, textUnits: 10, sidecar: extra };
+  extra = null;
+  const block = gate();
+  world.before = () => block.wait;
+  const { run, done } = start(env, [descriptor]);
+  const j = run.holder.jobs[0];
+  assert.notEqual(j.flat, flat, "a fresh container");
+  assert.deepEqual(Object.keys(j.flat).sort(), ["bytes", "count", "offsets", "truncated"]);
+  delete flat.sidecar; delete descriptor.sidecar;
+  await settleGc();
+  assert.equal(extraRef.deref(), undefined, "the sidecar is not reachable from the admitted job");
+  block.open();
+  await done;
+  world.before = null;
+  assert.deepEqual(W.tokensOf(world, "fo"), expectedTokens(secretOf(world, "wsp_a"), ["alpha", "beta"]));
+  assertExact(world);
+  assertIdle();
+});
+
+test("review R2-3: when ctx.waitUntil throws, the run settles at once and one skip line is logged", async () => {
+  const world = world1(["wt"]);
+  const env = aenv(world);
+  const req = adm.withDeferredWork(env);
+  adm.deferSearchIndexing(req, [job("wt", "alpha")]);
+  const { events } = await logs(async () => {
+    adm.startDeferredWork(req, { waitUntil: () => { throw new Error("refused"); } });
+    // No timer is advanced: the isolate is idle immediately.
+    const s = adm.searchAdmissionState();
+    assert.deepEqual([s.active, s.activeBytes], [0, 0], "settled synchronously");
+    await adm.drainSearchIndexing();
+  });
+  const skips = events.filter((e) => e.event === "search_index_skipped");
+  assert.equal(skips.length, 1, JSON.stringify(events));
+  assert.deepEqual(skips[0].reasons, { unstarted: 1 });
+  assert.equal(world.calls, 0);
+  assertIdle();
+});
+
+test("review R2-4: admitting into a run that has started, stopped, settled or detached is refused", async () => {
+  const world = world1(["rs"]);
+  const env = aenv(world);
+  // Started: the writer owns holder.jobs.
+  const block = gate();
+  world.before = () => block.wait;
+  const { run: started, done } = start(env, [job("rs", "alpha")]);
+  assert.throws(() => adm.admitSearchJobs(env, started, [job("rs", "beta")]), (e) => e.code === "search_run_invalid");
+  block.open(); await done; world.before = null;
+  // Settled.
+  assert.throws(() => adm.admitSearchJobs(env, started, [job("rs", "beta")]), (e) => e.code === "search_run_invalid");
+  // Detached.
+  const d = adm.openSearchRun(); d.detach();
+  assert.throws(() => adm.admitSearchJobs(env, d, [job("rs", "beta")]), (e) => e.code === "search_run_invalid");
+  d.settle();
+  assertRecovered();
+});
+
+test("review R2-4: a replaced job whose replacement is refused is counted as replaced", () => {
+  const world = world1([]);
+  const env = aenv(world);
+  const r = adm.openSearchRun();
+  adm.admitSearchJobs(env, r, [job("rp", "small")]);
+  // The replacement does not fit the run (11 Mi units > the 10 Mi text budget).
+  adm.admitSearchJobs(env, r, [job("rp", "x".repeat(11 * MiB))]);
+  assert.equal(r.holder.jobs.length, 0);
+  assert.deepEqual(r.skipped, { replaced: 1, admission: 1 });
+  r.settle();
+  assertRecovered();
+});
+
+test("review R2-5: a re-plan whose T1u and T1r change nothing: unchanged when another writer completed the same target, lost otherwise", async () => {
+  for (const same of [true, false]) {
+    const world = world1(["ru"]);
+    const env = aenv(world);
+    await logs(() => indexJobs(env, [job("ru", "alpha beta")]));
+    W.setHead(world, "ru", "rev_ru2");
+    const digestOf = async (terms) => { const k = await lib.searchTokenKey(env, "wsp_a"); return lib.searchTokenDigest(await lib.searchTokensFor(k.key, terms), ""); };
+    const target = await digestOf(["alpha", "gamma"]);
+    // Between planning and the stable read, another writer completes the same head and target (gen moves): the stable
+    // read misses, T1u (row complete) and T1r (row already correct) both change nothing, and rowIsCurrent finds it
+    // current. In the other case the row is then rebound to another owner (gone from this job's scope): both change
+    // nothing and the row is not this job's target, so the job is lost.
+    let moved = false;
+    world.before = ({ kind, q }) => {
+      if (!moved && kind === "all" && /ORDER BY d\.doc_id/.test(q)) {
+        moved = true;
+        W.run(world, "UPDATE search_token_docs SET revision_id = 'rev_ru2', gen = gen + 2, token_digest = ? WHERE artifact_id = 'ru'", same ? target : "someone-else");
+        if (!same) W.run(world, "UPDATE search_token_docs SET owner_id = 'hum_other' WHERE artifact_id = 'ru'");
+      }
+    };
+    const before = W.docRow(world, "ru");
+    const { result } = await logs(() => indexJobs(env, [job("ru", "alpha gamma", "rev_ru2")]));
+    world.before = null;
+    const row = W.docRow(world, "ru");
+    if (same) {
+      assert.equal(result.unchanged, 1, JSON.stringify(result));
+      assert.deepEqual([row.revision_id, row.token_digest, row.writer], ["rev_ru2", target, ""], "row untouched");
+    } else {
+      assert.deepEqual([result.unchanged, result.completed, result.skipped], [0, 0, { lost: 1 }], JSON.stringify(result));
+      assert.deepEqual([row.revision_id, row.token_digest, row.writer], ["rev_ru2", "someone-else", ""], "row untouched");
+    }
+    void before;
+    assertIdle();
+  }
 });

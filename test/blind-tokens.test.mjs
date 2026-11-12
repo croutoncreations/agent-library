@@ -590,7 +590,8 @@ test("review B7 (ii): the purge reads no tokens to select; each writer-held row 
   assert.equal(w.counted.size, 10, "every dead writer's row counted");
   assert.ok([...w.counted.values()].every((n) => n === 1), "each exactly once");
   // Count reads total exactly the dead rows' tokens (each counted once); the selections read none, and K reads what it
-  // deletes. So rows read over the whole purge stay within 1.5 × the 100,000 tokens deleted (plus document rows).
+  // deletes. This assumes K reads only the entries it deletes (its plan: a primary-key prefix lookup with LIMIT ?CHUNK);
+  // how real D1 counts rows_read is a staging check. So rows read over the whole purge stay within 1.5 × the 100,000 tokens deleted (plus document rows).
   assert.equal(w.batchesSeen.reduce((n, b) => n + b.countReads, 0), 50000);
   assert.equal(w.selectionReads(), 0, "the selections read no token entry");
   assert.ok(w.batchesSeen.every((b) => b.countReads <= 20001), "one row's bounded count at most per round");
@@ -650,7 +651,7 @@ test("review B7 (iv): purge, restore, a writer takes over a row holding the life
   const { result } = await quiet(() => lib.indexSearchJobs(env, [{ artifactId: "iv_1", projectId: "p_iv", revisionId: "rev_iv_1", text, textBytes: text.length }]));
   assert.equal(result.completed, 1);
   const row = W.docRow(world, "iv_1");
-  assert.equal(row.term_count, 300);
+  assert.equal(row.term_count, W.tokensOf(world, "iv_1").length, "after the restore the writer's T4 sets term_count to the exact count");
   assert.equal(W.tokensOf(world, "iv_1").length, 300);
   assertExact(world); assertClaims(world);
 });
