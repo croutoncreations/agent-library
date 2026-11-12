@@ -17,7 +17,7 @@ const lib = await loadWorker({
     "indexSearchJobs", "SEARCH_BATCH_TOKENS_MAX", "SEARCH_BATCH_STATEMENTS_MAX", "SEARCH_RUN_LIMITS",
     "openSearchRun", "admitSearchJobs", "runSearchIndexing", "searchAdmissionState", "withDeferredWork", "deferSearchIndexing", "startDeferredWork",
     "discardDeferredWork", "drainSearchIndexing", "SEARCH_CALL_ENVELOPE_BYTES", "SEARCH_RUN_BASE_BYTES", "SEARCH_ACTIVE_MAX_BYTES", "SEARCH_RUN_MAX_BYTES",
-    "SEARCH_DETACHED_MAX", "SEARCH_DETACH_AFTER_MS"],
+    "SEARCH_DETACHED_MAX", "SEARCH_DETACH_AFTER_MS", "reserveUploadTerms", "releaseUploadTerms"],
   "search/unicode61.js": ["u61FoldToken"],
   "limits.js": ["LIMIT_KEYS", "workspaceLimits"],
   "adapters.js": ["withAdapters", "resolveAdapters"],
@@ -1819,5 +1819,116 @@ test("review R7-2: search_phase lines are written only with SEARCH_PHASE_LOG exa
   const { events } = await done;
   world.after = null;
   assert.deepEqual(events.filter((e) => e.event === "search_phase").map((e) => e.phase), ["deadline"]);
+  assertIdle();
+});
+
+// --- Upload finish: reserveUploadTerms / releaseUploadTerms (the reservation is taken before extraction) --------------
+const uploadJob = (a, flat, text, ticket, extra = {}) => ({ artifactId: a, projectId: "proj_a", revisionId: `rev_${a}`, flat, textUnits: text.length, textBytes: Buffer.byteLength(text), ticket, ...extra });
+const uploadCharge = (text) => Math.min(12000000, 3 * text.length) + 96 * Math.min(20000, 256 + Math.floor(Buffer.byteLength(text) / 8));
+
+test("upload ticket: reserves the upload charge before extraction; admitting its job is a transfer (the run's total does not move)", async () => {
+  const world = world1(["up1"]);
+  const req = adm.withDeferredWork(aenv(world));
+  const text = "upload alpha beta gamma";
+  const held0 = adm.searchFlatHeld();
+  const ticket = adm.reserveUploadTerms(req, text, Buffer.byteLength(text));
+  assert.ok(ticket && Object.isFrozen(ticket) && Object.keys(ticket).length === 0, "opaque frozen ticket");
+  const s1 = adm.searchAdmissionState();
+  assert.equal(s1.activeBytes, ENV + BASE + uploadCharge(text), "reserved before any job exists");
+  const flat = adm.extractSearchTermsFlat(text, 20000);
+  adm.deferSearchIndexing(req, [uploadJob("up1", flat, text, ticket)]);
+  assert.equal(adm.searchAdmissionState().activeBytes, s1.activeBytes, "transfer: unchanged at admission");
+  // The finish's finally: the ticket is consumed, the handle admitted: nothing is released or dropped.
+  adm.releaseUploadTerms(req, ticket, flat);
+  assert.equal(adm.searchAdmissionState().activeBytes, s1.activeBytes);
+  assert.equal(adm.searchFlatHeld(), held0 + 1);
+  const waits = [];
+  const { events } = await logs(async () => { adm.startDeferredWork(req, { waitUntil: (p) => waits.push(p) }); await Promise.all(waits); });
+  assert.equal(W.docRow(world, "up1").revision_id, "rev_up1");
+  assert.deepEqual(W.tokensOf(world, "up1"), expectedTokens(secretOf(world, "wsp_a"), ["upload", "alpha", "beta", "gamma"]));
+  assert.ok(!events.some((e) => e.event === "search_index_skipped"));
+  assert.equal(adm.searchFlatHeld(), held0);
+  assertIdle();
+});
+
+test("upload ticket: forged, copied, consumed, released or another run's ticket is refused before anything is reserved", async () => {
+  const world = world1(["t1", "t2"]);
+  const text = "ticket words";
+  const held0 = adm.searchFlatHeld();
+  const other = adm.withDeferredWork(aenv(world));
+  const otherTicket = adm.reserveUploadTerms(other, text, Buffer.byteLength(text));
+  const req = adm.withDeferredWork(aenv(world));
+  const mine = adm.reserveUploadTerms(req, text, Buffer.byteLength(text));
+  const released = adm.reserveUploadTerms(req, text, Buffer.byteLength(text));
+  adm.releaseUploadTerms(req, released, null);
+  adm.releaseUploadTerms(req, released, null);   // idempotent
+  const forged = Object.freeze({});
+  const copied = Object.freeze({ ...mine });
+  for (const [why, t] of [["forged", forged], ["copied", copied], ["released", released], ["other run", otherTicket]]) {
+    const before = adm.searchAdmissionState().activeBytes;
+    const flat = adm.extractSearchTermsFlat(text, 20000);
+    const { events } = await logs(() => adm.deferSearchIndexing(req, [uploadJob("t1", flat, text, t)]));
+    assert.ok(events.some((e) => e.event === "search_index_failed" && e.code === "search_job_invalid"), why);
+    assert.equal(adm.searchAdmissionState().activeBytes, before, `${why}: nothing reserved`);
+    assert.equal(adm.searchFlatHeld(), held0, `${why}: its storage dropped`);
+  }
+  // A ticket whose amount does not match its job (a different text) is refused too.
+  const flat2 = adm.extractSearchTermsFlat("other text entirely", 20000);
+  await logs(() => adm.deferSearchIndexing(req, [uploadJob("t2", flat2, "other text entirely", mine)]));
+  assert.equal(adm.searchFlatHeld(), held0);
+  // Consumed: admitted once, then refused.
+  const flat3 = adm.extractSearchTermsFlat(text, 20000);
+  adm.deferSearchIndexing(req, [uploadJob("t1", flat3, text, mine)]);
+  const flat4 = adm.extractSearchTermsFlat(text, 20000);
+  const { events } = await logs(() => adm.deferSearchIndexing(req, [uploadJob("t2", flat4, text, mine)]));
+  assert.ok(events.some((e) => e.code === "search_job_invalid"), "consumed");
+  // A ticket on a text job is refused.
+  const { events: e2 } = await logs(() => adm.deferSearchIndexing(req, [{ ...job("t2", text), ticket: otherTicket }]));
+  assert.ok(e2.some((e) => e.code === "search_job_invalid"), "text job with a ticket");
+  adm.releaseUploadTerms(other, otherTicket, null);
+  await logs(() => { adm.discardDeferredWork(req); adm.discardDeferredWork(other); });
+  assert.equal(adm.searchFlatHeld(), held0);
+  assertIdle();
+});
+
+test("upload ticket: null with nothing reserved when it does not fit, when off, or without a queue; discard and detach release it", async () => {
+  const world = world1(["n1"]);
+  const big = "x ".repeat(5 * MiB + 1);   // 10 Mi + 2 code units: over the run's 10 Mi-unit limit
+  // Off: no ticket and no skip (the off row comes from publishRevision's own job).
+  const off = adm.withDeferredWork(aenv(world, { SEARCH_TERMS_MAX: "0" }));
+  assert.equal(adm.reserveUploadTerms(off, "words", 5), null);
+  assert.equal(adm.searchAdmissionState().active, 0, "no run opened");
+  // No queue: null, logged once as unwired.
+  const { result: none, events } = await logs(() => adm.reserveUploadTerms(aenv(world), "words", 5));
+  assert.equal(none, null);
+  assert.deepEqual(events.map((e) => e.reasons), [{ unwired: 1 }]);
+  // Does not fit the run's code-unit limit (10 Mi). Counted as one admission skip.
+  const req = adm.withDeferredWork(aenv(world));
+  const t0 = adm.reserveUploadTerms(req, big, big.length);
+  assert.equal(t0, null);
+  assert.equal(adm.searchAdmissionState().activeBytes, ENV + BASE, "nothing reserved beyond the run's own");
+  const { events: d } = await logs(() => adm.discardDeferredWork(req));
+  assert.deepEqual(d.map((e) => e.reasons), [{ admission: 1 }]);
+  assertIdle();
+  // Discard settles a run holding a ticket (the backstop when the finish throws past everything).
+  const r2 = adm.withDeferredWork(aenv(world));
+  const t2 = adm.reserveUploadTerms(r2, "some words", 10);
+  assert.ok(t2);
+  await logs(() => adm.discardDeferredWork(r2));
+  assertIdle();
+  adm.releaseUploadTerms(r2, t2, null);   // after settlement: a no-op, never negative
+  assertIdle();
+  // Detach at the horizon releases the ticket's bytes with the payload.
+  const r3 = adm.withDeferredWork(aenv(world));
+  const t3 = adm.reserveUploadTerms(r3, "more words", 10);
+  assert.ok(t3);
+  advance(adm.SEARCH_DETACH_AFTER_MS + 1);
+  const r4 = adm.withDeferredWork(aenv(world));
+  await logs(() => adm.reserveUploadTerms(r4, "w", 1));   // admission detaches the expired run
+  const s = adm.searchAdmissionState();
+  assert.equal(s.detached, 1);
+  adm.releaseUploadTerms(r3, t3, null);
+  assert.equal(adm.searchAdmissionState().activeBytes, s.activeBytes, "release after detach changes nothing");
+  await logs(async () => { adm.discardDeferredWork(r3); adm.discardDeferredWork(r4); });
   assertIdle();
 });

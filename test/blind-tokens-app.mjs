@@ -54,7 +54,7 @@ export async function app(vars = {}) {
   const env = { DB: world.DB, BLOBS, LOCAL_DEV_LOGIN: PASS, RATE_READS_PER_MIN: "100000", RATE_WRITES_PER_MIN: "100000", RATE_AUTHFAIL_PER_MIN: "100000", ...vars };
   const waits = [];
   let waitUntil = (p) => { waits.push(p); };
-  const fetch = (path, init = {}, ctxOverride) => lib.default.fetch(new Request("http://127.0.0.1" + path, init), env, ctxOverride ?? { waitUntil: (p) => waitUntil(p) });
+  const fetch = (path, init = {}, ctxOverride) => lib.default.fetch(new Request(/^https?:/.test(path) ? path : "http://127.0.0.1" + path, init), env, ctxOverride ?? { waitUntil: (p) => waitUntil(p) });
   const login = await fetch("/auth/dev-login", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ passphrase: PASS }) });
   if (login.status !== 200) throw new Error("dev-login " + login.status);
   const { csrf } = await login.json();

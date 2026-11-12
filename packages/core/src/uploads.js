@@ -7,6 +7,7 @@ import { FILE_BYTES_CEILING, explainLimit, fileTooLarge, guardSql, projectLimitG
 import { BINARY_TYPES, IMAGE_TYPES, VIDEO_TYPES, appConnectEnabled, assertWritable, audit, idemLookup, loadArtifact, mdBody, provenance, publishRevision, requireAppConnect, textCreateMetadata } from "./service.js";
 import { TEXT_MAX_BYTES } from "./text-limits.js";
 import { HttpError, int, nowIso, nowMs, randomId, sha256Hex, str } from "./util.js";
+import { deferSearchIndexing, extractSearchTermsFlat, releaseUploadTerms, reserveUploadTerms, searchDocCap } from "./search/tokens.js";
 
 var db2 = /* @__PURE__ */ __name((ctx) => ctx.env.DB, "db");
 const TEXT_UPLOAD_KINDS = { "text/markdown": "markdown", "text/html": "html", "application/json": "json", "text/csv": "csv" };
@@ -388,6 +389,9 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
   }
   const fenced = "EXISTS (SELECT 1 FROM uploads WHERE id = ? AND state = 'sealed' AND finalize_token = ?)";
   let text;
+  // Blind-index search terms of a text finish: the payload reservation (taken in the slot before extraction) and the
+  // packed terms. Every exit releases what no admitted job holds (finally below).
+  let searchTicket = null, searchFlat = null, searchUnits = 0, searchCap = 0;
   let hasTextFinishSlot = false;
   const releaseTextFinishSlot = () => {
     text = null;
@@ -474,6 +478,17 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
         if (text === null) return await fail(409, "missing_bytes", "Uploaded bytes missing", "failed");
         if (kind === "markdown" || kind === "html") mdBody(text, kind);
         else checkFile(kind, text, a.schema_id);
+        // Search terms, beside the validation and before the response: reserve, then extract (the text is not kept by
+        // search). A failure here never refuses the upload: the document is counted skipped and stays missing.
+        searchCap = searchDocCap(ctx.env, check.size);
+        searchUnits = text.length;
+        if (searchCap > 0) {
+          searchTicket = reserveUploadTerms(ctx.env, text, check.size);
+          if (searchTicket) {
+            try { searchFlat = extractSearchTermsFlat(text, searchCap); }
+            catch { releaseUploadTerms(ctx.env, searchTicket, null, "error"); searchTicket = null; }
+          }
+        }
       } catch (e) {
         // Only document validation errors are terminal. R2/D1 failures retain their retryable sealed state.
         if (e instanceof HttpError && (e.code === "invalid_content" || e.code === "too_large" || e.code === "invalid_input")) return await fail(e.status, e.code, e.message, "failed", e.extra);
@@ -492,8 +507,12 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
     if (hasTextFinishSlot && textFinishSlot?.token === token) textFinishSlot.until = renewedUntil;
     const ok2 = { artifact_id: u.artifact_id, revision: u.base_rev + 1, revision_id: revId, sha256: sha2, size };
     const gate = "EXISTS (SELECT 1 FROM revisions WHERE id = ?)";
+    // publishRevision's own "committed, not a replay" decision, without keeping its job (which holds the text).
+    let committedRevId = null;
+    const onSearchJob = (job) => { committedRevId = job.revisionId; };
+    let res;
     try {
-      const res = await publishRevision(
+      res = await publishRevision(
         ctx,
         projectId,
         u.artifact_id,
@@ -502,18 +521,13 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
         // change_note: recorded at upload_begin by OAuth connections (migration 0013); undefined on older schemas.
         // A binary carries its publication fence LAST (docs/encryption.md): its key must still be active, or (plaintext)
         // no real key may exist yet. Text publication is unchanged until slice 3c.
-        { ...kind ? { body: text, reservedUpload: { id: uploadId, token } } : { blobKey: finalKey, blobKeyId: held.enc_key_id ?? null, blobHeader: held.enc_header ?? null,
+        // With search on, the upload supplies its own (flat) job; off (SEARCH_TERMS_MAX = 0), publishRevision defers its
+        // off job as every path does (the text is not kept).
+        { ...kind ? { body: text, reservedUpload: { id: uploadId, token }, ...searchCap > 0 ? { onSearchJob } : {} } : { blobKey: finalKey, blobKeyId: held.enc_key_id ?? null, blobHeader: held.enc_header ?? null,
           contentFences: [held.enc_key_id ? keyFence(ctx.env, { keyId: held.enc_key_id, workspaceId }) : plaintextFence(ctx.env)] }, size, sha256: sha2, mime: u.mime, revId, change_note: u.change_note ?? void 0, fence: { sql: fenced, params: [uploadId, token] } },
         [db2(ctx).prepare(`UPDATE uploads SET state = 'published', final_revision_id = ?, result = ?, finalize_token = NULL, finalize_until = NULL WHERE id = ? AND state = 'sealed' AND finalize_token = ? AND ${gate}`).bind(revId, JSON.stringify({ status: 200, body: ok2 }), uploadId, token, revId)],
         "upload.publish"
       );
-      releaseTextFinishSlot();
-      if (!res.body?.idempotent_replay) {
-        if (kind) await dropUnpublished(ctx.env, uploadId, finalKey).catch(() => {});
-        await purgeStaging(ctx.env, u);
-        return { status: 200, body: ok2 };
-      }
-      return res;
     } catch (e) {
       // The fenced insert also fails when the lease was lost; only the current finisher may record a conflict.
       const row = await current();
@@ -536,7 +550,20 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
       }
       throw e;
     }
+    // Published (or replayed). Slot release, cleanup and the search defer are outside the publish try.
+    releaseTextFinishSlot();
+    if (!res.body?.idempotent_replay) {
+      if (committedRevId !== null && searchFlat !== null)
+        deferSearchIndexing(ctx.env, [{ artifactId: u.artifact_id, projectId, revisionId: committedRevId, flat: searchFlat, textUnits: searchUnits, textBytes: size, ticket: searchTicket }]);
+      if (kind) await dropUnpublished(ctx.env, uploadId, finalKey).catch(() => {});
+      await purgeStaging(ctx.env, u);
+      return { status: 200, body: ok2 };
+    }
+    return res;
   } finally {
+    // Releases an unconsumed reservation and drops terms no admitted job holds (idempotent; never throws).
+    releaseUploadTerms(ctx.env, searchTicket, searchFlat);
+    searchTicket = searchFlat = null;
     // Unexpected errors release the lease at once so a retry can take over; a no-op once it was cleared or taken.
     try {
       await db2(ctx).prepare("UPDATE uploads SET finalize_token = NULL, finalize_until = NULL WHERE id = ? AND finalize_token = ?").bind(uploadId, token).run().catch(() => {

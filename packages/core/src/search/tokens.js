@@ -779,13 +779,15 @@ async function step(run, work) {
 export function searchJob(env, input) {
   const invalid = (why) => new HttpError(500, "search_job_invalid", "A search job is invalid: " + why);
   // Each descriptor property is read exactly once, here.
-  const { artifactId, projectId, revisionId, text = null, flat = null, textBytes, textUnits } = input ?? {};
+  const { artifactId, projectId, revisionId, text = null, flat = null, textBytes, textUnits, ticket = null } = input ?? {};
   // A descriptor refused here drops its flat handle's storage (unless an admitted job holds that handle).
-  try { return validJob(env, invalid, { artifactId, projectId, revisionId, text, flat, textBytes, textUnits }); }
+  try { return validJob(env, invalid, { artifactId, projectId, revisionId, text, flat, textBytes, textUnits, ticket }); }
   catch (e) { dropUnadmittedFlat(flat); throw e; }
 }
-function validJob(env, invalid, { artifactId, projectId, revisionId, text, flat, textBytes, textUnits }) {
+function validJob(env, invalid, { artifactId, projectId, revisionId, text, flat, textBytes, textUnits, ticket }) {
   if (typeof artifactId !== "string" || typeof projectId !== "string" || typeof revisionId !== "string") throw invalid("ids");
+  // A ticket (reserveUploadTerms) only with a flat handle; its run and state are checked at admission.
+  if (ticket !== null && (flat === null || !UPLOAD_TICKETS.has(ticket))) throw invalid("ticket");
   const count = (n) => Number.isSafeInteger(n) && n >= 0;
   if ((text === null) === (flat === null)) throw invalid("exactly one of text and flat");
   if (!count(textBytes)) throw invalid("textBytes");
@@ -813,7 +815,7 @@ function validJob(env, invalid, { artifactId, projectId, revisionId, text, flat,
   return {
     // The handle (nothing the caller attached to the descriptor is carried into the job).
     meta: { artifactId, projectId, revisionId }, text: off ? null : text,
-    flat, terms: null, tokens: null, removes: null, adds: null,
+    flat, ticket, terms: null, tokens: null, removes: null, adds: null,
     cap, units: off ? 0 : units, charge: 0, reason: "", digest: "",
     kind: null, row: null, scope: null, done: false, replanned: false,
   };
@@ -1319,23 +1321,80 @@ export function deferSearchIndexing(env, jobs) {
     if (!Array.isArray(jobs) || !jobs.length) return;
     if (!q) { logEvent("search_index_skipped", { skipped: jobs.length, reasons: { unwired: jobs.length } }); return; }
     if (q.started || q.discarded) { q.skipped.late = (q.skipped.late ?? 0) + jobs.length; return; }
-    if (!q.run) {
-      q.run = openSearchRun();
-      if (!q.run) {
-        q.skipped.admission = (q.skipped.admission ?? 0) + jobs.length;
-        if (!q.stuckLogged && isolate.detached.size >= SEARCH_DETACHED_MAX) {
-          q.stuckLogged = true;
-          logError("search_admission_stuck", { active: isolate.active.size, activeBytes: isolate.activeBytes, detached: isolate.detached.size, refused: isolate.refused });
-        }
-        return;
-      }
-    }
+    if (!requestRun(q, jobs.length)) return;
     admitSearchJobs(env, q.run, jobs);
   } catch (e) {
     if (q) q.skipped.error = (q.skipped.error ?? 0) + (Array.isArray(jobs) ? jobs.length : 1);
     logError("search_index_failed", { code: e?.code ?? "error" });
   }
 }
+/** The request's run, opened on first use; null (the jobs counted as admission skips) when the isolate refuses one. */
+function requestRun(q, n) {
+  if (q.run) return q.run;
+  q.run = openSearchRun();
+  if (q.run) return q.run;
+  q.skipped.admission = (q.skipped.admission ?? 0) + n;
+  if (!q.stuckLogged && isolate.detached.size >= SEARCH_DETACHED_MAX) {
+    q.stuckLogged = true;
+    logError("search_admission_stuck", { active: isolate.active.size, activeBytes: isolate.activeBytes, detached: isolate.detached.size, refused: isolate.refused });
+  }
+  return null;
+}
+
+// --- Upload finish: the payload reservation is taken before extraction ----------------------------------------------
+/** Ticket → { run, amount, units, state: "held" | "consumed" | "released" }. Tickets are opaque frozen objects. */
+const UPLOAD_TICKETS = new WeakMap();
+function releaseTicket(t) {
+  if (t.state !== "held") return;
+  t.state = "released";
+  t.run.release(t.amount);   // a no-op once the run detached or settled (its payload is gone with it)
+}
+/**
+ * Upload finish, inside its slot and before extraction: reserve in this request's run the payload an upload job of
+ * `text` (the decoded upload; its .length is the job's textUnits) and `textBytes` (the stored size) will be charged:
+ * min(12,000,000, 3 × units) + 96 B × docCap. The same limits as admission (the run's 26 MiB and documents and code
+ * units, the isolate's 32 MiB). Returns an opaque ticket for the job's `ticket`, or null with nothing reserved: off
+ * (docCap 0), no deferred-work queue, the run already started, or no room (counted as one `admission` skip). Never throws.
+ */
+export function reserveUploadTerms(env, text, textBytes) {
+  const q = env?.[DEFERRED];
+  try {
+    if (typeof text !== "string" || !Number.isSafeInteger(textBytes) || textBytes < 0) return null;
+    const cap = searchDocCap(env, textBytes);
+    if (cap === 0) return null;
+    if (!q) { logEvent("search_index_skipped", { skipped: 1, reasons: { unwired: 1 } }); return null; }
+    if (q.started || q.discarded) { q.skipped.late = (q.skipped.late ?? 0) + 1; return null; }
+    const run = requestRun(q, 1);
+    if (!run) return null;
+    const units = text.length, amount = searchJobCharge({ cap, units }, { upload: true });
+    if (run.startedAt || run.settled || run.detached || run.running || run.holder.jobs.length >= SEARCH_RUN_LIMITS.docs
+      || run.textUnits + units > SEARCH_RUN_LIMITS.textUnits || !run.reserve(amount)) {
+      q.skipped.admission = (q.skipped.admission ?? 0) + 1;
+      return null;
+    }
+    const ticket = Object.freeze({});
+    UPLOAD_TICKETS.set(ticket, { run, amount, units, state: "held" });
+    return ticket;
+  } catch {
+    if (q) q.skipped.error = (q.skipped.error ?? 0) + 1;
+    return null;
+  }
+}
+/**
+ * Every exit of an upload finish's text branch (in its finally): release the ticket's reservation unless its job was
+ * admitted, and drop the flat handle's storage unless an admitted job holds it. `reason` (optional) counts the
+ * document as skipped (an extraction failure). Idempotent; never throws.
+ */
+export function releaseUploadTerms(env, ticket, handle, reason) {
+  try {
+    const t = ticket ? UPLOAD_TICKETS.get(ticket) : null;
+    if (t) releaseTicket(t);
+    if (handle) dropUnadmittedFlat(handle);
+    const q = env?.[DEFERRED];
+    if (reason && q) q.skipped[reason] = (q.skipped[reason] ?? 0) + 1;
+  } catch { /* never fails the finish */ }
+}
+
 /** Log the request's skipped jobs when it has no run (a run logs its own, once, when it ends). */
 function logRequestSkips(q) {
   const n = skipCount(q.skipped);
@@ -1423,6 +1482,15 @@ export function admitSearchJobs(env, run, jobs) {
       if (FLAT_ADMITTED.has(j.flat) || inCall.has(j.flat)) throw new HttpError(500, "search_job_invalid", "A search job is invalid: flat container");
       inCall.add(j.flat);
     }
+    // A ticket must be held (not consumed or released), belong to this run, appear once, and match the job's charge.
+    const tickets = new Set();
+    for (const j of all) {
+      if (j.ticket === null) continue;
+      const t = UPLOAD_TICKETS.get(j.ticket);
+      if (t.state !== "held" || t.run !== run || tickets.has(j.ticket) || t.units !== j.units || t.amount !== searchJobCharge(j, { upload: true }))
+        throw new HttpError(500, "search_job_invalid", "A search job is invalid: ticket");
+      tickets.add(j.ticket);
+    }
   } catch (e) {
     for (const j of all) dropUnadmittedFlat(j.flat);
     throw e;
@@ -1445,14 +1513,19 @@ export function admitSearchJobs(env, run, jobs) {
       old.text = null; old.flat = null;
     }
     const charge = searchJobCharge(job, { upload: job.flat !== null });
-    if (run.holder.jobs.length >= SEARCH_RUN_LIMITS.docs || run.textUnits + job.units > SEARCH_RUN_LIMITS.textUnits || !run.reserve(charge)) {
+    const ticket = job.ticket === null ? null : UPLOAD_TICKETS.get(job.ticket);
+    job.ticket = null;
+    // A ticket's bytes are already in this run's payload: admitting its job is a transfer, not a second reservation.
+    if (run.holder.jobs.length >= SEARCH_RUN_LIMITS.docs || run.textUnits + job.units > SEARCH_RUN_LIMITS.textUnits || !(ticket ? true : run.reserve(charge))) {
       // A job this one replaced is gone too: count it, not silently drop it.
       if (prev >= 0) run.skip("replaced");
       run.skip("admission");
+      if (ticket) releaseTicket(ticket);
       dropFlat(job.flat);
       job.flat = null;
       continue;
     }
+    if (ticket) ticket.state = "consumed";
     job.charge = charge;
     run.textUnits += job.units;
     if (job.flat !== null) FLAT_ADMITTED.add(job.flat);

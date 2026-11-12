@@ -9,6 +9,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { createHash } from "node:crypto";
 import { ROOT } from "./helpers.mjs";
 import { app, captureLogs, expectedFor, lib, until, W } from "./blind-tokens-app.mjs";
 
@@ -141,24 +142,193 @@ test("13p a binary upload changes nothing and leaves other tokens alone", async 
   idle();
 });
 
-test("interim (until the upload-finish commit): a TEXT upload finish publishes and defers no search job", async () => {
-  // The upload-finish commit (Part 2, commit 6) supplies the flat handle itself; this test is the one it inverts.
+// --- 13g, 13h: text upload finish indexes from packed terms ----------------------------------------------------------------
+const sha = (b) => createHash("sha256").update(b).digest("hex");
+/** Begin, PUT and (optionally) finish one text upload through a route family: "api" (browser), "v1" (API key). */
+async function textUpload(a, pid, text, { route = "api", token, begin = {}, finish = true, idem } = {}) {
+  const bytes = Buffer.from(text);
+  // /v1 is served on MCP_HOST (the app below sets it to mcp.example.test).
+  const base = route === "v1" ? `http://mcp.example.test/v1/projects/${pid}/uploads` : `/api/projects/${pid}/uploads`;
+  const auth = route === "v1" ? { authorization: `Bearer ${token}` } : { cookie: a.cookie, "x-csrf-token": a.csrf };
+  const bres = await a.fetch(base, { method: "POST", headers: { ...auth, "content-type": "application/json", "idempotency-key": `begin-${Math.random().toString(36).slice(2)}` },
+    body: JSON.stringify({ title: "Synthetic text", mime: "text/markdown", size: bytes.length, sha256: sha(bytes), ...begin }) });
+  const b = await bres.json();
+  assert.equal(bres.status, 201, JSON.stringify(b));
+  const put = await a.fetch(route === "v1" ? "http://mcp.example.test" + b.put_url : b.put_url, { method: "PUT", body: bytes, headers: { ...auth, "content-length": String(bytes.length) } });
+  assert.ok(put.status < 300, String(put.status) + await put.text());
+  if (!finish) return { begin: b };
+  const fres = await a.fetch(`${base}/${b.upload_id}/finish`, { method: "POST", headers: { ...auth, "content-type": "application/json", "idempotency-key": idem ?? `finish-${b.upload_id}` }, body: "{}" });
+  const ft = await fres.text();
+  return { begin: b, status: fres.status, body: ft ? JSON.parse(ft) : null, finishUrl: `${base}/${b.upload_id}/finish`, auth };
+}
+const baseline = () => ({ flat: lib.searchFlatHeld(), state: lib.searchAdmissionState() });
+const assertBaseline = (b0, why) => {
+  assert.equal(lib.searchFlatHeld(), b0.flat, `${why}: no flat storage left`);
+  const s = lib.searchAdmissionState();
+  assert.deepEqual([s.active, s.activeBytes, s.detached, s.running], [0, 0, 0, 0], `${why}: ${JSON.stringify(s)}`);
+};
+
+test("13g text upload finish, new document (browser route): it publishes and its tokens are the expected HMACs", async () => {
   const a = await app();
   await a.project("p13g");
-  const text = "interim upload words";
-  const { createHash } = await import("node:crypto");
-  const b = await a.req("POST", "/api/projects/p13g/uploads", { title: "Synthetic text", mime: "text/markdown", size: Buffer.byteLength(text), sha256: createHash("sha256").update(text).digest("hex") });
-  assert.equal(b.status, 201, JSON.stringify(b.body));
-  const put = await a.fetch(b.body.put_url, { method: "PUT", body: text, headers: { "content-length": String(Buffer.byteLength(text)), cookie: a.cookie, "x-csrf-token": a.csrf } });
-  assert.ok(put.status < 300, String(put.status));
-  const { result: f, events } = await captureLogs(() => a.req("POST", `/api/projects/p13g/uploads/${b.body.upload_id}/finish`, {}));
+  const b0 = baseline();
+  const text = "upload finish alpha beta gamma";
+  const f = await textUpload(a, "p13g", text);
   assert.equal(f.status, 200, JSON.stringify(f.body));
-  assert.equal(a.waits.length, 0, "no run handed to waitUntil");
-  assert.ok(!events.some((e) => e.event === "search_phase"), "no run admitted");
+  assert.equal(a.waits.length, 1, "one run handed to waitUntil");
   await a.settle();
-  assert.equal(docRow(a, f.body.artifact_id), undefined, "no search document row");
-  assert.equal(W.one(a.world, "SELECT COUNT(*) AS n FROM search_tokens").n, 0, "no token");
+  assertIndexed(a, "p13g", f.body.artifact_id, text, "13g");
+  assertBaseline(b0, "13g");
+});
+
+test("13h text upload finish, new version (/v1 with an API key): the new head's tokens replace the old", async () => {
+  const a = await app({ MCP_HOST: "mcp.example.test" });
+  await a.project("p13h");
+  const k = await a.req("POST", "/api/api-keys", { label: "Synthetic key", lifetime_days: 1, projects: [{ project_id: "p13h", access: "read_write" }] });
+  assert.equal(k.status, 201, JSON.stringify(k.body));
+  const b0 = baseline();
+  const first = await textUpload(a, "p13h", "first version words", { route: "v1", token: k.body.secret });
+  assert.equal(first.status, 200, JSON.stringify(first.body));
+  await a.settle();
+  assertIndexed(a, "p13h", first.body.artifact_id, "first version words", "13h v1");
+  const text = "second version other words";
+  const next = await textUpload(a, "p13h", text, { route: "v1", token: k.body.secret, begin: { title: undefined, artifact_id: first.body.artifact_id, expected_revision: 1 } });
+  assert.equal(next.status, 200, JSON.stringify(next.body));
+  await a.settle();
+  assertIndexed(a, "p13h", first.body.artifact_id, text, "13h v2");
+  assertBaseline(b0, "13h");
+});
+
+test("13g MCP upload_finish (official SDK client): indexed", async () => {
+  const a = await app();
+  await a.project("p13gm");
+  const g = await a.req("POST", "/api/projects/p13gm/grants", { label: "Synthetic agent", can_write: true });
+  const client = new Client({ name: "synthetic", version: "1.0.0" });
+  await client.connect(new StreamableHTTPClientTransport(new URL("http://127.0.0.1/mcp"), {
+    requestInit: { headers: { authorization: `Bearer ${g.body.token}` } }, fetch: (url, init) => a.fetch(new URL(url).pathname, init) }));
+  const text = "mcp upload words";
+  const b = await client.callTool({ name: "upload_begin", arguments: { project_id: "p13gm", title: "Synthetic", mime: "text/markdown", size: Buffer.byteLength(text), sha256: sha(text), idempotency_key: "mcp-begin-0001" } });
+  assert.ok(!b.isError, JSON.stringify(b));
+  const put = await a.fetch(b.structuredContent.put_url, { method: "PUT", body: text, headers: { authorization: `Bearer ${g.body.token}`, "content-length": String(Buffer.byteLength(text)) } });
+  assert.ok(put.status < 300, String(put.status));
+  const f = await client.callTool({ name: "upload_finish", arguments: { project_id: "p13gm", upload_id: b.structuredContent.upload_id, idempotency_key: "mcp-finish-0001" } });
+  assert.ok(!f.isError, JSON.stringify(f));
+  await a.settle();
+  assertIndexed(a, "p13gm", f.structuredContent.artifact_id, text, "13g mcp");
+  await client.close();
   idle();
+});
+
+test("upload finish exits: replay, conflict, fence refusal, validation failure and publish_failed leave no handle, reservation or job", async () => {
+  const a = await app();
+  await a.project("pex");
+  const b0 = baseline();
+  const ws = wsOf(a, "pex");
+  const noRun = async (why, fn) => {
+    const w0 = a.waits.length;
+    const { result, events } = await captureLogs(fn);
+    await a.settle();
+    assert.equal(a.waits.length, 0);
+    assert.ok(!events.some((e) => e.event === "search_phase"), `${why}: no run`);
+    assertBaseline(b0, why);
+    void w0;
+    return { result, events };
+  };
+  // Replay: the same finish again (recorded result).
+  const ok = await textUpload(a, "pex", "replayed words");
+  assert.equal(ok.status, 200);
+  await a.settle();
+  const before = W.all(a.world, "SELECT * FROM search_token_docs ORDER BY doc_id");
+  const { result: rp } = await noRun("replay", async () => (await a.fetch(ok.finishUrl, { method: "POST", headers: { ...ok.auth, "content-type": "application/json", "idempotency-key": "finish-replay-2" }, body: "{}" })).json());
+  assert.equal(rp.idempotent_replay, true);
+  // Conflict: a stale expected revision (a save moved the head after the upload began).
+  const v = await textUpload(a, "pex", "conflict words", { begin: { title: undefined, artifact_id: ok.body.artifact_id, expected_revision: 1 }, finish: false });
+  assert.equal((await a.req("PUT", `/api/projects/pex/artifacts/${ok.body.artifact_id}`, { expected_revision: 1, body: "moved on" })).status, 200);
+  await a.settle();
+  const before2 = W.all(a.world, "SELECT * FROM search_token_docs ORDER BY doc_id");
+  const { result: cf } = await noRun("conflict", () => a.req("POST", `/api/projects/pex/uploads/${v.begin.upload_id}/finish`, {}));
+  assert.equal(cf.status, 409, JSON.stringify(cf.body));
+  assert.equal(cf.body.error.code, "revision_conflict");
+  assert.deepEqual(W.all(a.world, "SELECT * FROM search_token_docs ORDER BY doc_id"), before2, "conflict wrote nothing");
+  // Validation failure after the ticket would be taken: not UTF-8 (invalid_content) ends before extraction.
+  const bad = Buffer.from([0x61, 0xff, 0x62]);
+  const bres = await a.req("POST", "/api/projects/pex/uploads", { title: "Synthetic text", mime: "text/markdown", size: bad.length, sha256: sha(bad) });
+  await a.fetch(bres.body.put_url, { method: "PUT", body: bad, headers: { cookie: a.cookie, "x-csrf-token": a.csrf, "content-length": "3" } });
+  const { result: vf } = await noRun("validation", () => a.req("POST", `/api/projects/pex/uploads/${bres.body.upload_id}/finish`, {}));
+  assert.equal(vf.status, 422, JSON.stringify(vf.body));
+  // Fence refusal (the text-write fence: the staged write expired inside the publishing batch) after extraction.
+  const r = await textUpload(a, "pex", "refused upload words", { finish: false });
+  a.world.before = async (c) => { if (c.kind === "batch" && c.qs.some((q) => /INSERT INTO revisions/.test(q))) W.run(a.world, "UPDATE content_writes SET created_at = 0"); };
+  const { result: rf } = await noRun("fence refusal", () => a.req("POST", `/api/projects/pex/uploads/${r.begin.upload_id}/finish`, {}));
+  a.world.before = null;
+  assert.equal(rf.status, 503, JSON.stringify(rf.body));
+  assert.equal(rf.body.error.code, "text_write_expired");
+  // The 503 is retryable (the upload stays sealed); end it so this identity may begin the next one.
+  W.run(a.world, "UPDATE uploads SET state = 'failed', finalize_token = NULL, finalize_until = NULL WHERE id = ?", r.begin.upload_id);
+  // publish_failed (finalization state inconsistent): the stored object's key is changed under the lease.
+  const pf = await textUpload(a, "pex", "publish failed words", { finish: false });
+  a.world.after = async (c) => { if (c.kind !== "batch" && /SET finalize_token = \?, finalize_until = \?, final_key = COALESCE/.test(c.q)) W.run(a.world, "UPDATE uploads SET final_key = 'elsewhere' WHERE id = ?", pf.begin.upload_id); };
+  const { result: pr } = await noRun("publish_failed", () => a.req("POST", `/api/projects/pex/uploads/${pf.begin.upload_id}/finish`, {}));
+  a.world.after = null;
+  assert.equal(pr.status, 500, JSON.stringify(pr.body));
+  assert.equal(pr.body.error.code, "publish_failed");
+  void before; void ws;
+  assertExact(a);
+});
+
+test("upload finish: SEARCH_TERMS_MAX = 0 writes the off row without extraction; an extraction failure still publishes (counted skipped)", async () => {
+  const off = await app({ SEARCH_TERMS_MAX: "0" });
+  await off.project("poff");
+  const b0 = baseline();
+  const f = await textUpload(off, "poff", "off words");
+  assert.equal(f.status, 200);
+  assert.equal(lib.searchFlatHeld(), b0.flat, "no handle was made");
+  await off.settle();
+  const row = docRow(off, f.body.artifact_id);
+  assert.equal(row.revision_id, headOf(off, f.body.artifact_id));
+  assert.equal(row.truncated_by, "off");
+  assertExact(off);
+  idle();
+  // Extraction failure: TextEncoder.encodeInto throwing during packing.
+  const a = await app();
+  await a.project("pxf");
+  const real = TextEncoder.prototype.encodeInto;
+  TextEncoder.prototype.encodeInto = function () { throw new Error("synthetic extraction failure"); };
+  let r, events;
+  try { ({ result: r, events } = await captureLogs(async () => { const x = await textUpload(a, "pxf", "fails to extract"); await a.settle(); return x; })); }
+  finally { TextEncoder.prototype.encodeInto = real; }
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  assert.deepEqual(events.filter((e) => e.event === "search_index_skipped").map((e) => e.reasons), [{ error: 1 }]);
+  assert.equal(docRow(a, r.body.artifact_id), undefined, "left missing");
+  assert.ok(missing(a).includes(r.body.artifact_id));
+  assertBaseline(b0, "extraction failure");
+});
+
+test("18 (upload): a second text finish is accepted while the first one's deferred work is paused; a forced token failure leaves the response unchanged", async () => {
+  const a = await app();
+  await a.project("p18u");
+  const b0 = baseline();
+  let release, held = false;
+  const paused = new Promise((r) => { release = r; });
+  a.world.before = async (c) => { if (!held && isPlan(c)) { held = true; await paused; } };
+  const one = await textUpload(a, "p18u", "first paused upload");
+  assert.equal(one.status, 200);
+  await until(() => held, { what: "the first run's plan read" });
+  const two = await textUpload(a, "p18u", "second upload words");
+  assert.equal(two.status, 200, JSON.stringify(two.body));
+  release();
+  a.world.before = null;
+  await a.settle();
+  assertIndexed(a, "p18u", one.body.artifact_id, "first paused upload", "first");
+  assertIndexed(a, "p18u", two.body.artifact_id, "second upload words", "second");
+  a.world.before = async (c) => { if ((c.qs ?? [c.q]).some((q) => /search_token_docs|search_tokens|workspace_search_keys/.test(q))) throw new Error("synthetic token failure"); };
+  const { result: three, events } = await captureLogs(async () => { const x = await textUpload(a, "p18u", "third upload words"); await a.settle(); return x; });
+  a.world.before = null;
+  assert.equal(three.status, 200, JSON.stringify(three.body));
+  assert.deepEqual(Object.keys(three.body).sort(), Object.keys(two.body).sort(), "the same response shape");
+  assert.ok(events.some((e) => e.event === "search_index_failed"));
+  assertExact(a);
+  assertBaseline(b0, "18 upload");
 });
 
 // --- 12: saves --------------------------------------------------------------------------------------------------------

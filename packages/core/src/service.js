@@ -434,9 +434,9 @@ async function publishRevision(ctx, projectId, artifactId, expected, i, rev, ext
     if (pub && !ctx.publisher) throw new HttpError(403, "protected_source", "This file is a source export owned by a connected app and cannot be modified here");
     throw new HttpError(403, "forbidden", "Grant no longer valid");
   }
-  // Committed text revision (not a replay, a conflict or a refusal): index it after the response. Temporary: an upload
-  // finish (reservedUpload) defers nothing until the upload-finish commit, where upload finish supplies its own job.
-  if (rev.body != null && !reserved) deferIndexing(ctx, artifactId, projectId, revId, rev.body, rev.size, rev.onSearchJob);
+  // Committed text revision (not a replay, a conflict or a refusal): index it after the response (upload finish passes
+  // onSearchJob and defers its own packed-terms job).
+  if (rev.body != null) deferIndexing(ctx, artifactId, projectId, revId, rev.body, rev.size, rev.onSearchJob);
   return { status: 200, body: body2 };
 }
 async function saveMarkdown(ctx, projectId, artifactId, input, key) {
