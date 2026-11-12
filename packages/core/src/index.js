@@ -408,7 +408,7 @@ var coreWorker = {
     // Not withSec: its X-Frame-Options DENY would stop the app from framing rendered pages (they set frame-ancestors).
     if (isContentHost(env, host)) return handleContentHost(req, env, url);
     if (e2.MCP_HOST && host === e2.MCP_HOST.toLowerCase()) {
-      const publisherRoute = env.APP_CONNECT_ENABLED === "1" && /^\/v1\/publisher(\/|$)/.test(url.pathname);
+      const publisherRoute = env.APP_CONNECT_ENABLED === "1" && /^\/v1\/(publisher|app)(\/|$)/.test(url.pathname);
       if (url.pathname.startsWith("/files/")) return withSec(await handleFileTransfer(req, env, url));
       if (isV1Path(url.pathname) && !publisherRoute) return withSec(await handleV1(req, env));
       return withSec(await handleOAuthHost(req, e2, ctx, host));

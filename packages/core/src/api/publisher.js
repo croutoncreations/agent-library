@@ -6,7 +6,7 @@ import { appOrigin, artifactWebUrl, previewWebUrl } from "../links.js";
 import { addressLinksResponse } from "../paths.js";
 import { explainLimit, projectLimitGuard, projectWorkspaceId } from "../limits.js";
 import { SCOPES, clientAllows, livePublisher } from "../oauth/server.js";
-import { baseParams, baseSql } from "./app-files.js";
+import { baseParams, baseSql, isAppFileContentPath, isAppFilesPath, routeAppFiles } from "./app-files.js";
 import { LIMITS, connectionInfo, idemLookup } from "../service.js";
 import { memberRoleSql, readOnlyError } from "../tenancy.js";
 import { HttpError, errorBody, idemKey, int, json, nowIso, randomId, sha256Hex, str } from "../util.js";
@@ -668,8 +668,9 @@ async function me(env, p) {
     retention: { ...JSON.parse(p.retention), auto_prune_enabled: false }
   };
 }
+// Rows an app deleted through App Files keep publisher_id but lose export_name: they are not this API's files.
 var FILE_SQL = `SELECT a.*, r.sha256, r.size FROM artifacts a LEFT JOIN revisions r ON r.id = a.head_revision_id
-WHERE a.publisher_id = ? AND a.head_rev > 0`;
+WHERE a.publisher_id = ? AND a.export_name IS NOT NULL AND a.head_rev > 0`;
 async function ownFile(env, p, fid) {
   const a = await env.DB.prepare(`${FILE_SQL} AND a.id = ?`).bind(p.id, fid).first();
   if (!a) throw new HttpError(404, "not_found", "File not found");
@@ -874,12 +875,15 @@ async function commitSnapshot(env, p, req, requestId) {
   }
   return { status: 201, body: respBody };
 }
-async function route(req, env, p, requestId) {
+async function route(req, env, execCtx, p, requestId) {
   const url = new URL(req.url);
   const path = url.pathname.replace(/\/$/, "");
   const m = req.method;
   const write = m !== "GET" && m !== "HEAD";
-  await rateLimit(env, `${write ? "w" : "r"}:${p.principal_id}`, await agentRate(env, p.workspace_id ?? await projectWorkspaceId(env, p.project_id), write));
+  const wsId = p.workspace_id ?? await projectWorkspaceId(env, p.project_id);
+  await rateLimit(env, `${write ? "w" : "r"}:${p.principal_id}`, await agentRate(env, wsId, write));
+  // Before the trailing-slash strip: App Files checks the raw path itself.
+  if (isAppFilesPath(url.pathname)) return routeAppFiles(req, env, execCtx, p, requestId, wsId);
   const only = (method) => {
     if (m !== method && !(method === "GET" && m === "HEAD")) throw new HttpError(405, "method_not_allowed", "Method not allowed");
   };
@@ -980,7 +984,10 @@ async function handlePublisherApi(req, env, ctx) {
     const p = await livePublisher(env, ctx.props).catch(() => null);
     if (!p) throw new HttpError(401, "unauthenticated", "Token is no longer valid; reconnect the app");
     if (p.revoked) throw new HttpError(401, "publisher_revoked", "This publisher has been revoked by the owner");
-    const res = await addressLinksResponse(env, await route(req, env, p, requestId), new URL(req.url).pathname, [p.project_id]);
+    const pathname = new URL(req.url).pathname;
+    const routed = await route(req, env, ctx, p, requestId);
+    // App Files content carries stored bytes: never rewritten (lists are, like every other JSON answer).
+    const res = isAppFileContentPath(pathname) ? routed : await addressLinksResponse(env, routed, pathname, [p.project_id]);
     const r = new Response(res.body, res);
     r.headers.set("x-request-id", requestId);
     return r;
@@ -991,4 +998,4 @@ async function handlePublisherApi(req, env, ctx) {
   }
 }
 
-export { handlePublisherApi };
+export { assertStillAuthorized, handlePublisherApi, pubCtx };

@@ -864,7 +864,7 @@ async function handleOAuthHost(req, env, ctx, host) {
       return await as.fetch(req, env, ctx);
     }
     if (url.pathname === RS_META || url.pathname === "/mcp") return await rs.fetch(req, env, ctx);
-    if (v1 && (url.pathname === "/.well-known/oauth-protected-resource/v1" || url.pathname.startsWith("/v1/publisher/") || url.pathname === "/v1/publisher")) {
+    if (v1 && (url.pathname === "/.well-known/oauth-protected-resource/v1" || url.pathname.startsWith("/v1/publisher/") || url.pathname === "/v1/publisher" || url.pathname.startsWith("/v1/app/") || url.pathname === "/v1/app")) {
       if (req.method === "OPTIONS") return await publisherPreflight(req, env);
       return await withPublisherCors(req, env, await v1.fetch(req, env, ctx));
     }
@@ -894,8 +894,8 @@ async function publisherPreflight(req, env) {
   if (!await registeredOrigin(env, origin)) return new Response(null, { status: 403, headers: { vary: "Origin" } });
   return new Response(null, { status: 204, headers: {
     "access-control-allow-origin": origin,
-    "access-control-allow-methods": "GET, POST",
-    "access-control-allow-headers": "Authorization, Content-Type, Idempotency-Key",
+    "access-control-allow-methods": "GET, HEAD, PUT, DELETE, POST",
+    "access-control-allow-headers": "Authorization, Content-Type, Idempotency-Key, If-Match, If-None-Match, Range, X-Content-SHA256",
     "access-control-max-age": "600",
     vary: "Origin"
   } });
@@ -906,7 +906,7 @@ async function withPublisherCors(req, env, res) {
   const origin = req.headers.get("origin");
   if (await registeredOrigin(env, origin)) {
     r.headers.set("access-control-allow-origin", origin);
-    r.headers.set("access-control-expose-headers", "WWW-Authenticate, Retry-After, X-Request-Id");
+    r.headers.set("access-control-expose-headers", "WWW-Authenticate, Retry-After, X-Request-Id, ETag, Content-Range, Content-Length, Accept-Ranges");
   }
   r.headers.set("vary", "Origin");
   return r;

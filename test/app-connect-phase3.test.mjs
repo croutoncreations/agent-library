@@ -460,6 +460,24 @@ test("review F1: a snapshot commit in flight when the app client is disabled ans
   assert.equal((await h.pub(D.access_token, "GET", "/publisher/me")).json.current_source_revision, 1, "pointer unchanged");
 });
 
+test("/v1/publisher/files lists only rows with an export name (rows released by App Files are not this API's files)", async () => {
+  const appR = await h.registerApp({ display_name: "Released rows", redirect_uris: ["http://127.0.0.1:5178/cb"], origins: [] });
+  const P = await h.connectPublisher(appR, { project_id: "other-test", destination: "new", new_folder_name: "Released rows" });
+  assert.equal((await commit(P.access_token, snapBody(1, synthMeasurements(2, { seed: 84 })))).status, 201);
+  const before = (await h.pub(P.access_token, "GET", "/publisher/files")).json.files;
+  assert.equal(before.length, 3);
+  const pb = (await rows(`SELECT principal_id, project_id, folder_id FROM publishers WHERE id = '${P.publisher_id}'`))[0];
+  const now = new Date().toISOString(), id = "art_released_" + randomBytes(6).toString("hex"), rev = "rev_released_" + randomBytes(6).toString("hex");
+  await sql(`INSERT INTO artifacts (id, project_id, kind, title, folder, folder_id, publisher_id, export_name, head_rev, head_revision_id, trashed_at, created_at, updated_at)
+    VALUES ('${id}', '${pb.project_id}', 'markdown', 'released.md', '', '${pb.folder_id}', '${P.publisher_id}', NULL, 1, '${rev}', '${now}', '${now}', '${now}');
+    INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, size, sha256, mime, created_at)
+    VALUES ('${rev}', '${id}', '${pb.project_id}', 1, '${pb.principal_id}', 'synthetic released', 18, '${sha("synthetic released")}', 'text/markdown', '${now}');`);
+  const after = (await h.pub(P.access_token, "GET", "/publisher/files")).json.files;
+  assert.deepEqual(after.map((f) => f.file_id), before.map((f) => f.file_id), "released row not listed");
+  assert.equal((await h.pub(P.access_token, "GET", `/publisher/files/${id}`)).status, 404);
+  assert.equal((await h.pub(P.access_token, "GET", `/publisher/files/${id}/content`)).status, 404);
+});
+
 test("review F2: per-publisher quota -> 413 quota_exceeded, nothing written; exports don't use the project file quota", async () => {
   const app4 = await h.registerApp({ display_name: "Quota probe", redirect_uris: ["http://127.0.0.1:5176/cb"], origins: [] });
   const Z = await h.connectPublisher(app4, { project_id: "other-test", destination: "root" });
