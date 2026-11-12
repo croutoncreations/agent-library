@@ -3,6 +3,7 @@ import { appOrigin, artifactWebUrl, previewWebUrl } from "../links.js";
 import { appConnectEnabled, db, rtReadAuthzSql } from "../service.js";
 import { HttpError, nowMs, sha256Hex } from "../util.js";
 import { addressLinks, resolveProjectRef } from "../paths.js";
+import { U61_TOKEN, u61FoldToken } from "./unicode61.js";
 
 /** Temporary plaintext FTS bridge: only the first 1 MiB, safely below D1's 2,000,000-byte value ceiling. */
 export function textSearchBridge(env, artifactId, revisionId, text) {
@@ -100,6 +101,62 @@ async function rsCursorDecode(secret,binding,cursor) {
     return v.a;
   }catch { throw bad(); }
 }
+// Excerpts come from at most this many leading characters of the indexed text. FTS5 snippet() costs the square of
+// the matches in one document (minutes for a 1 MiB body of one repeated word), so it is not used.
+const RS_EXCERPT_PREFIX_CHARS = 16384;
+const RS_EXCERPT_TOKENS = 40;
+/**
+ * The window FTS5 snippet(…,40) would pick (centred on a match, or from a sentence start: +120 at the start of the
+ * text, +100 elsewhere; 1000 per distinct word in the window, 1 per repeat), computed in linear time over a bounded
+ * prefix. Matches beyond the prefix are not seen; then the excerpt is the start of the text, as for a title-only hit.
+ */
+function rsExcerpt(source, terms) {
+  // SQL substr() counts characters; a UTF-16 length within the prefix already means at most that many characters.
+  const chars = source.length <= RS_EXCERPT_PREFIX_CHARS ? null : Array.from(source);
+  const complete = !chars || chars.length <= RS_EXCERPT_PREFIX_CHARS;
+  const text = complete ? source : chars.slice(0, RS_EXCERPT_PREFIX_CHARS).join("");
+  // Tokens and terms exactly as the index sees them (unicode61.js), so a word matches here only if it matches there.
+  const tokens = [...text.matchAll(U61_TOKEN)].map((m) => ({ start: m.index, end: m.index + m[0].length, word: m[0] }));
+  if (!complete && tokens.length && tokens.at(-1).end === text.length) tokens.pop(); // may be cut mid-word
+  const n = tokens.length, W = RS_EXCERPT_TOKENS, want = new Map(); // folded word -> [group, number of terms]
+  for (const t of terms) {
+    const parts = t.match(U61_TOKEN) ?? [];
+    if (parts.length !== 1) { want.clear(); break; } // the index matches such a term as a phrase: show the start of the text
+    const word = u61FoldToken(parts[0]), entry = want.get(word);
+    // Terms that fold to one word always occur together: one entry weighted by their number scores the same.
+    if (entry) entry[1]++; else want.set(word, [want.size, 1]);
+  }
+  const folded = new Map(), fold = (w) => { let f = folded.get(w); if (f === undefined) folded.set(w, f = u61FoldToken(w)); return f; };
+  const inst = []; // [position, group, weight], in position order like FTS5 instances
+  if (want.size) tokens.forEach((t, p) => { const e = want.get(fold(t.word)); if (e) inst.push([p, e[0], e[1]]); });
+  const sentences = [0];
+  if (inst.length) for (let p = 1; p < n; p++) { const gap = text.slice(tokens[p - 1].end, tokens[p].start); if (/[.:][ \t\r\n]+$/.test(gap)) sentences.push(p); }
+  // Sliding window over instances for non-decreasing window starts.
+  const slider = () => { let lo = 0, hi = 0, distinct = 0, total = 0; const count = new Array(want.size).fill(0);
+    return (s) => {
+      while (hi < inst.length && inst[hi][0] < s + W) { const [, g, w] = inst[hi]; if (count[g]++ === 0) distinct += w; total += w; hi++; }
+      while (lo < hi && inst[lo][0] < s) { const [, g, w] = inst[lo]; if (--count[g] === 0) distinct -= w; total -= w; lo++; }
+      return { score: distinct * 1000 + total - distinct, first: lo < hi ? inst[lo][0] : -1, last: lo < hi ? inst[hi - 1][0] + 1 : 0 };
+    }; };
+  const centred = slider(), fromSentence = slider();
+  let best = 0, start = 0, j = 0;
+  const docSize = complete ? n : Infinity;
+  for (const [io] of inst) {
+    const c = centred(io);
+    if (c.score > best) { best = c.score; start = Math.max(0, Math.min(c.first - Math.floor((W - (c.last - c.first)) / 2), docSize - W)); }
+    if (docSize > W) {
+      while (j < sentences.length - 1 && sentences[j + 1] <= io) j++;
+      if (sentences[j] < io) { const sc = fromSentence(sentences[j]).score + (sentences[j] === 0 ? 120 : 100); if (sc > best) { best = sc; start = sentences[j]; } }
+    }
+  }
+  const endToken = start + W - 1;
+  let out = start > 0 ? " … " + text.slice(tokens[start].start) : text;
+  const cut = (start > 0 ? " … ".length - tokens[start].start : 0);
+  if (complete && endToken >= n - 1) return out.slice(0, 500);
+  const last = tokens[Math.min(endToken, n - 1)];
+  if (!last) return ""; // no complete word in the prefix: the caller shows the title
+  return (out.slice(0, last.end + cut) + " … ").slice(0, 500);
+}
 async function searchArtifacts(ctx, args, transport = "api") {
   if (ctx.publisher) throw new HttpError(403, "forbidden", "Search is unavailable to publishers");
   // Project paths (<handle>/<slug>) become ids first; one that names nothing fails like an unknown id below.
@@ -130,18 +187,22 @@ async function searchArtifacts(ctx, args, transport = "api") {
     SELECT a.id, a.project_id, p.title AS project_title, a.title, a.kind, a.updated_at, r.rev_no, r.sha256, r.mime,
       (CASE WHEN lower(a.title)=lower(?) THEN 1000 ELSE 0 END + (${titleScore})) AS score,
       CASE WHEN (${titleScore})>0 THEN 'title' ELSE 'body' END AS matched_field,
-      CASE WHEN a.kind='binary' THEN a.title ELSE substr(snippet(artifact_search,4,'','',' … ',40),1,500) END AS snippet
+      s.rowid AS search_id
     FROM artifact_search s JOIN artifacts a ON a.id=s.artifact_id JOIN projects p ON p.id=a.project_id
       JOIN revisions r ON r.id=a.head_revision_id AND r.artifact_id=a.id AND r.project_id=a.project_id AND r.rev_no=a.head_rev
     WHERE artifact_search MATCH ? AND ${where.join(" AND ")}
-  ) SELECT * FROM hits ${after ? "WHERE score < ? OR (score = ? AND (updated_at < ? OR (updated_at = ? AND id > ?)))" : ""}
-    ORDER BY score DESC, updated_at DESC, id ASC LIMIT ?`;
+  ), page AS (SELECT * FROM hits ${after ? "WHERE score < ? OR (score = ? AND (updated_at < ? OR (updated_at = ? AND id > ?)))" : ""}
+    ORDER BY score DESC, updated_at DESC, id ASC LIMIT ?)
+  -- Only the returned page reads a bounded prefix of its indexed text, for the excerpt.
+  SELECT page.*, CASE WHEN page.kind='binary' THEN NULL ELSE
+      (SELECT substr(x.body,1,${RS_EXCERPT_PREFIX_CHARS + 1}) FROM artifact_search x WHERE x.rowid=page.search_id) END AS excerpt_source
+    FROM page ORDER BY score DESC, updated_at DESC, id ASC`;
   const tail = after ? [after[0], after[0], after[1], after[1], after[2]] : [];
   const rows = (await db(ctx).prepare(sql).bind(a.query, ...a.terms, ...a.terms, match, ...values, ...tail, a.limit + 1).all()).results;
   const origin = appOrigin(ctx.env.APP_HOST);
   const results = rows.slice(0, a.limit).map(r => ({
     project_id: r.project_id, project_title: r.project_title, artifact_id: r.id, title: r.title, kind: r.kind,
-    matched_field: r.matched_field, snippet: (r.snippet || r.title).slice(0,500), indexed_body: r.kind !== "binary",
+    matched_field: r.matched_field, snippet: (r.kind === "binary" ? r.title : rsExcerpt(r.excerpt_source ?? "", a.terms) || r.title).slice(0,500), indexed_body: r.kind !== "binary",
     revision: r.rev_no, sha256: r.sha256, updated_at: r.updated_at, ...(ctx.principal?.kind === "human" && !ctx.oauthConnection && !ctx.apiCredential ? { mime: r.mime } : {}),
     web_url: origin ? artifactWebUrl(origin,r.project_id,r.id) + "?v=" + r.rev_no : null,
     preview_url: origin ? previewWebUrl(origin,r.project_id,r.id) + "?v=" + r.rev_no : null
