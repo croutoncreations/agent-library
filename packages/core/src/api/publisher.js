@@ -530,7 +530,7 @@ async function abandon(env, p, id, req) {
 }
 async function routeGeneration(req, env, p, requestId) {
   const path = new URL(req.url).pathname.replace(/\/$/, "");
-  if ((path === "/v1/publisher/generations" || path.startsWith("/v1/publisher/generations/")) && p.client_disabled !== null) throw new HttpError(401, "unauthenticated", "App client is disabled; generation access requires an enabled client");
+  if ((path === "/v1/publisher/generations" || path.startsWith("/v1/publisher/generations/")) && !clientAllows(p, true)) throw new HttpError(401, "unauthenticated", "App client is disabled; generation access requires an enabled client");
   if (path === "/v1/publisher/generations") {
     if (req.method !== "POST")
       throw new HttpError(405, "method_not_allowed", "Method not allowed");
@@ -716,16 +716,26 @@ function parseSnapshot(b) {
   }
   return { source_revision: sr, exported_at, coverage, files };
 }
-async function testPause(env, req) {
-  if (env.AC_TEST_HOOKS !== "1" || !/^(127\.0\.0\.1|localhost)(:\d+)?$/.test(new URL(req.url).host)) return;
-  const ms = Number(req.headers.get("x-test-pause-before-batch-ms"));
-  if (Number.isInteger(ms) && ms > 0) await new Promise((r) => setTimeout(r, Math.min(ms, 5e3)));
+/** Test hooks run only with AC_TEST_HOOKS = "1" on a localhost or 127.0.0.1 host (never in an installation). */
+const testHooksOn = (env, req) => env.AC_TEST_HOOKS === "1" && /^(127\.0\.0\.1|localhost)(:\d+)?$/.test(new URL(req.url).host);
+/**
+ * Test hook: pause for `header` ms (at most 5 s). The pause announces itself in the server log, with the request's
+ * x-test-pause-tag, so a race test can act exactly while the request is paused.
+ */
+async function testPause(env, req, header = "x-test-pause-before-batch-ms") {
+  if (!testHooksOn(env, req)) return;
+  const ms = Number(req.headers.get(header));
+  if (!Number.isInteger(ms) || ms <= 0) return;
+  const tag = req.headers.get("x-test-pause-tag");
+  console.log(JSON.stringify({ event: "test_pause_entered", tag: tag && /^[A-Za-z0-9_-]{1,40}$/.test(tag) ? tag : null }));
+  await new Promise((r) => setTimeout(r, Math.min(ms, 5e3)));
 }
 var PUB_QUOTA = { files: 32, bytes: 256 * 1024 * 1024 };
 async function commitSnapshot(env, p, req, requestId) {
   const key = idemKey(req.headers.get("idempotency-key"));
-  const body2 = await readJsonBody(req);
+  // Authorization before the body: a disabled client or a suspended workspace costs no body read.
   await assertStillAuthorized(env, p);
+  const body2 = await readJsonBody(req);
   const ctx = pubCtx(env, p, requestId);
   const digest = await sha256Hex(JSON.stringify(body2));
   const i = { op: "snapshot.commit", key, projectId: p.project_id, digest };
@@ -998,4 +1008,4 @@ async function handlePublisherApi(req, env, ctx) {
   }
 }
 
-export { assertStillAuthorized, handlePublisherApi, pubCtx };
+export { assertStillAuthorized, handlePublisherApi, pubCtx, testHooksOn, testPause };

@@ -27,7 +27,7 @@ export const APP_PATH_SEGMENT_MAX_CHARS = 64;
 export const APP_FILES_PAGE_MAX = 100;
 const ROOT = "/v1/app/files";
 const SEGMENT = /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}$/;
-const KIND_BY_EXT = { md: "markdown", markdown: "markdown", html: "html", htm: "html", json: "json", csv: "csv" };
+const KIND_BY_EXT = new Map([["md", "markdown"], ["markdown", "markdown"], ["html", "html"], ["htm", "html"], ["json", "json"], ["csv", "csv"]]);
 const MANIFEST = "manifest.json";
 const invalidPath = () => new HttpError(400, "invalid_path", "File path must be 1-8 segments of letters, digits, '.', '_' or '-' (1-64 characters each, not starting with '.'), at most 200 characters, ending in .md, .markdown, .html, .htm, .json or .csv");
 /**
@@ -64,7 +64,7 @@ export function parseAppPath(rest) {
   const segments = rest.split("/");
   if (segments.length < 1 || segments.length > APP_PATH_MAX_SEGMENTS || !segments.every((s) => SEGMENT.test(s))) throw invalidPath();
   const ext = /\.([A-Za-z]+)$/.exec(segments.at(-1))?.[1]?.toLowerCase();
-  const kind = ext ? KIND_BY_EXT[ext] : void 0;
+  const kind = ext ? KIND_BY_EXT.get(ext) : void 0;
   if (!kind) throw invalidPath();
   return { path: rest, kind };
 }
@@ -118,7 +118,12 @@ async function list(env, p, url) {
   return json({ files: page.map((a) => fileItem(env, a)), next_cursor: next });
 }
 
-const etagMatches = (header, etag) => header !== null && header.split(",").some((t) => t.trim() === etag);
+/** If-None-Match against a strong etag: '*', or any listed tag under weak comparison (W/ ignored). */
+export function etagMatches(header, etag) {
+  if (header === null) return false;
+  if (header.trim() === "*") return true;
+  return header.split(",").some((t) => t.trim().replace(/^W\//, "") === etag);
+}
 
 async function read(req, env, p, requestId, rest) {
   const { path } = parseAppPath(rest);

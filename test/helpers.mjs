@@ -64,7 +64,7 @@ export async function startServer(name, port, { fresh = true, persistDir, vars =
     await sleep(300);
   }
   return {
-    base, dir, port,
+    base, dir, port, logPath,
     login: (user) => humanLogin(base, passphrase, user),
     loginAt: (b, user) => humanLogin(b, passphrase, user),
     passphrase: () => passphrase, // for real-browser login forms in tests only

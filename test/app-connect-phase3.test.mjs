@@ -451,8 +451,9 @@ test("review F1: a snapshot commit in flight when the app client is disabled ans
   assert.equal((await commit(D.access_token, snapBody(1, synthMeasurements(2, { seed: 82 })))).status, 201);
   const revCount = async () => (await rows(`SELECT COUNT(*) AS n FROM revisions WHERE artifact_id IN (SELECT id FROM artifacts WHERE publisher_id = '${D.publisher_id}')`))[0].n;
   const r0 = await revCount();
-  const slow = h.pub(D.access_token, "POST", "/publisher/snapshots", { body: snapBody(2, synthMeasurements(2, { seed: 83 })), idem: key("dis"), headers: { "x-test-pause-before-batch-ms": "2000" } });
-  await new Promise((r) => setTimeout(r, 500));
+  const barrier = h.pauseBarrier();
+  const slow = h.pub(D.access_token, "POST", "/publisher/snapshots", { body: snapBody(2, synthMeasurements(2, { seed: 83 })), idem: key("dis"), headers: { "x-test-pause-before-batch-ms": "3000", "x-test-pause-tag": barrier.tag } });
+  await barrier.entered;
   assert.equal((await owner.req("POST", `/api/app-clients/${app5.app_client_id}/disable`, {})).status, 200);
   const s = await slow;
   assert.equal(s.status, 401, s.text); assert.equal(s.json.error.code, "unauthenticated");

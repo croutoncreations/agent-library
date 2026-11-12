@@ -67,16 +67,25 @@ const file = (tok, path, headers = {}, method = "GET") => h.pub(tok, method, `/a
 /** The fixed headers a content answer carries; a 304 must carry the same values. */
 const FIXED = ["etag", "cache-control", "x-content-type-options", "content-security-policy", "cross-origin-resource-policy"];
 /** A publisher with one staged generation. */
-async function staged(pid) {
-  const c = await connect(pid);
+async function staged(pid, opts) {
+  const c = await connect(pid, opts);
   const gid = "g_" + uniq("abandon").replace(/-/g, "_");
   const b = await h.pub(c.tok, "POST", "/publisher/generations", { body: beginBody(gid), idem: uniq("begin-key") });
   assert.equal(b.status, 201, b.text);
   return { ...c, gid };
 }
 const abandon = (tok, gid, headers = {}) => h.pub(tok, "DELETE", `/publisher/generations/${gid}`, { headers });
-const pause = { "x-test-pause-before-batch-ms": "2000" };
-const during = async (pending, act) => { await new Promise((r) => setTimeout(r, 500)); await act(); return pending; };
+/**
+ * Run `send(headers)` with a 3 s test pause, wait until the server logs that this request entered its pause, then run
+ * `act` (which changes authorization) while it is paused, and return the request's answer.
+ */
+async function during(send, act) {
+  const b = h.pauseBarrier();
+  const pending = send({ "x-test-pause-before-batch-ms": "3000", "x-test-pause-tag": b.tag });
+  await b.entered;
+  await act();
+  return pending;
+}
 
 before(async () => {
   h = await startAppConnectServer({ port: PORT });
@@ -106,10 +115,10 @@ test("abandon: disabled client and revoked publisher are refused (401); the gene
 
 test("abandon: an app client disabled or a publisher revoked mid-request abandons nothing (401)", async () => {
   const d = await staged("files-own");
-  const r1 = await during(abandon(d.tok, d.gid, pause), async () => ok(await owner.req("POST", `/api/app-clients/${d.app.app_client_id}/disable`, {})));
+  const r1 = await during((hd) => abandon(d.tok, d.gid, hd), async () => ok(await owner.req("POST", `/api/app-clients/${d.app.app_client_id}/disable`, {})));
   assert.equal(r1.status, 401, r1.text); assert.equal(genState(d.gid), "staged");
   const v = await staged("files-own");
-  const r2 = await during(abandon(v.tok, v.gid, pause), async () => ok(await owner.req("POST", `/api/publishers/${v.P.publisher_id}/revoke`, {})));
+  const r2 = await during((hd) => abandon(v.tok, v.gid, hd), async () => ok(await owner.req("POST", `/api/publishers/${v.P.publisher_id}/revoke`, {})));
   assert.equal(r2.status, 401, r2.text); assert.equal(genState(v.gid), "staged");
 });
 
@@ -126,7 +135,7 @@ test("abandon in a suspended workspace: 403 workspace_read_only, the generation 
   // Suspended mid-request: the fenced UPDATE changes nothing.
   const s2 = await staged(pid);
   try {
-    const r = await during(abandon(s2.tok, s2.gid, pause), async () => sql(`UPDATE workspaces SET status = 'suspended' WHERE id = '${WSA}'`));
+    const r = await during((hd) => abandon(s2.tok, s2.gid, hd), async () => sql(`UPDATE workspaces SET status = 'suspended' WHERE id = '${WSA}'`));
     assert.equal(r.status, 403, r.text); assert.equal(r.json.error.code, "workspace_read_only"); assert.equal(genState(s2.gid), "staged");
   } finally { sql(`UPDATE workspaces SET status = 'active' WHERE id = '${WSA}'`); }
 });
@@ -147,7 +156,7 @@ test("abandon after the creator loses membership, before or during the request: 
   const pid = ok(await bob.req("POST", "/api/projects", { title: uniq("Membership"), workspace_id: WSA }), 201).id;
   const a = await staged(pid);
   const b = await staged(pid);
-  const r1 = await during(abandon(b.tok, b.gid, pause), async () => ok(await bob.req("DELETE", `/api/workspaces/${WSA}/members/${ownerId}`)));
+  const r1 = await during((hd) => abandon(b.tok, b.gid, hd), async () => ok(await bob.req("DELETE", `/api/workspaces/${WSA}/members/${ownerId}`)));
   // Observed (design Unverified 13): the post-change re-check answers 403 scope_mismatch mid-request.
   assert.equal(r1.status, 403, r1.text); assert.equal(r1.json.error.code, "scope_mismatch"); assert.equal(genState(b.gid), "staged");
   // Afterwards livePublisher requires membership, so the token is no longer valid at all.
@@ -163,11 +172,43 @@ test("abandon after the project is deleted, before or during the request: refuse
     const pid = ok(await owner.req("POST", "/api/projects", { title }), 201).id;
     const s = await staged(pid);
     const del = async () => ok(await owner.req("DELETE", `/api/projects/${pid}`, { confirm_title: title }));
-    const r = mid ? await during(abandon(s.tok, s.gid, pause), del) : (await del(), await abandon(s.tok, s.gid));
+    const r = mid ? await during((hd) => abandon(s.tok, s.gid, hd), del) : (await del(), await abandon(s.tok, s.gid));
     // Before: livePublisher's membership gate excludes deleted projects (401). During: the re-check finds no valid
     // destination for the creator (403 scope_mismatch).
     assert.equal(r.status, mid ? 403 : 401, `${mid ? "mid" : "before"}: ${r.text}`);
     assert.equal(genState(s.gid), "staged");
+  }
+});
+
+const folderOf = (pubId) => sql(`SELECT folder_id FROM publishers WHERE id = '${pubId}'`)[0].folder_id;
+const snapshot = (tok, rev, content = JSON.stringify({ synthetic: rev }), headers = {}) =>
+  h.pub(tok, "POST", "/publisher/snapshots", { body: { source_revision: rev, files: [{ name: "export.json", kind: "json", content }] }, idem: uniq("snapshot-key"), headers });
+// Folder deletion and token supersede have no route that fits inside a pause; they are applied to local D1.
+const MID = {
+  "destination folder deleted": (pubId) => sql(`DELETE FROM folders WHERE id = '${folderOf(pubId)}'`),
+  "token epoch superseded": (pubId) => sql(`UPDATE publishers SET token_epoch = token_epoch + 1 WHERE id = '${pubId}'`),
+};
+
+test("abandon: destination folder deleted or token superseded mid-request: refused, the generation stays staged", async () => {
+  for (const [label, act] of Object.entries(MID)) {
+    const s = await staged("files-own", { destination: "new" });
+    const r = await during((hd) => abandon(s.tok, s.gid, hd), async () => act(s.P.publisher_id));
+    assert.ok(r.status === 401 || r.status === 403, `${label}: ${r.status} ${r.text}`);
+    assert.equal(r.status, label.startsWith("token") ? 401 : 403, label);
+    assert.equal(genState(s.gid), "staged", label);
+  }
+});
+
+test("snapshot commit: destination folder deleted or token superseded mid-request: refused, nothing written", async () => {
+  for (const [label, act] of Object.entries(MID)) {
+    const c = await connect("files-own", { destination: "new" });
+    ok(await snapshot(c.tok, 1), 201);
+    const revs = () => sql(`SELECT COUNT(*) AS n FROM revisions WHERE artifact_id IN (SELECT id FROM artifacts WHERE publisher_id = '${c.P.publisher_id}')`)[0].n;
+    const r0 = revs();
+    const r = await during((hd) => snapshot(c.tok, 2, undefined, hd), async () => act(c.P.publisher_id));
+    assert.equal(r.status, label.startsWith("token") ? 401 : 403, `${label}: ${r.text}`);
+    assert.equal(revs(), r0, `${label}: no revisions`);
+    assert.equal(sql(`SELECT current_source_revision AS v FROM publishers WHERE id = '${c.P.publisher_id}'`)[0].v, 1, `${label}: pointer unchanged`);
   }
 });
 
@@ -244,6 +285,12 @@ test("read: GET, HEAD, Range 206/416, If-None-Match 304 with the same fixed head
   assert.equal(nm.status, 304); assert.equal(nm.text, "");
   for (const k of FIXED) assert.equal(nm.headers.get(k), g.headers.get(k), `304 ${k} equals the 200's`);
   assert.equal((await file(c.tok, "notes/day.md", { "if-none-match": '"' + "0".repeat(64) + '"' })).status, 200, "a different etag reads");
+  for (const inm of ["*", `W/"${md.sha256}"`, `"x", "${md.sha256}"`, `W/"x", W/"${md.sha256}"`]) {
+    const r = await file(c.tok, "notes/day.md", { "if-none-match": inm });
+    assert.equal(r.status, 304, inm);
+    for (const k of FIXED) assert.equal(r.headers.get(k), g.headers.get(k), `${inm} ${k}`);
+  }
+  assert.equal((await file(c.tok, "notes/day.md", { "if-none-match": 'W/"x", "y"' })).status, 200);
   // Query parameters for other content routes never reach serveContent here.
   const dl = await h.pub(c.tok, "GET", "/app/files/notes/day.md?download=1&rev=7");
   assert.equal(dl.status, 200); assert.equal(dl.headers.get("content-disposition"), g.headers.get("content-disposition"));
@@ -283,7 +330,8 @@ test("raw paths: every non-canonical or invalid path answers 400 invalid_path; n
   const N1 = "File path must be 1-8 segments of letters, digits, '.', '_' or '-' (1-64 characters each, not starting with '.'), at most 200 characters, ending in .md, .markdown, .html, .htm, .json or .csv";
   const long = "x/".repeat(98) + "abc.md"; // 202 characters
   const cases = ["a%2Fb.md", "%61.md", ".hidden.md", "a//b.md", "",
-    "a".repeat(198) + ".md", long, "1/2/3/4/5/6/7/8/9.md", "a".repeat(62) + ".md/x.md", "%C3%A9.md", "a.txt", "a", "a.", "a/b", "a/.md"];
+    "a".repeat(198) + ".md", long, "1/2/3/4/5/6/7/8/9.md", "a".repeat(62) + ".md/x.md", "%C3%A9.md", "a.txt", "a", "a.", "a/b", "a/.md",
+    "x.constructor", "x.toString", "x.__proto__", "x.hasOwnProperty", "constructor"];
   for (const rest of cases) {
     const r = await raw(`/v1/app/files/${rest}`, { headers: auth });
     assert.equal(r.status, 400, `${rest}: ${r.status} ${r.text}`); assert.equal(r.json.error.code, "invalid_path", rest); assert.equal(r.json.error.message, N1);
@@ -306,6 +354,64 @@ test("raw paths: every non-canonical or invalid path answers 400 invalid_path; n
   const ok64 = "a".repeat(61) + ".md"; // a 64-character segment is allowed
   assert.equal((await raw(`/v1/app/files/${ok64}`, { headers: auth })).status, 404);
   assert.equal((await raw("/v1/app/files/1/2/3/4/5/6/7/8.MD", { headers: auth })).status, 404, "8 segments, extension case-insensitive");
+  // Extensions are case-insensitive (design §1): .MD and .Md are valid paths, distinct from a.md.
+  for (const p of ["a.MD", "a.Md"]) { const r = await raw(`/v1/app/files/${p}`, { headers: auth }); assert.equal(r.status, 404, p); assert.equal(r.json.error.message, "File not found", p); }
+});
+
+test("GET by path never reaches an excluded row: trashed, staged generation part, released, unpublished, other folder, other publisher, other workspace", async () => {
+  const c = await connect("files-own", { destination: "new" });
+  const other = await connect("files-own", { destination: "new" });
+  // A second app whose publisher shares c's destination folder.
+  const sameApp = await h.registerApp({ display_name: uniq("Same dest"), redirect_uris: [`https://${uniq("same")}.example.test/cb`], origins: [] });
+  const same = await h.connectPublisher(sameApp, { project_id: "files-own", destination: `folder:${folderOf(c.P.publisher_id)}` });
+  const wsPid = ok(await bob.req("POST", "/api/projects", { title: uniq("Other ws"), workspace_id: WSA }), 201).id;
+  const far = await connect(wsPid);
+  insertFiles(c.P.publisher_id, [
+    { path: "x/trashed.md", trashed: true },
+    { path: "x/part.json", kind: "json", content: "{}", generationId: "g_synthetic_staged" },
+    { path: "x/released.md", exportName: null },
+    { path: "x/elsewhere.md", folderId: null },
+  ]);
+  const [unpub] = insertFiles(c.P.publisher_id, [{ path: "x/unpublished.md" }]);
+  sql(`UPDATE artifacts SET head_rev = 0 WHERE id = '${unpub.id}'`);
+  insertFiles(same.publisher_id, [{ path: "x/sibling.md" }]);
+  insertFiles(other.P.publisher_id, [{ path: "x/other.md" }]);
+  insertFiles(far.P.publisher_id, [{ path: "x/far.md" }]);
+  for (const p of ["x/trashed.md", "x/part.json", "x/released.md", "x/elsewhere.md", "x/unpublished.md", "x/sibling.md", "x/other.md", "x/far.md"]) {
+    for (const method of ["GET", "HEAD"]) {
+      const r = await file(c.tok, p, {}, method);
+      assert.equal(r.status, 404, `${method} ${p}`);
+    }
+  }
+  assert.deepEqual(ok(await files(c.tok, "?prefix=x/")).files, []);
+  assert.equal((await file(same.access_token, "x/sibling.md")).status, 200, "its own publisher reads it");
+});
+
+test("reads of content stored in R2 (written by the snapshot route): Range, HEAD, 304", async () => {
+  const c = await connect("files-own");
+  const content = JSON.stringify({ synthetic: "r2 content", n: [1, 2, 3, 4, 5, 6, 7, 8, 9] });
+  ok(await snapshot(c.tok, 1, content), 201);
+  const row = sql(`SELECT r.body, r.body_key, r.sha256 FROM artifacts a JOIN revisions r ON r.id = a.head_revision_id WHERE a.publisher_id = '${c.P.publisher_id}' AND a.export_name = 'export.json'`)[0];
+  assert.equal(row.body, null); assert.ok(row.body_key, "stored as an object, not inline");
+  const g = await file(c.tok, "export.json");
+  assert.equal(g.status, 200); assert.equal(g.text, content);
+  const r = await file(c.tok, "export.json", { range: "bytes=1-9" });
+  assert.equal(r.status, 206); assert.equal(r.text, content.slice(1, 10)); assert.equal(r.headers.get("content-range"), `bytes 1-9/${Buffer.byteLength(content)}`);
+  const hd = await file(c.tok, "export.json", { "accept-encoding": "identity" }, "HEAD");
+  assert.equal(hd.status, 200); assert.equal(hd.text, ""); assert.equal(hd.headers.get("content-length"), String(Buffer.byteLength(content)));
+  const nm = await file(c.tok, "export.json", { "if-none-match": `"${row.sha256}"` });
+  assert.equal(nm.status, 304);
+  for (const k of FIXED) assert.equal(nm.headers.get(k), g.headers.get(k), k);
+});
+
+test("reads with a superseded token (owner-approved resume) answer 401", async () => {
+  const c = await connect("files-own");
+  insertFiles(c.P.publisher_id, [{ path: "s.md" }]);
+  assert.equal((await file(c.tok, "s.md")).status, 200);
+  const R = await h.connectPublisher(c.app, { resume: c.P.publisher_id });
+  assert.equal(R.publisher_id, c.P.publisher_id);
+  for (const r of [await file(c.tok, "s.md"), await files(c.tok), await file(c.tok, "s.md", {}, "HEAD")]) assert.equal(r.status, 401);
+  assert.equal((await file(R.access_token, "s.md")).status, 200);
 });
 
 // Design tests 10 (GET) and 12.

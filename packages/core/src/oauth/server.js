@@ -101,9 +101,9 @@ function servers(origin, appConnect = false) {
 // What disabling an app client stops for its existing publishers: "writes" (recommended) or "all". Owner decision.
 const DISABLED_CLIENT_BLOCKS = "writes";
 /** Does the publisher row's app client allow this request? (A disabled client blocks writes, or everything under "all".) */
-function clientAllows(p, write) { return p.client_disabled === null || (DISABLED_CLIENT_BLOCKS === "writes" && !write); }
+function clientAllows(p, write, mode = DISABLED_CLIENT_BLOCKS) { return p.client_disabled === null || (mode === "writes" && !write); }
 /** The same rule as SQL over the app_clients row aliased `ac`. */
-function clientLiveSql(write) { return write || DISABLED_CLIENT_BLOCKS === "all" ? "ac.disabled_at IS NULL" : "1"; }
+function clientLiveSql(write, mode = DISABLED_CLIENT_BLOCKS) { return write || mode === "all" ? "ac.disabled_at IS NULL" : "1"; }
 async function livePublisher(env, p) {
   if (!p || typeof p.publisher_id !== "string" || !/^pub_[A-Za-z0-9_-]{10,64}$/.test(p.publisher_id)) return null;
   const row = await env.DB.prepare(

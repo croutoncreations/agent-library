@@ -3,6 +3,7 @@
 // publisher tokens) is generated per run, in memory, and only loopback is used. Never reads ~/.pi,
 // .dev.vars, Cloudflare credentials or production hosts.
 import { createServer } from "node:http";
+import { readFileSync } from "node:fs";
 import { generateKeyPairSync, createSign, createHash, randomBytes } from "node:crypto";
 import { startServer } from "../helpers.mjs";
 import { OIDC_OFFSET } from "../ports.mjs";
@@ -94,7 +95,24 @@ export async function startAppConnectServer({ port, oidcPort = port + OIDC_OFFSE
   });
   let ownerSession = null;
   const h = {
-    issuer, api: `${issuer}/v1`, appUi, resource: `${issuer}/v1`, dir: s.dir,
+    issuer, api: `${issuer}/v1`, appUi, resource: `${issuer}/v1`, dir: s.dir, logPath: s.logPath,
+    /**
+     * A fresh tag for x-test-pause-tag, and a promise that resolves once the server logs that it has entered the
+     * pause carrying that tag (AC_TEST_HOOKS on localhost only). Race tests await it instead of sleeping.
+     */
+    pauseBarrier(timeoutMs = 20_000) {
+      const tag = "t" + randomBytes(8).toString("hex");
+      const line = JSON.stringify({ event: "test_pause_entered", tag });
+      const entered = (async () => {
+        const deadline = Date.now() + timeoutMs;
+        for (;;) {
+          if (readFileSync(s.logPath, "utf8").includes(line)) return;
+          if (Date.now() > deadline) throw new Error(`pause ${tag} never entered (see ${s.logPath})`);
+          await new Promise((r) => setTimeout(r, 25));
+        }
+      })();
+      return { tag, entered };
+    },
     /** Owner session on the owner UI host (local dev login, per-run random passphrase). */
     async owner() { return (ownerSession ??= await s.loginAt(appUi)); },
     /** Another synthetic person on the owner UI host (local dev login, email <user>@example.test). */
