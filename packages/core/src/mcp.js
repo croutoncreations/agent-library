@@ -1,4 +1,4 @@
-import { authenticate, enforceRate } from "./auth.js";
+import { authenticate, authorizeProject, enforceRate } from "./auth.js";
 import { WEB_URL_OUTPUT_SCHEMAS, WEB_URL_TOOL_NOTE, appOrigin, withWebUrls } from "./links.js";
 import { addressLinks, resolveProjectRef } from "./paths.js";
 import { __name } from "./runtime.js";
@@ -108,10 +108,16 @@ function legacyUploadBegin(appConnect) {
       ["project_id", "mime", "size", "sha256", "idempotency_key"]
     ),
     run: async (c, a) => {
-      // Text uploads record change_note at begin; a binary upload records it here, as OAuth upload_begin does.
-      const note = provenance(c, a)[4];
+      // Text uploads record change_note at begin; a binary upload records it here, as OAuth upload_begin does. Its
+      // note is checked after authorization (a read-only grant gets 403, not a change_note error); uploadBegin re-checks.
+      const text = typeof a.mime === "string" && Object.hasOwn(TEXT_UPLOAD_KINDS, a.mime);
+      let note = null;
+      if (!text) {
+        await authorizeProject(c, a.project_id, true);
+        note = provenance(c, a)[4];
+      }
       const r = unwrap2(await uploadBegin(c, a.project_id, a, idemKey(a.idempotency_key), { allowText: true }));
-      if (note && r?.upload_id && !Object.hasOwn(TEXT_UPLOAD_KINDS, a.mime)) await c.env.DB.prepare("UPDATE uploads SET change_note = ? WHERE id = ? AND principal_id = ? AND state = 'pending' AND change_note IS NULL").bind(note, r.upload_id, c.principal.id).run();
+      if (note && r?.upload_id && !text) await c.env.DB.prepare("UPDATE uploads SET change_note = ? WHERE id = ? AND principal_id = ? AND state = 'pending' AND change_note IS NULL").bind(note, r.upload_id, c.principal.id).run();
       return r;
     }
   };

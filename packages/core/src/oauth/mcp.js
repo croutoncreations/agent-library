@@ -522,7 +522,7 @@ async function ftUploadInline(c, p, a) {
     // Evaluate at ftUploadBegin's shared-begin call, after its note/target/access checks, preserving error precedence.
     get mime() {
       const mime = str(rest.mime, "mime", 100);
-      if (!BINARY_TYPES[mime]) throw new HttpError(415, "unsupported_type", "Allowed: " + Object.keys(BINARY_TYPES).join(", "));
+      if (!Object.hasOwn(BINARY_TYPES, mime)) throw new HttpError(415, "unsupported_type", "Allowed: " + Object.keys(BINARY_TYPES).join(", "));
       return mime;
     }
   }, { link: false, binaryOnly: true });

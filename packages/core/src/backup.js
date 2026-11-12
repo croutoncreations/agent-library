@@ -198,7 +198,7 @@ function checkImportRows(env, backup, decoded, limits) {
     if (r.blob_key !== null) {
       const art = backup.artifacts.find((a) => a.id === r.artifact_id);
       if (!art || art.kind !== "binary") bad("A file version belongs to a document that isn't a file");
-      const sniff = BINARY_TYPES[r.mime];
+      const sniff = Object.hasOwn(BINARY_TYPES, r.mime) ? BINARY_TYPES[r.mime] : null;
       if (!sniff && r.mime !== "application/octet-stream") bad("Unsupported file type");
       if (sniff && !sniff(decoded.get(r.blob_key))) bad("A file's contents don't match its type");
       if (limits?.file_bytes !== undefined && r.size > limits.file_bytes) bad(`A file is larger than this plan allows (${fmtBytes(limits.file_bytes)})`);
