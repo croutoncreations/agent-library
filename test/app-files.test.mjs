@@ -584,7 +584,7 @@ const typeOf = (path) => TYPE[path.split(".").pop().toLowerCase()];
 /** PUT a file. opts: { create: true } (If-None-Match: *) or { match: '"sha"' | "rev:N" }, key, type, headers, body. */
 async function put(tok, path, body, { create, match, key, type = typeOf(path), headers = {}, method = "PUT" } = {}) {
   const hd = { "content-type": type, "idempotency-key": key === undefined ? uniq("put-key") : key, ...create ? { "if-none-match": "*" } : {}, ...match ? { "if-match": match } : {}, ...headers };
-  for (const [k, v] of Object.entries(hd)) if (v === null) delete hd[k];
+  for (const [k, v] of Object.entries(hd)) if (v === null || v === undefined) delete hd[k];
   if (tok) hd.authorization = `Bearer ${tok}`;
   const r = await fetch(`${h.api}/app/files/${path}`, { method, headers: hd, body });
   const text = await r.text(); let json = null; try { json = JSON.parse(text); } catch {}
@@ -1074,4 +1074,110 @@ test("concurrent replay: a loser that would be refused replays the winner's answ
   const k4 = uniq("race-key");
   const e = await race("re.md", "loser body", { create: true, key: k4 }, { create: true, key: k4, body: "winner body" });
   assert.equal(e.winner.status, 201); err(e.loser, 422, "idempotency_key_reused");
+});
+
+// ---- DELETE (design commit 4) ----
+const del = (tok, path, { match, key, headers = {} } = {}) => put(tok, path, undefined, { method: "DELETE", type: null, match, key, headers });
+
+// Design test 6.
+test("DELETE: stale 412 then 200; trashed with publisher_id kept and export_name released; re-create; owner restore is read-only; counters unchanged", async () => {
+  const c = await connect("files-own", { destination: "new" });
+  const a = await put(c.tok, "d.md", "one", { create: true });
+  ok(await put(c.tok, "d.md", "two", { match: "rev:1" }), 200);
+  const items = sql(`SELECT COUNT(*) AS n FROM artifacts WHERE project_id = 'files-own' AND publisher_id IS NULL`)[0].n;
+  const cnt = counters(c.P.publisher_id);
+  err(await del(c.tok, "d.md", { match: "rev:1" }), 412, "precondition_failed", N.N5);
+  err(await del(c.tok, "d.md"), 428, "precondition_required", N.N4);
+  err(await del(c.tok, "d.md", { match: "rev:2", key: null }), 400, "idempotency_key_required");
+  err(await del(c.tok, "d.md", { headers: { "if-none-match": "*" } }), 400, "invalid_input", N.N8);
+  const d = await del(c.tok, "d.md", { match: `"${sha("two")}"` });
+  assert.equal(d.status, 200, d.text);
+  assert.deepEqual(d.json, { file: { path: "d.md", file_id: a.json.file.file_id, trashed: true, revision: 2 } });
+  const row = sql(`SELECT publisher_id, export_name, trashed_at, title FROM artifacts WHERE id = '${a.json.file.file_id}'`)[0];
+  assert.equal(row.publisher_id, c.P.publisher_id); assert.equal(row.export_name, null); assert.ok(row.trashed_at); assert.equal(row.title, "d.md");
+  assert.equal((await file(c.tok, "d.md")).status, 404); assert.deepEqual(ok(await files(c.tok)).files, []);
+  err(await del(c.tok, "d.md", { match: "rev:2" }), 412, "precondition_failed", N.N7);
+  // The path is free: a re-create, deleted again, leaves two released rows (several NULL export_name values coexist).
+  ok(await put(c.tok, "d.md", "three", { create: true }), 201);
+  ok(await del(c.tok, "d.md", { match: "rev:1" }), 200);
+  assert.equal(sql(`SELECT COUNT(*) AS n FROM artifacts WHERE publisher_id = '${c.P.publisher_id}' AND export_name IS NULL`)[0].n, 2);
+  assert.equal(sql(`SELECT COUNT(*) AS n FROM artifacts WHERE project_id = 'files-own' AND publisher_id IS NULL`)[0].n, items, "items_per_project unchanged");
+  assert.deepEqual(counters(c.P.publisher_id), [cnt[0] + 1, cnt[1] + 1, cnt[2] + 5], "a delete changes no counter (the re-create did)");
+  // The owner restores it: read-only content (403), a rename works; the app still cannot see it.
+  const fid = a.json.file.file_id;
+  const meta = (await owner.req("GET", `/api/projects/files-own/artifacts?trashed=1`)).body.artifacts.find((x) => x.id === fid).meta_version;
+  ok(await owner.req("PATCH", `/api/projects/files-own/artifacts/${fid}`, { expected_meta_version: meta, trashed: false }));
+  assert.equal((await owner.req("PUT", `/api/projects/files-own/artifacts/${fid}`, { expected_revision: 2, body: "owner edit" })).status, 403);
+  assert.equal((await owner.req("PATCH", `/api/projects/files-own/artifacts/${fid}`, { expected_meta_version: meta + 1, title: "renamed.md" })).status, 200);
+  assert.deepEqual(ok(await files(c.tok)).files, [], "a restored file has no path: invisible to the app");
+});
+
+test("DELETE refusals: owner-trashed 409; generation row 409; manifest 400; owner trash racing a create 409", async () => {
+  const c = await connect("files-own");
+  const a = await put(c.tok, "o.md", "x", { create: true });
+  const fid = a.json.file.file_id;
+  const meta = (await owner.req("GET", `/api/projects/files-own/artifacts/${fid}`)).body.artifact.meta_version;
+  ok(await owner.req("PATCH", `/api/projects/files-own/artifacts/${fid}`, { expected_meta_version: meta, trashed: true }));
+  err(await del(c.tok, "o.md", { match: "rev:1" }), 409, "destination_file_trashed");
+  err(await put(c.tok, "o.md", "y", { match: "rev:1" }), 409, "destination_file_trashed");
+  err(await put(c.tok, "o.md", "y", { create: true }), 409, "destination_file_trashed");
+  insertFiles(c.P.publisher_id, [{ path: "gp.json", kind: "json", content: "{}", generationId: "g_synthetic_del" }]);
+  err(await del(c.tok, "gp.json", { match: "rev:1" }), 409, "path_conflict");
+  err(await del(c.tok, "manifest.json", { match: "rev:1" }), 400, "invalid_input", "manifest.json is reserved for the server");
+  // The owner trashes a file while the app's replace is paused: the fenced publish refuses with 409.
+  const b = await put(c.tok, "race.md", "x", { create: true });
+  const r = await during((hd) => put(c.tok, "race.md", "y", { match: "rev:1", headers: hd }), async () => {
+    const m = (await owner.req("GET", `/api/projects/files-own/artifacts/${b.json.file.file_id}`)).body.artifact.meta_version;
+    ok(await owner.req("PATCH", `/api/projects/files-own/artifacts/${b.json.file.file_id}`, { expected_meta_version: m, trashed: true }));
+  });
+  err(r, 409, "destination_file_trashed");
+  assert.equal(sql(`SELECT head_rev FROM artifacts WHERE id = '${b.json.file.file_id}'`)[0].head_rev, 1);
+});
+
+// Design test 5d.
+test("DELETE replay: a retry after success replays the 200; a different precondition with the same key is 422", async () => {
+  const c = await connect("files-own");
+  ok(await put(c.tok, "r.md", "x", { create: true }), 201);
+  const k = uniq("del-key");
+  const a = await del(c.tok, "r.md", { match: "rev:1", key: k });
+  const b = await del(c.tok, "r.md", { match: "rev:1", key: k });
+  assert.equal(b.status, 200, b.text); assert.equal(b.json.idempotent_replay, true); assert.deepEqual(b.json.file, a.json.file);
+  err(await del(c.tok, "r.md", { match: `"${sha("x")}"`, key: k }), 422, "idempotency_key_reused");
+});
+
+// Design test 13 (delete).
+test("DELETE liveness: disabled client, revoked, suspended, folder deleted, and each during the pause: refused, nothing trashed", async () => {
+  const pid = ok(await bob.req("POST", "/api/projects", { title: uniq("Del live"), workspace_id: WSA }), 201).id;
+  const before = {
+    "client disabled": [401, (c) => owner.req("POST", `/api/app-clients/${c.app.app_client_id}/disable`, {})],
+    "publisher revoked": [401, (c) => owner.req("POST", `/api/publishers/${c.P.publisher_id}/revoke`, {})],
+    "destination folder deleted": [403, (c) => MID["destination folder deleted"](c.P.publisher_id)],
+    "token epoch superseded": [401, (c) => MID["token epoch superseded"](c.P.publisher_id)],
+    "workspace suspended": [403, () => sql(`UPDATE workspaces SET status = 'suspended' WHERE id = '${WSA}'`)],
+  };
+  for (const mid of [false, true]) for (const [label, [status, act]] of Object.entries(before)) {
+    const c = await connect(pid, { destination: "new" });
+    const f = await put(c.tok, "x.md", "x", { create: true });
+    try {
+      const r = mid ? await during((hd) => del(c.tok, "x.md", { match: "rev:1", headers: hd }), async () => act(c))
+        : (await act(c), await del(c.tok, "x.md", { match: "rev:1" }));
+      assert.equal(r.status, status, `${mid ? "during" : "before"} ${label}: ${r.text}`);
+    } finally { sql(`UPDATE workspaces SET status = 'active' WHERE id = '${WSA}'`); }
+    const row = sql(`SELECT export_name, trashed_at FROM artifacts WHERE id = '${f.json.file.file_id}'`)[0];
+    assert.deepEqual(row, { export_name: "x.md", trashed_at: null }, `${label}: nothing trashed`);
+  }
+});
+
+// Design test 22d.
+test("concurrent replay (d): a DELETE loser that would see no file replays the winner's 200", async () => {
+  const c = await connect("files-own");
+  ok(await put(c.tok, "cd.md", "x", { create: true }), 201);
+  const k = uniq("race-del-key");
+  const b = h.pauseBarrier();
+  const loser = del(c.tok, "cd.md", { match: "rev:1", key: k, headers: { "x-test-pause-after-record-check-ms": "3000", "x-test-pause-tag": b.tag } });
+  await b.entered;
+  const winner = await del(c.tok, "cd.md", { match: "rev:1", key: k });
+  const l = await loser;
+  assert.equal(winner.status, 200); assert.equal(l.status, 200, l.text); assert.equal(l.json.idempotent_replay, true);
+  assert.deepEqual(l.json.file, winner.json.file);
 });

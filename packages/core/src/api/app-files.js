@@ -4,7 +4,9 @@
 import { authzSql } from "../auth.js";
 import { CONTENT_TYPE, MIME, checkFile } from "../formats.js";
 import { explainLimit, projectLimitGuard } from "../limits.js";
-import { createMarkdown, idemLookup, mdBody, publishRevision } from "../service.js";
+import { audit, createMarkdown, idemInsert, idemLookup, mdBody, publishRevision, runBatch } from "../service.js";
+import { metaBaselineInsert, metaVersionInsert } from "../history/service.js";
+import { nowIso } from "../util.js";
 import { appOrigin, artifactWebUrl, previewWebUrl } from "../links.js";
 import { clientLiveSql } from "../oauth/server.js";
 import { serveContent } from "../uploads.js";
@@ -269,6 +271,7 @@ export async function routeAppFiles(req, env, execCtx, p, requestId, wsId) {
   const rest = appFilesRawPath(req);
   const m = req.method;
   if (m === "PUT" && rest !== "") return put(req, env, execCtx, p, requestId, wsId, rest);
+  if (m === "DELETE" && rest !== "") return remove(req, env, p, requestId, rest);
   if (m !== "GET" && m !== "HEAD") throw new HttpError(405, "method_not_allowed", "Method not allowed");
   await assertStillAuthorized(env, p, { read: true });
   return rest === "" ? list(env, p, new URL(req.url)) : read(req, env, p, requestId, rest);
@@ -494,4 +497,65 @@ async function put(req, env, execCtx, p, requestId, wsId, rest) {
     }
     return refuse(e);
   }
+}
+
+/**
+ * DELETE: move the file to the owner's trash. It keeps publisher_id (still the app's data, read-only for the owner),
+ * loses export_name (the path is free again), and changes no counter. No body is read, so no slot is taken.
+ */
+async function remove(req, env, p, requestId, rest) {
+  await assertStillAuthorized(env, p);
+  const { path } = parseAppPath(rest);
+  if (path === MANIFEST) throw reserved();
+  const key = idemKey(req.headers.get("idempotency-key"));
+  const pre = parsePrecondition(req);
+  if (pre.create) throw new HttpError(400, "invalid_input", "If-Match must be one quoted SHA-256 ETag or rev:N; If-None-Match must be *; not both");
+  const ctx = pubCtx(env, p, requestId);
+  const i = { op: "app.delete", key, projectId: p.project_id, digest: await sha256Hex(JSON.stringify(["app.delete", path, pre.cond])) };
+  // The stored answer first: replay, or 422 for the same key with a different request.
+  const prior = await idemLookup(ctx, i);
+  await testPause(env, req, "x-test-pause-after-record-check-ms");
+  if (prior) return json(prior.body, prior.status);
+  // Mutable-state refusals re-check for a same-key request that committed meanwhile.
+  const refuse = async (err) => {
+    const again = await idemLookup(ctx, i);
+    if (again) return json(again.body, again.status);
+    throw err;
+  };
+  const load = () => env.DB.prepare(`SELECT a.*, r.sha256 FROM artifacts a LEFT JOIN revisions r ON r.id = a.head_revision_id
+    WHERE a.publisher_id = ? AND a.project_id = ? AND a.folder_id IS ? AND a.export_name = ? AND a.head_rev > 0`).bind(...ownParams(p), path).first();
+  const check = (row) => {
+    if (!row) return missing();
+    if (row.generation_id) return pathConflict();
+    if (row.trashed_at) return trashedErr(path, row.id);
+    if (pre.etag !== undefined ? pre.etag !== row.sha256 : pre.rev !== row.head_rev) return stale(row);
+    return null;
+  };
+  const a = await load();
+  const bad = check(a);
+  if (bad) return refuse(bad);
+  await testPause(env, req);
+  const az = authzSql(ctx, p.project_id);
+  const next = a.meta_version + 1;
+  const now = nowIso();
+  const gate = "EXISTS (SELECT 1 FROM artifacts WHERE id = ? AND meta_version = ? AND meta_request_id = ?)";
+  const gp = [a.id, next, requestId];
+  const body = { file: { path, file_id: a.id, trashed: true, revision: a.head_rev } };
+  const out = await runBatch(ctx, [
+    env.DB.prepare(`UPDATE artifacts SET trashed_at = ?, export_name = NULL, meta_version = ?, meta_request_id = ?, updated_at = ?
+      WHERE id = ? AND publisher_id = ? AND project_id = ? AND folder_id IS ? AND export_name = ? AND generation_id IS NULL AND trashed_at IS NULL
+        AND head_rev = ? AND meta_version = ? AND ${baseSql(true)} AND ${az.sql}`)
+      .bind(now, next, requestId, now, a.id, ...ownParams(p), path, a.head_rev, a.meta_version, ...baseParams(p), ...az.params),
+    metaBaselineInsert(ctx, a, gate, gp),
+    metaVersionInsert(ctx, a, next, { title: a.title, folder: a.folder, tags: a.tags, trashed: true, description: a.template_description, restoredFrom: null }, {}, gate, gp),
+    idemInsert(ctx, i, 200, body, gate, gp),
+    audit(ctx, p.project_id, "artifact.trash", a.id, null, "ok", gate, gp)
+  ], i);
+  if (!Array.isArray(out)) return json(out.body, out.status);
+  if (!out[0].meta.changes) {
+    // Authorization first, then the row as it is now.
+    await assertStillAuthorized(env, p);
+    return refuse(check(await load()) ?? new HttpError(409, "conflict", "Concurrent modification"));
+  }
+  return json(body, 200);
 }

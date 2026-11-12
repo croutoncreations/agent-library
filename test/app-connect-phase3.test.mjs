@@ -479,6 +479,20 @@ test("/v1/publisher/files lists only rows with an export name (rows released by 
   assert.equal((await h.pub(P.access_token, "GET", `/publisher/files/${id}/content`)).status, 404);
 });
 
+test("App Files DELETE: the released row is absent from /v1/publisher/files and its content by id is 404", async () => {
+  const appD = await h.registerApp({ display_name: "App Files delete", redirect_uris: ["http://127.0.0.1:5179/cb"], origins: [] });
+  const P = await h.connectPublisher(appD, { project_id: "other-test", destination: "new", new_folder_name: "App Files delete" });
+  const hd = (x) => ({ authorization: `Bearer ${P.access_token}`, "idempotency-key": key("afd"), ...x });
+  const c = await fetch(`${h.api}/app/files/gone.md`, { method: "PUT", headers: hd({ "content-type": "text/markdown", "if-none-match": "*" }), body: "synthetic" });
+  assert.equal(c.status, 201);
+  const fid = (await c.json()).file.file_id;
+  assert.deepEqual((await h.pub(P.access_token, "GET", "/publisher/files")).json.files.map((f) => f.file_id), [fid]);
+  const d = await fetch(`${h.api}/app/files/gone.md`, { method: "DELETE", headers: hd({ "if-match": "rev:1" }) });
+  assert.equal(d.status, 200, await d.text());
+  assert.deepEqual((await h.pub(P.access_token, "GET", "/publisher/files")).json.files, []);
+  assert.equal((await h.pub(P.access_token, "GET", `/publisher/files/${fid}/content`)).status, 404);
+});
+
 test("review F2: per-publisher quota -> 413 quota_exceeded, nothing written; exports don't use the project file quota", async () => {
   const app4 = await h.registerApp({ display_name: "Quota probe", redirect_uris: ["http://127.0.0.1:5176/cb"], origins: [] });
   const Z = await h.connectPublisher(app4, { project_id: "other-test", destination: "root" });
