@@ -108,7 +108,9 @@ const activeRow = (env, workspaceId) =>
 const hasShreddedRow = async (env, workspaceId) =>
   !!(await env.DB.prepare(`SELECT 1 AS x FROM workspace_keys WHERE workspace_id = ? AND ${SHREDDED_SQL} LIMIT 1`).bind(workspaceId).first("x"));
 const isShredded = (row) => (row.shredded_at !== null && row.shredded_at !== undefined) || row.wrapped === "";
-const shredded = () => new HttpError(410, "key_shredded", "This workspace's content key has been shredded");
+/** The message of every 410 key_shredded refusal (here and content-store.js fenceRefusal). */
+export const KEY_SHREDDED_MESSAGE = "This workspace's content key has been shredded";
+const shredded = () => new HttpError(410, "key_shredded", KEY_SHREDDED_MESSAGE);
 
 /**
  * Unwrap a row's data key through the provider and check what the provider returned. Refuses a shredded row and an

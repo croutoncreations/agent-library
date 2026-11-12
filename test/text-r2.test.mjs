@@ -8,7 +8,8 @@ import { ROOT } from "./helpers.mjs";
 import { loadWorker } from "./load-worker.mjs";
 import { SERVER_PORTS } from "./ports.mjs";
 import { MARKDOWN_PREVIEW_MAX_BYTES } from "../packages/core/src/text-limits.js";
-import { commitTextWrites, isTextWriteFenceError } from "../packages/core/src/content-store.js";
+import { commitTextWrites, fenceRefusal, isTextWriteFenceError, keyFence, plaintextFence } from "../packages/core/src/content-store.js";
+import { NO_REAL_KEY_SQL, shredWorkspaceKeys } from "../packages/core/src/crypto/keys.js";
 
 async function harness() {
   const lib = await loadWorker({ "service.js": ["createMarkdown", "saveMarkdown", "getArtifact", "restoreRevision", "updateMetadata", "listArtifacts", "addComment", "listComments"], "reads/service.js": ["readTextChunk"], "uploads.js": ["serveContent"], "history/service.js": ["diffRevisions"], "backup.js": ["exportBackup", "restoreBackup", "importBackup"], "cleanup.js": ["reconcileUploads"], "project-deletion.js": ["purgeDueProjects"], "render-source.js": ["getRenderSource"], "content-store.js": ["stageTextWrites", "commitTextWrites"], "adapters.js": ["withAdapters", "defaultAdapters"] });
@@ -373,6 +374,51 @@ test("publication fence matches real local D1 constraint text and rolls back a m
       DB.prepare("INSERT INTO content_writes (key, project_id, created_at) VALUES ('should-rollback', 'p', 0)")
     ]))), e => e.status === 503 && e.code === "text_write_expired");
     assert.equal(await DB.prepare("SELECT COUNT(*) AS n FROM content_writes WHERE key = 'should-rollback'").first("n"), 0);
+  } finally { await mf.dispose(); }
+});
+
+test("key and plaintext fences fail with the exact constraint text on real local D1 and roll back the whole batch", async () => {
+  const { Miniflare, convertV4MiniflareOptions } = await import("miniflare");
+  const mf = new Miniflare(convertV4MiniflareOptions({ port: SERVER_PORTS["text-r2"], name: "content-fences", modules: true, script: "export default { fetch() { return new Response('test'); } }", compatibilityDate: "2026-10-24", d1Databases: { DB: "content-fences" } }));
+  try {
+    const DB = await mf.getD1Database("DB");
+    // The real migrations that define workspace_keys and content_fences, statement by statement through local D1.
+    for (const f of ["0029_workspace_keys.sql", "0030_content_fences.sql"]) {
+      const statements = readFileSync(join(ROOT, "migrations", f), "utf8").replace(/^--.*$/gm, "").split(";").map(s => s.trim()).filter(Boolean);
+      for (const s of statements) await DB.prepare(s).run();
+    }
+    await DB.prepare("CREATE TABLE fence_probe (id TEXT PRIMARY KEY)").run();
+    const env = { DB };
+    const probe = (id) => DB.prepare("INSERT INTO fence_probe (id) VALUES (?)").bind(id);
+    const rejection = async (p) => { try { await p; } catch (e) { return e; } assert.fail("expected a refusal"); };
+    const probes = async () => (await DB.prepare("SELECT id FROM fence_probe ORDER BY id").all()).results.map(r => r.id);
+
+    // No real key: the plaintext fence passes and the batch commits with index 0 describing the first statement.
+    const out = await DB.batch([probe("plain-ok"), plaintextFence(env)]);
+    assert.equal(out.length, 2);
+    assert.equal(out[0].meta.changes, 1);
+    assert.equal(out[1].meta.changes, 0);
+    await DB.prepare("INSERT INTO workspace_keys (workspace_id, key_id, master_version, wrapped, created_at, shredded_at) VALUES ('wsp_a', 'wk_a', 1, 'c3ludGhldGlj', 1, NULL)").run();
+    const plain = await rejection(DB.batch([probe("plain-no"), plaintextFence(env)]));
+    assert.match(plain.message, /NOT NULL constraint failed: content_fences\.no_real_key(?![\w.])/);
+    assert.equal(fenceRefusal(plain).code, "encryption_started");
+    assert.equal(isTextWriteFenceError(plain), false);
+
+    const passed = await DB.batch([probe("key-ok"), keyFence(env, { keyId: "wk_a", workspaceId: "wsp_a" })]);
+    assert.equal(passed[0].meta.changes, 1);
+    for (const args of [{ keyId: "wk_unknown", workspaceId: "wsp_a" }, { keyId: "wk_a", workspaceId: "wsp_b" }]) {
+      const e = await rejection(DB.batch([probe("key-no-" + args.keyId), keyFence(env, args)]));
+      assert.match(e.message, /NOT NULL constraint failed: content_fences\.key_active(?![\w.])/);
+    }
+    await shredWorkspaceKeys(env, "wsp_a");
+    const key = await rejection(DB.batch([probe("key-no-shredded"), keyFence(env, { keyId: "wk_a", workspaceId: "wsp_a" })]));
+    assert.match(key.message, /NOT NULL constraint failed: content_fences\.key_active(?![\w.])/);
+    assert.equal(fenceRefusal(key).status, 410);
+
+    assert.deepEqual(await probes(), ["key-ok", "plain-ok"]);
+    assert.equal(await DB.prepare("SELECT COUNT(*) AS n FROM content_fences").first("n"), 0);
+    const plan = await DB.prepare(`EXPLAIN QUERY PLAN SELECT ${NO_REAL_KEY_SQL}`).all();
+    assert.match(plan.results.map(r => r.detail).join("\n"), /workspace_keys_real/);
   } finally { await mf.dispose(); }
 });
 
