@@ -6,7 +6,9 @@ import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import { existsSync, readFileSync } from "node:fs";
 import vm from "node:vm";
-import { startServer, setupProject, grant, agentHttp, mcpClient, sha256, key } from "./helpers.mjs";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { startServer, setupProject, grant, agentHttp, mcpClient, sha256, key, LOCAL_CONFIG, ROOT } from "./helpers.mjs";
 import { SERVER_PORTS } from "./ports.mjs";
 import { makeFixtures } from "./make-fixtures.mjs";
 
@@ -183,4 +185,53 @@ test("trash rows show type icons and never fetch content", { skip: !haveChrome &
   page.off("request", onReq);
   assert.deepEqual(seen, [], "trash rows show icons only");
   assert.equal(await page.$eval("main ul.list li .ficon-sm", (b) => b.dataset.type), "pdf");
+});
+
+// The previous Worker (through 4f43f26) accepted an upload whose mime is a name every object inherits and stored it as
+// is, so such a version can exist in production when this release deploys. This branch refuses those names on upload
+// and import, so the test seeds the state by SQL on a real uploaded file (synthetic bytes).
+const INHERITED = ["constructor", "toString", "valueOf", "toLocaleString", "__proto__", "hasOwnProperty"];
+const L = "ft-legacy", legacy = {};
+// Async on purpose (as list-limits.test.mjs): a synchronous child process stalls keep-alive sockets.
+const sql = async (q) => JSON.parse((await promisify(execFile)("wrangler", ["d1", "--config", LOCAL_CONFIG, "execute", "DB", "--local", "--persist-to", s.dir, "--json", "--command", q],
+  { cwd: ROOT, encoding: "utf8", maxBuffer: 16 * 1024 * 1024, env: { ...process.env, CI: "1", WRANGLER_SEND_METRICS: "false", NO_COLOR: "1" } })).stdout)[0].results;
+
+test("a stored file version whose mime is an inherited property name downloads as application/octet-stream under its title", async () => {
+  await setupProject(h, L, "Legacy types");
+  const bytes = Buffer.from("synthetic legacy file bytes\n");
+  for (const mime of INHERITED) {
+    const id = await upload(L, `Legacy ${mime}`, "application/octet-stream", bytes);
+    legacy[mime] = { id, rev: (await h.req("GET", `/api/projects/${L}/artifacts/${id}`)).body.revision.id };
+  }
+  await sql(`UPDATE revisions SET mime = CASE id ${INHERITED.map((m) => `WHEN '${legacy[m].rev}' THEN '${m}'`).join(" ")} END WHERE id IN (${INHERITED.map((m) => `'${legacy[m].rev}'`).join(", ")})`);
+  const list = await h.req("GET", `/api/projects/${L}/artifacts?include=mime`);
+  assert.deepEqual(Object.fromEntries(list.body.artifacts.map((a) => [a.title, a.mime])), Object.fromEntries(INHERITED.map((m) => [`Legacy ${m}`, m])));
+  for (const mime of INHERITED) {
+    const read = await h.req("GET", `/api/projects/${L}/artifacts/${legacy[mime].id}`);
+    assert.equal(read.body.revision.mime, mime);
+    const c = await h.req("GET", `/api/projects/${L}/artifacts/${legacy[mime].id}/content`, undefined, { binary: true });
+    assert.equal(c.status, 200, mime);
+    assert.equal(c.headers.get("content-type"), "application/octet-stream", mime);
+    assert.equal(c.headers.get("content-disposition"), `attachment; filename="Legacy ${mime}"`, mime);
+    assert.equal(sha256(c.body), sha256(bytes), mime);
+  }
+});
+
+test("such a file's type label is its stored mime, never an inherited function's text", { skip: !haveChrome && "Chrome not installed" }, async () => {
+  await page.goto(ORIGIN + "/#/p/" + L);
+  await page.waitForFunction((n) => document.querySelectorAll("main ul.list li.link").length === n, {}, INHERITED.length);
+  const rows = await page.$$eval("main ul.list li.link", (li) => li.map((x) => [x.querySelector(".grow a")?.textContent, x.querySelector(".badge")?.textContent, x.querySelector(".meta")?.textContent ?? ""]));
+  for (const mime of INHERITED) {
+    const [, badge, meta] = rows.find((r) => r[0] === `Legacy ${mime}`);
+    assert.equal(badge, mime.toLowerCase(), mime);
+    assert.ok(meta.startsWith(mime.toLowerCase() + " · "), meta);
+  }
+  assert.ok(!(await page.$eval("main", (m) => m.innerText)).includes("native code"));
+  for (const mime of INHERITED) {
+    await page.goto(ORIGIN + "/#/p/" + L + "/a/" + legacy[mime].id);
+    // Hash-only navigation: wait for this file's heading (main h1, the title) as well as an info line, so a previous file's line is never read.
+    await page.waitForFunction((t) => document.querySelector("main h1")?.textContent === t && [...document.querySelectorAll("p.muted.small")].some((p) => / · rev 1 · updated /.test(p.textContent)), {}, `Legacy ${mime}`);
+    const info = await page.$$eval("p.muted.small", (ps) => ps.map((p) => p.textContent).find((t) => / · rev 1 · updated /.test(t)));
+    assert.ok(info.startsWith(mime + " · "), info);
+  }
 });
