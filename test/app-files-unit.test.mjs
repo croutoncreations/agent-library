@@ -5,7 +5,7 @@ import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { loadWorker } from "./load-worker.mjs";
 import { ROOT } from "./helpers.mjs";
-import { mkWorld } from "./blind-tokens-world.mjs";
+import { mkWorld } from "./sqlite-world.mjs";
 
 const W = await loadWorker({
   "api/app-files.js": ["parseAppPath", "reservedAppPath", "conflictCheck", "etagMatches", "createSlotTable", "APP_FILES_SLOT_RECLAIM_MS", "APP_FILES_OVERRUN_MAX",

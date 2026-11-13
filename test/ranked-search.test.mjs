@@ -70,6 +70,28 @@ test('create/save/rename/trash/untrash/restore and bounded idempotent existing-d
  assert.equal((await search({query:'freshbridgeword'})).body.results[0].artifact_id,afterBackfill);
  const counts=(await sql('SELECT count(*) AS n,count(DISTINCT artifact_id) AS u FROM artifact_search;'))[0].results[0];assert.equal(counts.n,counts.u);
 });
+test('plaintext full-text search finds text from every write path: save, template copy, text upload and backup import',async()=>{
+ const id=await create('search-notes','Plaintext note','alpha quokkafirst beta');
+ let r=await owner.req('PUT',`/api/projects/search-notes/artifacts/${id}`,{expected_revision:1,body:'gamma wombatsecond delta'});assert.equal(r.status,200,JSON.stringify(r.body));
+ const titles=async w=>(await search({query:w})).body.results.map(x=>x.title);
+ assert.deepEqual(await titles('wombatsecond'),['Plaintext note']);
+ assert.deepEqual(await titles('quokkafirst'),[],'the replaced version is not found');
+ const tpl=await owner.req('POST','/api/projects/search-notes/templates',{source_artifact_id:id,source_revision:2,title:'Plaintext template'});assert.equal(tpl.status,201,JSON.stringify(tpl.body));
+ r=await owner.req('POST','/api/projects/search-notes/artifacts/from-template',{template_id:tpl.body.artifact_id,template_revision:1,title:'Plaintext copy'});assert.equal(r.status,201,JSON.stringify(r.body));
+ assert.ok((await titles('wombatsecond')).includes('Plaintext copy'));
+ const bytes=Buffer.from('upload words numbatthird');
+ const b=await owner.req('POST','/api/projects/search-notes/uploads',{title:'Plaintext upload',mime:'text/markdown',size:bytes.length,sha256:sha256(bytes)});assert.equal(b.status,201,JSON.stringify(b.body));
+ assert.equal((await owner.req('PUT',b.body.put_url,undefined,{raw:bytes})).status,200);
+ r=await owner.req('POST',`/api/projects/search-notes/uploads/${b.body.upload_id}/finish`,undefined);assert.equal(r.status,200,JSON.stringify(r.body));
+ assert.deepEqual(await titles('numbatthird'),['Plaintext upload']);
+ const at='2026-01-01T00:00:00.000Z',body='imported words echidnafourth';
+ const backup={schema:'agent-library-backup/1',exported_at:at,project:{id:'pbk_src',title:'Plaintext source',created_at:at},
+  artifacts:[{id:'art_src_0000',kind:'markdown',title:'Plaintext imported',folder:'',tags:'[]',head_rev:1,head_revision_id:'rev_src_0000',meta_version:1,trashed_at:null,created_at:at,updated_at:at}],
+  revisions:[{id:'rev_src_0000',artifact_id:'art_src_0000',rev_no:1,author_id:'hum_src',body,blob_key:null,size:Buffer.byteLength(body),sha256:sha256(body),mime:'text/markdown',restored_from:null,created_at:at}],comments:[],meta_versions:[],blobs:{}};
+ const ws=(await owner.req('GET','/api/workspaces')).body.workspaces.find(w=>w.personal).id;
+ r=await owner.req('POST',`/api/workspaces/${ws}/import`,backup);assert.equal(r.status,201,JSON.stringify(r.body));
+ assert.deepEqual(await titles('echidnafourth'),['Plaintext imported']);
+});
 test('literal operators, Unicode, punctuation, HTML-like text and invalid inputs',async()=>{
  await create('search-notes','Café 中文','<img src=x onerror=alert(1)> café 中文');
  assert.equal((await search({query:'CAFÉ 中文'})).body.results.length,1);

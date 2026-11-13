@@ -1,5 +1,5 @@
 // The deleted-workspace purge (packages/core/src/workspace-purge.js, docs/workspaces.md#deleting-a-workspace) against
-// the real packages/core/src bundle and every migration (node:sqlite, test/blind-tokens-world.mjs), with the real
+// the real packages/core/src bundle and every migration (node:sqlite, test/sqlite-world.mjs), with the real
 // purgeDeletingWorkspaces, purgeDueProjects and deleteWorkspace and an in-memory R2. No listener. Synthetic data only.
 // Two cases build states production can't write, on purpose and named: (g) a personal workspace marked deleting, and
 // (v) a marked workspace forced back to active by off-script SQL.
@@ -9,7 +9,7 @@ import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 import { loadWorker } from "./load-worker.mjs";
 import { ROOT } from "./helpers.mjs";
-import * as W from "./blind-tokens-world.mjs";
+import * as W from "./sqlite-world.mjs";
 
 const lib = await loadWorker({ "workspace-purge.js": ["purgeDeletingWorkspaces", "WORKSPACE_PURGE_GRACE_DAYS"], "project-deletion.js": ["purgeDueProjects"],
   "workspaces.js": ["deleteWorkspace"], "adapters.js": ["withAdapters", "defaultAdapters"] });
@@ -105,7 +105,7 @@ test("(b) 29 days: untouched; 31 days: marker set, then the projects are marked 
 });
 
 test("(c) after purgeDueProjects nothing of the workspace's projects remains in D1 string cells or R2", async () => {
-  // Scans every D1 string cell (including the unused 0032 search-token tables) and every R2 key. It does not cover BLOB
+  // Scans every D1 string cell (including every table) and every R2 key. It does not cover BLOB
   // cells or the full-text index's internal segments (artifact_search_data), which may keep word fragments until FTS5
   // merges them (docs/workspaces.md#deleting-a-workspace).
   const s = setup();

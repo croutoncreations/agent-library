@@ -1,8 +1,7 @@
 // node:sqlite with every migration applied, behind D1's prepare/bind/first/all/run/batch surface (a batch is one
-// transaction), for the blind-token tests. Counts calls (one per first/all/run/batch, like D1 round trips) and can
-// pause or intercept a call. Synthetic fixtures only; every INSERT names its columns. node:sqlite does not enforce
-// D1's limits (bound values per statement, statement size), so tests assert the design's bounds themselves.
-// It is the in-process D1 world on the real migrations.
+// transaction). Counts calls (one per first/all/run/batch, like D1 round trips) and can pause or intercept a call.
+// Synthetic fixtures only; every INSERT names its columns. node:sqlite does not enforce D1's limits (bound values per
+// statement, statement size), so tests assert the design's bounds themselves.
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -10,9 +9,6 @@ import { ROOT } from "./helpers.mjs";
 
 const MIGRATIONS = readdirSync(join(ROOT, "migrations")).filter((f) => f.endsWith(".sql")).sort();
 const AT = "2026-11-11T00:00:00.000Z";
-
-/** Token values bound in a statement: the lengths of its JSON-array bindings (?REM, ?ADD). */
-const tokenValues = (p) => p.reduce((n, v) => n + (typeof v === "string" && v.startsWith("[") ? JSON.parse(v).length : 0), 0);
 
 export function mkWorld() {
   const sql = new DatabaseSync(":memory:");
@@ -40,7 +36,7 @@ export function mkWorld() {
   });
   world.DB = {
     prepare: (q) => stmt(q),
-    batch: (list) => call("batch", { qs: list.map((s) => s.q), ps: list.map((s) => s.p), n: list.length, tokenValues: list.reduce((n, s) => n + tokenValues(s.p), 0) }, () => {
+    batch: (list) => call("batch", { qs: list.map((s) => s.q), ps: list.map((s) => s.p), n: list.length }, () => {
       sql.exec("BEGIN");
       try { const out = list.map((s) => execOne(s.q, s.p)); sql.exec("COMMIT"); return out; } catch (e) { sql.exec("ROLLBACK"); throw e; }
     }),
