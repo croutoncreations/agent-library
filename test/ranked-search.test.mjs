@@ -183,11 +183,11 @@ test('large MCP pages fit the encoded 64 KiB envelope and oversized IDs are refu
  const next=await call({query:'wirebudget',limit:50,cursor:r.structuredContent.next_cursor},1);assert.equal((await next.json()).result.isError,false);
  const bad=await call({query:'wirebudget'},'x'.repeat(1100));assert.equal((await bad.json()).id,null);
 });
-test('App Connect publication, unpublished heads, binary title-only results and live OAuth revocation',async()=>{
+test('App Connect app file, unpublished heads, binary title-only results and live OAuth revocation',async()=>{
  const app=await server.registerApp({display_name:'Search publication fixture',redirect_uris:['http://localhost:5173/callback'],origins:['http://localhost:5173']});
  const pub=await server.connectPublisher(app,{project_id:'search-notes',destination:'root'});
- const published=await server.pub(pub.access_token,'POST','/publisher/snapshots',{idem:'search-snapshot-fixture',body:{source_revision:1,files:[{name:'search-data.json',kind:'json',role:'authoritative',content:JSON.stringify({note:'publicationneedle'})}]}});
- assert.equal(published.status,201,JSON.stringify(published.json));assert.ok((await search({query:'publicationneedle',kind:'json'})).body.results.length>0);
+ const published=await fetch(`${server.api}/app/files/search-data.json`,{method:'PUT',body:JSON.stringify({note:'publicationneedle'}),headers:{authorization:`Bearer ${pub.access_token}`,'content-type':'application/json','if-none-match':'*','idempotency-key':'search-app-file-fixture'}});
+ assert.equal(published.status,201,await published.text());assert.ok((await search({query:'publicationneedle',kind:'json'})).body.results.length>0);
  const id=await create('search-notes','unpublishedneedle','unpublishedneedle');
  await sql(`UPDATE artifacts SET head_rev=0,head_revision_id=NULL WHERE id='${id}';`);
  assert.equal((await search({query:'unpublishedneedle'})).body.results.length,0);

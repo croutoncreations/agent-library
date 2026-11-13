@@ -87,9 +87,9 @@ test("App Connect publisher follows its creator's role", async () => {
   }
   pubApp = await h.registerApp({ display_name: "Synthetic Publisher", redirect_uris: ["http://127.0.0.1:5997/cb"] });
   pub = await h.connectPublisher(pubApp, { project_id: BOBP, destination: "root" });
-  assert.equal((await h.pub(pub.access_token, "GET", "/publisher/me")).status, 200);
+  assert.equal((await h.pub(pub.access_token, "GET", "/app")).status, 200);
   ok(await bob.req("PATCH", `/api/workspaces/${WS}/members/${ownerId}`, { role: "viewer" }));
-  const me = await h.pub(pub.access_token, "GET", "/publisher/me");
+  const me = await h.pub(pub.access_token, "GET", "/app");
   assert.ok(me.status === 401 || me.status === 403, `publisher must stop when its creator can no longer write (got ${me.status})`);
 });
 

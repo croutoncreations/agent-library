@@ -203,8 +203,7 @@ export async function listBlobKeys(env, prefix, limit = 100) {
 }
 
 
-// Inline compatibility codec: publisher generation copies still write inline; legacy versions and comments
-// are decoded here by getText/getTextRange.
+// Inline compatibility codec: legacy versions and comments are decoded here by getText/getTextRange.
 export function storeText(text) {
   return text;
 }

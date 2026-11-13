@@ -71,24 +71,16 @@ test("SQL never matches revision or comment body columns", () => {
   assert.deepEqual(bad, [], "inline bodies are compatibility reads, not SQL search inputs");
 });
 
-// Every new body is staged through the content store. Only publisher generation commits may still write inline:
-// staged-part SQL copies and the manifest's storeText call. The marker-codec test exercises actual reads/writes,
+// Every new body is staged through the content store. The marker-codec test exercises actual reads/writes,
 // including inline compatibility, and fails if encoded bytes are missing or leak into a response.
-test("body INSERTs use NULL revisions or empty comments, except allow-listed publisher generation copies", () => {
+test("body INSERTs use NULL revisions or empty comments", () => {
   const bad = [];
   for (const f of jsFiles(join(ROOT, "packages", "core", "src"))) {
     const text = readFileSync(f, "utf8");
     const re = /INSERT INTO (revisions|comments) \(([^)]*)\)/g;
     for (let m; (m = re.exec(text));) {
       if (!/\bbody\b/.test(m[2])) continue;
-      const before = text.slice(Math.max(0, m.index - 300), m.index), after = text.slice(m.index, m.index + 1500);
-      const bind = after.slice(after.indexOf(".bind("), after.indexOf(".bind(") + 600);
-      if (m[1] === "revisions") {
-        const sql = after.slice(0, after.indexOf(".bind("));
-        const generationCommit = f.endsWith("/api/publisher.js") && text.lastIndexOf("async function commit(", m.index) > text.lastIndexOf("async function commitSnapshot(", m.index);
-        if (generationCommit && /content-store: sql-side/.test(before) && /t\.body, t\.bytes, t\.sha256/.test(sql)) continue;
-        if (generationCommit && /storeText\(manifestText\)/.test(bind)) continue;
-      }
+      const after = text.slice(m.index, m.index + 1500);
       const sql = after.slice(0, after.indexOf(".bind("));
       const bodyIndex = m[2].split(",").map(c => c.trim()).indexOf("body");
       const values = sql.slice(sql.indexOf(")") + 1).match(/(?:SELECT|VALUES\s*\()\s*([\s\S]*?)(?:\bWHERE\b|\)\s*[`"])/i)?.[1].split(",").map(v => v.trim());
@@ -96,7 +88,7 @@ test("body INSERTs use NULL revisions or empty comments, except allow-listed pub
       bad.push(`${f.slice(ROOT.length + 1)}:${text.slice(0, m.index).split("\n").length}`);
     }
   }
-  assert.deepEqual(bad, [], "text-body INSERT outside the explicit inline generation allow-list");
+  assert.deepEqual(bad, [], "text-body INSERT with a body in the row");
 });
 test("main JS text and comment paths go through the content store (marker codec)", async () => {
   const { loadWorker } = await import("./load-worker.mjs");

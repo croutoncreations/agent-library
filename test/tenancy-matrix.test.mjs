@@ -129,7 +129,7 @@ test("own workspace: every read surface works for every credential type", async 
     const r = await op();
     assert.equal(r.status, 200, `oauth ${label} on own workspace: ${r.text.slice(0, 200)}`);
   }
-  assert.equal((await h.pub(cred.pub.access_token, "GET", "/publisher/me")).status, 200);
+  assert.equal((await h.pub(cred.pub.access_token, "GET", "/app")).status, 200);
 });
 
 test("other workspace: every read surface is 404 for every credential type, and nothing leaks", async () => {
@@ -338,7 +338,7 @@ test("management: members get 403, outsiders 404; a chosen project id is refused
   assert.equal((await dave.req("GET", "/api/app-clients")).body.other_publishers.some((p) => p.publisher_id === pubA.publisher_id), false);
   assert.equal((await dave.req("POST", `/api/publishers/${pubA.publisher_id}/revoke`)).status, 404);
   ok(await bob.req("POST", `/api/publishers/${pubA.publisher_id}/revoke`));
-  assert.equal((await h.pub(pubA.access_token, "GET", "/publisher/me")).status, 401);
+  assert.equal((await h.pub(pubA.access_token, "GET", "/app")).status, 401);
   // The owner's own app listing shows only publishers whose project they can see (the B one, and A while member).
   ok(await bob.req("DELETE", `/api/workspaces/${WSA}/members/${ownerId}`));
   const mineAfter = ok(await owner.req("GET", "/api/app-clients")).app_clients.flatMap((c) => c.publishers);

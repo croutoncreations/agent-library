@@ -88,28 +88,25 @@ test("legacy grant SDK: read-only effective access, revocation and no arbitrary 
 test("publisher: only its own destination, no project browser or credential details", async () => {
   const app = await h.registerApp({ display_name: "Synthetic publisher", redirect_uris: ["http://localhost:5173/cb"], origins: [] });
   const pub = await h.connectPublisher(app, { project_id: "diag-b", destination: "new", new_folder_name: "Diagnostic exports" });
-  const r = await h.pub(pub.access_token, "GET", "/publisher/connection-info");
+  const r = await h.pub(pub.access_token, "GET", "/app/connection-info");
   assert.equal(r.status, 200); safe(r.json, pub.access_token);
   assert.equal(r.json.connection.id, pub.publisher_id); assert.deepEqual(r.json.projects, []);
   assert.equal(r.json.destination.project_id, "diag-b"); assert.equal(r.json.destination.can_read_own_files, true);
   assert.match(r.json.restrictions.join(" "), /no general project browsing/);
   assert.equal((await h.pub(pub.access_token, "GET", "/connection-info")).status, 401);
-  assert.equal((await h.pub(pub.access_token, "GET", "/publisher/connection-info?connection_id=other")).status, 400);
+  assert.equal((await h.pub(pub.access_token, "GET", "/app/connection-info?connection_id=other")).status, 400);
 });
 
 test("publisher diagnostic of a disabled app: connection-info and writes answer 401 with the disabled message", async () => {
   const disabledApp = await h.registerApp({ display_name: "Disabled diagnostic publisher", redirect_uris: ["http://localhost:5174/cb"], origins: [] });
   const connection = await h.connectPublisher(disabledApp, { project_id: "diag-b", destination: "root" });
   const token = connection.access_token;
-  assert.equal((await h.pub(token, "GET", "/publisher/connection-info")).json.destination.can_write_own_files, true);
+  assert.equal((await h.pub(token, "GET", "/app/connection-info")).json.destination.can_write_own_files, true);
   assert.equal((await owner.req("POST", `/api/app-clients/${disabledApp.app_client_id}/disable`, {})).status, 200);
-  const r = await h.pub(token, "GET", "/publisher/connection-info");
+  const r = await h.pub(token, "GET", "/app/connection-info");
   assert.equal(r.status, 401); assert.equal(r.json.error.code, "unauthenticated");
   assert.equal(r.json.error.message, "This app has been disabled by the owner of this library");
-  const w = await h.pub(token, "POST", "/publisher/generations", { idem: key("disabled"), body: {
-    generation_id: "g_diagnostic_disabled", source_revision: 1, expected_current_snapshot_id: null,
-    root_name: "root.json", root_sha256: "a".repeat(64), part_count: 1, total_bytes: 16
-  } });
+  const w = await h.pub(token, "PUT", "/app/files/a.md", { idem: key("disabled"), headers: { "content-type": "text/markdown", "if-none-match": "*", "content-length": "0" } });
   assert.equal(w.status, 401); assert.equal(w.json.error.message, "This app has been disabled by the owner of this library");
 });
 
@@ -118,15 +115,12 @@ test("publisher diagnostic follows the actual write gate for missing or foreign 
   const publisherApp = await h.registerApp({ display_name: "Write gate publisher", redirect_uris: ["http://localhost:5174/cb"], origins: [] });
   const publisherConnection = await h.connectPublisher(publisherApp, { project_id: "diag-b", destination: "new", new_folder_name: "Write gate exports" });
   const token = publisherConnection.access_token;
-  const info = () => h.pub(token, "GET", "/publisher/connection-info");
+  const info = () => h.pub(token, "GET", "/app/connection-info");
   const initial = await info();
   assert.equal(initial.json.destination.can_write_own_files, true);
   const folder = initial.json.destination.folder_id;
   assert.ok(folder);
-  const write = () => h.pub(token, "POST", "/publisher/generations", { idem: key("blocked"), body: {
-    generation_id: "g_diagnostic", source_revision: 1, expected_current_snapshot_id: null,
-    root_name: "root.json", root_sha256: "a".repeat(64), part_count: 1, total_bytes: 16
-  } });
+  const write = () => h.pub(token, "PUT", "/app/files/a.md", { idem: key("blocked"), headers: { "content-type": "text/markdown", "if-none-match": "*", "content-length": "0" } });
   const blocked = async (reason, status) => {
     const r = await info(); assert.equal(r.status, 200); safe(r.json, token);
     assert.equal(r.json.destination.can_read_own_files, true);
@@ -190,7 +184,7 @@ test("real owner UI: matching safe ID and copy output, configured setup URL, exi
     assert.ok(cards.every((c) => typeof c.connection.id === "string" && c.connection.id.length > 0));
     if (tab === "api-keys") assert.ok(cards.every((c) => c.check.includes("GET /v1/connection-info")));
     if (tab === "publishing") {
-      assert.ok(cards.every((c) => c.check.includes("GET /v1/publisher/connection-info")));
+      assert.ok(cards.every((c) => c.check.includes("GET /v1/app/connection-info")));
       const pub = (await owner.req("GET", "/api/app-clients")).body.app_clients[0].publishers[0];
       assert.ok(cards.some((c) => c.connection.id === pub.publisher_id));
       assert.equal(cards.find((c) => c.connection.id === disabledPub.publisher_id).status, "disabled");

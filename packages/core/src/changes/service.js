@@ -1,7 +1,7 @@
 import { authorizeProject } from "../auth.js";
 import { appOrigin, artifactWebUrl } from "../links.js";
 import { appConnectEnabled, rtReadAuthzSql } from "../service.js";
-import { HttpError, nowMs, sha256Hex } from "../util.js";
+import { HttpError, nowMs } from "../util.js";
 
 // Durable project polling. D1 primary reads + one batch snapshot for auth, boundary and events.
 // No replica sessions: a cursor never advances past uncommitted sequence allocation.

@@ -52,7 +52,7 @@ test("owner /api: no json/csv create, no folders/records/app-clients, spreadshee
 });
 
 test("/v1: records/folders/publisher are 404 before auth; Phase 1 file shape", async () => {
-  for (const p of [`/projects/off-test/files/${aid}/records`, "/projects/off-test/folders", "/publisher/me", "/publisher/snapshots"]) {
+  for (const p of [`/projects/off-test/files/${aid}/records`, "/projects/off-test/folders", "/app", "/app/files"]) {
     const r = await v1("GET", p, { token: null });
     assert.equal(r.status, 404, p);
   }

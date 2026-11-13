@@ -11,7 +11,6 @@ import { promisify } from "node:util";
 import { join } from "node:path";
 import { readdirSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
-import { createHash } from "node:crypto";
 import { key, sha256, mcpClient, LOCAL_CONFIG, ROOT } from "./helpers.mjs";
 import { SERVER_PORTS } from "./ports.mjs";
 import { makePng } from "./make-fixtures.mjs";
@@ -32,22 +31,11 @@ async function http(base, token, method, path, body) {
   const r = await fetch(base + path, { method, headers: hd, body: body === undefined ? undefined : JSON.stringify(body) });
   return { status: r.status, text: await r.text() };
 }
-const sha = (s) => createHash("sha256").update(s).digest("hex");
-// A publisher commits one generation (two JSON parts) into the project, so the purge has generations and a snapshot.
-async function publishGeneration(pub) {
-  const gid = "g_pd", data = JSON.stringify({ format: "agentlib.generation.part/1", generation_id: gid, source_revision: 1, records: [{ synthetic: true }] });
-  const root = JSON.stringify({ format: "agentlib.generation.index/1", generation_id: gid, source_revision: 1,
-    entries: [{ name: "part.json", sha256: sha(data), bytes: Buffer.byteLength(data), kind: "synthetic", count: 1, file: "part.json", utf8_bytes: Buffer.byteLength(data) }] });
-  const base = "/publisher/generations";
-  let x = await h.pub(pub.access_token, "POST", base, { body: { generation_id: gid, source_revision: 1, expected_current_snapshot_id: null, root_name: "root.json",
-    root_sha256: sha(root), part_count: 2, total_bytes: Buffer.byteLength(data) + Buffer.byteLength(root) }, idem: key() });
-  assert.equal(x.status, 201, JSON.stringify(x.json));
-  for (const [name, content] of [["part.json", data], ["root.json", root]]) {
-    x = await h.pub(pub.access_token, "PUT", `${base}/${gid}/parts/${name}`, { body: { content, sha256: sha(content), bytes: Buffer.byteLength(content) } });
-    assert.ok([200, 201].includes(x.status), JSON.stringify(x.json));
-  }
-  x = await h.pub(pub.access_token, "POST", `${base}/${gid}/commit`, { body: {}, idem: key() });
-  assert.equal(x.status, 201, JSON.stringify(x.json));
+// A publisher writes one app file into the project, so the purge has an app-owned row to remove.
+async function publishFile(pub) {
+  const r = await fetch(`${h.api}/app/files/data.json`, { method: "PUT", body: "{}",
+    headers: { authorization: `Bearer ${pub.access_token}`, "content-type": "application/json", "if-none-match": "*", "idempotency-key": key("pd") } });
+  assert.equal(r.status, 201, await r.text());
 }
 // MCP tool errors carry the HTTP-like status and code; a refusal must be a real not_found/forbidden, not a crash.
 const toolCode = (r) => r.data?.error?.code ?? r.data?.code ?? null;
@@ -59,7 +47,7 @@ const reach = {
   key: (p, d) => http(h.issuer, cred.key, "GET", `/v1/projects/${p}/files/${d}`).then((r) => r.status),
   grant: (p, d) => http(h.appUi, cred.grant, "GET", `/api/projects/${p}/artifacts/${d}`).then((r) => r.status),
   oauth: async (p, d) => { const r = await cred.oauth.call("read_artifact", { project_id: p, artifact_id: d }); const s = toolStatus(r); return s === 200 ? 200 : `${s}:${toolCode(r)}`; },
-  publisher: async () => (await h.pub(cred.pub.access_token, "GET", "/publisher/me")).status,
+  publisher: async () => (await h.pub(cred.pub.access_token, "GET", "/app")).status,
   // The SDK client throws when the server refuses the token itself (401 at the transport).
   grantMcp: async (p, d) => { try { return toolStatus(await cred.grantMcp.call("read_artifact", { project_id: p, artifact_id: d })); } catch (e) { return /401|-32001/.test(String(e.message)) ? 401 : 500; } },
 };
@@ -90,8 +78,7 @@ before(async () => {
   cred.oauth = await h.connectMcpAgent({ [P.id]: "write" }, { clientName: "PD agent" });
   cred.app = await h.registerApp({ display_name: "PD Publisher", redirect_uris: ["http://127.0.0.1:5995/cb"] });
   cred.pub = await h.connectPublisher(cred.app, { project_id: P.id, destination: "root" });
-  await publishGeneration(cred.pub);
-  assert.ok(await n(`SELECT COUNT(*) AS n FROM snapshots WHERE publisher_id = '${cred.pub.publisher_id}'`) >= 1);
+  await publishFile(cred.pub);
 });
 after(async () => { await cred.grantMcp?.close(); await h?.stop(); });
 
@@ -143,8 +130,8 @@ test("delete: closed to everyone at once (same 404 as unknown), frees the limit 
 
 test("recently deleted: admins see it with its purge date; members don't", async () => {
   const l = ok(await bob.req("GET", `/api/workspaces/${WS}/deleted-projects`));
-  // 2 documents plus the publisher's 3 generation files (2 parts and its manifest).
-  assert.deepEqual(l.projects.map((p) => [p.id, p.title, p.items, p.deleted_by]), [[P.id, "Old Notes", 5, "Bob"]]);
+  // 2 documents plus the publisher's one app file.
+  assert.deepEqual(l.projects.map((p) => [p.id, p.title, p.items, p.deleted_by]), [[P.id, "Old Notes", 3, "Bob"]]);
   assert.equal((await carol.req("GET", `/api/workspaces/${WS}/deleted-projects`)).status, 403);
 });
 
@@ -199,10 +186,8 @@ test("delete permanently: rows and R2 files are removed, a tombstone stays, cred
   await sql(`INSERT INTO view_links (token_hash, session_hash, principal_id, project_id, artifact_id, rev_no, purpose, expires_at, created_at) VALUES ('vlh_pd', 's', 'p', '${P.id}', 'art_x', 1, 'render', ${Date.now() + 864e5}, 'now')`);
   ok(await bob.req("POST", `/api/projects/${P.id}/purge`, { confirm_title: "Old Notes" }));
   for (const t of ["artifacts", "revisions", "comments", "meta_versions", "uploads", "project_changes", "folders", "idempotency", "transfer_links", "view_links",
-    "project_members", "project_change_state", "change_scope_epochs", "publisher_generations"])
+    "project_members", "project_change_state", "change_scope_epochs"])
     assert.equal(await n(`SELECT COUNT(*) AS n FROM ${t} WHERE project_id = '${P.id}'`), 0, `${t} purged`);
-  assert.equal(await n(`SELECT COUNT(*) AS n FROM snapshots WHERE publisher_id = '${cred.pub.publisher_id}'`), 0, "snapshots purged");
-  assert.equal(await n(`SELECT COUNT(*) AS n FROM publisher_generation_parts WHERE publisher_id = '${cred.pub.publisher_id}'`), 0, "generation parts purged");
   // Credentials whose only project this was are revoked (they'd otherwise hold an agents slot forever).
   assert.equal(await n(`SELECT COUNT(*) AS n FROM publishers WHERE id = '${cred.pub.publisher_id}' AND revoked_at IS NOT NULL`), 1);
   assert.equal(await n(`SELECT COUNT(*) AS n FROM api_credential_projects acp JOIN api_credentials k ON k.id = acp.credential_id WHERE acp.project_id = '${P.id}' AND k.revoked_at IS NULL`), 0);

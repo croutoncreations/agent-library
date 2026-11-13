@@ -386,7 +386,7 @@ test("binary creation only at upload_finish; abandoned/rejected uploads produce 
   });
   assert.equal(visible.data.changes.length, 1);
 });
-test("App Connect staged generations stay invisible; atomic commit emits each artifact once; publishers excluded", async () => {
+test("an App Connect file write emits one change; the publisher token cannot read the feed", async () => {
   const cp = await poll();
   const app = await h.registerApp({
     display_name: "Synthetic publisher",
@@ -402,84 +402,23 @@ test("App Connect staged generations stay invisible; atomic commit emits each ar
       .status,
     401,
   );
-  const gid = "g_feed";
-  const data = JSON.stringify({
-    format: "agentlib.generation.part/1",
-    generation_id: gid,
-    source_revision: 1,
-    records: [{ synthetic: true }],
-  });
-  const root = JSON.stringify({
-    format: "agentlib.generation.index/1",
-    generation_id: gid,
-    source_revision: 1,
-    entries: [
-      {
-        name: "part.json",
-        sha256: sha(data),
-        bytes: Buffer.byteLength(data),
-        kind: "synthetic",
-        count: 1,
-        file: "part.json",
-        utf8_bytes: Buffer.byteLength(data),
+  const put = (body, etag) =>
+    fetch(h.api + "/app/files/feed.json", {
+      method: "PUT",
+      body,
+      headers: {
+        authorization: "Bearer " + pub.access_token,
+        "content-type": "application/json",
+        "idempotency-key": key(),
+        ...(etag ? { "if-match": etag } : { "if-none-match": "*" }),
       },
-    ],
-  });
-  const b = {
-    generation_id: gid,
-    source_revision: 1,
-    expected_current_snapshot_id: null,
-    root_name: "root.json",
-    root_sha256: sha(root),
-    part_count: 2,
-    total_bytes: Buffer.byteLength(data) + Buffer.byteLength(root),
-  };
-  const base = "/publisher/generations";
-  let r = await h.pub(pub.access_token, "POST", base, { body: b, idem: key() });
-  assert.equal(r.status, 201, JSON.stringify(r.json));
-  for (const [name, content] of [
-    ["part.json", data],
-    ["root.json", root],
-  ]) {
-    r = await h.pub(
-      pub.access_token,
-      "PUT",
-      base + "/" + gid + "/parts/" + name,
-      {
-        body: {
-          content,
-          sha256: sha(content),
-          bytes: Buffer.byteLength(content),
-        },
-      },
-    );
-    assert.ok([200, 201].includes(r.status), JSON.stringify(r.json));
-  }
-  assert.deepEqual((await poll(cp.next_cursor)).changes, []);
-  r = await h.pub(pub.access_token, "POST", base + "/" + gid + "/commit", {
-    body: {},
-    idem: key(),
-  });
-  assert.equal(r.status, 201, JSON.stringify(r.json));
-  assert.equal((await poll(cp.next_cursor)).changes.length, 3);
-  r = await h.pub(pub.access_token, "POST", base + "/" + gid + "/commit", {
-    body: {},
-    idem: key(),
-  });
-  assert.equal(r.status, 200, JSON.stringify(r.json));
-  assert.equal((await poll(cp.next_cursor)).changes.length, 3);
-  const tracked = await poll();
-  await sql("UPDATE change_generation_coverage SET snapshot_id=NULL");
-  const gap = await o.req(
-    "GET",
-    path + "/changes?cursor=" + encodeURIComponent(tracked.next_cursor),
-  );
-  assert.equal(gap.status, 409);
-  assert.equal(gap.body.error.code, "cursor_scope_changed");
-  assert.equal((await poll()).initialized, true);
-  await sql(
-    "UPDATE change_generation_coverage SET snapshot_id=(SELECT current_snapshot_id FROM publishers WHERE id=publisher_id)",
-  );
+    });
+  const created = await put('{"n":1}');
+  assert.equal(created.status, 201);
+  assert.equal((await poll(cp.next_cursor)).changes.length, 1);
+  const replaced = await put('{"n":2}', (await created.json()).file.etag);
+  assert.equal(replaced.status, 200);
+  assert.equal((await poll(cp.next_cursor)).changes.length, 2);
 });
 test("large escaped labels paginate within the full encoded MCP response budget", async () => {
   const gg = await grant(o, P, "Response budget reader", false);

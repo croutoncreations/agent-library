@@ -202,7 +202,7 @@ export async function startAppConnectServer({ port, oidcPort = port + OIDC_OFFSE
       if (!a.code) throw new Error(`connectPublisher: no code (${a.error ?? a.error_param}) ${(a.html ?? "").replace(/<[^>]+>/g, " ").slice(0, 300)}`);
       const t = await h.token({ grant_type: "authorization_code", code: a.code, redirect_uri: a.redirect_uri, client_id: app.client_id, code_verifier: a.verifier, resource: h.resource });
       if (t.status !== 200) throw new Error(`token ${t.status} ${JSON.stringify(t.body)}`);
-      const me = await h.pub(t.body.access_token, "GET", "/publisher/me");
+      const me = await h.pub(t.body.access_token, "GET", "/app");
       return { publisher_id: me.json?.publisher_id, access_token: t.body.access_token, refresh_token: t.body.refresh_token, iss: a.iss, state: a.state, sentState: a.sentState, token: t.body };
     },
     /** Call the publisher API. */
