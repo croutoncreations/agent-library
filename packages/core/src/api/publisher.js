@@ -6,7 +6,7 @@ import { appOrigin, artifactWebUrl, previewWebUrl } from "../links.js";
 import { addressLinksResponse } from "../paths.js";
 import { explainLimit, projectLimitGuard, projectWorkspaceId } from "../limits.js";
 import { SCOPES, livePublisher } from "../oauth/server.js";
-import { appFilesDrainsInUse, appFilesSlotsInUse, baseParams, baseSql, firstCaseTwin, isAppFileContentPath, isAppFilesPath, newNameConflictRows, newNameConflictSql, pathConflictAt, routeAppFiles } from "./app-files.js";
+import { appFilesDrainsInUse, appFilesSlotsInUse, baseParams, baseSql, firstCaseTwin, generationConflict, generationNameConflictRows, generationNameConflictSql, isAppFileContentPath, isAppFilesPath, newNameConflictRows, newNameConflictSql, pathConflictAt, routeAppFiles } from "./app-files.js";
 import { LIMITS, connectionInfo, idemLookup } from "../service.js";
 import { memberRoleSql, readOnlyError } from "../tenancy.js";
 import { HttpError, errorBody, idemKey, int, json, nowIso, randomId, sha256Hex, str } from "../util.js";
@@ -45,6 +45,7 @@ var bad = (message) => {
 var conflict = (message, extra) => {
   throw new HttpError(409, "generation_conflict", message, extra);
 };
+var MANIFEST_NAME_TAKEN = "The generation's manifest name already exists as a file of this publisher";
 var invalidClosure = (detail, file) => {
   throw new HttpError(422, "invalid_content", `Invalid generation: ${detail}`, { format: "schema", detail, ...file ? { file } : {} });
 };
@@ -133,6 +134,8 @@ function beginFields(b) {
   if (!ok)
     bad("Invalid generation bounds/identity");
   if (b.root_name === manifestName(b.generation_id))
+    bad("root_name is reserved");
+  if (b.root_name.toLowerCase() === MANIFEST)
     bad("root_name is reserved");
   const exp = b.expected_current_snapshot_id;
   if (exp !== null && (typeof exp !== "string" || !/^snp_[A-Za-z0-9_-]{1,64}$/.test(exp)))
@@ -240,6 +243,8 @@ async function begin(env, p, req) {
 async function put(env, p, id, name, req) {
   if (!NAME.test(name))
     bad("Invalid part name");
+  if (name.toLowerCase() === MANIFEST)
+    bad("Part name is reserved for the server manifest");
   if (name === manifestName(id))
     bad("Part name is reserved for the server manifest");
   const h = hooks(env, req);
@@ -423,6 +428,7 @@ async function commit(env, p, id, req, requestId) {
   const idsJson = JSON.stringify(ids);
   const gate = "EXISTS (SELECT 1 FROM publishers WHERE id = ? AND current_snapshot_id = ?)";
   const gp = [p.id, sid];
+  const nameRule = generationNameConflictSql(p.id, id, mName);
   const q = [];
   q.push(env.DB.prepare(`UPDATE publishers SET current_snapshot_id = ?, current_source_revision = ?
   WHERE id = ? AND token_epoch = ? AND revoked_at IS NULL AND EXISTS (SELECT 1 FROM app_clients c WHERE c.id=publishers.app_client_id AND c.disabled_at IS NULL) AND (folder_id IS NULL OR EXISTS (SELECT 1 FROM folders f WHERE f.id=publishers.folder_id AND f.project_id=publishers.project_id)) AND project_id = ? AND folder_id IS ? AND current_snapshot_id IS ?
@@ -430,8 +436,7 @@ async function commit(env, p, id, req, requestId) {
     AND EXISTS (SELECT 1 FROM publisher_generations WHERE publisher_id = ? AND id = ? AND state = 'staged' AND expires_at >= ? AND project_id = ? AND folder_id IS ?)
     AND (SELECT COUNT(*) FROM publisher_generation_parts WHERE publisher_id = ? AND generation_id = ? AND artifact_id IS NULL) = ?
     AND ${RETAINED_PARTS} <= ? AND ${RETAINED_BYTES} + ? <= ?
-    AND NOT EXISTS (SELECT 1 FROM publisher_generation_parts t JOIN artifacts a ON a.publisher_id = ? AND a.export_name = t.name WHERE t.publisher_id = ? AND t.generation_id = ?)
-    AND NOT EXISTS (SELECT 1 FROM artifacts WHERE publisher_id = ? AND export_name = ?)`).bind(sid, g.source_revision, p.id, p.token_epoch, p.project_id, p.folder_id ?? null, g.expected_current_snapshot_id, g.source_revision, ...az.params, p.id, id, h.now, p.project_id, p.folder_id ?? null, p.id, id, parts.length, p.id, p.id, h.maxRetainedParts, p.id, p.id, mSize, h.maxRetainedBytes, p.id, p.id, id, p.id, mName));
+    AND ${nameRule.sql}`).bind(sid, g.source_revision, p.id, p.token_epoch, p.project_id, p.folder_id ?? null, g.expected_current_snapshot_id, g.source_revision, ...az.params, p.id, id, h.now, p.project_id, p.folder_id ?? null, p.id, id, parts.length, p.id, p.id, h.maxRetainedParts, p.id, p.id, mSize, h.maxRetainedBytes, ...nameRule.params));
   q.push(env.DB.prepare(`INSERT INTO artifacts (id, project_id, kind, title, folder, folder_id, schema_id, publisher_id, export_name, generation_id, head_rev, head_revision_id, created_at, updated_at)
   SELECT json_extract(j.value, '$.a'), ?, 'json', t.name, '', ?, NULL, ?, t.name, ?, 1, json_extract(j.value, '$.r'), ?, ?
   FROM json_each(?) j JOIN publisher_generation_parts t ON t.publisher_id = ? AND t.generation_id = ? AND t.name = j.key WHERE ${gate}`).bind(p.project_id, p.folder_id ?? null, p.id, id, now, now, idsJson, p.id, id, ...gp));
@@ -491,9 +496,18 @@ async function commit(env, p, id, req, requestId) {
       throw new HttpError(401, "unauthenticated", "Publisher revoked or token superseded; nothing was written");
     if ((pub.current_snapshot_id ?? null) !== (g.expected_current_snapshot_id ?? null) || pub.current_source_revision !== null && pub.current_source_revision >= g.source_revision)
       throw new HttpError(409, "stale_generation", "Current snapshot changed since this generation began; nothing was written", { current_snapshot_id: pub.current_snapshot_id ?? null, current_source_revision: pub.current_source_revision ?? null, expected_current_snapshot_id: g.expected_current_snapshot_id });
-    const clash = await env.DB.prepare(`SELECT a.export_name FROM publisher_generation_parts t JOIN artifacts a ON a.publisher_id = ? AND a.export_name = t.name WHERE t.publisher_id = ? AND t.generation_id = ? LIMIT 1`).bind(p.id, p.id, id).first("export_name");
+    const clash = await env.DB.prepare(`SELECT a.export_name FROM publisher_generation_parts t JOIN artifacts a ON a.publisher_id = ? AND a.export_name = t.name
+      WHERE t.publisher_id = ? AND t.generation_id = ? ORDER BY t.name LIMIT 1`).bind(p.id, p.id, id).first("export_name");
     if (clash)
       conflict("A part name already exists as a file of this publisher", { name: clash });
+    const mClash = await env.DB.prepare("SELECT 1 AS hit FROM artifacts WHERE publisher_id = ? AND export_name = ? LIMIT 1").bind(p.id, mName).first("hit");
+    if (mClash)
+      conflict(MANIFEST_NAME_TAKEN, { name: mName });
+    if (again?.state === "staged") {
+      const nameRows = generationNameConflictRows(p.id, id, mName);
+      const found = generationConflict(parts.map((x) => x.name), (await env.DB.prepare(nameRows.sql).bind(...nameRows.params).first()) ?? null);
+      if (found) throw pathConflictAt(found.name, found.conflicts_with);
+    }
     throw new HttpError(413, "quota_exceeded", "Retained generation quota exceeded or generation changed; nothing was written", { max_retained_bytes: h.maxRetainedBytes, max_retained_parts: h.maxRetainedParts });
   }
   const expect = [1, parts.length, parts.length, 1, 1, parts.length, 1, 1, 1];

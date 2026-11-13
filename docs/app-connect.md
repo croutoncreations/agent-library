@@ -154,6 +154,8 @@ These never go down: deleting a file does not give them back. They are separate 
 
 Names follow one rule for the whole app, across App Files, snapshots and generations: no two names that differ only by case, and no file where a folder is needed (`409 path_conflict`, with `name` and `conflicts_with`). Names an app already has are kept. `manifest.json` is reserved in any case. Snapshot and generation commits need migration 0034 applied before the Worker that enforces this.
 
+A generation commit answers `409 path_conflict` for a part or manifest name that breaks this rule. A part with exactly the name of an existing file still answers `409 generation_conflict`. Generation ids that differ only by case (`g_A`, `g_a`) produce manifest names that differ only by case, so the second one to commit is refused.
+
 ### What a disabled app can do
 
 When you disable an app, every connection it has stops at once: reads and writes fail with `401` ("This app has been disabled by the owner of this library"), including a write already in progress, and token renewal is refused. A read that has already started finishes. The app's next token renewal ends that connection for good, so disabling cannot be undone; register the app again if you need it back. New connections are refused.

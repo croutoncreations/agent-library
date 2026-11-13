@@ -1774,3 +1774,65 @@ test("snapshot refusals of an app holding more than 32 generation part files are
   pathConflictPair(r, "Twin.json", "twin.json");
   assert.equal(currentRevision(c.P.publisher_id), 3);
 });
+
+/** Begin and upload every part of `g` (staged; not committed). */
+async function stageOnly(tok, g) {
+  const gid = g.begin.generation_id;
+  ok(await h.pub(tok, "POST", "/publisher/generations", { body: g.begin, idem: uniq("begin-key") }), 201);
+  for (const f of g.files) ok(await h.pub(tok, "PUT", `/publisher/generations/${gid}/parts/${f.name}`, { body: { content: f.content, sha256: sha(f.content) } }), 201);
+}
+const commitGeneration = (tok, gid) => h.pub(tok, "POST", `/publisher/generations/${gid}/commit`, { body: {}, idem: uniq("commit-key") });
+/** A refused commit wrote nothing: the generation is still staged and none of its parts became a file. */
+const nothingMaterialized = (pubId, gid) => {
+  assert.equal(genState(gid), "staged", gid);
+  assert.equal(sql(`SELECT COUNT(*) AS n FROM artifacts WHERE publisher_id = '${pubId}' AND generation_id = '${gid}'`)[0].n, 0, gid);
+  assert.equal(sql(`SELECT COUNT(*) AS n FROM publisher_generation_parts WHERE publisher_id = '${pubId}' AND generation_id = '${gid}' AND artifact_id IS NOT NULL`)[0].n, 0, gid);
+};
+
+// Addendum B, D 16.
+test("generation commit: new cases → path_conflict; exact name → generation_conflict as before; exact manifest name → generation_conflict N-B2", async () => {
+  // (a) A part twins an App Files file.
+  const a = await connect("files-own");
+  ok(await put(a.tok, "data.json", "{}", { create: true }), 201);
+  await stageOnly(a.tok, generationOf("g_a", 1, null, ["Data.json"]));
+  pathConflictPair(await commitGeneration(a.tok, "g_a"), "Data.json", "data.json");
+  nothingMaterialized(a.P.publisher_id, "g_a");
+  // (b) A part exactly equals an App Files file: today's answer.
+  const b = await connect("files-own");
+  ok(await put(b.tok, "exact.json", "{}", { create: true }), 201);
+  await stageOnly(b.tok, generationOf("g_b", 1, null, ["exact.json"]));
+  const rb = await commitGeneration(b.tok, "g_b");
+  err(rb, 409, "generation_conflict", "A part name already exists as a file of this publisher"); assert.equal(rb.json.error.name, "exact.json");
+  nothingMaterialized(b.P.publisher_id, "g_b");
+  // (c) Two parts of one generation differing only by case.
+  const c = await connect("files-own");
+  await stageOnly(c.tok, generationOf("g_c", 1, null, ["a.json", "A.json"]));
+  pathConflictPair(await commitGeneration(c.tok, "g_c"), "a.json", "A.json");
+  nothingMaterialized(c.P.publisher_id, "g_c");
+  // (d) Generation ids differing only by case: their manifest names twin each other.
+  const d = await connect("files-own");
+  const first = await stageAndCommit(d.tok, generationOf("g_Case", 1, null, ["case-one.json"], "case-one-root.json"));
+  assert.equal(first.status, 201, first.text);
+  await stageOnly(d.tok, generationOf("g_case", 2, first.json.snapshot.snapshot_id, ["case-two.json"], "case-two-root.json"));
+  pathConflictPair(await commitGeneration(d.tok, "g_case"), "g_case.manifest.json", "g_Case.manifest.json");
+  nothingMaterialized(d.P.publisher_id, "g_case");
+  // (e) The manifest name exactly equals an App Files file (was 413 quota_exceeded).
+  const e = await connect("files-own");
+  ok(await put(e.tok, "g_mx.manifest.json", "{}", { create: true }), 201);
+  await stageOnly(e.tok, generationOf("g_mx", 1, null, ["mx.json"]));
+  const re = await commitGeneration(e.tok, "g_mx");
+  err(re, 409, "generation_conflict", "The generation's manifest name already exists as a file of this publisher"); assert.equal(re.json.error.name, "g_mx.manifest.json");
+  nothingMaterialized(e.P.publisher_id, "g_mx");
+});
+
+// Addendum B, S2-3.
+test("manifest.json is reserved in any case for generation part and root names", async () => {
+  const c = await connect("files-own");
+  err(await h.pub(c.tok, "POST", "/publisher/generations", { body: { ...beginBody("g_root"), root_name: "MANIFEST.JSON" }, idem: uniq("begin-key") }), 400, "invalid_input", "root_name is reserved");
+  const g = generationOf("g_res", 1, null, ["sub-manifest.json"]);
+  ok(await h.pub(c.tok, "POST", "/publisher/generations", { body: g.begin, idem: uniq("begin-key") }), 201);
+  const part = (name, content) => h.pub(c.tok, "PUT", `/publisher/generations/g_res/parts/${name}`, { body: { content, sha256: sha(content) } });
+  const bad = JSON.stringify({ format: "agentlib.generation.part/1", generation_id: "g_res", source_revision: 1 });
+  err(await part("Manifest.json", bad), 400, "invalid_input", "Part name is reserved for the server manifest");
+  ok(await part(g.files[0].name, g.files[0].content), 201);
+});
