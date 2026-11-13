@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Loading lists (Home, Projects, a project's documents and trash) no longer show a clipped "Lc" sliver above the placeholders. The hidden "Loading…" text for screen readers was its own list row and lost to the list row styles. The placeholders now look like real rows (icon tile, title and details) with a staggered pulse, which stops when reduced motion is on.
+- Sign out now ends the session on the server even when the page's request token is out of date (a session renewal was in flight, or another tab had renewed the session). Before, on installations behind Cloudflare Access, the app could show "Signed out" while the session stayed valid on the server until it expired; using it still needed a valid Cloudflare Access sign-in.
 
 ## 0.1.0 (2026-10-28)
 
