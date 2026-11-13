@@ -241,7 +241,6 @@ test("opaque cursors hide global counters, use fresh nonces and reject ciphertex
     0,
     Date.now(),
     0,
-    "coverage",
   ];
   const a = await chEncode(key, data),
     b = await chEncode(key, data);

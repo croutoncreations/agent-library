@@ -78,12 +78,11 @@ const inWs = (wsCol, ownerCol, ws) => `(${wsCol} = ${ws} OR (${wsCol} IS NULL AN
 const PROJECTS_OF = (ws) => `SELECT id FROM projects WHERE ${inWs("workspace_id", "owner_id", ws)}`;
 const LIVE_PROJECTS_OF = (ws) => `${PROJECTS_OF(ws)} AND deleted_at IS NULL`;
 const NOW_MS = "CAST(strftime('%s','now') AS INTEGER) * 1000";
-/** Bytes stored: every revision (text and files) plus reservations in flight (uploads, staged app generations). */
+/** Bytes stored: every revision (text and files) plus reservations in flight (uploads). */
 export const usageSql = {
   storage_bytes: (ws) => `((SELECT COALESCE(SUM(size), 0) FROM revisions WHERE project_id IN (${PROJECTS_OF(ws)}))
     + (SELECT COALESCE(SUM(expected_size), 0) FROM uploads WHERE project_id IN (${PROJECTS_OF(ws)})
-         AND (state IN ('receiving','sealed') OR (state IN ('pending','received') AND expires_at > ${NOW_MS})))
-    + (SELECT COALESCE(SUM(total_bytes), 0) FROM publisher_generations WHERE project_id IN (${PROJECTS_OF(ws)}) AND state = 'staged' AND expires_at > ${NOW_MS}))`,
+         AND (state IN ('receiving','sealed') OR (state IN ('pending','received') AND expires_at > ${NOW_MS}))))`,
   projects: (ws) => `(SELECT COUNT(*) FROM (${LIVE_PROJECTS_OF(ws)}))`,
   // Accepted members only; live pending invitations are their own limit.
   members: (ws) => `(SELECT COUNT(*) FROM workspace_members WHERE workspace_id = ${ws})`,

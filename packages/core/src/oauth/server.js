@@ -1,5 +1,5 @@
 import { AuthorizationError, CimdFetchError, OAuthAuthorizationServer, OAuthError, OAuthResourceServer, authorizationErrorRedirect } from "@cloudflare/workers-oauth-provider";
-import { handlePublisherApi } from "../api/publisher.js";
+import { handleAppApi } from "../api/app.js";
 import { rateLimit } from "../auth.js";
 import { handleOAuthMcp } from "./mcp.js";
 import { adapters } from "../adapters.js";
@@ -103,7 +103,7 @@ function servers(origin, appConnect = false) {
       resourceMetadata: { resource: v1Resource, authorization_servers: [origin], bearer_methods_supported: ["header"], resource_name: "Agent Library publisher API" },
       requiredScopes: [SCOPES.publish],
       validateToken: (env) => (res, token) => as.validateToken(res, token, env),
-      handler: { fetch: (req, env, ctx) => handlePublisherApi(req, env, ctx) }
+      handler: { fetch: (req, env, ctx) => handleAppApi(req, env, ctx) }
     });
   }
   cache.set(cacheKey, s);
@@ -711,14 +711,14 @@ async function cxPublishPage(env, app, principalId, email, projects, consent, va
   const folderGroups = projects.map((p, i) => byProject.has(p.id) ? `<optgroup label="Folders in ${esc(p.title)}" data-i="${i}">${byProject.get(p.id).map((f) => opt(`folder:${f.id}`, f.name)).join("")}</optgroup>` : "").join("");
   const folderSelect = `<select name="destination" aria-label="Folder">${opt("new", "New folder")}${opt("root", "No folder (project root)")}${folderGroups}</select>`;
   const prev = await env.DB.prepare(
-    `SELECT pb.id, pb.created_at, pb.resumed_at, pb.current_source_revision, pb.revoked_at, p.title AS project_title, f.name AS folder_name FROM publishers pb
+    `SELECT pb.id, pb.created_at, pb.resumed_at, pb.revoked_at, p.title AS project_title, f.name AS folder_name FROM publishers pb
      JOIN projects p ON p.id = pb.project_id AND p.deleted_at IS NULL LEFT JOIN folders f ON f.id = pb.folder_id WHERE pb.app_client_id = ? AND pb.owner_principal_id = ? ORDER BY pb.created_at DESC LIMIT 20`
   ).bind(app.id, principalId).all();
   // Most recently used first. Nothing is resumed unless the owner picks it: resuming signs out the app's older session.
   const active = prev.results.filter((r) => r.revoked_at === null).sort((a, b) => String(b.resumed_at ?? b.created_at).localeCompare(String(a.resumed_at ?? a.created_at)));
   const resume = pick("resume", "new");
   const cards = active.map((r) => `<label class="choice"><input type="radio" name="resume" value="${esc(r.id)}"${resume === r.id ? " checked" : ""}><span><strong>Keep publishing to ${esc(r.project_title)} / ${r.folder_name ? esc(r.folder_name) : "project root"}</strong>
-<small>${r.current_source_revision == null ? "No exports yet" : `Last export: revision ${esc(r.current_source_revision)}`} \u00B7 connected ${esc(cxDate(r.created_at))}${active.length > 1 ? ` \u00B7 <code>${esc(r.id)}</code>` : ""}</small></span></label>`).join("");
+<small>Connected ${esc(cxDate(r.created_at))}${active.length > 1 ? ` \u00B7 <code>${esc(r.id)}</code>` : ""}</small></span></label>`).join("");
   const audiences = await Promise.all(projects.map(async (p) => [p.id, await readerAudience(env, principalId, p.id)]));
   const audienceHtml = audiences.map(([pid, a], i) => `<p class="aud" data-i="${i}"><strong>${esc(projects.find((p) => p.id === pid).title)}</strong>: ${a.length ? a.map((x) => `${esc(x.kind)} \u201C${esc(x.name)}\u201D (${x.can_write ? "read & edit" : "read"})`).join(", ") : "no connected apps or API keys yet"}</p>`).join("");
   // Show only the chosen project's folder list and readers (CSS; pages have no scripts).
@@ -873,7 +873,7 @@ async function handleOAuthHost(req, env, ctx, host) {
       return await as.fetch(req, env, ctx);
     }
     if (url.pathname === RS_META || url.pathname === "/mcp") return await rs.fetch(req, env, ctx);
-    if (v1 && (url.pathname === "/.well-known/oauth-protected-resource/v1" || url.pathname.startsWith("/v1/publisher/") || url.pathname === "/v1/publisher" || url.pathname.startsWith("/v1/app/") || url.pathname === "/v1/app")) {
+    if (v1 && (url.pathname === "/.well-known/oauth-protected-resource/v1" || url.pathname.startsWith("/v1/app/") || url.pathname === "/v1/app")) {
       if (req.method === "OPTIONS") return await publisherPreflight(req, env);
       return await withPublisherCors(req, env, await v1.fetch(req, env, ctx));
     }

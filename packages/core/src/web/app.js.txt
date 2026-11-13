@@ -1939,7 +1939,7 @@ function connectionSummary(type, id, label, projects, expires, activity, status,
   var value = JSON.stringify({ connection: { type: type, id: id, display_label: label, label_source: type === "oauth" || type === "publisher" ? "registered app name (self-reported)" : "owner-assigned label" }, status: status,
     saved_access_checked_at: checkedAt || null, expires_at: expires || null, last_activity_at: activity || null,
     projects: projects, successful_operations: "not measured",
-    check: "Saved access checked. Ask the intended client to " + (type === "publisher" ? "GET /v1/publisher/connection-info" : type === "api_key" ? "GET /v1/connection-info" : "run connection_info") + " and compare IDs. This does not prove the client is connected or test reads, rendering, transfers or writes." }, null, 2);
+    check: "Saved access checked. Ask the intended client to " + (type === "publisher" ? "GET /v1/app/connection-info" : type === "api_key" ? "GET /v1/connection-info" : "run connection_info") + " and compare IDs. This does not prove the client is connected or test reads, rendering, transfers or writes." }, null, 2);
   var field = h("textarea", { readOnly: true, rows: 9, class: "full-w", "aria-label": "Safe connection summary", value: value });
   var feedback = h("p", { class: "msg", role: "status", "aria-live": "polite" });
   return h("details", { class: "connection-summary" }, h("summary", { text: "Connection ID: " + id }),
@@ -1953,7 +1953,7 @@ function connectionHelp() {
     h("p", null, "MCP URL: ", h("code", { text: base ? base + "/mcp" : "Unavailable until installation settings load; reconnect and refresh." })),
     h("p", null, "API base: ", h("code", { text: API_BASE_HINT })),
     h("p", { text: "ChatGPT: add a connector in Settings → Apps. Claude: add a remote MCP connector. Codex or Cursor: add a remote MCP server in your client's MCP settings. Use the MCP URL above, sign in and select the intended projects." }),
-    h("p", { text: "Ask the intended agent to run connection_info with no arguments. API key clients: GET /v1/connection-info. Publishers: GET /v1/publisher/connection-info (own destination only). Compare the returned ID with the card below." }),
+    h("p", { text: "Ask the intended agent to run connection_info with no arguments. API key clients: GET /v1/connection-info. Publishers: GET /v1/app/connection-info (own destination only). Compare the returned ID with the card below." }),
     h("p", { text: "Wrong project or ID? Check this connection's project selection or reconnect from the intended client. For an expired or revoked connection, inspect its status here and reconnect. Permission changes use the existing owner controls." }),
     h("p", { text: "401/403: authentication or permission failure. Offline/network failure: check connectivity, then retry. 5xx: server failure; retry later. None proves an external client's state. Never paste credentials or request headers into chat." }),
     h("a", { href: "https://github.com/croutoncreations/agent-library/blob/main/docs/agent-setup.md", target: "_blank", rel: "noopener" }, "MCP and API setup guide"));
@@ -2047,7 +2047,7 @@ function viewPublishingApps() {
     list.append(connCard({name:c.display_name,icon:"upload",sub:"Publishing app · "+((c.origins||[]).join(", ")||"no web origins"),
       status:statusBadge(c.disabled?"disabled":active.length?"active":"registered"),inactive:!!c.disabled,
       accessLabel:active.length?"Publishes into:":"Not connected to any project yet. Connect from the app and choose a destination; you approve it on a consent page.",
-      access:active.length?active.map(function(p){return {title:projectTitles[p.project_id]||p.project_id,access:(p.folder_id?"own folder":"project root")+(p.current_source_revision!=null?" · export rev "+p.current_source_revision:" · no exports yet")};}):undefined,
+      access:active.length?active.map(function(p){return {title:projectTitles[p.project_id]||p.project_id,access:(p.folder_id?"own folder":"project root")};}):undefined,
       diagnostic: h("div", null, pubs.map(function(p) { return connectionSummary("publisher", p.publisher_id, c.display_name, [{ project_id: p.project_id, folder_id: p.folder_id, access: "own files only" }], null, null, c.disabled ? "disabled" : p.status, c.checked_at); })),
       foot:["Callbacks: "+(c.redirect_uris||[]).join(", ")].concat(c.suggested_project||c.suggested_folder?["Suggests: "+(c.suggested_project||"first project")+" / "+(c.suggested_folder||"app name")]:[]).concat(["Registered "+fmtDate(c.created_at)])}),
       h("details",null,h("summary",{text:"Public client ID (not a secret)"}),h("div",{class:"row"},id,h("button",{type:"button",class:"secondary",onclick:function(){id.select();copyText(c.client_id,msg);}},icon("copy"),"Copy"))));

@@ -332,7 +332,7 @@ test("(q) D1 calls per run: 14 in the steady state with ten pending, 29 at most"
   assert.equal(s.world.calls - before, 29);
 });
 
-test("(p) the purge's selections and the project marking use migration 0032's partial indexes", async () => {
+test("(p) the purge's selections and the project marking use migration 0030's partial indexes", async () => {
   const s = setup();
   team(s, { ws: "wsp_a", projects: ["prj_1"] });
   aged(s, "wsp_a", 31);

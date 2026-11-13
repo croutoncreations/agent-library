@@ -83,5 +83,5 @@ To undo a workspace deletion:
 (use `'suspended'` if billing had suspended it). 1 row changed = undone; nothing of the workspace was marked. 0 rows:
 the id is wrong, the workspace is not deleting, or it is already marked and cannot be undone; check with
 `SELECT status, deleting_at, purge_marked_at FROM workspaces WHERE id = '<workspace id>';`. Never change `status` of
-a workspace whose `purge_marked_at` is set. Before upgrading to the version with migration 0032, check
+a workspace whose `purge_marked_at` is set. Before upgrading to the version with migration 0030, check
 `SELECT id, name FROM workspaces WHERE status = 'deleting'`: those workspaces' 30 days start at the upgrade.

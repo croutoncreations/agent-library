@@ -89,7 +89,7 @@ async function listAppClients(ctx) {
   r.results = r.results.slice(0, 100);
   // Publishers of these apps, plus any publisher connected into a project where I'm an admin or connected it myself.
   const pubs = await ctx.env.DB.prepare(
-    `SELECT pb.id, pb.app_client_id, pb.project_id, pb.folder_id, pb.created_at, pb.revoked_at, pb.current_source_revision, pb.current_snapshot_id
+    `SELECT pb.id, pb.app_client_id, pb.project_id, pb.folder_id, pb.created_at, pb.revoked_at
      FROM publishers pb WHERE (pb.app_client_id IN (SELECT c.id FROM app_clients c WHERE ${APP_MANAGER})
          AND (COALESCE(pb.created_by, pb.owner_principal_id) = ? OR ${memberRoleSql("pb.project_id", "viewer")}))
        OR COALESCE(pb.created_by, pb.owner_principal_id) = ? OR ${memberRoleSql("pb.project_id", "admin", "?", true)} ORDER BY pb.created_at DESC LIMIT 501`
@@ -101,9 +101,7 @@ async function listAppClients(ctx) {
     project_id: p.project_id,
     folder_id: p.folder_id,
     created_at: p.created_at,
-    status: p.revoked_at === null ? "active" : "revoked",
-    current_source_revision: p.current_source_revision,
-    current_snapshot_id: p.current_snapshot_id
+    status: p.revoked_at === null ? "active" : "revoked"
   });
   const mine = new Set(r.results.map((c) => c.id));
   return {

@@ -177,8 +177,7 @@ async function searchArtifacts(ctx, args, transport = "api") {
   const match = a.terms.map(t => '"' + t + '"').join(" AND ");
   const titleScore = a.terms.map(() => "CASE WHEN instr(lower(a.title),?)>0 THEN 1 ELSE 0 END").join(" + ");
   const where = [scope.sql, "a.trashed_at IS NULL", "a.head_rev>0", "s.revision_id=r.id", "s.sha256=r.sha256", "s.title=a.title",
-    "a.kind IN (SELECT value FROM json_each(?))",
-    "(a.generation_id IS NULL OR EXISTS (SELECT 1 FROM publisher_generations pg WHERE pg.id=a.generation_id AND pg.publisher_id=a.publisher_id AND pg.state='committed'))"];
+    "a.kind IN (SELECT value FROM json_each(?))"];
   const values = [...scope.params, JSON.stringify(a.kind ? [a.kind] : kinds)];
   if (a.project_ids !== null) { where.push("p.id IN (SELECT value FROM json_each(?))"); values.push(JSON.stringify(a.project_ids)); }
   for (const [k, op] of [["updated_after", ">"], ["updated_before", "<"]]) if (a[k]) { where.push(`a.updated_at ${op} ?`); values.push(a[k]); }

@@ -162,7 +162,7 @@ Owners delete a shared workspace on its page by typing its name. The personal wo
   purged), and the projects' tombstones. Deleting a workspace does not cancel its subscription.
 - **Undoing a deletion** is an operator job, possible only until the workspace is marked
   ([operations](operations.md#monitoring)).
-- **Migration 0032** adds `deleting_at`, `purge_marked_at` and `purged_at` to `workspaces`, and the index
+- **Migration 0030** adds `deleting_at`, `purge_marked_at` and `purged_at` to `workspaces`, and the index
   `projects_live`. Workspaces deleted before it get `deleting_at` from the first cron run after the upgrade (up to 100
   per run), so their 30 days start then. A rolled-back Worker marks no new workspaces, but projects already marked
   keep being purged; the new Worker finishes the workspace afterwards. A workspace deleted while the older Worker runs

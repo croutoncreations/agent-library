@@ -7,12 +7,6 @@ import { HttpError, nowMs, sha256Hex } from "../util.js";
 // No replica sessions: a cursor never advances past uncommitted sequence allocation.
 const CH_RETENTION_MS = 30 * 86400000;
 const CH_MAX_BYTES = 65536;
-const CH_COVERAGE_SQL = `(SELECT group_concat(g, ',' ORDER BY g) FROM (
-  SELECT pb.id || ':' || pb.current_snapshot_id AS g FROM publishers pb
-  JOIN publisher_generations pg ON pg.snapshot_id=pb.current_snapshot_id
-  LEFT JOIN change_generation_coverage cv ON cv.publisher_id=pb.id
-  WHERE pb.project_id=p.id AND cv.snapshot_id IS NOT pb.current_snapshot_id
-))`;
 function chQuery(q) {
   for (const k of q.keys())
     if (!["cursor", "limit"].includes(k))
@@ -94,9 +88,8 @@ async function chDecode(key, cursor) {
     const v = JSON.parse(new TextDecoder().decode(data));
     if (
       !Array.isArray(v) ||
-      v.length !== 8 ||
+      v.length !== 7 ||
       !v.slice(3, 7).every((n) => Number.isSafeInteger(n) && n >= 0) ||
-      typeof v[7] !== "string" ||
       (v[4] && v[4] < v[3])
     )
       throw 0;
@@ -170,7 +163,6 @@ async function listChanges(ctx, projectId, opts = {}) {
   // Both SELECTs use the same transaction. The second repeats the live authorization fence.
   const stateSql = `SELECT COALESCE(s.high,0) high,COALESCE(s.floor,0) floor,
     (SELECT file_access FROM oauth_connections WHERE id=?) file_access,
-    ${CH_COVERAGE_SQL} coverage_gap,
     COALESCE((SELECT epoch FROM change_scope_epochs WHERE transport=? AND connection_id=? AND project_id=?),0) epoch
     FROM projects p LEFT JOIN project_change_state s ON s.project_id=p.id WHERE p.id=? AND ${az.sql}`;
   const [stateResult, eventResult] = await ctx.env.DB.batch([
@@ -214,14 +206,6 @@ async function listChanges(ctx, projectId, opts = {}) {
       "cursor_scope_changed",
       "Connection file access changed during this poll; retry with the current scope",
     );
-  const coverage = await sha256Hex(state.coverage_gap ?? "");
-  if (c && c[7] !== coverage)
-    throw new HttpError(
-      409,
-      "cursor_scope_changed",
-      "Publication coverage changed after Worker rollback; reconcile and take a new checkpoint",
-      { resync_required: true },
-    );
   if (c && c[6] !== state.epoch)
     throw new HttpError(
       409,
@@ -243,7 +227,6 @@ async function listChanges(ctx, projectId, opts = {}) {
           0,
           nowMs(),
           state.epoch,
-          coverage,
         ]),
       },
     );
@@ -258,7 +241,6 @@ async function listChanges(ctx, projectId, opts = {}) {
       b,
       issued,
       state.epoch,
-      coverage,
     ]);
   const out = {
     changes: [],
