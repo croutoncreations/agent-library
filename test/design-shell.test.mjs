@@ -263,6 +263,34 @@ test("home: switching filters does not refetch; a return visit shows this tab's 
   } finally { await ctx.close(); }
 });
 
+test("loading skeleton: screen-reader text stays visually hidden; every row is a placeholder (no clipped 'Lo…' sliver)", { skip: !haveChrome && "Chrome not installed" }, async () => {
+  const ctx = await browser.createBrowserContext(); const p = await ctx.newPage();
+  try {
+    await p.setViewport({ width: 412, height: 923, deviceScaleFactor: 2.625, isMobile: true, hasTouch: true });
+    let holding = true; const held = [];
+    await p.setRequestInterception(true);
+    p.on("request", (r) => { if (r.isInterceptResolutionHandled()) return; if (holding && new URL(r.url()).pathname === "/api/projects") held.push(r); else r.continue(); });
+    await p.goto(ORIGIN + "/"); await p.waitForSelector('input[name="passphrase"]');
+    await p.type('input[name="passphrase"]', s.passphrase()); await p.click('button[type="submit"]');
+    await p.waitForSelector("main ul.home-list[aria-busy=true] li.skel");
+    const r = await p.evaluate(() => {
+      const list = document.querySelector("main ul.home-list");
+      const sr = list.querySelector(".sr"), box = sr.getBoundingClientRect();
+      return { lis: [...list.children].map((li) => li.className), srTag: sr.tagName, srText: sr.textContent, srPos: getComputedStyle(sr).position,
+        srArea: box.width * box.height, icons: list.querySelectorAll(".skel-icon").length,
+        hidden: [...list.children].map((li) => li.getAttribute("aria-hidden")), iconW: list.querySelector(".skel-icon").getBoundingClientRect().width };
+    });
+    assert.deepEqual(r.lis, ["skel", "skel", "skel", "skel"], "only placeholder rows; no extra list item for the status text");
+    assert.deepEqual([r.srTag, r.srText, r.srPos], ["SPAN", "Loading…", "absolute"], "loading text is visually hidden");
+    assert.ok(r.srArea <= 1, "loading text occupies no visible area: " + r.srArea);
+    assert.equal(r.icons, 4, "each placeholder row mirrors a real row's icon tile");
+    assert.deepEqual(r.hidden, [null, "true", "true", "true"], "assistive tech sees one 'Loading…' item, not blank rows");
+    holding = false; held.forEach((q) => q.continue());
+    await p.waitForFunction(() => document.body.innerText.includes("First doc") && !document.querySelector("main ul.home-list[aria-busy]"));
+    assert.equal(await p.$eval("main ul.home-list .ficon-sm", (e) => e.getBoundingClientRect().width), r.iconW, "placeholder tile matches the real icon tile (no jump)");
+  } finally { await ctx.close(); }
+});
+
 
 test("reader connections show until disconnected instead of the storage sentinel date", { skip: !haveChrome && "Chrome not installed" }, async () => {
   const intercept = (r) => {

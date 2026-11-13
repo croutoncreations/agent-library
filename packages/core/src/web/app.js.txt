@@ -419,11 +419,16 @@ function stateBox(kind, iconName, title, text, actions) {
     h("span", { class: "st-icon", "aria-hidden": "true" }, icon(iconName)), h("h3", { text: title }), text ? h("p", { text: text }) : null,
     actions ? h("div", { class: "row" }, actions) : null);
 }
-// Loading placeholder rows that reserve layout space.
+// Loading placeholder rows that reserve layout space and mirror a real row (icon tile + title + meta).
+// The screen-reader text lives inside the first row as a span: an li.sr would lose to .list li
+// (higher specificity) and render in-flow as a clipped "Lo…" sliver.
 function skeletonRows(list, n) {
   list.setAttribute("aria-busy", "true");
-  list.replaceChildren(h("li", { class: "sr", text: "Loading…" }));
-  for (var i = 0; i < (n || 3); i++) list.append(h("li", { class: "skel", "aria-hidden": "true" }, h("div", { class: "grow" }, h("span", { class: "skel-line wide" }), h("span", { class: "skel-line" }))));
+  list.replaceChildren();
+  for (var i = 0; i < (n || 3); i++) list.append(h("li", { class: "skel", "aria-hidden": i ? "true" : null },
+    i === 0 ? h("span", { class: "sr", text: "Loading…" }) : null,
+    h("span", { class: "skel-icon", "aria-hidden": "true" }),
+    h("div", { class: "grow", "aria-hidden": "true" }, h("span", { class: "skel-line wide" }), h("span", { class: "skel-line" }))));
 }
 function doneLoading(list) { list.removeAttribute("aria-busy"); }
 function rowLink(href, title) { return h("a", { class: "stretch", href: href, text: title }); }
