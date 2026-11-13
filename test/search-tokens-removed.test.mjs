@@ -11,6 +11,14 @@ import { loadWorker } from "./load-worker.mjs";
 import { ROOT } from "./helpers.mjs";
 import * as W from "./blind-tokens-world.mjs";
 
+// Text upload PUTs (uploadPut) need workerd's FixedLengthStream; copied verbatim from test/upload-world.mjs.
+globalThis.FixedLengthStream ??= class extends TransformStream {
+  constructor(n) {
+    let seen = 0;
+    super({ transform(c, out) { seen += c.byteLength; if (seen > n) throw new RangeError("Attempt to write too many bytes through a FixedLengthStream."); out.enqueue(c); }, flush() { if (seen !== n) throw new RangeError("FixedLengthStream did not see all expected bytes before close()."); } });
+  }
+};
+
 const lib = await loadWorker();
 const PASS = "synthetic-local-pass";
 const TOKEN_TABLES = ["search_token_docs", "search_tokens", "search_term_counters", "workspace_search_keys"];
@@ -55,7 +63,7 @@ async function app() {
   };
   // Everything a request handed to waitUntil has finished (so deferred work, if any existed, has run).
   const settle = async () => { while (waits.length) await Promise.allSettled(waits.splice(0)); };
-  return { world, req, settle };
+  return { world, req, settle, fetch, cookie, csrf };
 }
 const rowCounts = (world) => Object.fromEntries(TOKEN_TABLES.map((t) => [t, W.one(world, `SELECT COUNT(*) AS n FROM ${t}`).n]));
 const zero = Object.fromEntries(TOKEN_TABLES.map((t) => [t, 0]));
@@ -90,6 +98,35 @@ test("create, save a new version and create from a template write no search-toke
   assert.deepEqual(old.body?.results ?? [], [], "the replaced version is not found");
 });
 
+test("a text upload (begin, PUT, finish) and a backup import write no search-token rows; full-text search finds both", async () => {
+  const a = await app();
+  assert.equal((await a.req("POST", "/api/projects", { id: "p-removed-2", title: "Synthetic" })).status, 201);
+  const bytes = Buffer.from("upload words numbatthird");
+  const b = await a.req("POST", "/api/projects/p-removed-2/uploads", { title: "Synthetic upload", mime: "text/markdown", size: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex") });
+  assert.equal(b.status, 201, JSON.stringify(b.body));
+  const put = await a.fetch(b.body.put_url, { method: "PUT", body: bytes, headers: { cookie: a.cookie, "x-csrf-token": a.csrf, "content-length": String(bytes.length) } });
+  assert.equal(put.status, 200, await put.text());
+  const f = await a.req("POST", `/api/projects/p-removed-2/uploads/${b.body.upload_id}/finish`, {});
+  assert.equal(f.status, 200, JSON.stringify(f.body));
+  await a.settle();
+  assert.deepEqual(rowCounts(a.world), zero, "after a text upload finish");
+  const ws = W.one(a.world, "SELECT id FROM workspaces ORDER BY created_at LIMIT 1").id;
+  const at = "2026-01-01T00:00:00.000Z", body = "imported words echidnafourth";
+  const backup = { schema: "agent-library-backup/1", exported_at: at, project: { id: "pbk_src", title: "Synthetic source", created_at: at },
+    artifacts: [{ id: "art_src_0000", kind: "markdown", title: "Synthetic imported", folder: "", tags: "[]", head_rev: 1, head_revision_id: "rev_src_0000", meta_version: 1, trashed_at: null, created_at: at, updated_at: at }],
+    revisions: [{ id: "rev_src_0000", artifact_id: "art_src_0000", rev_no: 1, author_id: "hum_src", body, blob_key: null, size: Buffer.byteLength(body), sha256: createHash("sha256").update(body).digest("hex"), mime: "text/markdown", restored_from: null, created_at: at }],
+    comments: [], meta_versions: [], blobs: {} };
+  const imp = await a.req("POST", `/api/workspaces/${ws}/import`, backup);
+  assert.equal(imp.status, 201, JSON.stringify(imp.body));
+  await a.settle();
+  assert.deepEqual(rowCounts(a.world), zero, "after a backup import");
+  for (const [word, title] of [["numbatthird", "Synthetic upload"], ["echidnafourth", "Synthetic imported"]]) {
+    const s = await a.req("GET", `/api/search?query=${word}`);
+    assert.equal(s.status, 200);
+    assert.ok((s.body?.results ?? []).some((r) => r.title === title), JSON.stringify(s.body));
+  }
+});
+
 /** Every .js/.mjs file under dir. */
 function jsFiles(dir) {
   const out = [];
@@ -103,7 +140,7 @@ function jsFiles(dir) {
 
 test("no source under packages/ names the search-token writer", () => {
   const hits = jsFiles(join(ROOT, "packages"))
-    .filter((f) => /search\/tokens|search-key|deferSearchIndexing|search_token/.test(readFileSync(f, "utf8")))
+    .filter((f) => /search\/tokens|search-key|deferSearchIndexing|search_token|workspace_search_keys|search_term_counters|\bsearch_terms\b|deferIndexing/.test(readFileSync(f, "utf8")))
     .map((f) => relative(ROOT, f));
   assert.deepEqual(hits, []);
 });
