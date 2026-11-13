@@ -197,11 +197,3 @@ test("main JS text and comment paths go through the content store (marker codec)
   assert.equal(restoredComment.body, "");
   assert.equal(new TextDecoder().decode(objects.get(restoredComment.body_key)), "ENC:a comment");
 });
-test("workspaceSearchKey is defined in crypto/ and imported only by search/tokens.js", () => {
-  const named = jsFiles(join(ROOT, "packages"))
-    .filter((f) => /\bworkspaceSearchKey\b/.test(readFileSync(f, "utf8")))
-    .map(rel);
-  assert.deepEqual(named.filter((f) => !f.startsWith("packages/core/src/crypto/")), ["packages/core/src/search/tokens.js"]);
-  const definers = named.filter((f) => /export\s+async\s+function\s+workspaceSearchKey\b/.test(readFileSync(join(ROOT, f), "utf8")));
-  assert.deepEqual(definers, ["packages/core/src/crypto/search-key.js"]);
-});

@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Loading lists (Home, Projects, a project's documents and trash) no longer show a clipped "Lc" sliver above the placeholders. The hidden "Loading…" text for screen readers was its own list row and lost to the list row styles. The placeholders now look like real rows (icon tile, title and details) with a staggered pulse, which stops when reduced motion is on.
+
 ## 0.1.0 (2026-10-28)
 
 First open-source release.
