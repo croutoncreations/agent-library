@@ -87,7 +87,7 @@ export async function updateWorkspace(ctx, id, input) {
   return { ok: true, id, name: row.name, handle: row.handle };
 }
 
-/** Marks a shared workspace 'deleting': closed to everyone immediately. Data removal is an operator job (hosted). */
+/** Marks a shared workspace 'deleting' and records when (clearing any purge marker an operator left on it): closed to everyone immediately; the cron removes its content WORKSPACE_PURGE_GRACE_DAYS later (workspace-purge.js). */
 export async function deleteWorkspace(ctx, id) {
   requireHuman(ctx);
   // Owners can delete a suspended workspace too (e.g. after a billing suspension).
@@ -96,8 +96,8 @@ export async function deleteWorkspace(ctx, id) {
   if (ws.role !== "owner") throw new HttpError(403, "forbidden", "Needs the owner role in this workspace");
   if (ws.personal) throw new HttpError(409, "personal_workspace", "Your personal workspace can't be deleted");
   const [r] = await ctx.env.DB.batch([
-    ctx.env.DB.prepare(`UPDATE workspaces AS w SET status = 'deleting' WHERE w.id = ? AND w.personal = 0 AND w.status <> 'deleting'
-        AND EXISTS (SELECT 1 FROM workspace_members m WHERE m.workspace_id = w.id AND m.principal_id = ? AND m.role = 'owner')`).bind(id, ctx.principal.id),
+    ctx.env.DB.prepare(`UPDATE workspaces AS w SET status = 'deleting', deleting_at = ?, purge_marked_at = NULL, purged_at = NULL WHERE w.id = ? AND w.personal = 0 AND w.status <> 'deleting'
+        AND EXISTS (SELECT 1 FROM workspace_members m WHERE m.workspace_id = w.id AND m.principal_id = ? AND m.role = 'owner')`).bind(nowMs(), id, ctx.principal.id),
     wsAudit(ctx.env, ctx, id, "workspace.delete", id, "ok", "changes() = 1")
   ]);
   if (!r.meta.changes) throw new HttpError(403, "forbidden", "Needs the owner role in this workspace");

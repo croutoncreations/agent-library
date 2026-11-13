@@ -250,6 +250,32 @@ test("the cron purges projects whose 30 days have passed", async () => {
   assert.equal(await n(`SELECT COUNT(*) AS n FROM projects WHERE id = '${q}' AND purged_at IS NOT NULL`), 1);
 });
 
+test("a deleted workspace's content is removed by the cron 30 days later; the workspace row stays", async () => {
+  const ws = ok(await owner.req("POST", "/api/workspaces", { name: "Purge Team" }), 201).id;
+  const q = ok(await owner.req("POST", "/api/projects", { title: "Purge Me", workspace_id: ws }), 201).id;
+  const d = ok(await owner.req("POST", `/api/projects/${q}/artifacts`, { title: "Synthetic purge doc", body: "synthetic purge body" }), 201).artifact_id;
+  ok(await owner.req("DELETE", `/api/workspaces/${ws}`));
+  // The DELETE set deleting_at (checked before the test moves it back).
+  const at = (await sql(`SELECT deleting_at FROM workspaces WHERE id = '${ws}'`))[0].deleting_at;
+  assert.ok(Math.abs(at - Date.now()) < 60e3, `deleting_at ${at}`);
+  await sql(`UPDATE workspaces SET deleting_at = ${at - 31 * 864e5} WHERE id = '${ws}'`);
+  // The cron's steps start together, so the marking, the project purge and the finish may land in successive runs.
+  let s;
+  for (let i = 0; i < 10; i++) {
+    assert.equal((await fetch(`${h.issuer}/cdn-cgi/handler/scheduled`)).status, 200);
+    await new Promise((r) => setTimeout(r, 500));
+    s = (await sql(`SELECT w.purge_marked_at AS m, w.purged_at AS wp, p.purged_at AS pp FROM workspaces w JOIN projects p ON p.id = '${q}' WHERE w.id = '${ws}'`))[0];
+    if (s.m && s.wp && s.pp) break;
+  }
+  assert.ok(s.m && s.pp && s.wp, JSON.stringify(s));
+  assert.equal(await n(`SELECT COUNT(*) AS n FROM artifacts WHERE project_id = '${q}'`), 0);
+  assert.equal(await n(`SELECT COUNT(*) AS n FROM revisions WHERE project_id = '${q}'`), 0);
+  assert.equal((await sql(`SELECT title FROM projects WHERE id = '${q}'`))[0].title, "Deleted project");
+  assert.equal(await n(`SELECT COUNT(*) AS n FROM workspaces WHERE id = '${ws}' AND status = 'deleting' AND name = 'Purge Team'`), 1, "the row stays");
+  // Gate check only: a deleting workspace already answered 404 before any purge.
+  assert.equal((await owner.req("GET", `/api/projects/${q}/artifacts/${d}`)).status, 404);
+});
+
 test("browser: delete from Project settings, see it under Recently deleted, restore it", async (t) => {
   const { createRequire } = await import("node:module");
   const { existsSync, mkdirSync } = await import("node:fs");

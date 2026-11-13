@@ -24,6 +24,7 @@ import { handleOAuthHost, originFor } from "./oauth/server.js";
 import { servePwa } from "./pwa.js";
 import { contentOrigin, handleContentHost, isContentHost, projectMedia, viewLinkRedirect, wantsContentHost } from "./view-links.js";
 import { deleteProject, listDeletedProjects, purgeDueProjects, purgeProjectNow, restoreProject } from "./project-deletion.js";
+import { purgeDeletingWorkspaces } from "./workspace-purge.js";
 import { acceptInvite, createInvite, createWorkspace, deleteWorkspace, listMembers, listWorkspaces, multiUser, previewInvite, removeMember, revokeInvite, setMemberRole, updateWorkspace } from "./workspaces.js";
 import { __name } from "./runtime.js";
 import { IMAGE_TYPES, VIDEO_TYPES, addComment, appConnectEnabled, chQuery, cleanupChanges, createFile, createFolder, createFromTemplate, createGrant, createMarkdown, createProject, updateProject, diffRevisions, getArtifact, history, listArtifacts, listAudit, listChanges, listComments, listFolders, listGrants, listProjects, listTemplates, metaHistory, previewTemplate, readRecords, readTextChunk, requireAppConnect, restoreMetadata, restoreRevision, rsQuery, rsReady, rtQuery, saveAsTemplate, saveFile, saveMarkdown, searchArtifacts, updateGrant, updateMetadata } from "./service.js";
@@ -398,6 +399,8 @@ var coreWorker = {
       (e) => console.error(JSON.stringify({ event: "retention_failed", message: String(e?.message ?? e).slice(0, 200) }))));
     // Deleted projects past their 30 days (D21): bounded per run, finished by later runs.
     ctx.waitUntil(purgeDueProjects(env).then((r) => { if (r.projects || r.rows || r.files) console.log("project_purge", JSON.stringify({ projects: r.projects, rows: r.rows, files: r.files })); }));
+    // Deleted workspaces past their 30 days: their projects are marked due for the purge above (workspace-purge.js).
+    ctx.waitUntil(purgeDeletingWorkspaces(env));
   },
   async fetch(req, env, ctx) {
     const url = new URL(req.url);
