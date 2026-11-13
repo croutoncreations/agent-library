@@ -50,7 +50,7 @@ for (const kind of ["markdown", "html"]) for (const transport of ["app", "v1"]) 
   for (const [method, url, extra] of [["POST", base, { kind, title: "Too large" }], ["PUT", path, { expected_revision: 2 }]]) {
     const over = await request(method, url, { ...extra, body: large + "x" });
     assert.equal(over.status, 413);
-    assert.match(over.body.error.message, /(?:Markdown|HTML) exceeds 10 MiB/);
+    assert.equal(over.body.error.message, kind === "html" ? "HTML exceeds 10 MiB" : "Markdown exceeds 10 MiB");
   }
   t.diagnostic(`create/save/boundary ${transport} ${kind}: ${(performance.now() - start).toFixed(1)} ms`);
 });
