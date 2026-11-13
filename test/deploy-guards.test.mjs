@@ -242,6 +242,9 @@ test('a forbidden setting name in the config or the deploy target refuses, namin
     }
     namesIt(checkConfigAgainstTarget(good, { ...target, requiredSecrets: [...target.requiredSecrets, name] }), name, `${name} in requiredSecrets`);
     namesIt(checkConfigAgainstTarget(good, { ...target, pendingVars: { [name]: null } }), name, `${name} in pendingVars`);
+    const targetOnly = checkConfigAgainstTarget(good, { ...target, vars: { ...target.vars, [name]: SENTINEL } });
+    assert.ok(targetOnly.some((m) => m.startsWith(`deploy target vars has ${name},`)), `${name} in the target only: ${JSON.stringify(targetOnly)}`);
+    noSentinel(targetOnly, `${name} in the target only`);
   }
 });
 
@@ -268,6 +271,14 @@ test('a forbidden setting on the live Worker (var, secret or other binding) refu
     // Listed in the target too (pendingVars cannot make it pass): still refused, still no value.
     const listed = checkLiveVersion(liveFixture((b) => [...b, { type: 'plain_text', name, text: SENTINEL }]), { ...target, vars: { ...target.vars, [name]: SENTINEL } });
     namesIt(listed, name, `live and target ${name}`); noSentinel(listed, `live and target ${name}`);
+    // Another var drifts at the same time: the drift line lists live vars with values, but never the forbidden one.
+    const drifting = checkLiveVersion(liveFixture((b) => [...b, { type: 'plain_text', name, text: SENTINEL }, { type: 'plain_text', name: 'NEW_FLAG', text: '1' }]), target);
+    assert.ok(drifting.some((m) => m.startsWith('live vars differ')), `drift is still reported next to ${name}`);
+    namesIt(drifting, name, `drift with ${name}`); noSentinel(drifting, `drift with ${name}`);
+    // A pendingVars entry for it changes nothing: refused by name, and neither the recorded nor the live value shows.
+    const pending = checkLiveVersion(liveFixture((b) => [...b, { type: 'plain_text', name, text: SENTINEL }]), { ...target, vars: { ...target.vars, [name]: 'x' }, pendingVars: { [name]: SENTINEL } });
+    assert.equal(pending.length, 1, `${name} in pendingVars and live: ${JSON.stringify(pending)}`);
+    namesIt(pending, name, `pendingVars ${name}`); noSentinel(pending, `pendingVars ${name}`);
   }
 });
 

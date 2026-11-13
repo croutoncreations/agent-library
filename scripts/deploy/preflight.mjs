@@ -69,7 +69,10 @@ if (eff.via) console.log(`::notice::live ${liveVersionId} is a ${history[0].trig
 const liveTag = eff.tag;
 // Secrets are listed separately: `wrangler deploy` keeps the latest version's secrets, deployed or not.
 // `secret list` prints JSON by default (names and types, never values).
-const liveProblems = [...checkLiveVersion(live, t), ...checkLiveSecretNames(JSON.parse(wrangler('secret', 'list', '--env', env)))];
+let secretList;
+try { secretList = JSON.parse(wrangler('secret', 'list', '--env', env)); }
+catch { fail('wrangler secret list did not print a JSON list, so the live secret names could not be checked'); }
+const liveProblems = [...checkLiveVersion(live, t), ...checkLiveSecretNames(secretList)];
 if (liveProblems.length) fail(`live Worker does not match the recorded target:\n  ${liveProblems.join('\n  ')}`);
 
 const resolve = (short) => { try { return git('rev-parse', '--verify', '--quiet', `${short}^{commit}`); } catch { return null; } };

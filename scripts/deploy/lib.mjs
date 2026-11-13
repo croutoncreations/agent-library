@@ -123,6 +123,7 @@ export function checkLiveVersion(live, target) {
   if (typeof pv !== 'object' || Array.isArray(pv) || pv === null) p.push('pendingVars must be an object: { NAME: <current live value, or null if new> }');
   const pending = new Set();
   for (const [k, from] of Object.entries(pv && typeof pv === 'object' && !Array.isArray(pv) ? pv : {})) {
+    if (isForbiddenSetting(k)) continue; // refused by name (checkConfigAgainstTarget, and above when it is live)
     if (!Object.hasOwn(target.vars, k)) { p.push(`pendingVars lists ${k}, which is not in the target vars`); continue; }
     if (from !== null && typeof from !== 'string') { p.push(`pendingVars.${k} must be the current live value (a string) or null`); continue; }
     const now = Object.hasOwn(liveVars, k) ? liveVars[k] : null;
