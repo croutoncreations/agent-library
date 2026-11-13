@@ -1636,3 +1636,33 @@ test("PUT and DELETE in flight: the creator removed from the workspace, or the p
     assert.equal(revCount(d.P.publisher_id), dRevs, op); assert.deepEqual(counters(d.P.publisher_id), dBefore, op);
   }
 });
+
+// ---- Addendum B: one set of path rules for App Files, snapshots and generations ----
+/**
+ * A generation of `gid` at `rev`: a root index `rootName` that references every payload part in `payloads`.
+ * Returns { begin, files } for begin, the part PUTs and commit.
+ */
+function generationOf(gid, rev, parent, payloads, rootName = `${gid}-root.json`) {
+  const files = payloads.map((name) => ({ name, content: JSON.stringify({ format: "agentlib.generation.part/1", generation_id: gid, source_revision: rev, synthetic: name }) }));
+  const root = JSON.stringify({ format: "agentlib.generation.index/1", generation_id: gid, source_revision: rev,
+    entries: files.map((f) => ({ name: f.name, sha256: sha(f.content), bytes: Buffer.byteLength(f.content), kind: "synthetic", count: 1 })) });
+  const all = [...files, { name: rootName, content: root }];
+  return { begin: { generation_id: gid, source_revision: rev, expected_current_snapshot_id: parent, root_name: rootName, root_sha256: sha(root),
+    part_count: all.length, total_bytes: all.reduce((n, f) => n + Buffer.byteLength(f.content), 0) }, files: all };
+}
+/** Begin and upload every part of `g`; returns the commit answer. */
+async function stageAndCommit(tok, g) {
+  const gid = g.begin.generation_id;
+  ok(await h.pub(tok, "POST", "/publisher/generations", { body: g.begin, idem: uniq("begin-key") }), 201);
+  for (const f of g.files) ok(await h.pub(tok, "PUT", `/publisher/generations/${gid}/parts/${f.name}`, { body: { content: f.content, sha256: sha(f.content) } }), 201);
+  return h.pub(tok, "POST", `/publisher/generations/${gid}/commit`, { body: {}, idem: uniq("commit-key") });
+}
+
+// Addendum B, D 15.
+test("App Files create twinning a committed generation part → 409", async () => {
+  const c = await connect("files-own");
+  ok(await stageAndCommit(c.tok, generationOf("g_x", 1, null, ["g_x-part.json"])), 201);
+  err(await put(c.tok, "G_X-part.json", "{}", { create: true }), 409, "path_conflict");
+  err(await put(c.tok, "g_x-part.json/inner.md", "x", { create: true }), 409, "path_conflict");
+  assert.equal(sql(`SELECT COUNT(*) AS n FROM artifacts WHERE publisher_id = '${c.P.publisher_id}' AND generation_id IS NULL`)[0].n, 0, "nothing created");
+});

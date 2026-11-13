@@ -5,9 +5,11 @@ import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { loadWorker } from "./load-worker.mjs";
 import { ROOT } from "./helpers.mjs";
+import { mkWorld } from "./blind-tokens-world.mjs";
 
 const W = await loadWorker({
-  "api/app-files.js": ["parseAppPath", "reservedAppPath", "conflictCheck", "etagMatches", "createSlotTable", "APP_FILES_SLOT_RECLAIM_MS", "APP_FILES_OVERRUN_MAX"],
+  "api/app-files.js": ["parseAppPath", "reservedAppPath", "conflictCheck", "etagMatches", "createSlotTable", "APP_FILES_SLOT_RECLAIM_MS", "APP_FILES_OVERRUN_MAX",
+    "newNameConflictSql", "newNameConflictRows", "generationNameConflictSql", "generationNameConflictRows", "firstCaseTwin", "generationConflict"],
   "api/publisher.js": ["testHooksOn"],
 });
 
@@ -118,6 +120,102 @@ test("slots: reclaim moves at most 2 stale slots to overrun; they still count fo
   // Releasing an overrun entry frees it.
   T.release(held[0]);
   assert.equal(T.sizes().overrun, 1);
+});
+
+// Addendum B, D 5-6: the name rule for snapshot and generation commits, on node:sqlite with every migration applied.
+const now = "2026-11-12T00:00:00.000Z", P0 = "pub_unit_000001";
+function nameWorld() {
+  const world = mkWorld();
+  const run = (q, ...p) => world.sql.prepare(q).run(...p);
+  run("INSERT INTO principals (id, kind, issuer, subject, label, created_at) VALUES (?, ?, ?, ?, ?, ?)", "prn_owner", "human", "https://issuer.example.test", "owner", "Owner", now);
+  run("INSERT INTO principals (id, kind, issuer, subject, label, created_at) VALUES (?, ?, ?, ?, ?, ?)", "prn_agent", "agent", "app-connect", P0, "Unit app", now);
+  run("INSERT INTO projects (id, owner_id, title, created_at) VALUES (?, ?, ?, ?)", "prj_unit", "prn_owner", "Unit", now);
+  run("INSERT INTO app_clients (id, owner_principal_id, client_id, display_name, redirect_uris, origins, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    "apc_unit", "prn_owner", "cli_unit", "Unit app", '["https://unit.example.test/cb"]', "[]", now);
+  run("INSERT INTO publishers (id, owner_principal_id, principal_id, app_client_id, display_name, project_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    P0, "prn_owner", "prn_agent", "apc_unit", "Unit app", "prj_unit", now);
+  const art = (id, kind, exportName, generationId, trashedAt, title = exportName) => run(
+    "INSERT INTO artifacts (id, project_id, kind, title, folder, publisher_id, export_name, generation_id, head_rev, trashed_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    id, "prj_unit", kind, title, "", P0, exportName, generationId, 1, trashedAt, now, now);
+  art("art_1", "json", "Data.json", null, null);
+  art("art_2", "markdown", "notes.md/x.md", null, null);
+  art("art_3", "json", "gen.json", "g_old", null);
+  art("art_4", "json", "old.json", null, now);
+  art("art_5", "json", null, null, null, "released.json");
+  art("art_6", "json", "exact.json", null, null);
+  art("art_7", "json", "g_m.manifest.json", null, null);
+  const first = (f) => { const r = world.sql.prepare(f.sql).get(...f.params); return r ? { ...r } : null; };
+  const gate = (f) => world.sql.prepare(`SELECT ${f.sql} AS ok`).get(...f.params).ok;
+  const plan = (f) => world.sql.prepare(`EXPLAIN QUERY PLAN ${f.sql.startsWith("SELECT") ? f.sql : `SELECT ${f.sql}`}`).all(...f.params).map((r) => r.detail).join("\n");
+  return { world, run, art, first, gate, plan };
+}
+const placeholders = (f) => (f.sql.match(/\?/g) ?? []).length;
+
+test("newNameConflictRows/Sql: twins, a file where a folder is needed, generation rows, trashed rows; released rows ignored; input order", () => {
+  const { first, gate, plan } = nameWorld();
+  for (const [name, conflictsWith] of [["DATA.json", "Data.json"], ["notes.md", "notes.md/x.md"], ["GEN.JSON", "gen.json"], ["OLD.json", "old.json"]]) {
+    const row = first(W.newNameConflictRows(P0, [name]));
+    assert.deepEqual({ name: row?.name, conflicts_with: row?.conflicts_with }, { name, conflicts_with: conflictsWith }, name);
+    assert.equal(gate(W.newNameConflictSql(P0, [name])), 0, name);
+  }
+  for (const name of ["new.json", "released.json"]) {
+    assert.equal(first(W.newNameConflictRows(P0, [name])), null, name);
+    assert.equal(gate(W.newNameConflictSql(P0, [name])), 1, name);
+  }
+  const order = first(W.newNameConflictRows(P0, ["new.json", "notes.md", "DATA.json"]));
+  assert.deepEqual({ name: order.name, conflicts_with: order.conflicts_with }, { name: "notes.md", conflicts_with: "notes.md/x.md" }, "input order");
+  assert.deepEqual(W.firstCaseTwin(["b.json", "x.json", "X.json", "B.json", "manifest.json"]), { name: "X.json", conflicts_with: "x.json" });
+  assert.equal(W.firstCaseTwin(["a.json", "b.json"]), null);
+  assert.deepEqual(W.newNameConflictSql(P0, []), { sql: "1", params: [] });
+  const forms = [W.newNameConflictSql(P0, ["a.json"]), W.newNameConflictRows(P0, ["a.json"]), W.generationNameConflictSql(P0, "g_x", "g_x.manifest.json"), W.generationNameConflictRows(P0, "g_x", "g_x.manifest.json")];
+  assert.deepEqual(forms.map(placeholders), [4, 4, 16, 17]);
+  assert.deepEqual(forms.map((f) => f.params.length), [4, 4, 16, 17]);
+  for (const f of forms) {
+    const p = plan(f);
+    assert.match(p, /artifacts_publisher_lname/); assert.doesNotMatch(p, /SCAN c\b/);
+  }
+});
+
+test("generation name rule: every case, and which one is reported", () => {
+  const { run, art, first, gate } = nameWorld();
+  art("art_8", "json", "G_MT.manifest.json", null, null);
+  const gen = (gid, parts) => {
+    run("INSERT INTO publisher_generations (publisher_id, id, project_id, folder_id, token_epoch, source_revision, expected_current_snapshot_id, root_name, root_sha256, part_count, total_bytes, begin_digest, state, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      P0, gid, "prj_unit", null, 1, 1, null, parts[0], "0".repeat(64), parts.length, 2 * parts.length, "0".repeat(64), "staged", now, 4102444800000);
+    for (const n of parts) run("INSERT INTO publisher_generation_parts (publisher_id, generation_id, name, sha256, bytes, body, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", P0, gid, n, "1".repeat(64), 2, "{}", now);
+  };
+  /** What a commit of `gid` reports, as the mapping computes it: part names in binary order and the result row. */
+  const reported = (gid, parts) => {
+    gen(gid, parts);
+    const mName = gid + ".manifest.json";
+    const names = [...parts].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+    return { found: W.generationConflict(names, first(W.generationNameConflictRows(P0, gid, mName))), gate: gate(W.generationNameConflictSql(P0, gid, mName)) };
+  };
+  const cases = [
+    ["g_clean", ["clean.json"], null],
+    ["g_twin", ["DATA.json"], ["DATA.json", "Data.json"]],
+    ["g_dir", ["notes.md"], ["notes.md", "notes.md/x.md"]],
+    ["g_pair", ["a.json", "A.json"], ["a.json", "A.json"]],
+    ["g_trio", ["b.json", "B.json", "B.JSON"], ["B.json", "B.JSON"]],
+    ["g_ex", ["exact.json", "Data.JSON"], ["Data.JSON", "Data.json"]],
+    ["g_M", ["r.json"], ["g_M.manifest.json", "g_m.manifest.json"]],
+    ["g_self", ["G_self.manifest.json"], ["g_self.manifest.json", "G_self.manifest.json"]],
+    ["g_mt", ["r.json"], ["g_mt.manifest.json", "G_MT.manifest.json"]],
+    ["g_gen", ["GEN.json", "zz.json"], ["GEN.json", "gen.json"]],
+    ["g_lower", ["zz.json", "ZZ.json", "DATA.json"], ["DATA.json", "Data.json"]],
+    ["g_mixed", ["Zz.json", "zz.json", "aa.json", "GEN.json"], ["GEN.json", "gen.json"]],
+    ["g_both", ["data.json", "DATA.json"], ["DATA.json", "Data.json"]],
+    ["g_pair_and_manifest", ["q.json", "Q.json", "G_pair_and_manifest.manifest.json"], ["q.json", "Q.json"]],
+  ];
+  for (const [gid, parts, expected] of cases) {
+    const r = reported(gid, parts);
+    assert.deepEqual(r.found, expected && { name: expected[0], conflicts_with: expected[1] }, gid);
+    assert.equal(r.gate, expected ? 0 : 1, `${gid} gate`);
+  }
+  // 2,048 parts and no conflict (no timing assertion).
+  const many = Array.from({ length: 2048 }, (_, i) => `p-${String(i).padStart(4, "0")}.json`);
+  assert.deepEqual(reported("g_many", many), { found: null, gate: 1 });
+  assert.equal(W.generationConflict(["a.json", "b.json"], null), null);
 });
 
 test("path conflicts: exact and ancestor names are bound lowercased (at most 8 values); descendants are a lowercased range", () => {

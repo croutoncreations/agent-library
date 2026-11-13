@@ -325,7 +325,7 @@ export const reservedAppPath = (path) => path.split("/", 1)[0].toLowerCase() ===
 
 /**
  * SQL: no other file of this publisher conflicts with `path`, ignoring case. Considers every row of the publisher
- * with an export name that is not a generation row, in any folder and whether trashed or not. Conflicts: the same
+ * with an export name (generation part files included), in any folder and whether trashed or not. Conflicts: the same
  * name; an existing file at an ancestor of `path` (a file where a folder is needed); an existing file below `path`
  * (a folder where a file is needed, as the range lower(path)/ .. lower(path)0, '0' following '/'). Written so the
  * artifacts_publisher_lname index (publisher_id, lower(export_name)) answers it.
@@ -336,12 +336,82 @@ export function conflictCheck(publisherId, path) {
   const names = [lp, ...segs.slice(0, -1).map((_, i) => segs.slice(0, i + 1).join("/"))];
   // Two seeks, each pinned to the index (without statistics SQLite would read the publisher's rows through
   // artifacts_publisher_name instead); INDEXED BY also fails loudly if the index is missing.
-  const own = "c.publisher_id = ? AND c.export_name IS NOT NULL AND c.generation_id IS NULL";
+  const own = "c.publisher_id = ? AND c.export_name IS NOT NULL";
   return {
     sql: `NOT EXISTS (SELECT 1 FROM artifacts c INDEXED BY artifacts_publisher_lname WHERE ${own} AND lower(c.export_name) IN (${names.map(() => "?").join(", ")}))
       AND NOT EXISTS (SELECT 1 FROM artifacts c INDEXED BY artifacts_publisher_lname WHERE ${own} AND lower(c.export_name) >= ? AND lower(c.export_name) < ?)`,
     params: [publisherId, ...names, publisherId, lp + "/", lp + "0"]
   };
+}
+
+const LNAME = "artifacts c INDEXED BY artifacts_publisher_lname";
+const TWIN = (x) => `lower(c.export_name) = lower(${x})`;
+const BELOW = (x) => `lower(c.export_name) >= lower(${x}) || '/' AND lower(c.export_name) < lower(${x}) || '0'`;
+const PARTS = "publisher_generation_parts";
+
+/** Snapshot gate: no row of the publisher twins a new name or sits below it. `names`: new names (not exact existing). */
+export function newNameConflictSql(publisherId, names) {
+  if (!names.length) return { sql: "1", params: [] };
+  const j = JSON.stringify(names);
+  return { sql: `NOT EXISTS (SELECT 1 FROM json_each(?) j CROSS JOIN ${LNAME} WHERE c.publisher_id = ? AND c.export_name IS NOT NULL AND ${TWIN("j.value")})
+    AND NOT EXISTS (SELECT 1 FROM json_each(?) j CROSS JOIN ${LNAME} WHERE c.publisher_id = ? AND c.export_name IS NOT NULL AND ${BELOW("j.value")})`,
+    params: [j, publisherId, j, publisherId] };
+}
+/** Snapshot result form: the first conflicting name in input order, against the lowest existing name. */
+export function newNameConflictRows(publisherId, names) {
+  const j = JSON.stringify(names);
+  return { sql: `SELECT j.key AS pos, j.value AS name, c.export_name AS conflicts_with FROM json_each(?) j CROSS JOIN ${LNAME}
+      WHERE c.publisher_id = ? AND c.export_name IS NOT NULL AND ${TWIN("j.value")}
+    UNION ALL
+    SELECT j.key, j.value, c.export_name FROM json_each(?) j CROSS JOIN ${LNAME}
+      WHERE c.publisher_id = ? AND c.export_name IS NOT NULL AND ${BELOW("j.value")}
+    ORDER BY pos, conflicts_with LIMIT 1`, params: [j, publisherId, j, publisherId] };
+}
+/** Generation gate: parts vs existing rows (twin, below), parts vs each other, mName vs existing rows (twin, below), mName vs parts. */
+export function generationNameConflictSql(publisherId, generationId, mName) {
+  return { sql: `NOT EXISTS (SELECT 1 FROM ${PARTS} t CROSS JOIN ${LNAME} WHERE t.publisher_id = ? AND t.generation_id = ? AND t.artifact_id IS NULL
+        AND c.publisher_id = ? AND c.export_name IS NOT NULL AND ${TWIN("t.name")})
+    AND NOT EXISTS (SELECT 1 FROM ${PARTS} t CROSS JOIN ${LNAME} WHERE t.publisher_id = ? AND t.generation_id = ? AND t.artifact_id IS NULL
+        AND c.publisher_id = ? AND c.export_name IS NOT NULL AND ${BELOW("t.name")})
+    AND NOT EXISTS (SELECT 1 FROM ${PARTS} WHERE publisher_id = ? AND generation_id = ? AND artifact_id IS NULL GROUP BY lower(name) HAVING COUNT(*) > 1)
+    AND NOT EXISTS (SELECT 1 FROM ${LNAME} WHERE c.publisher_id = ? AND c.export_name IS NOT NULL AND ${TWIN("?")})
+    AND NOT EXISTS (SELECT 1 FROM ${LNAME} WHERE c.publisher_id = ? AND c.export_name IS NOT NULL AND lower(c.export_name) >= lower(?) || '/' AND lower(c.export_name) < lower(?) || '0')
+    AND NOT EXISTS (SELECT 1 FROM ${PARTS} WHERE publisher_id = ? AND generation_id = ? AND artifact_id IS NULL AND lower(name) = lower(?))`,
+    params: [publisherId, generationId, publisherId, publisherId, generationId, publisherId, publisherId, generationId,
+      publisherId, mName, publisherId, mName, mName, publisherId, generationId, mName] };
+}
+/** Generation result form without part pairs: grp 0 = a part against an existing row, 1 = the manifest name against an existing row, 2 = the manifest name against a part. */
+export function generationNameConflictRows(publisherId, generationId, mName) {
+  return { sql: `SELECT 0 AS grp, t.name AS name, c.export_name AS conflicts_with FROM ${PARTS} t CROSS JOIN ${LNAME}
+      WHERE t.publisher_id = ? AND t.generation_id = ? AND t.artifact_id IS NULL AND c.publisher_id = ? AND c.export_name IS NOT NULL AND ${TWIN("t.name")}
+    UNION ALL
+    SELECT 0, t.name, c.export_name FROM ${PARTS} t CROSS JOIN ${LNAME}
+      WHERE t.publisher_id = ? AND t.generation_id = ? AND t.artifact_id IS NULL AND c.publisher_id = ? AND c.export_name IS NOT NULL AND ${BELOW("t.name")}
+    UNION ALL
+    SELECT 1, ?, c.export_name FROM ${LNAME} WHERE c.publisher_id = ? AND c.export_name IS NOT NULL AND ${TWIN("?")}
+    UNION ALL
+    SELECT 1, ?, c.export_name FROM ${LNAME} WHERE c.publisher_id = ? AND c.export_name IS NOT NULL AND lower(c.export_name) >= lower(?) || '/' AND lower(c.export_name) < lower(?) || '0'
+    UNION ALL
+    SELECT 2, ?, t.name FROM ${PARTS} t WHERE t.publisher_id = ? AND t.generation_id = ? AND t.artifact_id IS NULL AND lower(t.name) = lower(?)
+    ORDER BY grp, name, conflicts_with LIMIT 1`,
+    params: [publisherId, generationId, publisherId, publisherId, generationId, publisherId,
+      mName, publisherId, mName, mName, publisherId, mName, mName, mName, publisherId, generationId, mName] };
+}
+/** The first new name that differs only by case from an earlier one: { name: later, conflicts_with: earlier } or null. */
+export function firstCaseTwin(names) {
+  const seen = new Map();
+  for (const n of names) {
+    const k = n.toLowerCase();
+    if (seen.has(k)) return { name: n, conflicts_with: seen.get(k) };
+    seen.set(k, n);
+  }
+  return null;
+}
+/** The conflict a generation commit reports. `names`: its part names in binary order; `hit`: the row of generationNameConflictRows, or null. */
+export function generationConflict(names, hit) {
+  const pair = firstCaseTwin(names);
+  if (pair && (!hit || hit.grp !== 0 || pair.name < hit.name)) return pair;
+  return hit ? { name: hit.name, conflicts_with: hit.conflicts_with } : null;
 }
 
 /** Validate an App Files path; returns { path, kind }. */
@@ -457,7 +527,9 @@ const quotaExceeded = () => new HttpError(413, "quota_exceeded", "This app has r
 const TEXT_TYPES = new Map([["text/markdown", "markdown"], ["text/html", "html"], ["application/json", "json"], ["text/csv", "csv"]]);
 const unsupportedType = () => new HttpError(415, "unsupported_type", "Allowed: " + [...TEXT_TYPES.keys()].join(", "));
 const trashedErr = (path, id) => new HttpError(409, "destination_file_trashed", "The owner moved this app's file to trash; ask the owner to restore it", { name: path, file_id: id });
-const pathConflict = () => new HttpError(409, "path_conflict", "This path conflicts with another file of this app (the same path in another case, a file where a folder is needed, or a reserved export file)");
+const PATH_CONFLICT_MESSAGE = "This path conflicts with another file of this app (the same path in another case, a file where a folder is needed, or a reserved export file)";
+const pathConflict = () => new HttpError(409, "path_conflict", PATH_CONFLICT_MESSAGE);
+export const pathConflictAt = (name, conflictsWith) => new HttpError(409, "path_conflict", PATH_CONFLICT_MESSAGE, { name, conflicts_with: conflictsWith });
 const exists = () => new HttpError(412, "precondition_failed", "A file already exists at this path");
 const missing = () => new HttpError(412, "precondition_failed", "No file exists at this path");
 const stale = (row) => new HttpError(412, "precondition_failed", "If-Match does not match the file's current version", { current_revision: row.head_rev, current_etag: `"${row.sha256}"` });
