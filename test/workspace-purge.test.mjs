@@ -332,6 +332,32 @@ test("(q) D1 calls per run: 14 in the steady state with ten pending, 29 at most"
   assert.equal(s.world.calls - before, 29);
 });
 
+test("(p) the purge's selections and the project marking use migration 0035's partial indexes", async () => {
+  const s = setup();
+  team(s, { ws: "wsp_a", projects: ["prj_1"] });
+  aged(s, "wsp_a", 31);
+  await lib.purgeDeletingWorkspaces(s.env);
+  const seen = new Map();
+  for (const e of s.world.log) if ((e.kind === "all" || e.kind === "run") && e.q && !seen.has(e.q)) seen.set(e.q, e);
+  const issued = [...seen.values()];
+  const plan = (e) => W.all(s.world, "EXPLAIN QUERY PLAN " + e.q, ...Array(e.params).fill(1)).map((r) => r.detail).join(" | ");
+  const pick = (re) => {
+    const hits = issued.filter((e) => re.test(e.q.trim()));
+    assert.equal(hits.length, 1, `exactly one issued statement matches ${re}`);
+    return plan(hits[0]);
+  };
+  const fill = pick(/^UPDATE workspaces SET deleting_at = \?/);
+  assert.match(fill, /workspaces_purge_due/);
+  const sel1 = pick(/^SELECT id FROM workspaces WHERE status = 'deleting' AND purge_marked_at IS NULL/);
+  assert.match(sel1, /workspaces_purge_due/); assert.doesNotMatch(sel1, /TEMP B-TREE/);
+  const recovery = pick(/^SELECT w\.id FROM workspaces w/);
+  assert.match(recovery, /workspaces_purge_pending/); assert.match(recovery, /projects_live/); assert.doesNotMatch(recovery, /TEMP B-TREE/);
+  const sel2 = pick(/^SELECT id FROM workspaces WHERE status = 'deleting' AND purge_marked_at IS NOT NULL/);
+  assert.match(sel2, /workspaces_purge_pending/); assert.doesNotMatch(sel2, /TEMP B-TREE/);
+  const marking = pick(/^UPDATE projects SET deleted_at = \?, deleted_by = 'system'/);
+  assert.match(marking, /projects_live/);
+});
+
 function sourceFiles(dir) {
   return readdirSync(dir).flatMap((n) => {
     const p = join(dir, n);
@@ -358,7 +384,7 @@ test("(x) deleteWorkspace requires the workspace's name: missing, wrong, padded,
   s.sql("INSERT INTO principals (id, kind, issuer, subject, label, created_at) VALUES ('hum_o', 'human', 'synthetic', 'hum_o', 'Synthetic', ?)", AT);
   s.sql("INSERT INTO workspace_members (workspace_id, principal_id, role, added_by, created_at) VALUES ('wsp_a', 'hum_m', 'admin', 'hum_a', ?)", AT);
   const del = (input, who = "hum_a", ws = "wsp_a") => lib.deleteWorkspace(ctxOf(s.env, who), ws, input);
-  for (const input of [undefined, {}, { confirm_name: "synthetic team" }, { confirm_name: 3 }])
+  for (const input of [undefined, null, [], {}, { confirm_name: "synthetic team" }, { confirm_name: 3 }, { confirm_name: "   " }])
     await assert.rejects(del(input), (e) => e.status === 400 && e.code === "confirmation_required" && e.message === "Type the workspace's name to confirm");
   await assert.rejects(del({ confirm_name: "Synthetic team" }, "hum_m"), (e) => e.status === 403);
   await assert.rejects(del({ confirm_name: "Personal" }, "hum_a", "wsp_hum_a"), (e) => e.status === 409);

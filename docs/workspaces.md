@@ -144,13 +144,13 @@ Owners delete a shared workspace on its page by typing its name. The personal wo
 - **From 30 days later** (`WORKSPACE_PURGE_GRACE_DAYS`, as for a deleted project), the 15-minute cron
   (`purgeDeletingWorkspaces`, `workspace-purge.js`) first marks the workspace (`purge_marked_at`), then marks every
   live project of it deleted and due. The project purge ([above](#deleting-a-project)) removes their content:
-  documents, versions, comments, files and their R2 objects, and the rest it lists. Projects already in Recently
-  deleted have reached their own purge date by then and go with the rest. Once no project is left, the workspace gets
-  `purged_at`.
-- **30 days is the earliest, not an exact time.** The project purge handles 5 projects per run across the whole
-  installation, in the order they fell due, so a large workspace takes several runs and shares that queue with
-  ordinary project deletions. A project's purge waits while an upload into it is finishing; none can still be running
-  30 days after a workspace was closed.
+  documents, versions, comments, files and their R2 objects, and the rest it lists. Projects that were already in
+  Recently deleted when the workspace was deleted keep their own date: each is removed when its own 30 days end, which
+  is before the workspace's 30 days do. Once no project is left, the workspace gets `purged_at`.
+- **For projects that were live when the workspace was deleted, 30 days is the earliest, not an exact time.** The
+  project purge handles 5 projects per run across the whole installation, in the order they fell due, so a large
+  workspace takes several runs and shares that queue with ordinary project deletions. A project's purge waits while an
+  upload into it is finishing; none can still be running 30 days after a workspace was closed.
 - **What "deleted" means.** Files are deleted from R2 when the purge reaches them; Agent Library keeps no other copy.
   Database rows are deleted, but the whole database can still be restored to an earlier moment with D1 Time Travel
   for its retention window (30 days on Workers Paid, 7 on Free), and any database export or backup the operator made

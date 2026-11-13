@@ -254,6 +254,9 @@ test("a deleted workspace's content is removed by the cron 30 days later; the wo
   const ws = ok(await owner.req("POST", "/api/workspaces", { name: "Purge Team" }), 201).id;
   const q = ok(await owner.req("POST", "/api/projects", { title: "Purge Me", workspace_id: ws }), 201).id;
   const d = ok(await owner.req("POST", `/api/projects/${q}/artifacts`, { title: "Synthetic purge doc", body: "synthetic purge body" }), 201).artifact_id;
+  // Control for the R2 check below: the project has stored bytes.
+  assert.equal(await n(`SELECT COUNT(*) AS n FROM revisions WHERE project_id = '${q}' AND body_key IS NOT NULL`), 1, "the document's text is an R2 object");
+  const key = (await sql(`SELECT body_key FROM revisions WHERE project_id = '${q}' AND body_key IS NOT NULL`))[0].body_key;
   ok(await owner.req("DELETE", `/api/workspaces/${ws}`, { confirm_name: "Purge Team" }));
   // The DELETE set deleting_at (checked before the test moves it back).
   const at = (await sql(`SELECT deleting_at FROM workspaces WHERE id = '${ws}'`))[0].deleting_at;
@@ -274,6 +277,14 @@ test("a deleted workspace's content is removed by the cron 30 days later; the wo
   assert.equal(await n(`SELECT COUNT(*) AS n FROM workspaces WHERE id = '${ws}' AND status = 'deleting' AND name = 'Purge Team'`), 1, "the row stays");
   // Gate check only: a deleting workspace already answered 404 before any purge.
   assert.equal((await owner.req("GET", `/api/projects/${q}/artifacts/${d}`)).status, 404);
+  const dir = join(h.dir, "v3", "r2", "miniflare-R2BucketObject");
+  const r2db = readdirSync(dir).find((f) => f.endsWith(".sqlite") && f !== "metadata.sqlite");
+  const r2 = new DatabaseSync(join(dir, r2db), { readOnly: true });
+  try {
+    const r2keys = r2.prepare("SELECT key FROM _mf_objects").all().map((r) => r.key);
+    assert.ok(!r2keys.includes(key), `R2 object ${key} removed`);
+    assert.ok(!r2keys.some((k) => k.startsWith(`text/${q}/`) || k.startsWith(`blobs/${q}/`) || k.startsWith(`staging/${q}/`)), "nothing left under the purged project's prefixes");
+  } finally { r2.close(); }
 });
 
 test("browser: delete from Project settings, see it under Recently deleted, restore it", async (t) => {
