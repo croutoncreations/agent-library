@@ -13,7 +13,7 @@ import { RENDER_CSP, htmlRefs, renderHtmlDocument } from "./html.js";
 import { WEB_ROUTE } from "./links.js";
 import { requireWorkspaceRole, visibleProjects } from "./tenancy.js";
 import { withRequestMemo, workspaceUsage } from "./limits.js";
-import { ENCRYPTION_MISCONFIGURED_MESSAGE, encryptionConfigured, encryptionRequired, withDataKeyMemo } from "./crypto/keys.js";
+import { withDataKeyMemo } from "./crypto/keys.js";
 import { RESERVED_HANDLES, addressLinksResponse, resolveProjectRef } from "./paths.js";
 import { imageRefs, renderMarkdown } from "./markdown.js";
 import { getRenderSource } from "./render-source.js";
@@ -362,32 +362,49 @@ async function extraRoute(req, env, url, requestId, ctx) {
 /** The Worker for one installation: core plus its adapters (packages/self-host, or the hosted repo). */
 function createWorker(adapterConfig = {}) {
   const A = resolveAdapters(adapterConfig);
+  // Decided once, like A: a later change to adapterConfig never lets a supplied provider through.
+  const providerSupplied = !!adapterConfig?.keyProvider;
   // Fail closed: Cloudflare Access is configured but this entry has no sign-in provider, so it would not be enforced.
   const misconfigured = (env) => A.identity.name === "none" && !!(env?.ACCESS_TEAM_DOMAIN || env?.ACCESS_AUD);
   const refuse = () => new Response(JSON.stringify({ error: { code: "misconfigured", message: "This build has no sign-in provider but Access is configured" } }), { status: 500, headers: { "content-type": "application/json" } });
-  // Fail closed: CONTENT_ENCRYPTION_REQUIRED=1 but the key provider is not configured or its configuration is
-  // malformed. Only applies when that var is set. The response names no secret; the log line has the reason and, for
-  // an error, only its code (HttpError) or constructor name, never its message.
-  // An invalid CONTENT_ENCRYPTION_REQUIRED value is refused the same way (reason required_value_invalid, never the value).
-  const encryptionMissing = (env) => {
-    const log = (detail) => console.error(JSON.stringify({ event: "encryption_misconfigured", ...detail }));
-    try { if (!encryptionRequired(env)) return false; }
-    catch { log({ reason: "required_value_invalid" }); return true; }
-    try {
-      if (encryptionConfigured(withAdapters(env, A))) return false;
-      log({ reason: "not_configured" });
-    } catch (e) {
-      log({ reason: "configuration_error", error: e instanceof HttpError ? e.code : String(e?.constructor?.name ?? typeof e) });
-    }
-    return true;
-  };
-  const refuseEncryption = () => new Response(JSON.stringify({ error: { code: "encryption_misconfigured", message: ENCRYPTION_MISCONFIGURED_MESSAGE } }), { status: 500, headers: { "content-type": "application/json" } });
+  // Content encryption cannot be switched on in this release: text would stay plaintext while files were encrypted.
+  // A Worker with any encryption setting refuses every request and logs which setting (never its value).
+  const unsupported = (env) => encryptionSetting(env, providerSupplied);
+  const refuseUnsupported = () => new Response(JSON.stringify({ error: { code: "encryption_unsupported", message: ENCRYPTION_UNSUPPORTED_MESSAGE } }), { status: 500, headers: { "content-type": "application/json" } });
   return {
-    scheduled: (ev, env, ctx) => coreWorker.scheduled(ev, withAdapters(env, A), ctx),
-    fetch: async (req, env, ctx) => misconfigured(env) ? refuse() : encryptionMissing(env) ? refuseEncryption()
-      : coreWorker.fetch(req, withDataKeyMemo(withRequestMemo(withAdapters(env, A))), ctx)
+    scheduled: (ev, env, ctx) => {
+      // Cron jobs write no content (they expire uploads and delete rows and objects), so they keep running.
+      const setting = unsupported(env);
+      if (setting) logEncryptionUnsupported(setting);
+      return coreWorker.scheduled(ev, withAdapters(env, A), ctx);
+    },
+    fetch: async (req, env, ctx) => {
+      if (misconfigured(env)) return refuse();
+      const setting = unsupported(env);
+      if (setting) { logEncryptionUnsupported(setting); return refuseUnsupported(); }
+      return coreWorker.fetch(req, withDataKeyMemo(withRequestMemo(withAdapters(env, A))), ctx);
+    }
   };
 }
+/** The refusal's message: names no setting and no value. */
+const ENCRYPTION_UNSUPPORTED_MESSAGE = "Content encryption settings are present, but this release does not support content encryption; remove them";
+/** Master-key secret names (crypto/worker-secret-keys.js). Exact names only: other settings such as CONTENT_HOST never match. */
+const MASTER_KEY_SECRET = /^CONTENT_MASTER_KEY_V\d+$/;
+const isUnset = (v) => v === undefined || v === null || v === "";
+/**
+ * The first content-encryption setting present, or null: a supplied keyProvider adapter, CONTENT_MASTER_KEY_VERSION,
+ * CONTENT_ENCRYPTION_REQUIRED other than its "off" values ("0" or 0), then any CONTENT_MASTER_KEY_V<n> (own property
+ * names in order). Unset means undefined, null or "".
+ */
+function encryptionSetting(env, providerSupplied) {
+  if (providerSupplied) return "keyProvider";
+  if (!isUnset(env?.CONTENT_MASTER_KEY_VERSION)) return "CONTENT_MASTER_KEY_VERSION";
+  const required = env?.CONTENT_ENCRYPTION_REQUIRED;
+  if (!isUnset(required) && required !== "0" && required !== 0) return "CONTENT_ENCRYPTION_REQUIRED";
+  for (const name of Object.getOwnPropertyNames(env ?? {})) if (MASTER_KEY_SECRET.test(name) && !isUnset(env[name])) return name;
+  return null;
+}
+const logEncryptionUnsupported = (setting) => console.error(JSON.stringify({ event: "encryption_unsupported", setting }));
 var coreWorker = {
   // Cron: expire abandoned uploads and delete their R2 objects (bounded, idempotent).
   async scheduled(_ev, env, ctx) {

@@ -1,5 +1,10 @@
 # Encryption at rest
 
+> **Not available in this release.** Content encryption cannot be switched on. A Worker that has
+> `CONTENT_MASTER_KEY_VERSION`, any `CONTENT_MASTER_KEY_V<n>` secret, or `CONTENT_ENCRYPTION_REQUIRED` (other than
+> `0`) set refuses every request with `500 encryption_unsupported`. The rest of this page describes a design
+> that is not active.
+
 ## Today
 
 All content is encrypted at rest by the storage provider: Cloudflare encrypts D1 and R2 with AES-256. Accurate

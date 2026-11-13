@@ -250,11 +250,18 @@ test("keyProvider: the default reads Worker secrets; a custom provider replaces 
   assert.throws(() => K.resolveAdapters({ keyProvider: { name: "synthetic-kms", configured: () => true } }), /keyProvider/);
   assert.equal(K.encryptionConfigured(K.withAdapters({}, A)), true, "core asks the installation's provider, not the default");
   assert.equal(K.encryptionConfigured(K.withAdapters({}, K.defaultAdapters())), false);
-  // createWorker attaches the same resolved provider to every request's env.
-  let seen;
-  const w = W.createWorker({ keyProvider: custom, routes: [{ method: "GET", path: "/kp", handler: async (_r, env) => { seen = W.adapters(env).keyProvider; return new Response("ok"); } }] });
-  assert.equal((await call(w, "/kp")).status, 200);
-  assert.equal(seen.name, "synthetic-kms");
+  // Content encryption is refused in this release: createWorker with a supplied keyProvider (resolved and validated
+  // above as before) answers every request with the refusal and never reaches a route.
+  let reached = false;
+  const w = W.createWorker({ keyProvider: custom, routes: [{ method: "GET", path: "/kp", handler: async () => { reached = true; return new Response("ok"); } }] });
+  const logs = [], realError = console.error;
+  console.error = (...a) => logs.push(a.map(String).join(" "));
+  let res;
+  try { res = await call(w, "/kp"); } finally { console.error = realError; }
+  assert.equal(res.status, 500);
+  assert.deepEqual(await res.json(), { error: { code: "encryption_unsupported", message: "Content encryption settings are present, but this release does not support content encryption; remove them" } });
+  assert.equal(reached, false);
+  assert.deepEqual(logs.filter((l) => l.includes("encryption_unsupported")).map((l) => JSON.parse(l)), [{ event: "encryption_unsupported", setting: "keyProvider" }]);
 });
 
 test("Turnstile: the test-key hostname exception needs local dev AND a Cloudflare test secret", async () => {

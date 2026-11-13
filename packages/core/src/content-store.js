@@ -8,6 +8,7 @@ import { projectWorkspaceId } from "./limits.js";
 // Today content is encrypted at rest by the storage provider (Cloudflare D1/R2), so these are pass-throughs.
 // Per-workspace envelope encryption (hosted plan, "Encryption at rest") plugs in here: a KeyProvider wraps
 // per-workspace data keys and R2 objects become chunked AES-GCM so Range reads keep working.
+// The encryption paths here are inactive: createWorker (index.js) refuses every request while a content-encryption setting is present.
 // test/content-store.test.mjs fails if any other module touches env.BLOBS. Text versions and comments use
 // staged immutable writes and getText; legacy inline bodies still pass through readText.
 

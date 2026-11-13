@@ -9,19 +9,13 @@
 // 500 itself, so no Real (listener) test may count R2 requests on a read that fails mid-body; such counts belong in
 // World tests (test/upload-world.mjs), which have no proxy. Whether production workerd aborts the body mid-stream is
 // checked on a deployed Worker, not here.
-// 2. the shipped Worker with synthetic content-master-key settings (random bytes generated here, passed as --var,
-//    never printed) and CONTENT_ENCRYPTION_REQUIRED "1": design tests 2, 3, 9, 17 and 23 (Real parts).
+// 2. the shipped Worker refuses content encryption: started with an encryption setting (synthetic, never printed), every request answers 500 encryption_unsupported and the log names the setting, never its value.
 import { describe, test, before, after } from "node:test";
 import assert from "node:assert/strict";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { promisify } from "node:util";
-import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { startServer, ROOT, LOCAL_CONFIG, sha256 } from "./helpers.mjs";
-import { startAppConnectServer } from "./fixtures/app-connect-harness.mjs";
-import { makePng } from "./make-fixtures.mjs";
+import { startServer, ROOT } from "./helpers.mjs";
 import { SERVER_PORTS } from "./ports.mjs";
 import { buildWorker } from "../scripts/build.mjs";
 
@@ -124,139 +118,29 @@ describe("probe (design test 1)", () => {
   });
 });
 
-describe("shipped Worker with synthetic encryption settings (design tests 2, 3, 9, 17, 23: Real parts)", () => {
-  let h, owner, agent;
-  const PID = "enc-files";
-  const sql = async (q) => JSON.parse((await promisify(execFile)("wrangler", ["d1", "--config", LOCAL_CONFIG, "execute", "DB", "--local", "--persist-to", h.dir, "--json", "--command", q], { cwd: ROOT, env: { ...process.env, CI: "1", NO_COLOR: "1" } })).stdout)[0].results;
-  const pngOf = (n) => { const b = randomBytes(n); makePng(4, 4).copy(b, 0, 0, 16); return b; };
-  async function upload(bytes, extra = {}) {
-    const b = await owner.req("POST", `/api/projects/${PID}/uploads`, { title: "Synthetic.png", mime: "image/png", size: bytes.length, sha256: sha256(bytes), ...extra });
-    assert.equal(b.status, 201, JSON.stringify(b.body));
-    const p = await owner.req("PUT", b.body.put_url, undefined, { raw: bytes, idem: false });
-    assert.equal(p.status, 200, JSON.stringify(p.body));
-    return { upload: b.body.upload_id, finish: () => owner.req("POST", `/api/projects/${PID}/uploads/${b.body.upload_id}/finish`, {}) };
+describe("the shipped Worker refuses content-encryption settings (Real)", () => {
+  // Values here must stay synthetic: they are passed to wrangler dev as --var (wrangler prints --var bindings as
+  // env.NAME ("(hidden)"), but nothing real may ever be used).
+  for (const [setting, value] of [["CONTENT_MASTER_KEY_VERSION", "1"], ["CONTENT_MASTER_KEY_V7", randomBytes(32).toString("base64")]]) {
+    test(`${setting} alone: /api/me answers 500 encryption_unsupported; the log names ${setting} and never its value`, async () => {
+      // Only this run's part of the log counts (startServer appends to it; an older line must not satisfy the test).
+      const logPath = join(ROOT, "tmp", "test-state-encryption-files.log");
+      const from = existsSync(logPath) ? statSync(logPath).size : 0;
+      const s = await startServer("encryption-files", PORT, { vars: { [setting]: value }, readyStatus: 500 });
+      try {
+        assert.equal(s.logPath, logPath);
+        const r = await fetch(s.base + "/api/me");
+        assert.equal(r.status, 500);
+        assert.deepEqual(await r.json(), { error: { code: "encryption_unsupported", message: "Content encryption settings are present, but this release does not support content encryption; remove them" } });
+      } finally { await s.stop(); }
+      // Read after the server has exited, so workerd's output has been flushed to the log.
+      const log = readFileSync(logPath).subarray(from).toString("utf8");
+      assert.ok(log.includes(JSON.stringify({ event: "encryption_unsupported", setting })), "logged in this run");
+      if (value.length > 8) {
+        assert.ok(!log.includes(value), "never the value");
+        assert.ok(!log.includes(value.slice(0, 12)), "never its start");
+        assert.ok(!log.includes(value.slice(-12)), "never its end");
+      }
+    });
   }
-  before(async () => {
-    h = await startAppConnectServer({ port: PORT, vars: {
-      CONTENT_MASTER_KEY_VERSION: "1", CONTENT_MASTER_KEY_V1: randomBytes(32).toString("base64"), CONTENT_ENCRYPTION_REQUIRED: "1",
-      PROJECT_BINARY_BYTES: "0", FILE_MAX_BYTES: String(8 * 1024 * 1024) } });
-    owner = await h.owner();
-    assert.equal((await owner.req("POST", "/api/projects", { id: PID, title: "Encrypted files" })).status, 201);
-    agent = await h.connectMcpAgent({ [PID]: "write" }, { clientName: "Synthetic encrypted" });
-  });
-  after(async () => { await h?.stop(); });
-
-  test("design test 2 and 3 (Real): a 3.5-chunk PNG upload reads back identically, whole and by Range", async () => {
-    const bytes = pngOf(Math.floor(3.5 * 65536));
-    const u = await upload(bytes);
-    const f = await u.finish();
-    assert.equal(f.status, 200, JSON.stringify(f.body));
-    const [row] = await sql(`SELECT blob_key_id, blob_header FROM revisions WHERE artifact_id = '${f.body.artifact_id}'`);
-    assert.match(row.blob_key_id, /^wk_/, "stored encrypted");
-    const url = `/api/projects/${PID}/artifacts/${f.body.artifact_id}/content`;
-    const whole = await owner.req("GET", url, undefined, { binary: true });
-    assert.equal(whole.status, 200);
-    assert.equal(whole.headers.get("content-length"), String(bytes.length));
-    assert.ok(whole.body.equals(bytes));
-    const n = bytes.length;
-    for (const [spec, start, end] of [["0-0", 0, 0], ["65535-65536", 65535, 65536], ["65536-65551", 65536, 65551], [`${n - 1}-${n - 1}`, n - 1, n - 1], ["-100", n - 100, n - 1], ["1000-140000", 1000, 140000]]) {
-      const r = await owner.req("GET", url, undefined, { binary: true, headers: { range: `bytes=${spec}` } });
-      assert.equal(r.status, 206, spec);
-      assert.equal(r.headers.get("content-range"), `bytes ${start}-${end}/${n}`, spec);
-      assert.ok(r.body.equals(bytes.subarray(start, end + 1)), spec);
-    }
-  });
-
-  test("design test 9 and 17 (Real, HTTP): after a shred, finish answers 410 key_shredded (upload failed), and restoring an encrypted version answers 410 with no new revision", async () => {
-    const v1 = pngOf(3000), v2 = pngOf(4000);
-    const f1 = await (await upload(v1)).finish();
-    assert.equal(f1.status, 200, JSON.stringify(f1.body));
-    const art = f1.body.artifact_id;
-    const u2 = await upload(v2, { artifact_id: art, expected_revision: 1, title: undefined });
-    const f2 = await u2.finish();
-    assert.equal(f2.status, 200, JSON.stringify(f2.body));
-    const pending = await upload(pngOf(2000));
-    // Shred the workspace key exactly as shredWorkspaceKeys does (local D1 only; synthetic data).
-    const now = Date.now();
-    const [p] = await sql(`SELECT COALESCE(workspace_id, 'wsp_' || owner_id) AS w FROM projects WHERE id = '${PID}'`);
-    await sql(`UPDATE workspace_keys SET shredded_at = COALESCE(shredded_at, ${now}), wrapped = '' WHERE workspace_id = '${p.w}'`);
-    const fin = await pending.finish();
-    assert.deepEqual([fin.status, fin.body?.error?.code], [410, "key_shredded"], JSON.stringify(fin.body));
-    const [up] = await sql(`SELECT state FROM uploads WHERE id = '${pending.upload}'`);
-    assert.equal(up.state, "failed");
-    const r = await owner.req("POST", `/api/projects/${PID}/artifacts/${art}/restore`, { from_revision: 1, expected_revision: 2 });
-    assert.deepEqual([r.status, r.body?.error?.code], [410, "key_shredded"], JSON.stringify(r.body));
-    const [{ n }] = await sql(`SELECT COUNT(*) AS n FROM revisions WHERE artifact_id = '${art}'`);
-    assert.equal(n, 2, "no new revision");
-    const read = await owner.req("GET", `/api/projects/${PID}/artifacts/${art}/content`, undefined, { binary: true });
-    assert.equal(read.status, 410);
-  });
-});
-
-describe("official MCP SDK client over OAuth with encryption on (design test 23)", () => {
-  let h, sdk;
-  const PID = "enc-mcp";
-  before(async () => {
-    h = await startAppConnectServer({ port: PORT, vars: {
-      CONTENT_MASTER_KEY_VERSION: "1", CONTENT_MASTER_KEY_V1: randomBytes(32).toString("base64"), CONTENT_ENCRYPTION_REQUIRED: "1", PROJECT_BINARY_BYTES: "0" } });
-    const owner = await h.owner();
-    assert.equal((await owner.req("POST", "/api/projects", { id: PID, title: "Encrypted MCP" })).status, 201);
-    const rw = await h.connectMcpAgent({ [PID]: "write" }, { clientName: "Synthetic SDK" });
-    sdk = new Client({ name: "synthetic-sdk", version: "1.0" });
-    await sdk.connect(new StreamableHTTPClientTransport(new URL(`${h.issuer}/mcp`), { requestInit: { headers: { authorization: `Bearer ${rw.access_token}` } } }));
-  });
-  after(async () => { await sdk?.close(); await h?.stop(); });
-
-  test("upload_file an inline PNG, then read_file returns it inline", async () => {
-    const png = makePng(12, 12);
-    const made = await sdk.callTool({ name: "upload_file", arguments: { project_id: PID, title: "Inline.png", mime: "image/png", content_base64: png.toString("base64"), change_note: "Synthetic inline image", idempotency_key: "uf-" + randomBytes(6).toString("hex") } });
-    assert.equal(made.isError, false, JSON.stringify(made.structuredContent));
-    const rd = await sdk.callTool({ name: "read_file", arguments: { project_id: PID, artifact_id: made.structuredContent.artifact_id } });
-    assert.equal(rd.isError, false, JSON.stringify(rd.structuredContent));
-    const img = rd.content.find((c) => c.type === "image");
-    assert.ok(Buffer.from(img.data, "base64").equals(png));
-  });
-});
-
-describe("backup round trip across installations (design test 18, Real)", () => {
-  // Installation A has no encryption; B has synthetic key settings. They run one after the other on the same port.
-  const PID = "enc-backup-src";
-  let exported, bytes, sourceBlobKey;
-  test("export from A (plaintext) carries no encryption columns; import into B encrypts under B's key and downloads identically; A is unchanged", async () => {
-    const a = await startAppConnectServer({ port: PORT, vars: { PROJECT_BINARY_BYTES: "0" } });
-    try {
-      const owner = await a.owner();
-      assert.equal((await owner.req("POST", "/api/projects", { id: PID, title: "Backup source" })).status, 201);
-      bytes = Buffer.concat([makePng(6, 6), randomBytes(70_000)]);
-      const b = await owner.req("POST", `/api/projects/${PID}/uploads`, { title: "Round trip.png", mime: "image/png", size: bytes.length, sha256: sha256(bytes) });
-      assert.equal(b.status, 201, JSON.stringify(b.body));
-      assert.equal((await owner.req("PUT", b.body.put_url, undefined, { raw: bytes, idem: false })).status, 200);
-      const f = await owner.req("POST", `/api/projects/${PID}/uploads/${b.body.upload_id}/finish`, {});
-      assert.equal(f.status, 200, JSON.stringify(f.body));
-      const e = await owner.req("GET", `/api/projects/${PID}/backup`);
-      assert.equal(e.status, 200);
-      exported = e.body;
-      assert.ok(exported.revisions.every((r) => !("blob_key_id" in r) && !("blob_header" in r)), "no encryption columns in a backup");
-      sourceBlobKey = exported.revisions.find((r) => r.blob_key).blob_key;
-      assert.ok(Buffer.from(exported.blobs[sourceBlobKey].data, "base64").equals(bytes), "blobs are plaintext");
-      const again = await owner.req("GET", `/api/projects/${PID}/artifacts/${f.body.artifact_id}/content`, undefined, { binary: true });
-      assert.ok(again.body.equals(bytes), "A unchanged");
-    } finally { await a.stop(); }
-    const b = await startAppConnectServer({ port: PORT, vars: {
-      CONTENT_MASTER_KEY_VERSION: "1", CONTENT_MASTER_KEY_V1: randomBytes(32).toString("base64"), CONTENT_ENCRYPTION_REQUIRED: "1", PROJECT_BINARY_BYTES: "0" } });
-    try {
-      const owner = await b.owner();
-      const me = await owner.req("GET", "/api/me");
-      const wid = `wsp_${me.body.principal.id}`; // the owner's personal workspace (migration 0017's trigger)
-      const imp = await owner.req("POST", `/api/workspaces/${wid}/import`, exported);
-      assert.equal(imp.status, 201, JSON.stringify(imp.body));
-      const sql = async (q) => JSON.parse((await promisify(execFile)("wrangler", ["d1", "--config", LOCAL_CONFIG, "execute", "DB", "--local", "--persist-to", b.dir, "--json", "--command", q], { cwd: ROOT, env: { ...process.env, CI: "1", NO_COLOR: "1" } })).stdout)[0].results;
-      const [row] = await sql(`SELECT r.artifact_id, r.blob_key_id, k.workspace_id FROM revisions r JOIN workspace_keys k ON k.key_id = r.blob_key_id WHERE r.project_id = '${imp.body.project_id}'`);
-      assert.ok(row, "the imported version is encrypted under a key of B");
-      assert.equal(row.workspace_id, wid);
-      const d = await owner.req("GET", `/api/projects/${imp.body.project_id}/artifacts/${row.artifact_id}/content`, undefined, { binary: true });
-      assert.equal(d.status, 200);
-      assert.ok(d.body.equals(bytes), "identical download");
-    } finally { await b.stop(); }
-  });
 });

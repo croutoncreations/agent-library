@@ -32,7 +32,7 @@ let built = null;
  * worker: optional path of another built Worker to run instead of dist/worker/index.js (the hosted repository runs its
  * own bundle through this harness). It runs with the same local config, bindings and migrations.
  */
-export async function startServer(name, port, { fresh = true, persistDir, vars = FUNCTIONAL_VARS, readyHeaders = {}, readyBase, worker } = {}) {
+export async function startServer(name, port, { fresh = true, persistDir, vars = FUNCTIONAL_VARS, readyHeaders = {}, readyBase, worker, readyStatus = 401 } = {}) {
   if (!Object.values(SERVER_PORTS).includes(port)) throw new Error(`port ${port} is not in test/ports.mjs SERVER_PORTS`);
   for (const p of [port, port + INSPECTOR_OFFSET]) if (!(await portFree(p))) throw new Error(`port ${p} for server ${name} is already in use (a previous server did not exit?)`);
   if (!worker) { built ??= buildWorker(); await built; }
@@ -59,7 +59,7 @@ export async function startServer(name, port, { fresh = true, persistDir, vars =
   const deadline = Date.now() + 60_000;
   for (;;) {
     if (child.exitCode !== null) throw new Error(`wrangler exited early; see ${logPath}`);
-    try { const r = await fetch((readyBase ?? base) + "/api/me", { headers: readyHeaders }); if (r.status === 401) break; } catch {}
+    try { const r = await fetch((readyBase ?? base) + "/api/me", { headers: readyHeaders }); if (r.status === readyStatus) break; } catch {}
     if (Date.now() > deadline) { stopProc(child); throw new Error(`server ${name} not ready; see ${logPath}`); }
     await sleep(300);
   }

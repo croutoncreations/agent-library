@@ -1,7 +1,7 @@
 // Workspace data keys (docs/encryption.md#workspace-keys): one active key per workspace in D1 `workspace_keys`, wrapped
 // by the keyProvider adapter (default: worker-secret-keys.js). In memory a data key exists only as a non-extractable
 // HKDF CryptoKey (usages ["deriveKey"]); its raw bytes exist only while a new key is created, then are zeroed.
-// Nothing calls this yet: content is not encrypted. docs/encryption.md#rules-for-code-that-uses-this says how to.
+// Inactive: createWorker (index.js) refuses every request while a content-encryption setting is present.
 import { adapters } from "../adapters.js";
 import { HttpError, randomId } from "../util.js";
 
@@ -51,7 +51,7 @@ export function encryptionConfigured(env) {
   return v;
 }
 
-/** The message of every encryption_misconfigured refusal (also createWorker's). Names no secret. */
+/** The message of every encryption_misconfigured refusal. Names no secret. */
 export const ENCRYPTION_MISCONFIGURED_MESSAGE = "Content encryption is required but not configured";
 
 /**

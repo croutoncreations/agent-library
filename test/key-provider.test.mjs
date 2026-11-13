@@ -485,13 +485,14 @@ test("encryptionRequired reads CONTENT_ENCRYPTION_REQUIRED: unset, \"\", \"0\"/0
       const env = { CONTENT_ENCRYPTION_REQUIRED: v, ...keys };
       assert.throws(() => lib.encryptionRequired(env), misconfigured, label);
       await assert.rejects(lib.encryptionEnabled(request({ DB, ...env })), misconfigured, label);
+      // createWorker refuses any encryption setting before reading it (this release does not support encryption).
       let res;
       const logs = await captureErrors(async () => { res = await call(env); });
       assert.equal(res.status, 500, label);
-      assert.deepEqual(await res.json(), { error: { code: "encryption_misconfigured", message: "Content encryption is required but not configured" } }, label);
-      const lines = logs.filter((l) => l.includes('"event":"encryption_misconfigured"'));
-      assert.deepEqual(lines.map((l) => JSON.parse(l)), [{ event: "encryption_misconfigured", reason: "required_value_invalid" }], label);
-      assert.ok(!lines[0].includes(secret), label);
+      assert.deepEqual(await res.json(), { error: { code: "encryption_unsupported", message: "Content encryption settings are present, but this release does not support content encryption; remove them" } }, label);
+      const lines = logs.filter((l) => l.includes('"event":"encryption_unsupported"'));
+      assert.deepEqual(lines.map((l) => JSON.parse(l)), [{ event: "encryption_unsupported", setting: keys.CONTENT_MASTER_KEY_VERSION ? "CONTENT_MASTER_KEY_VERSION" : "CONTENT_ENCRYPTION_REQUIRED" }], label);
+      assert.ok(!logs.some((l) => l.includes(secret) || l.includes("encryption_misconfigured")), label);
     }
   }
 });
@@ -555,16 +556,18 @@ test("workspaceDataKey refuses to hand out a key for encrypting when the configu
   assertDataKey((await lib.dataKeyById(request({ ...base, CONTENT_MASTER_KEY_VERSION: undefined }), WS_A, keyId)).key);
 });
 
-test("createWorker refuses every request when encryption is required but not configured (or malformed); unchanged otherwise", async () => {
+test("createWorker refuses every request while a content-encryption setting is present (configured, required, malformed or a custom provider); unchanged otherwise", async () => {
   const { DB } = mkDB();
   const call = (env, adapters) => lib.createWorker(adapters).fetch(new Request("https://app.example.test/api/me"), { APP_HOST: "app.example.test", DB, ...env }, { waitUntil() {} });
-  const refusedBody = { error: { code: "encryption_misconfigured", message: "Content encryption is required but not configured" } };
+  const refusedBody = { error: { code: "encryption_unsupported", message: "Content encryption settings are present, but this release does not support content encryption; remove them" } };
   const secret = masterSecret();
   for (const env of [
     { CONTENT_ENCRYPTION_REQUIRED: "1" },
     { CONTENT_ENCRYPTION_REQUIRED: "1", CONTENT_MASTER_KEY_V1: secret },
     { CONTENT_ENCRYPTION_REQUIRED: "1", CONTENT_MASTER_KEY_VERSION: "1", CONTENT_MASTER_KEY_V1: "not-32-bytes" },
     { CONTENT_ENCRYPTION_REQUIRED: "1", CONTENT_MASTER_KEY_VERSION: "1" },
+    { CONTENT_ENCRYPTION_REQUIRED: "1", CONTENT_MASTER_KEY_VERSION: "1", CONTENT_MASTER_KEY_V1: secret },
+    { CONTENT_MASTER_KEY_VERSION: "1", CONTENT_MASTER_KEY_V1: "not-32-bytes" },
   ]) {
     const res = await call(env);
     assert.equal(res.status, 500, JSON.stringify(Object.keys(env)));
@@ -572,47 +575,53 @@ test("createWorker refuses every request when encryption is required but not con
     assert.deepEqual(JSON.parse(text), refusedBody);
     assert.ok(!text.includes(secret) && !/CONTENT_/.test(text));
   }
-  // A custom provider whose configured() throws or says false is refused too.
+  // A supplied provider is refused whatever it says (it is never asked).
   const d = lib.defaultAdapters().keyProvider;
   const off = { ...d, name: "synthetic-off", configured: () => false };
-  assert.equal((await call({ CONTENT_ENCRYPTION_REQUIRED: "1" }, { keyProvider: off })).status, 500);
   const broken = { ...d, name: "synthetic-broken", configured: () => { throw new Error("synthetic"); } };
-  assert.equal((await call({ CONTENT_ENCRYPTION_REQUIRED: "1" }, { keyProvider: broken })).status, 500);
-  // Required and configured, or not required: requests go through to core (whatever core answers, it is not this refusal).
-  for (const env of [{ CONTENT_ENCRYPTION_REQUIRED: "1", CONTENT_MASTER_KEY_VERSION: "1", CONTENT_MASTER_KEY_V1: secret }, {}, { CONTENT_ENCRYPTION_REQUIRED: "0" },
-    { CONTENT_MASTER_KEY_VERSION: "1", CONTENT_MASTER_KEY_V1: "not-32-bytes" }]) {
-    const body = await (await call(env)).text();
-    assert.ok(!body.includes("encryption_misconfigured"), JSON.stringify(Object.keys(env)));
+  for (const keyProvider of [off, broken]) for (const env of [{ CONTENT_ENCRYPTION_REQUIRED: "1" }, {}]) {
+    const res = await call(env, { keyProvider });
+    assert.equal(res.status, 500, keyProvider.name);
+    assert.deepEqual(await res.json(), refusedBody);
+  }
+  // No setting, or REQUIRED off: requests go through to core (401 here: no sign-in).
+  for (const env of [{}, { CONTENT_ENCRYPTION_REQUIRED: "0" }, { CONTENT_ENCRYPTION_REQUIRED: "" }, { CONTENT_ENCRYPTION_REQUIRED: 0 }]) {
+    const res = await call(env);
+    const body = await res.text();
+    assert.equal(res.status, 401, JSON.stringify(env));
+    assert.ok(!body.includes("encryption_unsupported") && !body.includes("encryption_misconfigured"), JSON.stringify(env));
   }
 });
 
-test("createWorker's encryption refusal logs one line with its reason, never an error message or a secret name", async () => {
+test("createWorker's encryption refusal logs one line naming the setting, never a value or a provider's message; the provider is never asked", async () => {
   const { DB } = mkDB();
   const call = (env, adapters) => lib.createWorker(adapters).fetch(new Request("https://app.example.test/api/me"), { APP_HOST: "app.example.test", DB, ...env }, { waitUntil() {} });
-  const refusedBody = { error: { code: "encryption_misconfigured", message: "Content encryption is required but not configured" } };
-  const events = (logs) => logs.map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter((e) => e?.event === "encryption_misconfigured");
+  const refusedBody = { error: { code: "encryption_unsupported", message: "Content encryption settings are present, but this release does not support content encryption; remove them" } };
+  const events = (logs) => logs.map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter((e) => e?.event === "encryption_unsupported" || e?.event === "encryption_misconfigured");
   const d = lib.defaultAdapters().keyProvider;
   const SYNTHETIC_MESSAGE = "synthetic provider failure text";
+  const BAD_SECRET = "not-32-bytes-" + masterSecret();
   class SyntheticProviderError extends Error {}
+  let asked = 0;
   const cases = [
-    [{ CONTENT_ENCRYPTION_REQUIRED: "1" }, undefined, { event: "encryption_misconfigured", reason: "not_configured" }],
-    [{ CONTENT_ENCRYPTION_REQUIRED: "1", CONTENT_MASTER_KEY_VERSION: "1", CONTENT_MASTER_KEY_V1: "not-32-bytes" }, undefined,
-      { event: "encryption_misconfigured", reason: "configuration_error", error: "master_key_invalid" }],
-    [{ CONTENT_ENCRYPTION_REQUIRED: "1" }, { keyProvider: { ...d, name: "synthetic-broken", configured: () => { throw new SyntheticProviderError(SYNTHETIC_MESSAGE); } } },
-      { event: "encryption_misconfigured", reason: "configuration_error", error: "SyntheticProviderError" }],
-    [{ CONTENT_ENCRYPTION_REQUIRED: "1" }, { keyProvider: { ...d, name: "synthetic-async", configured: async () => true } },
-      { event: "encryption_misconfigured", reason: "configuration_error", error: "key_provider_invalid" }],
+    [{ CONTENT_ENCRYPTION_REQUIRED: "1" }, undefined, { event: "encryption_unsupported", setting: "CONTENT_ENCRYPTION_REQUIRED" }],
+    [{ CONTENT_ENCRYPTION_REQUIRED: "1", CONTENT_MASTER_KEY_VERSION: "1", CONTENT_MASTER_KEY_V1: BAD_SECRET }, undefined,
+      { event: "encryption_unsupported", setting: "CONTENT_MASTER_KEY_VERSION" }],
+    [{ CONTENT_ENCRYPTION_REQUIRED: "1" }, { keyProvider: { ...d, name: "synthetic-broken", configured: () => { asked++; throw new SyntheticProviderError(SYNTHETIC_MESSAGE); } } },
+      { event: "encryption_unsupported", setting: "keyProvider" }],
+    [{ CONTENT_ENCRYPTION_REQUIRED: "1" }, { keyProvider: { ...d, name: "synthetic-async", configured: async () => { asked++; return true; } } },
+      { event: "encryption_unsupported", setting: "keyProvider" }],
   ];
   for (const [env, adapters, want] of cases) {
     let res;
     const logs = await captureErrors(async () => { res = await call(env, adapters); });
     assert.equal(res.status, 500);
-    assert.deepEqual(await res.json(), refusedBody, "the client response is unchanged");
+    assert.deepEqual(await res.json(), refusedBody);
     assert.deepEqual(events(logs), [want], JSON.stringify(want));
-    const line = logs.find((l) => l.includes('"event":"encryption_misconfigured"'));
-    assert.ok(!line.includes(SYNTHETIC_MESSAGE) && !/CONTENT_/.test(line), line);
+    assert.ok(!logs.some((l) => l.includes(SYNTHETIC_MESSAGE) || l.includes(BAD_SECRET)), JSON.stringify(logs));
   }
-  // Not required: no refusal and no such line.
+  assert.equal(asked, 0, "a supplied provider is never asked");
+  // No setting: no refusal and no such line.
   const logs = await captureErrors(() => call({}));
   assert.deepEqual(events(logs), []);
 });
