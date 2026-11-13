@@ -149,7 +149,7 @@ the error instead of a reset connection.
 | Imported versions, comments, details versions | 2,000 each | import | fixed | `400 bad_backup` |
 | Imported file bytes | `PROJECT_BINARY_BYTES` (`"0"` = no cap) | import | `PROJECT_BINARY_BYTES` | `400 bad_backup` |
 | Workspace limits on import | `projects`, `storage_bytes` | workspace | plan | `402 limit_reached` |
-| File storage keys on import and restore | at most 1,015 UTF-8 bytes per resulting key | key | fixed | `400 bad_backup` "A file key is too long", before anything is written |
+| File storage keys on import and restore | at most 1,024 UTF-8 bytes per resulting key (R2's object-key limit) | key | fixed | `400 bad_backup` "A file key is too long", before anything is written |
 | A file version's key on import | must lie in the version's own document | version | fixed | `400 bad_backup` "A file key does not match its document" |
 
 Comments are not counted in the 32 MiB backup export text budget.
