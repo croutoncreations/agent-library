@@ -1342,13 +1342,16 @@ test("rate limit: App Files writes share the publisher write budget (429 with Re
   assert.equal(appRows(c.P.publisher_id), 0);
 });
 
-// Design test 21.
-test("encryption: App Files text is stored like every other text write", { todo: "App Files are text; text is encrypted by slice 3c, which is not built yet; until then text is stored as plaintext" }, async () => {
+// Design test 21 (content encryption was dropped): App Files text is stored like every other text write, as the bytes written.
+test("App Files text is stored like every other text write", async () => {
   const c = await connect("files-own");
-  ok(await put(c.tok, "enc.md", "synthetic secret", { create: true }), 201);
-  const key = sql(`SELECT r.body_key FROM artifacts a JOIN revisions r ON r.id = a.head_revision_id WHERE a.publisher_id = '${c.P.publisher_id}'`)[0].body_key;
-  const stored = execFileSync("wrangler", ["r2", "object", "get", `agent-library-blobs/${key}`, "--local", "--persist-to", h.dir, "--pipe", "--config", LOCAL_CONFIG], { cwd: ROOT }).toString();
-  assert.doesNotMatch(stored, /synthetic secret/);
+  const text = "synthetic app file bytes e5\n";
+  ok(await put(c.tok, "stored-bytes.md", text, { create: true }), 201);
+  const digest = createHash("sha256").update(text).digest("hex");
+  const rows = sql(`SELECT r.body_key FROM artifacts a JOIN revisions r ON r.id = a.head_revision_id WHERE a.publisher_id = '${c.P.publisher_id}' AND r.sha256 = '${digest}'`);
+  assert.equal(rows.length, 1, JSON.stringify(rows));
+  const stored = execFileSync("wrangler", ["r2", "object", "get", `agent-library-blobs/${rows[0].body_key}`, "--local", "--persist-to", h.dir, "--pipe", "--config", LOCAL_CONFIG], { cwd: ROOT });
+  assert.ok(Buffer.from(text).equals(stored), stored.toString());
 });
 
 // Design test 22 a-c, e: a same-key winner commits while the loser is paused after its record check.
