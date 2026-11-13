@@ -10,6 +10,8 @@ import { explainLimit, fmtBytes, limitGuard, workspaceLimits } from "./limits.js
 
 
 var SCHEMA = "agent-library-backup/1";
+// Schema 3 adds `app: { name, path }` on the files an App Connect app wrote.
+var APP_SCHEMA = "agent-library-backup/3";
 /** Largest total of distinct file bytes a project export holds (exports above it refuse with 413 backup_too_large). */
 var BACKUP_EXPORT_FILE_BYTES = 16 * 1024 * 1024;
 var BACKUP_EXPORT_TEXT_BYTES = 32 * 1024 * 1024;
@@ -27,8 +29,6 @@ async function exportBackup(ctx, projectId) {
   await requireProjectRole(ctx, projectId, "admin", true); // export works while suspended (read-only)
   const p = await DB.prepare("SELECT * FROM projects WHERE id = ?").bind(projectId).first();
   if (!p) throw new HttpError(404, "not_found", "Project not found");
-  const pubFiles = await DB.prepare("SELECT COUNT(*) AS n FROM artifacts WHERE project_id = ? AND publisher_id IS NOT NULL").bind(projectId).first("n").catch(() => 0);
-  if (pubFiles) throw new HttpError(409, "backup_unsupported", "This project contains app exports; backup of App Connect projects is not supported yet");
   // The backup is one JSON response with every file inline (base64), built in Worker memory (128 MB), so it is capped
   // before any file is read. Streamed backups are a follow-up.
   const fileBytes = await DB.prepare("SELECT COALESCE(SUM(size),0) AS n FROM (SELECT DISTINCT blob_key, size FROM revisions WHERE project_id = ? AND blob_key IS NOT NULL)").bind(projectId).first("n");
@@ -36,7 +36,7 @@ async function exportBackup(ctx, projectId) {
   const textBytes = await DB.prepare("SELECT COALESCE(SUM(size),0) AS n FROM revisions WHERE project_id = ? AND blob_key IS NULL").bind(projectId).first("n");
   if (textBytes > BACKUP_EXPORT_TEXT_BYTES) throw new HttpError(413, "backup_too_large", "This project's text versions exceed 32 MiB for a single backup. Download documents individually or export a smaller project.");
   const [arts, revs, comments] = await DB.batch([
-    DB.prepare("SELECT id, kind, title, folder, tags, head_rev, head_revision_id, meta_version, trashed_at, created_at, updated_at, is_template, template_description, source_artifact_id, source_revision, source_role, template_date FROM artifacts WHERE project_id = ? AND head_rev > 0").bind(projectId),
+    DB.prepare("SELECT id, kind, title, folder, tags, head_rev, head_revision_id, meta_version, trashed_at, created_at, updated_at, is_template, template_description, source_artifact_id, source_revision, source_role, template_date, publisher_id, export_name, (SELECT display_name FROM publishers WHERE id = artifacts.publisher_id) AS app_name FROM artifacts WHERE project_id = ? AND head_rev > 0").bind(projectId),
     DB.prepare("SELECT id, artifact_id, rev_no, author_id, body, body_key, blob_key, size, sha256, mime, restored_from, created_at, via_kind, via_id, via_label, client_info, change_note FROM revisions WHERE project_id = ?").bind(projectId),
     DB.prepare("SELECT id, artifact_id, rev_no, author_id, body, body_key, created_at FROM comments WHERE project_id = ?").bind(projectId),
     DB.prepare("SELECT id, artifact_id, version, title, folder, tags, trashed, author_id, via_kind, via_id, via_label, client_info, change_note, restored_from, created_at, template_description FROM meta_versions WHERE project_id = ?").bind(projectId)
@@ -50,21 +50,32 @@ async function exportBackup(ctx, projectId) {
     blobs[r.blob_key] = { sha256: sha2, data: b64(bytes) };
   }
   await DB.prepare("INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id) VALUES (?, ?, ?, 'backup.export', ?, 'ok', ?)").bind(nowIso(), ctx.principal.id, projectId, projectId, ctx.requestId).run();
+  // An app's file is exported as an ordinary file that says which app wrote it and at which path (null once trashed).
+  const artifacts = arts.results.map(({ publisher_id, export_name, app_name, ...a }) => publisher_id ? { ...a, app: { name: app_name ?? "app", path: export_name ?? null } } : a);
   return {
-    schema: arts.results.some(a => a.is_template || a.source_artifact_id) ? "agent-library-backup/2" : SCHEMA,
+    schema: artifacts.some(a => a.app) ? "agent-library-backup/3" : artifacts.some(a => a.is_template || a.source_artifact_id) ? "agent-library-backup/2" : SCHEMA,
     features: ["document_templates/1"],
     exported_at: nowIso(),
     project: { id: p.id, title: p.title, created_at: p.created_at },
-    artifacts: arts.results,
+    artifacts,
     revisions: await mapContent(revs.results, async ({ body_key, ...r }) => ({ ...r, body: r.blob_key ? null : await getText(ctx.env, { ...r, body_key }) })),
     comments: await mapContent(comments.results, async ({ body_key, ...c }) => ({ ...c, body: await getText(ctx.env, { ...c, body_key }) })),
     meta_versions: metaVersionsExport,
     blobs
   };
 }
+/** What a restored or imported file is: a file an app wrote becomes an ordinary editable file (title = its path, tag app:<name>). */
+function restoredIdentity(a) {
+  if (!a.app) return { title: a.title, tags: a.tags ?? "[]" };
+  let tags = [];
+  try { tags = JSON.parse(a.tags ?? "[]"); } catch {}
+  if (!Array.isArray(tags)) tags = [];
+  const tag = `app:${a.app.name}`.slice(0, 50);
+  return { title: a.app.path ?? a.title, tags: JSON.stringify(tags.includes(tag) || tags.length >= 20 ? tags : [...tags, tag]) };
+}
 // Checks a backup's shape, ids and every hash; returns its project id and decoded blobs (nothing is written).
 async function validateBackup(backup) {
-  if (backup?.schema !== SCHEMA && backup?.schema !== "agent-library-backup/2") throw new HttpError(400, "bad_backup", "Unsupported backup schema");
+  if (backup?.schema !== SCHEMA && backup?.schema !== "agent-library-backup/2" && backup?.schema !== APP_SCHEMA) throw new HttpError(400, "bad_backup", "Unsupported backup schema");
   for (const k of ["artifacts", "revisions", "comments"]) if (!Array.isArray(backup[k])) throw new HttpError(400, "bad_backup", `${k} must be a list`);
   if (backup.meta_versions !== void 0 && !Array.isArray(backup.meta_versions)) throw new HttpError(400, "bad_backup", "meta_versions must be a list");
   const pid = String(backup.project?.id ?? "");
@@ -73,6 +84,11 @@ async function validateBackup(backup) {
     if (a.is_template != null && a.is_template !== 0 && a.is_template !== 1) throw new HttpError(400, "bad_backup", "Invalid template identity");
     if (a.is_template && (a.kind !== "markdown" || a.publisher_id)) throw new HttpError(400, "bad_backup", "Invalid template kind");
     str(a.template_description ?? "", "template_description", 280);
+    if (a.app != null) {
+      if (typeof a.app !== "object" || Array.isArray(a.app)) throw new HttpError(400, "bad_backup", "Invalid app origin");
+      str(a.app.name, "app.name", 120, { min: 1 });
+      if (a.app.path !== null) str(a.app.path, "app.path", 200, { min: 1 });
+    }
     if (a.source_artifact_id != null) {
       str(a.source_artifact_id, "source_artifact_id", 64, { min: 1 });
       int(a.source_revision, "source_revision", 1);
@@ -271,9 +287,11 @@ async function restoreBackup(ctx, backup) {
   for (const a of authors) if (a !== ctx.principal.id)
     head.push(DB.prepare("INSERT OR IGNORE INTO principals (id, kind, issuer, subject, label, created_at) VALUES (?, 'agent', 'restored', ?, ?, ?)").bind(a, a, "restored " + a, nowIso()));
   head.push(DB.prepare("INSERT INTO projects (id, owner_id, title, created_at, workspace_id) VALUES (?, ?, ?, ?, ?)").bind(pid, ctx.principal.id, backup.project.title, backup.project.created_at, workspaceId));
-  for (const a of backup.artifacts)
+  for (const a of backup.artifacts) {
+    const own = restoredIdentity(a);
     head.push(DB.prepare(`INSERT INTO artifacts (id, project_id, kind, title, folder, tags, head_rev, head_revision_id, meta_version, trashed_at, created_at, updated_at, is_template, template_description, source_artifact_id, source_revision, source_role, template_date)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(a.id, pid, a.kind, a.title, a.folder, a.tags, a.head_rev, a.head_revision_id, a.meta_version, a.trashed_at, a.created_at, a.updated_at, a.is_template ?? 0, a.template_description ?? "", a.source_artifact_id ?? null, a.source_revision ?? null, a.source_role ?? null, a.template_date ?? null));
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(a.id, pid, a.kind, own.title, a.folder, own.tags, a.head_rev, a.head_revision_id, a.meta_version, a.trashed_at, a.created_at, a.updated_at, a.is_template ?? 0, a.template_description ?? "", a.source_artifact_id ?? null, a.source_revision ?? null, a.source_role ?? null, a.template_date ?? null));
+  }
   // Revision loop, part 1: text keys, text writes and bridges before stageTextWrites.
   const textKeys = [], textWrites = [], bridges = [], bodyKeys = new Map();
   for (const r of backup.revisions) {
@@ -435,8 +453,9 @@ async function importBackup(ctx, workspaceId, input, idemKeyValue, digest = "") 
   ];
   for (const a of backup.artifacts) {
     const src = a.source_artifact_id != null && artId.has(a.source_artifact_id);
+    const own = restoredIdentity(a);
     stmts.push(DB.prepare(`INSERT INTO artifacts (id, project_id, kind, title, folder, tags, head_rev, head_revision_id, meta_version, trashed_at, created_at, updated_at, is_template, template_description, source_artifact_id, source_revision, source_role, template_date)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(artId.get(a.id), pid, a.kind, a.title, a.folder ?? "", a.tags ?? "[]", a.head_rev, revId.get(a.head_revision_id) ?? null, a.meta_version, a.trashed_at ?? null, a.created_at, a.updated_at, a.is_template ?? 0, a.template_description ?? "", src ? artId.get(a.source_artifact_id) : null, src ? a.source_revision : null, src ? a.source_role : null, a.template_date ?? null));
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(artId.get(a.id), pid, a.kind, own.title, a.folder ?? "", own.tags, a.head_rev, revId.get(a.head_revision_id) ?? null, a.meta_version, a.trashed_at ?? null, a.created_at, a.updated_at, a.is_template ?? 0, a.template_description ?? "", src ? artId.get(a.source_artifact_id) : null, src ? a.source_revision : null, src ? a.source_role : null, a.template_date ?? null));
   }
   // Text keys, text writes and bridges are computed before stageTextWrites.
   const textKeys = [], textWrites = [];

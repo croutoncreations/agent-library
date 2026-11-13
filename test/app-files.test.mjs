@@ -310,8 +310,17 @@ test("agents can read app files but never write them; the owner cannot edit them
   const f = (await put(c.tok, "index.json", '{"files":[]}', { create: true })).json.file;
   const doc = (await put(c.tok, "note.md", "# note\n", { create: true })).json.file;
   const agent = await h.connectMcpAgent({ "files-own": "write" }, { clientName: "Files agent" });
+  const apiKey = ok(await owner.req("POST", "/api/api-keys", { label: "path key", projects: [{ project_id: "files-own", access: "read" }] }), 201).secret;
   const read = await agent.call("read_artifact", { project_id: "files-own", artifact_id: f.file_id });
   assert.equal(read.isError, false); assert.match(JSON.stringify(read.data), /files/);
+  // An agent finds a file by its app path, and every app file's metadata says its path.
+  const found = await agent.call("list_artifacts", { project_id: "files-own", app_path: "index.json" });
+  assert.equal(found.isError, false, JSON.stringify(found.data));
+  assert.deepEqual(found.data.artifacts.map((x) => [x.id, x.app_path]), [[f.file_id, "index.json"]]);
+  assert.deepEqual((await agent.call("list_artifacts", { project_id: "files-own", app_path: "nope.json" })).data.artifacts, []);
+  const viaKey = await fetch(`${h.api}/projects/files-own/files?app_path=index.json`, { headers: { authorization: `Bearer ${apiKey}` } });
+  assert.deepEqual((await viaKey.json()).files.map((x) => x.app_path), ["index.json"]);
+  assert.equal((await agent.call("list_artifacts", { project_id: "files-own", app_path: "A/B" })).isError, true, "an invalid path is refused");
   const save = await agent.call("save_markdown", { project_id: "files-own", artifact_id: doc.file_id, expected_revision: 1, body: "x", idempotency_key: uniq("agent-save") });
   assert.equal(save.isError, true); assert.match(JSON.stringify(save.data), /protected_source/);
   const edit = await owner.req("PUT", `/api/projects/files-own/artifacts/${f.file_id}`, { expected_revision: 1, content: "{}" });
@@ -334,4 +343,33 @@ test("the removed routes are gone: /v1/publisher/* answers 404 and upload slots 
   for (const [m, p] of [["GET", "/publisher/me"], ["GET", "/publisher/files"], ["POST", "/publisher/snapshots"], ["POST", "/publisher/generations"]])
     assert.equal((await h.pub(c.tok, m, p)).status, 404, p);
   assert.equal((await h.pub(c.tok, "GET", "/app/nope")).status, 404);
+});
+
+test("backup: a project with app files exports them with app:{name,path}; import makes ordinary editable files", async () => {
+  const title = uniq("Backup project");
+  const pid = ok(await owner.req("POST", "/api/projects", { title }), 201).id;
+  const c = await connect(pid, { destination: "new" });
+  const kept = (await put(c.tok, "summary/steps.json", '{"steps":1}', { create: true })).json.file;
+  const gone = (await put(c.tok, "old.md", "# old\n", { create: true })).json.file;
+  assert.equal((await del(c.tok, "old.md", { match: etagOf("# old\n") })).status, 200);
+  const backup = ok(await owner.req("GET", `/api/projects/${pid}/backup`));
+  assert.equal(backup.schema, "agent-library-backup/3");
+  const byId = Object.fromEntries(backup.artifacts.map((a) => [a.id, a]));
+  const appName = byId[kept.file_id].app.name;
+  assert.match(appName, /^Files app-/);
+  assert.deepEqual(byId[kept.file_id].app, { name: appName, path: "summary/steps.json" });
+  assert.deepEqual(byId[gone.file_id].app, { name: appName, path: null }, "a trashed app file has no path");
+  assert.ok(!("publisher_id" in byId[kept.file_id]) && !("export_name" in byId[kept.file_id]));
+
+  const personal = ok(await owner.req("GET", "/api/workspaces")).workspaces.find((w) => w.personal).id;
+  const imported = ok(await owner.req("POST", `/api/workspaces/${personal}/import`, { backup, title: "Imported app project" }), 201);
+  const rows = sql(`SELECT id, title, tags, publisher_id, export_name, trashed_at IS NOT NULL AS trashed FROM artifacts WHERE project_id = '${imported.project_id}' ORDER BY title`);
+  assert.equal(rows.length, 2);
+  const restored = rows.find((r) => r.title === "summary/steps.json");
+  assert.deepEqual([restored.publisher_id, restored.export_name, JSON.parse(restored.tags)], [null, null, [`app:${appName}`]]);
+  assert.equal(rows.find((r) => r.trashed).publisher_id, null);
+  // Ordinary and editable: the owner can save a new version of the restored file.
+  const doc = rows.find((r) => r.title === "summary/steps.json");
+  const saved = await owner.req("PUT", `/api/projects/${imported.project_id}/artifacts/${doc.id}`, { expected_revision: 1, content: '{"steps":2}' });
+  assert.equal(saved.status, 200, JSON.stringify(saved.body));
 });
