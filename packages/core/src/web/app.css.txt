@@ -284,6 +284,10 @@ details summary:hover{color:var(--fg)}
 .vh-head{display:flex;align-items:center;gap:8px}
 .vh-head h2{margin:0;scroll-margin-top:calc(var(--top-h) + 8px);scroll-margin-bottom:calc(var(--tab-h) + 16px)}
 .vh-body{margin-top:12px}
+.vh-compare-field{display:inline-flex;align-items:center;gap:8px;min-width:0;max-width:100%}
+.vh-compare-field label{white-space:nowrap}
+@media (pointer:coarse){.vh-compare{min-height:44px}}
+.vh-compare{min-width:0;max-width:min(22rem,100%);flex:1 1 auto;cursor:pointer}
 .vh-diff{font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--card);border:1px solid var(--line);border-radius:var(--r2);overflow:auto;max-height:60vh}
 .vh-diff:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .vh-line{display:grid;grid-template-columns:3.5em 3.5em 1.5em minmax(0,1fr);white-space:pre-wrap;overflow-wrap:anywhere}

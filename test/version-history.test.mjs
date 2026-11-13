@@ -4,7 +4,7 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { startServer, setupProject, grant, mcpClient, key, ROOT, LOCAL_CONFIG } from "./helpers.mjs";
@@ -378,6 +378,15 @@ test("browser: History shows who/why, groups autosave bursts, compares, restores
     assert.equal(await burstToggle.evaluate((b) => b.getAttribute("aria-expanded")), "true");
     await page.click('.vh-row[data-rev="6"] button');
     await page.waitForFunction(() => [...document.querySelectorAll(".vh-detail button")].some((b) => b.textContent === "Restore this version"));
+    // An older version opens compared with current; the picker compares it with any other version instead.
+    await page.waitForFunction(() => /Current \(v7\) compared with v6 · 1 added, 0 removed/.test(document.querySelector(".vh-body").textContent));
+    assert.equal(await page.$eval(".vh-compare", (s) => s.value), "7");
+    assert.deepEqual((await page.$$eval(".vh-compare option:not([hidden])", (os) => os.map((o) => o.value))), ["7", "5", "4", "3", "2", "1"]);
+    assert.match(await page.$eval('.vh-compare option[value="5"]', (o) => o.textContent), /^v5 \(previous\)/);
+    assert.equal(await page.$eval('label[for="vh-compare-6"]', (l) => l.textContent), "Compare with");
+    assert.equal(await page.evaluate(() => [...document.querySelectorAll(".vh-detail button")].some((b) => /Compare with current|What changed in/.test(b.textContent))), false);
+    await page.select(".vh-compare", "2");
+    await page.waitForFunction(() => /Changes from v2 to v6 · 1 added, 1 removed/.test(document.querySelector(".vh-body").textContent));
     await page.evaluate(() => [...document.querySelectorAll(".vh-detail button")].find((b) => b.textContent === "Restore this version").click());
     await page.waitForFunction(() => /Restored version 6 as version 8/.test(document.querySelector(".vh .msg").textContent));
     assert.equal((await owner.req("GET", docUrl(id))).body.body, "start\nedit 5");
@@ -442,5 +451,77 @@ test("browser: History shows who/why, groups autosave bursts, compares, restores
     assert.match(caption, /too large to compare here \(.+ → .+\); use Show full text/);
     assert.doesNotMatch(await page.$eval(".vh-body", e => e.textContent), /\bnull\b|undefined/);
     assert.equal(await page.$(".vh-body .vh-diff"), null);
+  } finally { await browser.close(); }
+});
+
+test("browser: a read-only viewer compares versions through the picker (also too large to compare) and gets no Restore", { skip: !haveChrome && "Chrome not installed" }, async () => {
+  // A real viewer: a workspace project, an invite with role viewer, accepted by the second signed-in person.
+  const viewer = await s.loginAt(APP, "viewer");
+  const ws = (await owner.req("POST", "/api/workspaces", { name: "Synthetic history viewers" })).body.id;
+  const pid = (await owner.req("POST", "/api/projects", { title: "Viewer history", workspace_id: ws })).body.id;
+  const invite = await owner.req("POST", `/api/workspaces/${ws}/invites`, { email: "viewer@example.test", role: "viewer" });
+  assert.equal((await viewer.req("POST", "/api/invites/accept", { token: invite.body.accept_url.split("/").pop() })).status, 200);
+  const url = (id) => `/api/projects/${pid}/artifacts/${id}`;
+  const small = (await owner.req("POST", `/api/projects/${pid}/artifacts`, { title: "Viewer compare", body: "one" })).body.artifact_id;
+  assert.equal((await owner.req("PUT", url(small), { expected_revision: 1, body: "one\ntwo", change_note: "Added two" })).status, 200);
+  assert.equal((await owner.req("PUT", url(small), { expected_revision: 2, body: "one\ntwo\nthree", change_note: "Added three" })).status, 200);
+  const large = (await owner.req("POST", `/api/projects/${pid}/artifacts`, { title: "Viewer large", body: "small" })).body.artifact_id;
+  assert.equal((await owner.req("PUT", url(large), { expected_revision: 1, body: "synthetic ".repeat(220000), change_note: "Large" })).status, 200);
+  assert.equal((await owner.req("PUT", url(large), { expected_revision: 2, body: "small again", change_note: "Small again" })).status, 200);
+  const out = "tmp/design-captures/upstream-small"; mkdirSync(out, { recursive: true });
+  const browser = await require(PUPPETEER).launch({ executablePath: CHROME, headless: true, args: ["--no-first-run"] });
+  async function openOlder(page, id, n) {
+    await page.goto(`${APP}/p/${pid}/a/${id}`);
+    await page.waitForFunction(() => [...document.querySelectorAll("[role=tab]")].some((t) => t.textContent.trim() === "History"));
+    await page.evaluate(() => [...document.querySelectorAll("[role=tab]")].find((t) => t.textContent.trim() === "History").click());
+    await page.waitForSelector(`.vh-row[data-rev="${n}"] button`);
+    await page.waitForFunction(() => document.querySelector(".vh-list").getAttribute("aria-busy") !== "true");
+    await page.evaluate((n) => document.querySelector(`.vh-row[data-rev="${n}"] button`).click(), n);
+  }
+  try {
+    for (const [who, role] of [[owner, "owner"], [viewer, "viewer"]]) {
+      const page = await browser.newPage(); const [name, value] = who.cookie.split("="); await page.setCookie({ name, value, url: APP });
+      for (const width of [1280, 390]) {
+        await page.setViewport({ width, height: 900 });
+        // An older version opens compared with current, with the picker; a viewer sees no Restore or other write control.
+        await openOlder(page, small, 1);
+        await page.waitForFunction(() => /Current \(v3\) compared with v1 · 2 added, 0 removed/.test(document.querySelector(".vh-body")?.textContent));
+        assert.equal(await page.$eval(".vh-compare", (e) => e.value), "3");
+        assert.equal(await page.$eval('label[for="vh-compare-1"]', (l) => l.textContent), "Compare with");
+        const restore = await page.evaluate(() => [...document.querySelectorAll(".vh button")].filter((b) => /Restore/.test(b.textContent)).length);
+        if (role === "viewer") {
+          assert.equal(restore, 0, "a viewer is never offered Restore");
+          assert.equal(await page.evaluate(() => document.querySelectorAll("[data-write]").length), 0, "no write control in the DOM");
+          assert.ok(await page.$(".view-only-note"), "the view-only note shows");
+        } else assert.ok(restore > 0, "the owner can restore");
+        await page.screenshot({ path: `${out}/history-picker-${role}-${width}.png`, fullPage: true });
+        if (width === 390) assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1), true, "no horizontal overflow at 390px");
+      }
+      await page.setViewport({ width: 1280, height: 900 });
+      if (role !== "viewer") { await page.close(); continue; }
+      // Picking another version updates the comparison.
+      await page.select(".vh-compare", "2");
+      await page.waitForFunction(() => /Changes from v1 to v2 · 1 added, 0 removed/.test(document.querySelector(".vh-body").textContent));
+      // A pair too large to compare shows the existing message through the picker, not null counts.
+      await openOlder(page, large, 1);
+      await page.waitForFunction(() => /Current \(v3\) compared with v1/.test(document.querySelector(".vh-body")?.textContent));
+      await page.select(".vh-compare", "2");
+      await page.waitForFunction(() => /Changes from v1 to v2/.test(document.querySelector(".vh-body").textContent));
+      assert.match(await page.$eval(".vh-body .muted.small", (e) => e.textContent), /too large to compare here \(.+ → .+\); use Show full text/);
+      assert.doesNotMatch(await page.$eval(".vh-body", (e) => e.textContent), /\bnull\b|undefined/);
+      assert.equal(await page.$(".vh-body .vh-diff"), null);
+      assert.equal(await page.evaluate(() => document.querySelectorAll("[data-write]").length), 0);
+      await page.close();
+      // Capture: a loading list with the placeholders (a fresh context, so no cached list; the projects request is held).
+      const ctx = await browser.createBrowserContext(); const lp = await ctx.newPage();
+      await lp.setCookie({ name, value, url: APP }); await lp.setViewport({ width: 1280, height: 900 });
+      let holding = true; const held = [];
+      await lp.setRequestInterception(true);
+      lp.on("request", (r) => { if (r.isInterceptResolutionHandled()) return; if (holding && new URL(r.url()).pathname === "/api/projects") held.push(r); else r.continue(); });
+      await lp.goto(`${APP}/`); await lp.waitForSelector("main ul[aria-busy=true] li.skel");
+      await lp.screenshot({ path: `${out}/loading-list-1280.png` });
+      holding = false; held.forEach((q) => q.continue());
+      await ctx.close();
+    }
   } finally { await browser.close(); }
 });
