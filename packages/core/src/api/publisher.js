@@ -6,7 +6,7 @@ import { appOrigin, artifactWebUrl, previewWebUrl } from "../links.js";
 import { addressLinksResponse } from "../paths.js";
 import { explainLimit, projectLimitGuard, projectWorkspaceId } from "../limits.js";
 import { SCOPES, livePublisher } from "../oauth/server.js";
-import { appFilesDrainsInUse, appFilesSlotsInUse, baseParams, baseSql, isAppFileContentPath, isAppFilesPath, routeAppFiles } from "./app-files.js";
+import { appFilesDrainsInUse, appFilesSlotsInUse, baseParams, baseSql, firstCaseTwin, isAppFileContentPath, isAppFilesPath, newNameConflictRows, newNameConflictSql, pathConflictAt, routeAppFiles } from "./app-files.js";
 import { LIMITS, connectionInfo, idemLookup } from "../service.js";
 import { memberRoleSql, readOnlyError } from "../tenancy.js";
 import { HttpError, errorBody, idemKey, int, json, nowIso, randomId, sha256Hex, str } from "../util.js";
@@ -696,7 +696,7 @@ function parseSnapshot(b) {
   const files = b.files.map((f) => {
     if (!f || typeof f !== "object") throw new HttpError(400, "invalid_input", "each file must be an object");
     if (typeof f.name !== "string" || !NAME_RE.test(f.name)) throw new HttpError(400, "invalid_input", "file name must match [A-Za-z0-9._-]{1,64}");
-    if (f.name === MANIFEST) throw new HttpError(400, "invalid_input", "manifest.json is reserved for the server");
+    if (f.name.toLowerCase() === MANIFEST) throw new HttpError(400, "invalid_input", "manifest.json is reserved for the server");
     if (names.has(f.name)) throw new HttpError(400, "invalid_input", `duplicate file name ${f.name}`);
     names.add(f.name);
     if (f.kind !== "json" && f.kind !== "csv") throw new HttpError(422, "unsupported_kind", "snapshot files must be json or csv");
@@ -732,6 +732,14 @@ async function testPause(env, req, header = "x-test-pause-before-batch-ms") {
   await new Promise((r) => setTimeout(r, Math.min(ms, 5e3)));
 }
 var PUB_QUOTA = { files: 32, bytes: 256 * 1024 * 1024 };
+/** After a refused snapshot commit: would the publisher quota refuse it, counted as the gate counts (non-generation rows; staged generation bytes)? */
+async function snapshotQuotaRefusal(env, publisherId, newCount, addBytes) {
+  const q = await env.DB.prepare(`SELECT (SELECT COUNT(*) FROM artifacts WHERE publisher_id = ? AND generation_id IS NULL) AS n,
+      (SELECT COALESCE(SUM(r.size), 0) FROM revisions r JOIN artifacts a ON a.id = r.artifact_id WHERE a.publisher_id = ?) AS bytes,
+      (SELECT COALESCE(SUM(total_bytes), 0) FROM publisher_generations WHERE publisher_id = ? AND state = 'staged') AS staged`).bind(publisherId, publisherId, publisherId).first();
+  if (!q) return false;
+  return q.n + newCount > PUB_QUOTA.files || q.bytes + q.staged + addBytes > PUB_QUOTA.bytes;
+}
 async function commitSnapshot(env, p, req, requestId) {
   const key = idemKey(req.headers.get("idempotency-key"));
   // Authorization before the body: a disabled client or a suspended workspace costs no body read.
@@ -771,6 +779,12 @@ async function commitSnapshot(env, p, req, requestId) {
   const targets = [...checked.map((c) => c.name), MANIFEST];
   const existingTargets = targets.map((n) => byName.get(n)).filter(Boolean);
   const newNames = targets.filter((n) => !byName.has(n));
+  const twin = firstCaseTwin(newNames);
+  if (twin) throw pathConflictAt(twin.name, twin.conflicts_with);
+  const nameRows = newNameConflictRows(p.id, newNames);
+  const hit = newNames.length ? await env.DB.prepare(nameRows.sql).bind(...nameRows.params).first() : null;
+  if (hit) throw pathConflictAt(hit.name, hit.conflicts_with);
+  const nameRule = newNameConflictSql(p.id, newNames);
   const filesStill = existingTargets.map(() => "EXISTS (SELECT 1 FROM artifacts WHERE id = ? AND publisher_id = ? AND project_id = ? AND head_rev = ? AND trashed_at IS NULL)").join(" AND ") || "1";
   const filesParams = existingTargets.flatMap((x) => [x.id, p.id, p.project_id, x.head_rev]);
   const addBytes = checked.reduce((n, c) => n + c.size, 0) + 4096;
@@ -782,7 +796,7 @@ async function commitSnapshot(env, p, req, requestId) {
   const noNewParams = newNames.length ? [p.id, ...newNames] : [];
   stmts.push(env.DB.prepare(`UPDATE publishers SET current_snapshot_id = ?, current_source_revision = ?
     WHERE id = ? AND token_epoch = ? AND (current_source_revision IS NULL OR current_source_revision < ?) AND current_snapshot_id IS ? AND ${az.sql} AND ${baseSql(true)}
-      AND ${filesStill} AND ${noNew} AND ${quota} AND ${lg.sql}`).bind(snapshotId, snap.source_revision, p.id, p.token_epoch, snap.source_revision, p.current_snapshot_id ?? null, ...az.params, ...baseParams(p), ...filesParams, ...noNewParams, ...quotaParams, ...lg.params));
+      AND ${filesStill} AND ${noNew} AND ${nameRule.sql} AND ${quota} AND ${lg.sql}`).bind(snapshotId, snap.source_revision, p.id, p.token_epoch, snap.source_revision, p.current_snapshot_id ?? null, ...az.params, ...baseParams(p), ...filesParams, ...noNewParams, ...nameRule.params, ...quotaParams, ...lg.params));
   const gate = "EXISTS (SELECT 1 FROM publishers WHERE id = ? AND current_snapshot_id = ?)";
   const gp = [p.id, snapshotId];
   await testPause(env, req);
@@ -874,11 +888,11 @@ async function commitSnapshot(env, p, req, requestId) {
       const now2 = await env.DB.prepare("SELECT trashed_at FROM artifacts WHERE id = ?").bind(x.id).first();
       if (now2?.trashed_at) throw new HttpError(409, "destination_file_trashed", "The owner moved this app's file to trash; ask the owner to restore it", { name: x.export_name, file_id: x.id });
     }
-    const q = await env.DB.prepare(`SELECT (SELECT COUNT(*) FROM artifacts WHERE publisher_id = ?) AS n,
-      (SELECT COALESCE(SUM(r.size), 0) FROM revisions r JOIN artifacts a ON a.id = r.artifact_id WHERE a.publisher_id = ?) AS bytes`).bind(p.id, p.id).first();
-    if (q && (q.n + newNames.length > PUB_QUOTA.files || q.bytes + addBytes > PUB_QUOTA.bytes))
+    if (await snapshotQuotaRefusal(env, p.id, newNames.length, addBytes))
       throw new HttpError(413, "quota_exceeded", "This app has reached its storage quota in the library; ask the owner", { max_files: PUB_QUOTA.files, max_bytes: PUB_QUOTA.bytes });
     if (lg.workspaceId) await explainLimit(env, lg.workspaceId, { storage_bytes: addBytes }, lg.limits);
+    const late = newNames.length ? await env.DB.prepare(nameRows.sql).bind(...nameRows.params).first() : null;
+    if (late) throw pathConflictAt(late.name, late.conflicts_with);
     throw new HttpError(409, "conflict", "A concurrent snapshot commit won; re-read /publisher/me and retry");
   }
   if (res.some((r, idx) => idx > 0 && !r.meta.changes)) {
@@ -1019,4 +1033,4 @@ async function handlePublisherApi(req, env, ctx) {
   }
 }
 
-export { assertStillAuthorized, handlePublisherApi, pubCtx, testHooksOn, testPause };
+export { assertStillAuthorized, handlePublisherApi, pubCtx, snapshotQuotaRefusal, testHooksOn, testPause };

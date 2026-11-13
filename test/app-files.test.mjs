@@ -1666,3 +1666,111 @@ test("App Files create twinning a committed generation part → 409", async () =
   err(await put(c.tok, "g_x-part.json/inner.md", "x", { create: true }), 409, "path_conflict");
   assert.equal(sql(`SELECT COUNT(*) AS n FROM artifacts WHERE publisher_id = '${c.P.publisher_id}' AND generation_id IS NULL`)[0].n, 0, "nothing created");
 });
+
+/** A snapshot commit of json files: `names` in order, the first authoritative and the rest derived from it. */
+const snapshotNamed = (tok, rev, names, headers = {}) => h.pub(tok, "POST", "/publisher/snapshots", { idem: uniq("snapshot-key"), headers,
+  body: { source_revision: rev, files: names.map((name, i) => ({ name, kind: "json", role: i ? "derived" : "authoritative", content: JSON.stringify({ synthetic: true }) })) } });
+const pathConflictPair = (r, name, conflictsWith) => {
+  err(r, 409, "path_conflict", "This path conflicts with another file of this app (the same path in another case, a file where a folder is needed, or a reserved export file)");
+  assert.deepEqual({ name: r.json.error.name, conflicts_with: r.json.error.conflicts_with }, { name, conflicts_with: conflictsWith });
+};
+const currentRevision = (pubId) => sql(`SELECT current_source_revision AS r FROM publishers WHERE id = '${pubId}'`)[0].r;
+const contentWrites = () => sql("SELECT COUNT(*) AS n FROM content_writes")[0].n;
+
+// Addendum B, D 7 (and S2-5: a snapshot name exactly equal to a generation part's name).
+test("snapshot commit: a new name that twins an App Files file → 409 path_conflict {name, conflicts_with}; nothing written; no R2 object", async () => {
+  const c = await connect("files-own");
+  ok(await put(c.tok, "Data.json", "{}", { create: true }), 201);
+  const rows = appRows(c.P.publisher_id), writes = contentWrites();
+  pathConflictPair(await snapshotNamed(c.tok, 1, ["data.json"]), "data.json", "Data.json");
+  assert.equal(currentRevision(c.P.publisher_id), null);
+  assert.equal(appRows(c.P.publisher_id), rows); assert.equal(contentWrites(), writes, "refused before any text is staged");
+  // A generation part's exact name is a new name for a snapshot: refused with name equal to conflicts_with.
+  const g = await connect("files-own");
+  ok(await stageAndCommit(g.tok, generationOf("g_s", 1, null, ["g_s-part.json"])), 201);
+  const gRows = appRows(g.P.publisher_id);
+  pathConflictPair(await snapshotNamed(g.tok, 2, ["g_s-part.json"]), "g_s-part.json", "g_s-part.json");
+  assert.equal(currentRevision(g.P.publisher_id), 1); assert.equal(appRows(g.P.publisher_id), gRows);
+});
+
+// Addendum B, D 8.
+test("snapshot commit: a file where a folder is needed → 409", async () => {
+  const c = await connect("files-own");
+  ok(await put(c.tok, "notes.md/x.md", "x", { create: true }), 201);
+  pathConflictPair(await snapshotNamed(c.tok, 1, ["notes.md"]), "notes.md", "notes.md/x.md");
+  assert.equal(currentRevision(c.P.publisher_id), null);
+});
+
+// Addendum B, D 9.
+test("App Files create twinning a snapshot file → 409", async () => {
+  const c = await connect("files-own");
+  ok(await snapshotNamed(c.tok, 1, ["export.json"]), 201);
+  err(await put(c.tok, "Export.json", "{}", { create: true }), 409, "path_conflict");
+});
+
+// Addendum B, D 10.
+test("snapshot re-commit of the same names is an update; grandfathered twins keep committing", async () => {
+  const c = await connect("files-own");
+  const content = JSON.stringify({ synthetic: true });
+  // The publisher has a current snapshot first, as one that made the twins through two commits would.
+  ok(await h.pub(c.tok, "POST", "/publisher/snapshots", { body: { source_revision: 1, files: [{ name: "export.json", kind: "json", content }] }, idem: uniq("snapshot-key") }), 201);
+  // Two snapshot-written rows: kind json, schema_id NULL (insertFiles does not set it), the publisher's folder
+  // (insertFiles' default), head_rev 1, not trashed.
+  insertFiles(c.P.publisher_id, [{ path: "Twin.json", kind: "json", content }, { path: "twin.json", kind: "json", content }]);
+  ok(await snapshotNamed(c.tok, 2, ["export.json"]), 201);
+  ok(await snapshotNamed(c.tok, 3, ["Twin.json", "twin.json"]), 201);
+  pathConflictPair(await snapshotNamed(c.tok, 4, ["TWIN.json"]), "TWIN.json", "Twin.json");
+  assert.equal(currentRevision(c.P.publisher_id), 3);
+});
+
+// Addendum B, D 11.
+test("one commit with two new names differing by case → 409", async () => {
+  const c = await connect("files-own");
+  pathConflictPair(await snapshotNamed(c.tok, 1, ["x.json", "X.json"]), "X.json", "x.json");
+  err(await snapshotNamed(c.tok, 1, ["x.json", "x.json"]), 400, "invalid_input", "duplicate file name x.json");
+  assert.equal(appRows(c.P.publisher_id), 0);
+});
+
+// Addendum B, D 12.
+test("snapshot manifest.json in any case → 400", async () => {
+  const c = await connect("files-own");
+  err(await snapshotNamed(c.tok, 1, ["export.json", "Manifest.json"]), 400, "invalid_input", "manifest.json is reserved for the server");
+  assert.equal(appRows(c.P.publisher_id), 0);
+});
+
+// Addendum B, D 13.
+test("case-only rename through App Files DELETE", async () => {
+  const c = await connect("files-own");
+  ok(await snapshotNamed(c.tok, 1, ["data.json"]), 201);
+  ok(await del(c.tok, "data.json", { match: "rev:1" }), 200);
+  ok(await snapshotNamed(c.tok, 2, ["Data.json"]), 201);
+});
+
+// Addendum B, D 14.
+test("concurrent: a snapshot paused before its batch while App Files creates a twin", async () => {
+  const c = await connect("files-own");
+  const r = await during((hd) => snapshotNamed(c.tok, 1, ["Twin.json"], hd), async () => ok(await put(c.tok, "twin.json", "{}", { create: true }), 201));
+  pathConflictPair(r, "Twin.json", "twin.json");
+  assert.equal(currentRevision(c.P.publisher_id), null); assert.equal(appRows(c.P.publisher_id), 1, "only the App Files file");
+  // The reverse: an App Files create paused while a snapshot commits the twin; the App Files fence refuses.
+  const d = await connect("files-own");
+  const slow = await during((hd) => put(d.tok, "Other.json", "{}", { create: true, headers: hd }), async () => ok(await snapshotNamed(d.tok, 1, ["other.json"]), 201));
+  err(slow, 409, "path_conflict");
+  assert.equal(sql(`SELECT COUNT(*) AS n FROM artifacts WHERE publisher_id = '${d.P.publisher_id}' AND export_name = 'Other.json'`)[0].n, 0);
+});
+
+// Addendum B, D 18 (S2-2): the snapshot mapping's quota step counts only non-generation rows, as the gate does.
+test("snapshot refusals of an app holding more than 32 generation part files are not quota_exceeded", async () => {
+  const c = await connect("files-own");
+  const payloads = Array.from({ length: 32 }, (_, i) => `g_big-p${String(i).padStart(2, "0")}.json`);
+  ok(await stageAndCommit(c.tok, generationOf("g_big", 1, null, payloads)), 201);
+  ok(await snapshotNamed(c.tok, 2, ["export.json"]), 201);
+  // A second snapshot with the same source_revision wins while this one is paused: its gate refuses.
+  const lost = await during((hd) => snapshotNamed(c.tok, 3, ["export.json"], hd), async () => ok(await h.pub(c.tok, "POST", "/publisher/snapshots", { idem: uniq("snapshot-key"),
+    body: { source_revision: 3, files: [{ name: "export.json", kind: "json", content: JSON.stringify({ synthetic: "winner" }) }] } }), 201));
+  assert.equal(lost.status, 409, lost.text); assert.notEqual(lost.json.error.code, "quota_exceeded");
+  // D 14's paused case on this publisher.
+  const r = await during((hd) => snapshotNamed(c.tok, 4, ["Twin.json"], hd), async () => ok(await put(c.tok, "twin.json", "{}", { create: true }), 201));
+  pathConflictPair(r, "Twin.json", "twin.json");
+  assert.equal(currentRevision(c.P.publisher_id), 3);
+});

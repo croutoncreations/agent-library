@@ -150,7 +150,9 @@ A server instance admits at most **4** uploads at a time, at most **2 per worksp
 
 These never go down: deleting a file does not give them back. They are separate from the workspace storage limit (`402`), which also applies.
 
-**App Files and snapshots interact one way.** App Files has its own limits (above: 10,000 files, 100,000 versions and 1 GiB per app, for the app's lifetime). Snapshot commits are limited to **32 files and 256 MiB per app**, and that count includes the app's App Files rows (also ones the app deleted). So once an app holds about 32 App Files, it can no longer commit a snapshot (`413 quota_exceeded`). The reverse does not apply: snapshot files do not count toward the App Files limits. The case-insensitive and file-versus-folder rules are enforced for App Files only, not for snapshot file names. An app should use one of the two APIs, not both.
+**App Files and snapshots interact one way.** App Files has its own limits (above: 10,000 files, 100,000 versions and 1 GiB per app, for the app's lifetime). Snapshot commits are limited to **32 files and 256 MiB per app**, and that count includes the app's App Files rows (also ones the app deleted). So once an app holds about 32 App Files, it can no longer commit a snapshot (`413 quota_exceeded`). The reverse does not apply: snapshot files do not count toward the App Files limits.
+
+Names follow one rule for the whole app, across App Files, snapshots and generations: no two names that differ only by case, and no file where a folder is needed (`409 path_conflict`, with `name` and `conflicts_with`). Names an app already has are kept. `manifest.json` is reserved in any case. Snapshot and generation commits need migration 0034 applied before the Worker that enforces this.
 
 ### What a disabled app can do
 

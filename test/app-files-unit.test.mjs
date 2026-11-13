@@ -10,7 +10,7 @@ import { mkWorld } from "./blind-tokens-world.mjs";
 const W = await loadWorker({
   "api/app-files.js": ["parseAppPath", "reservedAppPath", "conflictCheck", "etagMatches", "createSlotTable", "APP_FILES_SLOT_RECLAIM_MS", "APP_FILES_OVERRUN_MAX",
     "newNameConflictSql", "newNameConflictRows", "generationNameConflictSql", "generationNameConflictRows", "firstCaseTwin", "generationConflict"],
-  "api/publisher.js": ["testHooksOn"],
+  "api/publisher.js": ["testHooksOn", "snapshotQuotaRefusal"],
 });
 
 function jsFiles(dir) {
@@ -124,7 +124,8 @@ test("slots: reclaim moves at most 2 stale slots to overrun; they still count fo
 
 // Addendum B, D 5-6: the name rule for snapshot and generation commits, on node:sqlite with every migration applied.
 const now = "2026-11-12T00:00:00.000Z", P0 = "pub_unit_000001";
-function nameWorld() {
+/** node:sqlite with every migration, one owner, project, app client and publisher P0 (no files). */
+function publisherWorld() {
   const world = mkWorld();
   const run = (q, ...p) => world.sql.prepare(q).run(...p);
   run("INSERT INTO principals (id, kind, issuer, subject, label, created_at) VALUES (?, ?, ?, ?, ?, ?)", "prn_owner", "human", "https://issuer.example.test", "owner", "Owner", now);
@@ -134,6 +135,10 @@ function nameWorld() {
     "apc_unit", "prn_owner", "cli_unit", "Unit app", '["https://unit.example.test/cb"]', "[]", now);
   run("INSERT INTO publishers (id, owner_principal_id, principal_id, app_client_id, display_name, project_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
     P0, "prn_owner", "prn_agent", "apc_unit", "Unit app", "prj_unit", now);
+  return { world, run };
+}
+function nameWorld() {
+  const { world, run } = publisherWorld();
   const art = (id, kind, exportName, generationId, trashedAt, title = exportName) => run(
     "INSERT INTO artifacts (id, project_id, kind, title, folder, publisher_id, export_name, generation_id, head_rev, trashed_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     id, "prj_unit", kind, title, "", P0, exportName, generationId, 1, trashedAt, now, now);
@@ -216,6 +221,44 @@ test("generation name rule: every case, and which one is reported", () => {
   const many = Array.from({ length: 2048 }, (_, i) => `p-${String(i).padStart(4, "0")}.json`);
   assert.deepEqual(reported("g_many", many), { found: null, gate: 1 });
   assert.equal(W.generationConflict(["a.json", "b.json"], null), null);
+});
+
+// Addendum B, S2-2 and S2-6: the snapshot mapping's quota step counts as the gate does (only non-generation rows;
+// staged generation bytes included).
+test("snapshotQuotaRefusal: staged generation bytes count; generation rows do not count as files", async () => {
+  const QUOTA_BYTES = 256 * 1024 * 1024, addBytes = 1000;
+  {
+    const { world, run } = publisherWorld();
+    run("INSERT INTO artifacts (id, project_id, kind, title, folder, publisher_id, export_name, head_rev, head_revision_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      "art_big", "prj_unit", "json", "big.json", "", P0, "big.json", 1, "rev_big", now, now);
+    run("INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, size, sha256, mime, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      "rev_big", "art_big", "prj_unit", 1, "prn_agent", "{}", QUOTA_BYTES - addBytes - 10, "2".repeat(64), "application/json", now);
+    const env = { DB: world.DB };
+    assert.equal(await W.snapshotQuotaRefusal(env, P0, 0, addBytes), false, "10 bytes under the quota");
+    run("INSERT INTO publisher_generations (publisher_id, id, project_id, folder_id, token_epoch, source_revision, expected_current_snapshot_id, root_name, root_sha256, part_count, total_bytes, begin_digest, state, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      P0, "g_staged", "prj_unit", null, 1, 1, null, "g_staged-root.json", "0".repeat(64), 1, 100, "0".repeat(64), "staged", now, 4102444800000);
+    assert.equal(await W.snapshotQuotaRefusal(env, P0, 0, addBytes), true, "staged generation bytes tip it over");
+    run("UPDATE publisher_generations SET state = 'abandoned', abandoned_at = ? WHERE publisher_id = ? AND id = ?", now, P0, "g_staged");
+    assert.equal(await W.snapshotQuotaRefusal(env, P0, 0, addBytes), false, "an abandoned generation holds no bytes");
+  }
+  {
+    const { world, run } = publisherWorld();
+    const env = { DB: world.DB };
+    for (let i = 0; i < 33; i++) run("INSERT INTO artifacts (id, project_id, kind, title, folder, publisher_id, export_name, generation_id, head_rev, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      `art_g${i}`, "prj_unit", "json", `g_rows-${i}.json`, "", P0, `g_rows-${i}.json`, "g_rows", 1, now, now);
+    assert.equal(await W.snapshotQuotaRefusal(env, P0, 1, 0), false, "33 generation rows do not count");
+    for (let i = 0; i < 32; i++) run("INSERT INTO artifacts (id, project_id, kind, title, folder, publisher_id, export_name, head_rev, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      `art_s${i}`, "prj_unit", "json", `s-${i}.json`, "", P0, `s-${i}.json`, 1, now, now);
+    assert.equal(await W.snapshotQuotaRefusal(env, P0, 1, 0), true, "32 files and one new name");
+    assert.equal(await W.snapshotQuotaRefusal(env, P0, 0, 0), false, "32 files and no new name");
+  }
+});
+
+test("commitSnapshot's mapping uses snapshotQuotaRefusal, not a second copy of the quota query", () => {
+  const src = readFileSync(join(ROOT, "packages", "core", "src", "api", "publisher.js"), "utf8").replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+  const body = src.slice(src.indexOf("async function commitSnapshot("), src.indexOf("async function route("));
+  assert.match(body, /snapshotQuotaRefusal\(/);
+  assert.doesNotMatch(body, /AS n,/, "no inline copy of the quota query in commitSnapshot");
 });
 
 test("path conflicts: exact and ancestor names are bound lowercased (at most 8 values); descendants are a lowercased range", () => {
