@@ -906,11 +906,11 @@ async function viewWorkspace(id) {
         h("form", { class: "card danger-zone", "aria-label": "Delete workspace", onsubmit: async function (e) {
           e.preventDefault(); if (confirmName.value.trim() !== ws.name) return;
           delBtn.disabled = true;
-          try { await api("DELETE", "/api/workspaces/" + enc(id)); toast("Deleted " + ws.name); location.hash = "#/workspaces"; }
+          try { await api("DELETE", "/api/workspaces/" + enc(id), { confirm_name: confirmName.value }); toast("Deleted " + ws.name); location.hash = "#/workspaces"; }
           catch (err) { sectionErr(setMsg, err); delBtn.disabled = false; }
         } },
           h("p", null, h("strong", { text: "Delete workspace" }), h("br"),
-            h("span", { class: "muted small", text: "Closes it right away for all " + nMem + (nMem === 1 ? " member" : " members") + " and the agents and API keys they connected. Its " + nProj + (nProj === 1 ? " project is" : " projects are") + " no longer reachable by anyone. Export any project you need first (project backup). This can't be undone from the app." })),
+            h("span", { class: "muted small", text: "Closes it right away for all " + nMem + (nMem === 1 ? " member" : " members") + " and the agents and API keys they connected. Its " + nProj + (nProj === 1 ? " project is" : " projects are") + " no longer reachable by anyone. Export any project you need first (project backup). Its documents and files start being deleted after 30 days; this can't be undone from the app." })),
           h("label", { class: "field" }, h("span", { text: "Type " + ws.name + " to confirm" }), confirmName), delBtn));
     }
     body.replaceChildren.apply(body, parts.filter(Boolean));

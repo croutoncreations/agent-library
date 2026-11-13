@@ -250,6 +250,43 @@ test("the cron purges projects whose 30 days have passed", async () => {
   assert.equal(await n(`SELECT COUNT(*) AS n FROM projects WHERE id = '${q}' AND purged_at IS NOT NULL`), 1);
 });
 
+test("a deleted workspace's content is removed by the cron 30 days later; the workspace row stays", async () => {
+  const ws = ok(await owner.req("POST", "/api/workspaces", { name: "Purge Team" }), 201).id;
+  const q = ok(await owner.req("POST", "/api/projects", { title: "Purge Me", workspace_id: ws }), 201).id;
+  const d = ok(await owner.req("POST", `/api/projects/${q}/artifacts`, { title: "Synthetic purge doc", body: "synthetic purge body" }), 201).artifact_id;
+  // Control for the R2 check below: the project has stored bytes.
+  assert.equal(await n(`SELECT COUNT(*) AS n FROM revisions WHERE project_id = '${q}' AND body_key IS NOT NULL`), 1, "the document's text is an R2 object");
+  const key = (await sql(`SELECT body_key FROM revisions WHERE project_id = '${q}' AND body_key IS NOT NULL`))[0].body_key;
+  ok(await owner.req("DELETE", `/api/workspaces/${ws}`, { confirm_name: "Purge Team" }));
+  // The DELETE set deleting_at (checked before the test moves it back).
+  const at = (await sql(`SELECT deleting_at FROM workspaces WHERE id = '${ws}'`))[0].deleting_at;
+  assert.ok(Math.abs(at - Date.now()) < 60e3, `deleting_at ${at}`);
+  await sql(`UPDATE workspaces SET deleting_at = ${at - 31 * 864e5} WHERE id = '${ws}'`);
+  // The cron's steps start together, so the marking, the project purge and the finish may land in successive runs.
+  let s;
+  for (let i = 0; i < 10; i++) {
+    assert.equal((await fetch(`${h.issuer}/cdn-cgi/handler/scheduled`)).status, 200);
+    await new Promise((r) => setTimeout(r, 500));
+    s = (await sql(`SELECT w.purge_marked_at AS m, w.purged_at AS wp, p.purged_at AS pp FROM workspaces w JOIN projects p ON p.id = '${q}' WHERE w.id = '${ws}'`))[0];
+    if (s.m && s.wp && s.pp) break;
+  }
+  assert.ok(s.m && s.pp && s.wp, JSON.stringify(s));
+  assert.equal(await n(`SELECT COUNT(*) AS n FROM artifacts WHERE project_id = '${q}'`), 0);
+  assert.equal(await n(`SELECT COUNT(*) AS n FROM revisions WHERE project_id = '${q}'`), 0);
+  assert.equal((await sql(`SELECT title FROM projects WHERE id = '${q}'`))[0].title, "Deleted project");
+  assert.equal(await n(`SELECT COUNT(*) AS n FROM workspaces WHERE id = '${ws}' AND status = 'deleting' AND name = 'Purge Team'`), 1, "the row stays");
+  // Gate check only: a deleting workspace already answered 404 before any purge.
+  assert.equal((await owner.req("GET", `/api/projects/${q}/artifacts/${d}`)).status, 404);
+  const dir = join(h.dir, "v3", "r2", "miniflare-R2BucketObject");
+  const r2db = readdirSync(dir).find((f) => f.endsWith(".sqlite") && f !== "metadata.sqlite");
+  const r2 = new DatabaseSync(join(dir, r2db), { readOnly: true });
+  try {
+    const r2keys = r2.prepare("SELECT key FROM _mf_objects").all().map((r) => r.key);
+    assert.ok(!r2keys.includes(key), `R2 object ${key} removed`);
+    assert.ok(!r2keys.some((k) => k.startsWith(`text/${q}/`) || k.startsWith(`blobs/${q}/`) || k.startsWith(`staging/${q}/`)), "nothing left under the purged project's prefixes");
+  } finally { r2.close(); }
+});
+
 test("browser: delete from Project settings, see it under Recently deleted, restore it", async (t) => {
   const { createRequire } = await import("node:module");
   const { existsSync, mkdirSync } = await import("node:fs");

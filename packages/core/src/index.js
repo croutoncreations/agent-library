@@ -24,6 +24,7 @@ import { handleOAuthHost, originFor } from "./oauth/server.js";
 import { servePwa } from "./pwa.js";
 import { contentOrigin, handleContentHost, isContentHost, projectMedia, viewLinkRedirect, wantsContentHost } from "./view-links.js";
 import { deleteProject, listDeletedProjects, purgeDueProjects, purgeProjectNow, restoreProject } from "./project-deletion.js";
+import { purgeDeletingWorkspaces } from "./workspace-purge.js";
 import { acceptInvite, createInvite, createWorkspace, deleteWorkspace, listMembers, listWorkspaces, multiUser, previewInvite, removeMember, revokeInvite, setMemberRole, updateWorkspace } from "./workspaces.js";
 import { __name } from "./runtime.js";
 import { IMAGE_TYPES, VIDEO_TYPES, addComment, appConnectEnabled, chQuery, cleanupChanges, createFile, createFolder, createFromTemplate, createGrant, createMarkdown, createProject, updateProject, diffRevisions, getArtifact, history, listArtifacts, listAudit, listChanges, listComments, listFolders, listGrants, listProjects, listTemplates, metaHistory, previewTemplate, readRecords, readTextChunk, requireAppConnect, restoreMetadata, restoreRevision, rsQuery, rsReady, rtQuery, saveAsTemplate, saveFile, saveMarkdown, searchArtifacts, updateGrant, updateMetadata } from "./service.js";
@@ -187,7 +188,7 @@ async function route3(req, env, url, requestId, seen = {}) {
     if (seg.length === 1 && m === "POST") return json(await createWorkspace(ctx, await body(req)), 201);
     const wid = str(seg[1], "workspace", 80);
     if (seg.length === 2 && m === "PATCH") return json(await updateWorkspace(ctx, wid, await body(req)));
-    if (seg.length === 2 && m === "DELETE") return json(await deleteWorkspace(ctx, wid));
+    if (seg.length === 2 && m === "DELETE") return json(await deleteWorkspace(ctx, wid, await body(req)));
     if (seg[2] === "members" && seg.length === 3 && m === "GET") return json(await listMembers(ctx, wid));
     if (seg[2] === "members" && seg.length === 4 && m === "PATCH") return json(await setMemberRole(ctx, wid, str(seg[3], "member", 80), await body(req)));
     if (seg[2] === "members" && seg.length === 4 && m === "DELETE") return json(await removeMember(ctx, wid, str(seg[3], "member", 80)));
@@ -415,6 +416,8 @@ var coreWorker = {
       (e) => console.error(JSON.stringify({ event: "retention_failed", message: String(e?.message ?? e).slice(0, 200) }))));
     // Deleted projects past their 30 days (D21): bounded per run, finished by later runs.
     ctx.waitUntil(purgeDueProjects(env).then((r) => { if (r.projects || r.rows || r.files) console.log("project_purge", JSON.stringify({ projects: r.projects, rows: r.rows, files: r.files })); }));
+    // Deleted workspaces past their 30 days: their projects are marked due for the purge above (workspace-purge.js).
+    ctx.waitUntil(purgeDeletingWorkspaces(env));
   },
   async fetch(req, env, ctx) {
     const url = new URL(req.url);

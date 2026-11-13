@@ -41,6 +41,7 @@ A workspace always has at least one owner. A `project_members` row can narrow on
    new or replaced API keys, Edit grants, app settings, invitations, role changes and renaming. Cleanup still works: revoking keys, connections, grants and
    publishers, removing members, leaving and deleting the workspace. A workspace being deleted is closed: people get
    404, agent credentials 401, and refresh is `invalid_grant`, like a revoked connection or a removed creator.
+   Its documents and files start being deleted 30 days after deletion ([below](#deleting-a-workspace)).
 
 ## Data model (migration 0017, additive)
 
@@ -71,7 +72,7 @@ shared workspace exists, or accept this for the rollback window.
 
 - `GET /api/workspaces`: workspaces I belong to, with my role and member count.
 - `POST /api/workspaces` `{name}`: create a shared workspace (I'm its owner). Self-host: allowed for the owner.
-- `PATCH /api/workspaces/:id` `{name?, handle?}` (owner); `DELETE` marks it `deleting` (owner; not the personal one).
+- `PATCH /api/workspaces/:id` `{name?, handle?}` (owner); `DELETE` `{confirm_name}` marks it `deleting` and records when (owner; not the personal one; the workspace's name must be typed, else 400 `confirmation_required`); its content is deleted from 30 days later.
 - `GET /api/workspaces/:id/members`, `PATCH …/members/:principal` `{role}`, `DELETE …/members/:principal`
   (admin+; can't remove or demote the last owner; admins can't change owners; anyone may remove themselves except
   the last owner).
@@ -135,6 +136,37 @@ Decision D21 B. Workspace owners and admins delete a project from Project settin
   purged) projects are open again to their members and agents, under no address. Purged ones show as empty "Deleted
   project" rows. Roll back across this change only in an emergency, and delete any project that must stay closed again
   once the new Worker is back.
+
+## Deleting a workspace
+
+Owners delete a shared workspace on its page by typing its name. The personal workspace can't be deleted.
+- **At once:** it is closed to everyone and every agent (rule 5), and `deleting_at` records when.
+- **From 30 days later** (`WORKSPACE_PURGE_GRACE_DAYS`, as for a deleted project), the 15-minute cron
+  (`purgeDeletingWorkspaces`, `workspace-purge.js`) first marks the workspace (`purge_marked_at`), then marks every
+  live project of it deleted and due. The project purge ([above](#deleting-a-project)) removes their content:
+  documents, versions, comments, files and their R2 objects, and the rest it lists. Projects that were already in
+  Recently deleted when the workspace was deleted keep their own date: each is removed when its own 30 days end, which
+  is before the workspace's 30 days do. Once no project is left, the workspace gets `purged_at`.
+- **For projects that were live when the workspace was deleted, 30 days is the earliest, not an exact time.** The
+  project purge handles 5 projects per run across the whole installation, in the order they fell due, so a large
+  workspace takes several runs and shares that queue with ordinary project deletions. A project's purge waits while an
+  upload into it is finishing; none can still be running 30 days after a workspace was closed.
+- **What "deleted" means.** Files are deleted from R2 when the purge reaches them; Agent Library keeps no other copy.
+  Database rows are deleted, but the whole database can still be restored to an earlier moment with D1 Time Travel
+  for its retention window (30 days on Workers Paid, 7 on Free), and any database export or backup the operator made
+  still holds them. The full-text search index may keep word fragments in its internal segments until it compacts
+  them; they can't be reached through the app (the same is true of the project purge). An import's retry record
+  (`backup.import` idempotency) holds the imported project's title for up to 30 days from the import.
+- **What stays:** the workspace row (its name and address, which stays taken), its members, invitations, billing
+  record and audits, its app registrations, revoked credentials (agent credentials are revoked as their projects are
+  purged), and the projects' tombstones. Deleting a workspace does not cancel its subscription.
+- **Undoing a deletion** is an operator job, possible only until the workspace is marked
+  ([operations](operations.md#monitoring)).
+- **Migration 0035** adds `deleting_at`, `purge_marked_at` and `purged_at` to `workspaces`, and the index
+  `projects_live`. Workspaces deleted before it get `deleting_at` from the first cron run after the upgrade (up to 100
+  per run), so their 30 days start then. A rolled-back Worker marks no new workspaces, but projects already marked
+  keep being purged; the new Worker finishes the workspace afterwards. A workspace deleted while the older Worker runs
+  gets its 30 days from the new Worker's first cron run.
 
 ## Addresses
 
