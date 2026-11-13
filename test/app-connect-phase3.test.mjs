@@ -118,7 +118,7 @@ test("refresh: rotation, single use, resource pinned; resume is owner-approved, 
   assert.equal((await h.pub(at, "GET", "/app")).status, 401, "old access token dead after resume");
   assert.equal((await h.token({ grant_type: "refresh_token", refresh_token: t1.body.refresh_token, client_id: app.client_id })).status, 400, "old refresh dead");
   // resuming another app's publisher is impossible (only same-client publishers are offered/accepted)
-  const Qid = (await rows(`SELECT id FROM publishers WHERE app_client_id = '${app2.app_client_id}'`))[0].id;
+  const Qid = (await h.connectPublisher(app2, { project_id: "notes-test", destination: "root" })).publisher_id;
   const bad = await h.authorize(app, { resume: Qid });
   assert.ok(!bad.code && /can(&#39;|')t be resumed/.test(bad.html));
   P = { ...P, ...R };
@@ -126,12 +126,14 @@ test("refresh: rotation, single use, resource pinned; resume is owner-approved, 
 
 test("revocation: publisher revoked -> 401 publisher_revoked, refresh invalid_grant, disabled app blocks connect", async () => {
   const X = await h.connectPublisher(app2, { project_id: "other-test", destination: "new", new_folder_name: "Trip Log" });
+  const wrote = await fetch(`${h.api}/app/files/trip.json`, { method: "PUT", body: "{}", headers: { authorization: `Bearer ${X.access_token}`, "content-type": "application/json", "if-none-match": "*", "idempotency-key": key("trip") } });
+  assert.equal(wrote.status, 201);
   assert.equal((await owner.req("POST", `/api/publishers/${X.publisher_id}/revoke`, {})).status, 200);
   const r = await h.pub(X.access_token, "GET", "/app");
   assert.equal(r.status, 401); assert.equal(r.json.error.code, "publisher_revoked"); assert.match(r.headers.get("www-authenticate"), /revoked/);
   assert.equal((await h.token({ grant_type: "refresh_token", refresh_token: X.refresh_token, client_id: app2.client_id })).body.error, "invalid_grant");
   const files = (await rows(`SELECT id FROM artifacts WHERE publisher_id = '${X.publisher_id}'`));
-  assert.ok(files.length >= 3, "files remain after revocation");
+  assert.equal(files.length, 1, "the file remains after revocation");
   const own = await owner.req("PUT", `/api/projects/other-test/artifacts/${files[0].id}`, { expected_revision: 1, content: "{}" });
   assert.equal(own.body.error.code, "protected_source");
   assert.equal((await owner.req("POST", `/api/app-clients/${app2.app_client_id}/disable`, {})).status, 200);

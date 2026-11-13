@@ -158,9 +158,9 @@ async function route2(req, env, url, requestId, seen = {}) {
     if (m === "GET") {
       const ctx = projectCtx(env, k, requestId, pid);
       const cursor = url.searchParams.get("cursor") ?? void 0;
-      const kind = url.searchParams.get("kind") ?? void 0, folderId = url.searchParams.get("folder_id") ?? void 0;
-      if ((kind !== void 0 || folderId !== void 0) && !appConnectEnabled(env)) throw new HttpError(400, "invalid_input", "Unknown query parameter");
-      const r = await listArtifacts(ctx, pid, { query: url.searchParams.get("query") ?? void 0, cursor, kind, folderId });
+      const kind = url.searchParams.get("kind") ?? void 0, folderId = url.searchParams.get("folder_id") ?? void 0, appPath = url.searchParams.get("app_path") ?? void 0;
+      if ((kind !== void 0 || folderId !== void 0 || appPath !== void 0) && !appConnectEnabled(env)) throw new HttpError(400, "invalid_input", "Unknown query parameter");
+      const r = await listArtifacts(ctx, pid, { query: url.searchParams.get("query") ?? void 0, cursor, kind, folderId, appPath });
       return json({ files: r.artifacts.map((a) => fileView2(origin, a, env)), next_cursor: r.next_cursor });
     }
     if (m === "POST") {

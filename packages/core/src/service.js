@@ -224,14 +224,17 @@ async function listArtifacts(ctx, projectId, q) {
   if (kind && !["markdown", "html", "json", "csv", "binary"].includes(kind)) throw new HttpError(400, "invalid_input", "kind must be markdown, html, json, csv or binary");
   const folder = q.folderId ?? "";
   if (folder && folder !== "root" && !/^fld_[A-Za-z0-9_-]{1,40}$/.test(folder)) throw new HttpError(400, "invalid_input", "folder_id must be a folder id or root");
+  const appPath = q.appPath ?? "";
+  if (appPath && !/^[a-z0-9._/-]{1,200}$/.test(appPath)) throw new HttpError(400, "invalid_input", "app_path must be an app file path (lowercase letters, digits, '.', '_', '-', '/')");
   const r = await db(ctx).prepare(
     `SELECT ${ART_COLS}, r.mime AS head_mime FROM artifacts a LEFT JOIN revisions r ON r.id = a.head_revision_id
      WHERE a.project_id = ? AND a.head_rev > 0 AND (a.trashed_at IS NOT NULL) = ?
+       AND (? = '' OR (a.publisher_id IS NOT NULL AND a.export_name = ?))
        AND (? = '' OR instr(lower(a.title), lower(?)) > 0) -- same as LIKE with ESCAPE, without D1's 50-byte pattern limit
        AND (? = '' OR a.kind = ?)
        AND (? = '' OR (? = 'root' AND a.folder_id IS NULL) OR a.folder_id = ?)
      ORDER BY a.updated_at DESC, a.id LIMIT ? OFFSET ?`
-  ).bind(projectId, q.trashed ? 1 : 0, term, term, kind, kind, folder, folder, folder, LIMITS.pageSize + 1, offset).all();
+  ).bind(projectId, q.trashed ? 1 : 0, appPath, appPath, term, term, kind, kind, folder, folder, folder, LIMITS.pageSize + 1, offset).all();
   const rows = r.results.slice(0, LIMITS.pageSize);
   return {
     artifacts: rows.map((a) => q.withMime ? { ...artifactView(a, appConnectEnabled(ctx.env)), mime: a.head_mime ?? null } : artifactView(a, appConnectEnabled(ctx.env))),
@@ -767,7 +770,8 @@ artifactView = (a, appConnect = true) => ({
   ...appConnect ? {
     folder_id: a.folder_id ?? null,
     schema: a.schema_id ?? null,
-    publisher: a.publisher_id ? { id: a.publisher_id, display_name: a.pub_name ?? null, protected: true } : null
+    publisher: a.publisher_id ? { id: a.publisher_id, display_name: a.pub_name ?? null, protected: true } : null,
+    app_path: a.publisher_id ? a.export_name ?? null : null
   } : {}
 });
 ART_COLS = "a.*, (SELECT display_name FROM publishers WHERE id = a.publisher_id) AS pub_name";

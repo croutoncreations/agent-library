@@ -207,7 +207,7 @@ TOOLS = [
     write: false,
     run: async (c, p, a) => {
       if (appConnectEnabled(c.env)) {
-        const r2 = await listArtifacts(c, p, { query: a.query, cursor: a.cursor, kind: a.kind, folderId: a.folder_id });
+        const r2 = await listArtifacts(c, p, { query: a.query, cursor: a.cursor, kind: a.kind, folderId: a.folder_id, appPath: a.app_path });
         return { ...r2, artifacts: r2.artifacts.filter((x) => x.kind !== "binary") };
       }
       if (a.kind !== void 0 || a.folder_id !== void 0) throw new HttpError(400, "invalid_input", "kind/folder_id filters are not available");
@@ -301,7 +301,8 @@ TOOLS = [
 ];
 AC_LIST_PROPS = {
   kind: { type: "string", enum: ["markdown", "json", "csv"], description: "Only files of this kind" },
-  folder_id: { type: "string", maxLength: 64, description: 'Only files in this folder (fld_\u2026), or "root"' }
+  folder_id: { type: "string", maxLength: 64, description: 'Only files in this folder (fld_\u2026), or "root"' },
+  app_path: { type: "string", maxLength: 200, description: 'Only the file a connected app wrote at this path, e.g. "index.json" (each item\'s app_path says which app path it is)' }
 };
 READ_RECORDS = {
   name: "read_records",
@@ -508,7 +509,7 @@ async function ftUploadInline(c, p, a) {
 }
 async function ftList(c, p, a) {
   const prefix = a.mime_prefix === void 0 ? "" : str(a.mime_prefix, "mime_prefix", 100).toLowerCase();
-  const r = await listArtifacts(c, p, { query: a.query, cursor: a.cursor, kind: a.kind, folderId: appConnectEnabled(c.env) ? a.folder_id : void 0 });
+  const r = await listArtifacts(c, p, { query: a.query, cursor: a.cursor, kind: a.kind, folderId: appConnectEnabled(c.env) ? a.folder_id : void 0, appPath: appConnectEnabled(c.env) ? a.app_path : void 0 });
   const ids = r.artifacts.map((x) => x.id);
   const info = /* @__PURE__ */ new Map();
   if (ids.length) {
@@ -624,7 +625,7 @@ function ftToolsFor(env, conn) {
           cursor: { type: "string", maxLength: 12 },
           kind: { type: "string", enum: ["markdown", "html", "json", "csv", "binary"], description: 'Only this kind; "binary" means files (images, PDFs, video)' },
           mime_prefix: { type: "string", maxLength: 100, description: 'Only items whose MIME type starts with this, e.g. "image/" or "application/pdf". A page can then hold fewer than 50 items; keep following next_cursor.' },
-          ...appConnectEnabled(env) ? { folder_id: AC_LIST_PROPS.folder_id } : {}
+          ...appConnectEnabled(env) ? { folder_id: AC_LIST_PROPS.folder_id, app_path: AC_LIST_PROPS.app_path } : {}
         }, []),
         run: (c, p, a) => ftList(c, p, a)
       });
