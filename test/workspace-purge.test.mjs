@@ -345,3 +345,8 @@ test("(j) the cron calls purgeDeletingWorkspaces(env) and nothing else calls it;
   assert.deepEqual(calls, ["packages/core/src/index.js: purgeDeletingWorkspaces(env)"]);
   assert.equal(lib.WORKSPACE_PURGE_GRACE_DAYS, 30);
 });
+
+test("(k) the delete-workspace dialog states the grace period", () => {
+  const app = readFileSync(join(ROOT, "packages/core/src/web/app.js.txt"), "utf8");
+  assert.ok(app.includes(`Export any project you need first (project backup). Its documents and files start being deleted after ${lib.WORKSPACE_PURGE_GRACE_DAYS} days; this can't be undone from the app.`));
+});
