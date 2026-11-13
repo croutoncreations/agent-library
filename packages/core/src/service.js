@@ -7,7 +7,6 @@ import { diffRevisions, historyPage, lineDiff, metaBaselineInsert, metaHistory, 
 import { RT_ID_TOO_LONG, RT_KINDS_ALL, RT_KINDS_DOCS, readTextChunk, rtChunkLimit, rtFit, rtIdBytes, rtQuery, rtReadAuthzSql } from "./reads/service.js";
 import { __name } from "./runtime.js";
 import { RS_SCHEMA, refreshTextSearch, rsQuery, rsReady, rsToolReady, searchArtifacts, textSearchBridge } from "./search/service.js";
-import { deferSearchIndexing } from "./search/tokens.js";
 import { createFromTemplate, listTemplates, previewTemplate, saveAsTemplate, tplAssertMaintenance, tplDate, tplProvenance, tplTools } from "./templates/service.js";
 import { ROLE_RANK, memberRoleSql, personalWorkspaceId, projectRole, workspaceRoleSql, requireProjectRole, requireWorkspaceRole, visibleProjects } from "./tenancy.js";
 import { HttpError, b64url, cutLists, int, nowIso, nowMs, randomId, sha256Hex, str } from "./util.js";
@@ -41,22 +40,6 @@ async function idemLookup(ctx, i) {
   if (row.digest !== i.digest)
     throw new HttpError(422, "idempotency_key_reused", "Idempotency key was used with a different request");
   return { status: row.status, body: { ...JSON.parse(row.response), idempotent_replay: true } };
-}
-/**
- * Hand a committed text publication to blind-index search indexing (search/tokens.js): to `onSearchJob` when the caller
- * supplied one, else to this request's deferred run, which starts after the response. Called only after the commit is
- * known; never awaited. `text` is the reference the path already holds (no copy, no re-read); `textBytes` its stored
- * UTF-8 size. Nothing here can change, delay or fail the response: a throw is logged once, without content, as a
- * skipped job, and the document stays missing until a later save or the backfill.
- */
-function deferIndexing(ctx, artifactId, projectId, revisionId, text, textBytes, onSearchJob) {
-  try {
-    const job = { artifactId, projectId, revisionId, text, textBytes };
-    if (onSearchJob) onSearchJob(job);
-    else deferSearchIndexing(ctx.env, [job]);
-  } catch {
-    try { console.log(JSON.stringify({ event: "search_index_skipped", skipped: 1, reasons: { error: 1 } })); } catch { /* never fail the save */ }
-  }
 }
 function idemInsert(ctx, i, status, body2, gate, gateParams) {
   return db(ctx).prepare(
@@ -359,8 +342,6 @@ async function createMarkdown(ctx, projectId, input, key, kind = "markdown") {
     if (lg.workspaceId) await explainLimit(ctx.env, lg.workspaceId, adds, lg.limits, projectId);
     throw new HttpError(403, "forbidden", "Grant no longer valid");
   }
-  // Committed (not a replay, a conflict or a refusal): index the new document after the response.
-  deferIndexing(ctx, artId, projectId, revId, body2, bytes);
   return result;
 }
 async function publishRevision(ctx, projectId, artifactId, expected, i, rev, extra = [], action = "artifact.save") {
@@ -434,9 +415,6 @@ async function publishRevision(ctx, projectId, artifactId, expected, i, rev, ext
     if (pub && !ctx.publisher) throw new HttpError(403, "protected_source", "This file is a source export owned by a connected app and cannot be modified here");
     throw new HttpError(403, "forbidden", "Grant no longer valid");
   }
-  // Committed text revision (not a replay, a conflict or a refusal): index it after the response (upload finish passes
-  // onSearchJob and defers its own packed-terms job).
-  if (rev.body != null) deferIndexing(ctx, artifactId, projectId, revId, rev.body, rev.size, rev.onSearchJob);
   return { status: 200, body: body2 };
 }
 async function saveMarkdown(ctx, projectId, artifactId, input, key) {
@@ -779,4 +757,4 @@ artifactView = (a, appConnect = true) => ({
 });
 ART_COLS = "a.*, (SELECT display_name FROM publishers WHERE id = a.publisher_id) AS pub_name";
 
-export { BINARY_TYPES, FOLDERS_PER_PROJECT, FOLDER_ROOM_SQL, IMAGE_TYPES, LIMITS, RS_SCHEMA, RT_ID_TOO_LONG, RT_KINDS_ALL, RT_KINDS_DOCS, VIDEO_TYPES, addComment, appConnectEnabled, assertWritable, audit, auditDenied, chQuery, cleanupChanges, connectionInfo, createFile, createFolder, createFromTemplate, createGrant, createMarkdown, createProject, updateProject, db, diffRevisions, folderCheck, folderName, getArtifact, history, idemInsert, idemLookup, legacyConnectionInfo, listArtifacts, listAudit, listChanges, listComments, listFolders, listGrants, listProjects, listTemplates, loadArtifact, textCreateMetadata, mdBody, metaHistory, previewTemplate, provenance, publishRevision, readRecords, readRecordsPage, readTextChunk, requireAppConnect, restoreMetadata, restoreRevision, rsQuery, rsReady, rsToolReady, rtChunkLimit, rtFit, rtIdBytes, rtQuery, rtReadAuthzSql, runBatch, saveAsTemplate, saveFile, saveMarkdown, searchArtifacts, tplDate, tplTools, tooManyFolders, updateGrant, updateMetadata, deferIndexing };
+export { BINARY_TYPES, FOLDERS_PER_PROJECT, FOLDER_ROOM_SQL, IMAGE_TYPES, LIMITS, RS_SCHEMA, RT_ID_TOO_LONG, RT_KINDS_ALL, RT_KINDS_DOCS, VIDEO_TYPES, addComment, appConnectEnabled, assertWritable, audit, auditDenied, chQuery, cleanupChanges, connectionInfo, createFile, createFolder, createFromTemplate, createGrant, createMarkdown, createProject, updateProject, db, diffRevisions, folderCheck, folderName, getArtifact, history, idemInsert, idemLookup, legacyConnectionInfo, listArtifacts, listAudit, listChanges, listComments, listFolders, listGrants, listProjects, listTemplates, loadArtifact, textCreateMetadata, mdBody, metaHistory, previewTemplate, provenance, publishRevision, readRecords, readRecordsPage, readTextChunk, requireAppConnect, restoreMetadata, restoreRevision, rsQuery, rsReady, rsToolReady, rtChunkLimit, rtFit, rtIdBytes, rtQuery, rtReadAuthzSql, runBatch, saveAsTemplate, saveFile, saveMarkdown, searchArtifacts, tplDate, tplTools, tooManyFolders, updateGrant, updateMetadata };

@@ -14,7 +14,6 @@ import { WEB_ROUTE } from "./links.js";
 import { requireWorkspaceRole, visibleProjects } from "./tenancy.js";
 import { withRequestMemo, workspaceUsage } from "./limits.js";
 import { ENCRYPTION_MISCONFIGURED_MESSAGE, encryptionConfigured, encryptionRequired, withDataKeyMemo } from "./crypto/keys.js";
-import { discardDeferredWork, startDeferredWork, withDeferredWork } from "./search/tokens.js";
 import { RESERVED_HANDLES, addressLinksResponse, resolveProjectRef } from "./paths.js";
 import { imageRefs, renderMarkdown } from "./markdown.js";
 import { getRenderSource } from "./render-source.js";
@@ -385,34 +384,20 @@ function createWorker(adapterConfig = {}) {
   const refuseEncryption = () => new Response(JSON.stringify({ error: { code: "encryption_misconfigured", message: ENCRYPTION_MISCONFIGURED_MESSAGE } }), { status: 500, headers: { "content-type": "application/json" } });
   return {
     scheduled: (ev, env, ctx) => coreWorker.scheduled(ev, withAdapters(env, A), ctx),
-    fetch: async (req, env, ctx) => {
-      if (misconfigured(env)) return refuse();
-      if (encryptionMissing(env)) return refuseEncryption();
-      // The request's deferred work (search indexing, search/tokens.js): every service env derives from this one by
-      // spreading it, which keeps the Symbol-keyed queue. It starts only after coreWorker.fetch has resolved its
-      // Response, and a run that was not started is discarded in finally (also when fetch rejects).
-      const e = withDeferredWork(withDataKeyMemo(withRequestMemo(withAdapters(env, A))));
-      try {
-        const res = await coreWorker.fetch(req, e, ctx);
-        try { startDeferredWork(e, ctx); } catch { /* never changes the response; the run is discarded below */ }
-        return res;
-      } finally {
-        // Never replaces the handler's own result or rejection (it does not throw; guarded anyway).
-        try { discardDeferredWork(e); } catch { /* ignored */ }
-      }
-    }
+    fetch: async (req, env, ctx) => misconfigured(env) ? refuse() : encryptionMissing(env) ? refuseEncryption()
+      : coreWorker.fetch(req, withDataKeyMemo(withRequestMemo(withAdapters(env, A))), ctx)
   };
 }
 var coreWorker = {
   // Cron: expire abandoned uploads and delete their R2 objects (bounded, idempotent).
-  async scheduled(ev, env, ctx) {
+  async scheduled(_ev, env, ctx) {
     ctx.waitUntil(cleanupChanges(env));
     ctx.waitUntil(reconcileUploads(env, { limit: 100 }).then((r) => console.log("reconcile", JSON.stringify(r))));
     // Expired sessions, idempotency records past 30 days, audits past AUDIT_RETENTION_DAYS (bounded per run).
     ctx.waitUntil(pruneExpiredRows(env).then((r) => { if (r.sessions || r.idempotency || r.audits) console.log("retention", JSON.stringify(r)); },
       (e) => console.error(JSON.stringify({ event: "retention_failed", message: String(e?.message ?? e).slice(0, 200) }))));
     // Deleted projects past their 30 days (D21): bounded per run, finished by later runs.
-    ctx.waitUntil(purgeDueProjects(env, { scheduledTime: ev.scheduledTime }).then((r) => { if (r.projects || r.rows || r.files) console.log("project_purge", JSON.stringify({ projects: r.projects, rows: r.rows, files: r.files })); }));
+    ctx.waitUntil(purgeDueProjects(env).then((r) => { if (r.projects || r.rows || r.files) console.log("project_purge", JSON.stringify({ projects: r.projects, rows: r.rows, files: r.files })); }));
   },
   async fetch(req, env, ctx) {
     const url = new URL(req.url);

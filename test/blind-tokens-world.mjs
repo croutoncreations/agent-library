@@ -2,6 +2,7 @@
 // transaction), for the blind-token tests. Counts calls (one per first/all/run/batch, like D1 round trips) and can
 // pause or intercept a call. Synthetic fixtures only; every INSERT names its columns. node:sqlite does not enforce
 // D1's limits (bound values per statement, statement size), so tests assert the design's bounds themselves.
+// It is the in-process D1 world on the real migrations.
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -67,19 +68,3 @@ export function seedDoc(world, { project = "proj_a", artifact, rev = `rev_${arti
   return { artifact, rev, project };
 }
 export const setHead = (world, artifact, rev) => run(world, "UPDATE artifacts SET head_revision_id = ?, head_rev = head_rev + 1 WHERE id = ?", rev, artifact);
-
-/** Charged units per scope from the stored rows: 5 per document row plus its tokens. */
-export function expectedCounters(world) {
-  const out = {};
-  for (const r of all(world, `SELECT d.workspace_id AS w, d.owner_id AS o, 5 + (SELECT COUNT(*) FROM search_tokens s WHERE s.doc_id = d.doc_id) AS n FROM search_token_docs d`)) {
-    for (const scope of ["w:" + r.w, "o:" + r.o, "i"]) out[scope] = (out[scope] ?? 0) + r.n;
-  }
-  return out;
-}
-export function counters(world) {
-  return Object.fromEntries(all(world, "SELECT scope, terms FROM search_term_counters").filter((r) => r.terms !== 0).map((r) => [r.scope, r.terms]));
-}
-export const tokensOf = (world, artifact) => all(world, `SELECT lower(hex(s.token)) AS t FROM search_tokens s JOIN search_token_docs d ON d.doc_id = s.doc_id
-  WHERE d.artifact_id = ? ORDER BY s.token`, artifact).map((r) => r.t);
-export const docRow = (world, artifact) => one(world, "SELECT doc_id, artifact_id, project_id, workspace_id, owner_id, revision_id, key_id, token_digest, writer, gen, term_count, truncated, truncated_by FROM search_token_docs WHERE artifact_id = ?", artifact);
-export const missing = (world) => all(world, "SELECT id FROM search_tokens_missing ORDER BY id").map((r) => r.id);

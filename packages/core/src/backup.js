@@ -2,7 +2,6 @@ import { TEXT_MAX_BYTES } from "./text-limits.js";
 import { personalWorkspaceId } from "./tenancy.js";
 import { blobKeyFits, blobPrefix, blobRef, commitTextWrites, deleteBlobs, dropUnreferencedBlobs, fenceRefusal, getText, isTextWriteFenceError, keyFence, mapContent, plaintextFence, readBlobBytes, stageTextWrites, storedText, textKey, textWriteComplete, writeBlobBytes } from "./content-store.js";
 import { textSearchBridge } from "./search/service.js";
-import { deferSearchIndexing, skipSearchJobs } from "./search/tokens.js";
 import { limitsFor, requireHuman } from "./auth.js";
 import { BINARY_TYPES, LIMITS, tplDate } from "./service.js";
 import { requireProjectRole, requireWorkspaceRole, workspaceRoleSql } from "./tenancy.js";
@@ -85,13 +84,9 @@ async function validateBackup(backup) {
   for (const v of Array.isArray(backup.meta_versions) ? backup.meta_versions : []) str(v.template_description ?? "", "template_description", 280);
   const blobs = backup.blobs ?? {};
   const decoded = /* @__PURE__ */ new Map();
-  // Each text's UTF-8 length, from the size check's own encode (search jobs use it; never the backup's size field).
-  const textBytes = /* @__PURE__ */ new Map();
   for (const r of backup.revisions) {
     if (r.blob_key === null) {
-      const n = typeof r.body === "string" ? new TextEncoder().encode(r.body).length : -1;
-      if (n < 0 || n > TEXT_MAX_BYTES) throw new HttpError(400, "bad_backup", "Text revision exceeds 10 MiB or is not a string");
-      textBytes.set(r, n);
+      if (typeof r.body !== "string" || new TextEncoder().encode(r.body).length > TEXT_MAX_BYTES) throw new HttpError(400, "bad_backup", "Text revision exceeds 10 MiB or is not a string");
       if (await sha256Hex(r.body) !== r.sha256) throw new HttpError(400, "bad_backup", `Revision ${r.id} hash mismatch`);
       continue;
     }
@@ -102,7 +97,7 @@ async function validateBackup(backup) {
     if (await sha256Hex(bytes) !== r.sha256 || bytes.length !== r.size) throw new HttpError(400, "bad_backup", `Blob for ${r.id} hash/size mismatch`);
     decoded.set(r.blob_key, bytes);
   }
-  return { pid, decoded, textBytes };
+  return { pid, decoded };
 }
 // Pre-write checks shared by import and restore: every value that binds into a statement after the first object
 // is written must be bindable, and every row must name a document of the backup. Restore gains only these (and the
@@ -164,10 +159,7 @@ function checkBindable(backup, { strict = false, docKey = (v) => v } = {}) {
  * lookup issues at most one statement per such row. Returns Map(value -> stored text, or a tagged key for a BLOB).
  */
 async function storedDocumentIds(DB, backup) {
-  return storedForms(DB, new Set([...backup.artifacts.map((a) => a?.id), ...[...backup.revisions, ...backup.meta_versions ?? [], ...backup.comments].map((x) => x?.artifact_id)]));
-}
-/** The stored form of each value of a TEXT id column (as storedDocumentIds describes). */
-async function storedForms(DB, values) {
+  const values = new Set([...backup.artifacts.map((a) => a?.id), ...[...backup.revisions, ...backup.meta_versions ?? [], ...backup.comments].map((x) => x?.artifact_id)]);
   const stored = new Map();
   const ask = [];
   for (const v of values) {
@@ -238,35 +230,6 @@ async function publishBackup(env, { objects, workspaceId, textKeys, build }) {
   }
 }
 
-/**
- * Before a restore or import commits (prepareBackupJobs), deferred after it (deferBackupIndexing): one search job per
- * document whose head is text (a trashed head too; binary heads none), in backup order, each with the head's text as
- * the backup holds it, its UTF-8 length from the validation pass, and its ids in their stored forms. The request's
- * run admits what fits its limits (100 documents, 10 Mi code units, the isolate's free bytes); the rest are counted
- * skipped and stay missing for a later save or the backfill. Never awaited, never throws.
- */
-function prepareBackupJobs(backup, textBytes, ids) {
-  const revs = new Map(backup.revisions.map((r) => [r.id, r]));
-  const jobs = [];
-  let refused = 0;
-  for (const a of backup.artifacts) {
-    const r = revs.get(a.head_revision_id);
-    if (!r || r.blob_key !== null || typeof r.body !== "string" || !textBytes.has(r)) continue;
-    const artifactId = ids.artifact(a.id), revisionId = ids.revision(r.id);
-    // An id that is not text once stored (a byte list is a BLOB) gets no job, and costs no other document its job.
-    if (typeof artifactId !== "string" || typeof revisionId !== "string" || artifactId.startsWith("\u0000") || revisionId.startsWith("\u0000")) { refused++; continue; }
-    jobs.push({ artifactId, projectId: ids.project, revisionId, text: r.body, textBytes: textBytes.get(r) });
-  }
-  return { jobs, refused };
-}
-/** After the commit: hand the prepared jobs over (no text work here). Never awaited, never throws. */
-function deferBackupIndexing(env, prepared) {
-  try {
-    if (prepared.refused) skipSearchJobs(env, "refused", prepared.refused);
-    deferSearchIndexing(env, prepared.jobs);
-  } catch { /* deferSearchIndexing never throws; never fail the restore */ }
-}
-
 async function restoreBackup(ctx, backup) {
   requireHuman(ctx);
   const DB = ctx.env.DB;
@@ -278,7 +241,7 @@ async function restoreBackup(ctx, backup) {
   if (await DB.prepare("SELECT COUNT(*) AS n FROM principals WHERE kind = 'human'").first("n") > 1) throw new HttpError(403, "restore_unavailable", "Restore is only available on a single-owner installation");
   const existing = await DB.prepare("SELECT COUNT(*) AS n FROM projects").first("n");
   if (existing) throw new HttpError(409, "store_not_empty", "Restore targets an empty isolated store only");
-  const { pid, decoded, textBytes } = await validateBackup(backup);
+  const { pid, decoded } = await validateBackup(backup);
   const storedIds = await storedDocumentIds(DB, backup);
   checkBindable(backup, { docKey: (v) => storedIds.has(v) ? storedIds.get(v) : v });
   // IDs stay stable, but each attempt owns fresh immutable objects, even after a lost acknowledgement: text keys carry
@@ -336,11 +299,6 @@ async function restoreBackup(ctx, backup) {
     tail.push(DB.prepare("INSERT INTO comments (id, project_id, artifact_id, rev_no, author_id, body, body_key, created_at) VALUES (?, ?, ?, ?, ?, '', ?, ?)").bind(c.id, pid, c.artifact_id, c.rev_no, c.author_id, bodyKey, c.created_at));
   }
   tail.push(DB.prepare("INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id) VALUES (?, ?, ?, 'backup.restore', ?, 'ok', ?)").bind(nowIso(), ctx.principal.id, pid, pid, ctx.requestId));
-  // Search jobs, prepared before the commit with the ids' stored forms (head version ids looked up like document ids:
-  // no statement unless a head version id is a number or boolean).
-  const heads = new Set(backup.artifacts.map((a) => a.head_revision_id));
-  const storedRevs = await storedForms(DB, new Set(backup.revisions.filter((r) => r.blob_key === null && heads.has(r.id)).map((r) => r.id)));
-  const searchJobs = prepareBackupJobs(backup, textBytes, { project: pid, artifact: (id) => storedIds.get(id) ?? null, revision: (id) => storedRevs.get(id) ?? null });
   await stageTextWrites(ctx.env, textWrites);
   const objects = new Map();
   for (const r of fileRevisions) if (!objects.has(restoreKey(r))) objects.set(restoreKey(r), [restoreKey(r), decoded.get(r.blob_key), r.mime]);
@@ -359,7 +317,6 @@ async function restoreBackup(ctx, backup) {
     if (await DB.prepare("SELECT COUNT(*) AS n FROM projects").first("n")) throw new HttpError(409, "store_not_empty", "Restore targets an empty isolated store only");
     throw out.error;
   }
-  deferBackupIndexing(ctx.env, searchJobs);
   return { restored_project: pid, artifacts: backup.artifacts.length, revisions: backup.revisions.length, blobs: decoded.size, grants: 0 };
 }
 
@@ -446,7 +403,7 @@ async function importBackup(ctx, workspaceId, input, idemKeyValue, digest = "") 
     return { ...JSON.parse(prior.response), idempotent_replay: true };
   };
   if (idemKeyValue) { const prior = await replay(); if (prior) return prior; }
-  const { pid: oldPid, decoded, textBytes } = await validateBackup(backup);
+  const { pid: oldPid, decoded } = await validateBackup(backup);
   checkBindable(backup, { strict: true });
   checkImportRows(ctx.env, backup, decoded, await workspaceLimits(ctx.env, workspaceId));
   const DB = ctx.env.DB, me = ctx.principal.id, at = nowIso();
@@ -517,8 +474,6 @@ async function importBackup(ctx, workspaceId, input, idemKeyValue, digest = "") 
   stmts.push(DB.prepare(`INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id, workspace_id) SELECT ?, ?, ?, 'backup.import', ?, 'ok', ?, ? WHERE ${exists}`).bind(at, me, pid, pid, ctx.requestId, workspaceId, pid));
   if (idemKeyValue) stmts.push(DB.prepare(`INSERT INTO idempotency (principal_id, project_id, op, key, digest, status, response, created_at) SELECT ?, ?, 'backup.import', ?, ?, 201, ?, ? WHERE ${exists}`)
     .bind(me, workspaceId, idemKeyValue, digest, JSON.stringify(result), at, pid));
-  // Import ids are server-made strings.
-  const searchJobs = prepareBackupJobs(backup, textBytes, { project: pid, artifact: (id) => artId.get(id), revision: (id) => revId.get(id) });
   await stageTextWrites(ctx.env, textWrites);
   // The file bytes go under the authorized target workspace's key (never anything named in the backup).
   const mimeOf = new Map(backup.revisions.filter((r) => r.blob_key).map((r) => [r.blob_key, r.mime]));
@@ -544,9 +499,8 @@ async function importBackup(ctx, workspaceId, input, idemKeyValue, digest = "") 
     await explainLimit(ctx.env, workspaceId, { projects: 1, storage_bytes: addBytes }, lg.limits);
     throw new HttpError(403, "forbidden", "Needs the admin role in an active workspace");
   }
-  deferBackupIndexing(ctx.env, searchJobs);
   return result;
 }
 
-export { IMPORT_MAX_ROWS, checkImportRows, exportBackup, importBackup, prepareBackupJobs, restoreBackup };
+export { IMPORT_MAX_ROWS, checkImportRows, exportBackup, importBackup, restoreBackup };
 
