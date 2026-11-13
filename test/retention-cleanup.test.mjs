@@ -119,7 +119,7 @@ test("a failing placeholder cleanup doesn't stop the rest of cleanup", async () 
   assert.equal(w.count("rate_counters"), 0, "later cleanup steps still ran");
 });
 
-test("retention deletes use their indexes (migration 0026), not full scans", () => {
+test("retention deletes use their indexes (migration 0027), not full scans", () => {
   const w = world();
   for (const [t, c] of [["sessions", "expires_at"], ["idempotency", "created_at"], ["audits", "at"]]) {
     const plan = w.db.prepare(`EXPLAIN QUERY PLAN SELECT rowid FROM ${t} WHERE ${c} < ? ORDER BY ${c} LIMIT 5`).all(1).map((r) => r.detail).join(" | ");

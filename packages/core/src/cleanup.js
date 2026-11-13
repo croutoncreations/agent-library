@@ -94,7 +94,8 @@ async function reconcileUploads(env, opts = {}) {
 var PLACEHOLDER_GRACE_MS = 864e5;
 // Only a placeholder nothing else refers to: a comment, details version or revision on it (all foreign keys to
 // artifacts) leaves it alone, so the delete can never fail a foreign key and roll the cleanup batch back.
-var ORPHAN_PLACEHOLDER_SQL = `a.head_rev = 0 AND a.publisher_id IS NULL
+// pending_review = 1 (migration 0017_review_gating.sql) is a new document that exists only as a proposal: never an orphan.
+var ORPHAN_PLACEHOLDER_SQL = `a.head_rev = 0 AND a.publisher_id IS NULL AND a.pending_review = 0
   AND NOT EXISTS (SELECT 1 FROM meta_versions m WHERE m.artifact_id = a.id)
   AND NOT EXISTS (SELECT 1 FROM comments c WHERE c.artifact_id = a.id)
   AND NOT EXISTS (SELECT 1 FROM revisions r WHERE r.artifact_id = a.id)
@@ -117,7 +118,7 @@ async function deleteOrphanPlaceholders(env, now, stale, projectId, limit) {
 }
 
 // Retention (cron, every 15 minutes): each table loses at most PRUNE_BATCH rows per run, oldest first, through its index
-// (migration 0026). 5000 rows a run is 480,000 a day per table, far above what a busy installation writes.
+// (migration 0027). 5000 rows a run is 480,000 a day per table, far above what a busy installation writes.
 // - sessions: expired ones (expires_at, ms). A signed-out session has a past expiry or revoked_at; revoked ones go
 //   when they expire (at most 30 days later).
 // - idempotency: records older than 30 days (created_at, ISO text). Replays are for retries of the same request:

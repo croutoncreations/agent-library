@@ -43,7 +43,7 @@ A workspace always has at least one owner. A `project_members` row can narrow on
    404, agent credentials 401, and refresh is `invalid_grant`, like a revoked connection or a removed creator.
    Its documents and files start being deleted 30 days after deletion ([below](#deleting-a-workspace)).
 
-## Data model (migration 0017, additive)
+## Data model (migration 0018, additive)
 
 - `workspaces(id, name, personal, status, plan, created_by, created_at)`
 - `workspace_members(workspace_id, principal_id, role, added_by, created_at)`
@@ -52,20 +52,20 @@ A workspace always has at least one owner. A `project_members` row can narrow on
 - `project_members(project_id, principal_id, role)`
 - `principals.email` (verified email from sign-in, used to match invitations)
 - `workspace_id` on `projects`, `oauth_connections`, `api_credentials`, `app_clients`, `publishers`, `audits`
-  (migration 0019 fills it for every project-scoped audit row; app audits write it explicitly);
+  (migration 0020 fills it for every project-scoped audit row; app audits write it explicitly);
   `created_by` on `oauth_connections`, `api_credentials`, `publishers` (`grants.created_by` already exists).
 
 **Existing data needs no rewrite.** A human's personal workspace has the deterministic id `wsp_<principal id>`. The
-migration inserts one for every existing human (with them as owner). Rows written before 0017, or by a rolled-back
+migration inserts one for every existing human (with them as owner). Rows written before 0018, or by a rolled-back
 Worker, have `workspace_id` NULL and mean "the owner's personal workspace": queries resolve
 `COALESCE(projects.workspace_id, 'wsp_' || projects.owner_id)`, and a credential's creator is
 `COALESCE(created_by, owner_principal_id)`. The new Worker still fills `projects.owner_id` (with the workspace's
-creator) so the previous Worker keeps working after a rollback. Migration 0018 adds a partial index so project lists
+creator) so the previous Worker keeps working after a rollback. Migration 0019 adds a partial index so project lists
 find those legacy rows without scanning.
 
-**Rolling back past 0017 re-grants workspace creators.** The previous Worker knows only `projects.owner_id`. After a
+**Rolling back past 0018 re-grants workspace creators.** The previous Worker knows only `projects.owner_id`. After a
 rollback, the person who created a shared workspace gets full access to all of its projects (even if they were
-removed, or the workspace is suspended), and every other member is locked out. Only roll back past 0017 while no
+removed, or the workspace is suspended), and every other member is locked out. Only roll back past 0018 while no
 shared workspace exists, or accept this for the rollback window.
 
 ## Browser API
@@ -131,7 +131,7 @@ Decision D21 B. Workspace owners and admins delete a project from Project settin
   revocations run only if it is. After the rows, both R2 prefixes (`blobs/<id>/`, `staging/<id>/`) are swept for files
   no row names. Credentials are revoked only when every project they cover is purged, so a project still in Recently
   deleted keeps its agent access for a restore.
-- **Migration 0024** adds `deleted_at`, `deleted_by`, `purge_at`, `purged_at` and `deleted_slug` to `projects`.
+- **Migration 0025** adds `deleted_at`, `deleted_by`, `purge_at`, `purged_at` and `deleted_slug` to `projects`.
   **Rollback risk:** a Worker from before this change doesn't know `deleted_at`, so after a rollback deleted (not yet
   purged) projects are open again to their members and agents, under no address. Purged ones show as empty "Deleted
   project" rows. Roll back across this change only in an emergency, and delete any project that must stay closed again
@@ -162,7 +162,7 @@ Owners delete a shared workspace on its page by typing its name. The personal wo
   purged), and the projects' tombstones. Deleting a workspace does not cancel its subscription.
 - **Undoing a deletion** is an operator job, possible only until the workspace is marked
   ([operations](operations.md#monitoring)).
-- **Migration 0035** adds `deleting_at`, `purge_marked_at` and `purged_at` to `workspaces`, and the index
+- **Migration 0032** adds `deleting_at`, `purge_marked_at` and `purged_at` to `workspaces`, and the index
   `projects_live`. Workspaces deleted before it get `deleting_at` from the first cron run after the upgrade (up to 100
   per run), so their 30 days start then. A rolled-back Worker marks no new workspaces, but projects already marked
   keep being purged; the new Worker finishes the workspace afterwards. A workspace deleted while the older Worker runs
@@ -194,7 +194,7 @@ is `https://<app>/acme/notes` (documents: `…/acme/notes/a/<id>`, with `/previe
   links then answer "not available" (ids still work). The app asks for confirmation. A released handle can be taken by
   another workspace, which is one reason a path never grants anything by itself. Changes are audited
   (`workspace.handle`, `project.address`).
-- **Migration 0020** adds `workspaces.handle` (unique) and `projects.slug` (unique per `workspace_id`), both nullable.
+- **Migration 0021** adds `workspaces.handle` (unique) and `projects.slug` (unique per `workspace_id`), both nullable.
   Rows without them, including rows a rolled-back Worker writes, get them on first use (at most 20 per request, to stay
   within D1's per-request query limit; the rest on later requests); a project given a slug also
   gets its `workspace_id` filled in (the personal workspace, as resolved today), so the previous Worker keeps working.

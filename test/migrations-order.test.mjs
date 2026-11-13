@@ -34,6 +34,14 @@ test('both 0009 migrations exist, in production order (html_documents before pub
   assert.equal(repo[i].sha256, HTML_DOCUMENTS_SHA256);
 });
 
+test('migration numbers are contiguous (the two 0009 files aside) and 0017_review_gating.sql is main\'s file byte for byte', () => {
+  const numbers = names.map((n) => Number(n.slice(0, 4)));
+  assert.deepEqual([...new Set(numbers)], Array.from({ length: Math.max(...numbers) }, (_, i) => i + 1));
+  assert.equal(names.filter((n) => n.startsWith('0017_')).join(), '0017_review_gating.sql');
+  // SHA-256 of origin/main's migrations/0017_review_gating.sql. Its code is not ported yet; the schema is inert.
+  assert.equal(repo.find((m) => m.name === '0017_review_gating.sql').sha256, REVIEW_GATING_SHA256);
+});
+
 test('migrations after the baseline are additive unless explicitly owner-approved', () => {
   for (const m of repo.filter((x) => !target.appliedMigrationsAtBaseline.includes(x.name))) {
     assert.ok(!m.destructive || m.approved, `${m.name} is destructive; add an owner-approved marker and apply it manually (docs/deploy-pipeline.md#destructive-migrations)`);
@@ -52,4 +60,5 @@ test('all migrations apply cleanly, in order, to a fresh database', () => {
   db.close();
 });
 
+const REVIEW_GATING_SHA256 = 'cdbbbd6926d618566d54be7c061d3151990bfea6d45acbcfb7102affba2cec93';
 const HTML_DOCUMENTS_SHA256 = '696e040163ba0b7b46fbfa37ff600273fc3c97a54815f31e8176392472ac3309';

@@ -82,7 +82,7 @@ that site instead, so a browser bug in rendering them can't reach the app's cook
 
 - When the app's preview frame (or a tab opening a PDF with `?open=1`) navigates to `/render` or `/content`, the app
   host checks access as usual and answers `302` to `https://CONTENT_HOST/c/<link>`. The link (`view_links`, migration
-  0025) names one revision of one document, the session that asked for it and its person; only its SHA-256 is stored.
+  0026) names one revision of one document, the session that asked for it and its person; only its SHA-256 is stored.
   It lasts 5 minutes for a page (the frame asks for a new one each time it opens) and 30 minutes for a PDF tab (the
   viewer's range requests reuse it).
 - Every request to the content host re-checks that the session hasn't been signed out or expired and that its person

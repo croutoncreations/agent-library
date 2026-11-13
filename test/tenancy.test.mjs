@@ -196,7 +196,7 @@ test("at least one owner; admins can't touch owners; members can leave", async (
   assert.equal((await v1(ids.carolKey.secret, "GET", `/v1/projects/${P.team}/files/${ids.teamDoc}`)).status, 401);
 });
 
-test("rows written before migration 0017 (workspace_id NULL) resolve to the owner's personal workspace", async () => {
+test("rows written before migration 0018 (workspace_id NULL) resolve to the owner's personal workspace", async () => {
   // A rolled-back Worker writes projects without workspace_id.
   const aliceId = (await me(alice)).id;
   sql(`INSERT INTO projects (id, owner_id, title, created_at) VALUES ('legacy-proj', '${aliceId}', 'Legacy', '2026-01-01T00:00:00Z')`);

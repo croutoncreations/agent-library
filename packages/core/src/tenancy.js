@@ -21,7 +21,7 @@ export const ROLE_RANK = { none: 0, viewer: 1, member: 2, admin: 3, owner: 4 };
 /** Minimum role for an operation class. */
 export const NEED = { read: "viewer", write: "member", manage: "admin", own: "owner" };
 
-/** Workspace of a project, also for rows written before migration 0017 (workspace_id NULL). SQL expression. */
+/** Workspace of a project, also for rows written before migration 0018 (workspace_id NULL). SQL expression. */
 export const projectWorkspaceSql = (alias) => `COALESCE(${alias}.workspace_id, 'wsp_' || ${alias}.owner_id)`;
 export const personalWorkspaceId = (principalId) => `wsp_${principalId}`;
 
@@ -113,7 +113,7 @@ export async function requireProjectRole(ctx, projectId, need, allowSuspended = 
 /**
  * Projects a human can see, with their effective role (excludes 'none' and deleting workspaces; suspended ones are
  * included as read-only, see workspace_status).
- * Driven from the person's memberships: projects_workspace serves current rows, projects_owner_legacy (0018) the
+ * Driven from the person's memberships: projects_workspace serves current rows, projects_owner_legacy (0019) the
  * rows a rolled-back Worker wrote without workspace_id (they belong to the owner's personal workspace).
  */
 export const VISIBLE_PROJECTS_MAX = 1000;

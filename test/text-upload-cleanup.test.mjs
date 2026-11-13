@@ -68,8 +68,9 @@ for (const projectId of [undefined, P]) test(`real cron upload SQL plans: ${proj
     assert.ok(plan.some(d => /(?:SEARCH|SCAN) (?:u|uploads) USING/.test(d)), q);
     assert.ok(plan.every(d => !/^SCAN (?:u|uploads)$/.test(d)), q);
     const failureLane = q.startsWith("SELECT id, final_key") || q.startsWith("SELECT final_key");
-    if (failureLane) assert.ok(plan.includes("SCAN r"), "pre-existing binary reference guard remains unchanged");
-    else assert.ok(!plan.includes("SCAN r"), "no full revision scan on success paths");
+    // The binary reference guard of the failure lane used to scan revisions; 0017_review_gating.sql adds revisions_blob_key, which serves it.
+    if (failureLane) assert.ok(plan.includes("SEARCH r USING COVERING INDEX revisions_blob_key (blob_key=?)"), "binary reference guard uses revisions_blob_key");
+    assert.ok(!plan.includes("SCAN r"), "no full revision scan on any path");
     if (q.startsWith("SELECT id, staging_key")) {
       const expected = projectId
         ? "SEARCH uploads USING INDEX uploads_project_state (project_id=? AND state=?)"

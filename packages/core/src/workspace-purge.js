@@ -53,7 +53,7 @@ export async function purgeDeletingWorkspaces(env, { now = nowMs() } = {}) {
   try {
     const db = env.DB;
     const cutoff = now - WORKSPACE_PURGE_GRACE_DAYS * DAY_MS;
-    // Deleted by a Worker from before migration 0035: their grace starts now.
+    // Deleted by a Worker from before migration 0032: their grace starts now.
     await db.prepare(`UPDATE workspaces SET deleting_at = ? WHERE id IN (SELECT id FROM workspaces
         WHERE status = 'deleting' AND purge_marked_at IS NULL AND deleting_at IS NULL LIMIT ${FILL_PER_RUN})`).bind(now).run();
     const due = (await db.prepare(`SELECT id FROM workspaces WHERE status = 'deleting' AND purge_marked_at IS NULL AND personal = 0 AND deleting_at <= ?

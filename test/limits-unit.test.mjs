@@ -1,6 +1,6 @@
 // Limits internals against the real packages/core/src/ bundle (node:sqlite with every migration, no server): the
 // PLAN_LIMITS owned_workspaces fallback, the backup import's per-import document cap, the per-request plan memo
-// (agent rate limits read each workspace's plan once per request, never across requests) and migration 0026's
+// (agent rate limits read each workspace's plan once per request, never across requests) and migration 0027's
 // indexes for the comments cursor, a project's audit list and the owned-workspaces count. Synthetic data only.
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -81,7 +81,7 @@ test("agent rate limits read a workspace's plan once per request; a new request 
   assert.equal(planReads(), 4);
 });
 
-test("migration 0026: the comments cursor, a project's audit list and the owned-workspaces count use indexes", () => {
+test("migration 0027: the comments cursor, a project's audit list and the owned-workspaces count use indexes", () => {
   const { sql } = mkDB();
   const plan = (q, ...p) => sql.prepare(`EXPLAIN QUERY PLAN ${q}`).all(...p).map((r) => r.detail).join(" | ");
   const comments = plan(`SELECT c.id FROM comments c WHERE c.artifact_id = ? AND c.project_id = ? AND (c.created_at, c.id) < (?, ?) ORDER BY c.created_at DESC, c.id DESC LIMIT 201`, "a", "p", "z", "z");

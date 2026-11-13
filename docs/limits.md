@@ -262,7 +262,7 @@ D13 A).
 
 ### Rolling back the Worker
 
-Migration 0026 only adds indexes, so an earlier Worker runs on the new schema and no data is corrupted. Worker
+Migration 0027 only adds indexes, so an earlier Worker runs on the new schema and no data is corrupted. Worker
 rollback doesn't undo data written under these limits, and the earlier Worker treats it differently:
 
 - It caps a project at 100 documents and files, so projects that grew past 100 can't take new items.
@@ -293,7 +293,7 @@ Other installations can supply their own `entitlements.limits(env, { workspaceId
 
 ## Billing
 
-Core keeps a provider-neutral billing state per workspace (`workspace_billing`, `billing_events`; migration 0022) and
+Core keeps a provider-neutral billing state per workspace (`workspace_billing`, `billing_events`; migration 0023) and
 decides what a billing change does, in one batch (`billing.js` `applyBillingChange`):
 
 - **Replay-safe:** each provider event id is applied at most once; a redelivered event changes nothing.

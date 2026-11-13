@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { P, lib, world } from "./upload-world.mjs";
 
-for (const projectId of [undefined, P]) test(`real orphan-placeholder SQL uses 0028: ${projectId ? "project" : "global"}`, async () => {
+for (const projectId of [undefined, P]) test(`real orphan-placeholder SQL uses 0029: ${projectId ? "project" : "global"}`, async () => {
   const w = world(), queries = [], prepare = w.env.DB.prepare;
   w.env.DB.prepare = q => {
     const stmt = prepare(q);
@@ -15,8 +15,8 @@ for (const projectId of [undefined, P]) test(`real orphan-placeholder SQL uses 0
   w.sql.exec("DROP INDEX artifacts_unpublished");
   const before = explain();
   assert.ok(before.includes(projectId ? "SEARCH a USING INDEX artifacts_folder (project_id=?)" : "SCAN a"));
-  const migration = readFileSync(new URL("../migrations/0028_text_upload_placeholders.sql", import.meta.url), "utf8");
-  w.sql.exec(migration); w.sql.exec(migration); // retry-safe; 0026 is deliberately retained
+  const migration = readFileSync(new URL("../migrations/0029_text_upload_placeholders.sql", import.meta.url), "utf8");
+  w.sql.exec(migration); w.sql.exec(migration); // retry-safe; 0027 is deliberately retained
   const after = explain();
   assert.ok(after.some(d => /(?:SCAN|SEARCH) a USING INDEX artifacts_unpublished/.test(d)));
   assert.ok(after.every(d => !/^SCAN (?:a|artifacts|r|revisions)$/.test(d)));

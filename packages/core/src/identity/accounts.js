@@ -2,7 +2,7 @@
 // Order: an existing link (upstream_identities, or the principal's own issuer/subject) -> the one existing person,
 // only for identity adapters whose upstream admits a single configured owner (identity.linkSoleOwner; self-host
 // Cloudflare Access) -> a new account, if the identity adapter allows sign-up.
-// Sign-in claims never grant access: a new account starts with only its personal workspace (migration 0017 trigger).
+// Sign-in claims never grant access: a new account starts with only its personal workspace (migration 0018 trigger).
 import { adapters } from "../adapters.js";
 import { HttpError, nowIso, randomId } from "../util.js";
 

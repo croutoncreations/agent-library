@@ -75,7 +75,7 @@ CREATE INDEX IF NOT EXISTS audits_workspace ON audits(workspace_id, seq);
 
 -- Every human principal has a personal workspace 'wsp_' || principal id, owned by them. Existing humans are
 -- backfilled here; the trigger covers humans created later by any Worker version (including a rolled-back one).
--- Projects with workspace_id NULL (written before 0017 or by a rolled-back Worker) belong to the personal workspace
+-- Projects with workspace_id NULL (written before 0018 or by a rolled-back Worker) belong to the personal workspace
 -- of their owner_id: code resolves COALESCE(projects.workspace_id, 'wsp_' || projects.owner_id). Nothing existing
 -- is rewritten.
 INSERT OR IGNORE INTO workspaces (id, name, personal, status, plan, created_by, created_at)

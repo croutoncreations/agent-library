@@ -152,7 +152,7 @@ These never go down: deleting a file does not give them back. They are separate 
 
 **App Files and snapshots interact one way.** App Files has its own limits (above: 10,000 files, 100,000 versions and 1 GiB per app, for the app's lifetime). Snapshot commits are limited to **32 files and 256 MiB per app**, and that count includes the app's App Files rows (also ones the app deleted). So once an app holds about 32 App Files, it can no longer commit a snapshot (`413 quota_exceeded`). The reverse does not apply: snapshot files do not count toward the App Files limits.
 
-Names follow one rule for the whole app, across App Files, snapshots and generations: no two names that differ only by case, and no file where a folder is needed (`409 path_conflict`, with `name` and `conflicts_with`). Names an app already has are kept. `manifest.json` is reserved in any case. Snapshot and generation commits need migration 0034 applied before the Worker that enforces this.
+Names follow one rule for the whole app, across App Files, snapshots and generations: no two names that differ only by case, and no file where a folder is needed (`409 path_conflict`, with `name` and `conflicts_with`). Names an app already has are kept. `manifest.json` is reserved in any case. Snapshot and generation commits need migration 0031 applied before the Worker that enforces this.
 
 A generation commit answers `409 path_conflict` for a part or manifest name that breaks this rule. A part with exactly the name of an existing file still answers `409 generation_conflict`. Generation ids that differ only by case (`g_A`, `g_a`) produce manifest names that differ only by case, so the second one to commit is refused.
 

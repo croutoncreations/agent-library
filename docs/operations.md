@@ -40,7 +40,7 @@ Restored file keys carry a per-attempt suffix, so a retried restore never overwr
 
 Note the current Worker version ID before each upgrade. To roll back the code, run `npx wrangler rollback <version-id>` with your config. (If you use the [deploy pipeline](deploy-pipeline.md), its next run will refuse because a hand-made version is live; follow its [Recovery](deploy-pipeline.md#recovery) table instead.) **Rollback only reverts the Worker.** D1 migrations, R2 files, KV state and secrets stay as they are. Migrations are additive, but schema compatibility does not guarantee data compatibility. A Worker from before this release cannot restore a history version larger than about 2 MB; the restore fails without changing data.
 
-**Do not roll back past the text-in-R2 release (migration 0027) once it has taken text writes; fix forward.** A Worker from before 0027 reads those text versions as empty: saving one stores empty text as a new version, restoring one creates a broken version, record reads and backup export fail, and they drop out of search. If rollback is unavoidable, treat the library as read-only until the newer Worker is back.
+**Do not roll back past the text-in-R2 release (migration 0028) once it has taken text writes; fix forward.** A Worker from before 0028 reads those text versions as empty: saving one stores empty text as a new version, restoring one creates a broken version, record reads and backup export fail, and they drop out of search. If rollback is unavoidable, treat the library as read-only until the newer Worker is back.
 
 ## Monitoring
 
@@ -83,5 +83,5 @@ To undo a workspace deletion:
 (use `'suspended'` if billing had suspended it). 1 row changed = undone; nothing of the workspace was marked. 0 rows:
 the id is wrong, the workspace is not deleting, or it is already marked and cannot be undone; check with
 `SELECT status, deleting_at, purge_marked_at FROM workspaces WHERE id = '<workspace id>';`. Never change `status` of
-a workspace whose `purge_marked_at` is set. Before upgrading to the version with migration 0035, check
+a workspace whose `purge_marked_at` is set. Before upgrading to the version with migration 0032, check
 `SELECT id, name FROM workspaces WHERE status = 'deleting'`: those workspaces' 30 days start at the upgrade.

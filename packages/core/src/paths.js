@@ -91,7 +91,7 @@ export async function projectPaths(env, ids) {
      FROM projects p JOIN workspaces w ON w.id = COALESCE(p.workspace_id, 'wsp_' || p.owner_id)
      WHERE p.id IN (SELECT value FROM json_each(?)) AND p.deleted_at IS NULL`
   ).bind(JSON.stringify(want.slice(0, 1000))).all()).results;
-  // Missing handles/slugs are assigned here (first use after migration 0020), at most ASSIGN_PER_CALL per request so
+  // Missing handles/slugs are assigned here (first use after migration 0021), at most ASSIGN_PER_CALL per request so
   // one request stays far below D1's per-invocation query limit; the rest get theirs on later requests.
   const handles = new Map();
   let budget = ASSIGN_PER_CALL;
