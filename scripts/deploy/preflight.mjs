@@ -12,7 +12,7 @@
 // Writes state.json with { action: deploy|skip, reason, pending[], live, bookmark, ... }.
 import { execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync } from 'node:fs';
-import { loadTarget, loadWrangler, hostedConfig, checkConfigAgainstTarget, checkLiveVersion, decideRelease, effectiveLive, NON_CODE_TRIGGERS, readMigrations, planMigrations, sha256 } from './lib.mjs';
+import { loadTarget, loadWrangler, hostedConfig, checkConfigAgainstTarget, checkLiveVersion, checkLiveSecretNames, decideRelease, effectiveLive, NON_CODE_TRIGGERS, readMigrations, planMigrations, sha256 } from './lib.mjs';
 
 const out = process.argv[2] ?? 'deploy-state.json';
 const checkOnly = process.argv.includes('--check-only');
@@ -67,7 +67,9 @@ if (!history[0].tag?.startsWith('gh-') && liveVersionId !== t.baseline.versionId
 const eff = effectiveLive(history, t.baseline);
 if (eff.via) console.log(`::notice::live ${liveVersionId} is a ${history[0].triggeredBy} change on top of ${eff.versionId} (${eff.tag ?? 'untagged'}); deciding from that version`);
 const liveTag = eff.tag;
-const liveProblems = checkLiveVersion(live, t);
+// Secrets are listed separately: `wrangler deploy` keeps the latest version's secrets, deployed or not.
+// `secret list` prints JSON by default (names and types, never values).
+const liveProblems = [...checkLiveVersion(live, t), ...checkLiveSecretNames(JSON.parse(wrangler('secret', 'list', '--env', env)))];
 if (liveProblems.length) fail(`live Worker does not match the recorded target:\n  ${liveProblems.join('\n  ')}`);
 
 const resolve = (short) => { try { return git('rev-parse', '--verify', '--quiet', `${short}^{commit}`); } catch { return null; } };

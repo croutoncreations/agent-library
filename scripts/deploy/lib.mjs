@@ -30,6 +30,22 @@ export const loadExampleWrangler = (root = '.') => parseToml(readFileSync(join(r
 
 const PLACEHOLDER = /^0+(-0+)*$|^replace-with-|example\.(com|net|org)$/;
 
+// Setting names an installation must never have, checked by name only (a value is never read, logged or stored):
+// content encryption, which the Worker refuses on every request (encryptionSetting in packages/core/src/index.js;
+// docs/encryption.md), and the test switches that act only on localhost. Refused whatever the value, even
+// CONTENT_ENCRYPTION_REQUIRED = "0": none of these names has a use on an installation. The deploy never removes one.
+export const FORBIDDEN_SETTING_NAMES = ['CONTENT_MASTER_KEY_VERSION', 'CONTENT_ENCRYPTION_REQUIRED', 'AC_TEST_HOOKS', 'V1_TEST_ENDPOINTS'];
+const FORBIDDEN_MASTER_KEY = /^CONTENT_MASTER_KEY_V\d+$/;
+export const isForbiddenSetting = (name) => FORBIDDEN_SETTING_NAMES.includes(name) || FORBIDDEN_MASTER_KEY.test(name);
+const forbiddenSetting = (where, name) => `${where} has ${name}, a setting this release must never have: remove it (the deploy never removes or changes it for you)`;
+const withoutForbidden = (vars) => Object.fromEntries(Object.entries(vars ?? {}).filter(([k]) => !isForbiddenSetting(k)));
+
+// Secret names from `wrangler secret list` ([{ name, type }]). Names only. An unreadable list refuses.
+export function checkLiveSecretNames(list) {
+  if (!Array.isArray(list) || list.some((s) => typeof s?.name !== 'string')) return ['live secret list is not readable (a list with a name each); refusing'];
+  return list.map((s) => s.name).filter(isForbiddenSetting).map((n) => forbiddenSetting('live Worker secret', n));
+}
+
 // The effective hosted config, i.e. what `wrangler deploy --env hosted` would apply.
 // Wrangler does not inherit bindings/vars into named envs, so we read env.hosted only.
 export function hostedConfig(wrangler, envName = 'hosted') {
@@ -68,7 +84,8 @@ export function checkConfigAgainstTarget(cfg, target) {
   eq('preview_urls', cfg.previewUrls, false);
   eq('routes', cfg.routes.map((r) => `${r.pattern}|${r.custom_domain === true}`).sort(), target.customDomains.map((h) => `${h}|true`).sort());
   eq('crons', [...cfg.crons].sort(), [...target.crons].sort());
-  eq('vars', sortObj(cfg.vars), sortObj(target.vars));
+  // A forbidden name is refused below by name; leaving it out here keeps its value out of the vars message.
+  eq('vars', sortObj(withoutForbidden(cfg.vars)), sortObj(withoutForbidden(target.vars)));
   eq('d1', cfg.d1.map(({ binding, id, name }) => ({ binding, id, name })), target.bindings.d1);
   eq('kv', cfg.kv, target.bindings.kv);
   eq('r2', cfg.r2, target.bindings.r2);
@@ -77,6 +94,11 @@ export function checkConfigAgainstTarget(cfg, target) {
   }
   for (const r of cfg.routes) if (PLACEHOLDER.test(r.pattern)) p.push(`placeholder hostname in hosted config: ${r.pattern}`);
   if (!target.accountId || !/^[0-9a-f]{32}$/.test(target.accountId)) p.push('deploy target accountId must be your 32-hex Cloudflare account ID');
+  for (const k of Object.keys(cfg.vars ?? {}).filter(isForbiddenSetting)) p.push(forbiddenSetting('wrangler.toml vars', k));
+  for (const k of Object.keys(target.vars ?? {}).filter(isForbiddenSetting)) p.push(forbiddenSetting('deploy target vars', k));
+  const pv = target.pendingVars && typeof target.pendingVars === 'object' && !Array.isArray(target.pendingVars) ? target.pendingVars : {};
+  for (const k of Object.keys(pv).filter(isForbiddenSetting)) p.push(forbiddenSetting('deploy target pendingVars', k));
+  for (const k of (Array.isArray(target.requiredSecrets) ? target.requiredSecrets : []).filter(isForbiddenSetting)) p.push(forbiddenSetting('deploy target requiredSecrets', k));
   return p;
 }
 
@@ -85,9 +107,13 @@ export function checkConfigAgainstTarget(cfg, target) {
 // never "fix" production by creating or replacing resources.
 export function checkLiveVersion(live, target) {
   const p = [];
-  const b = live?.resources?.bindings ?? [];
+  // Fail closed: without a readable binding list nothing below (forbidden names, drift, secrets) can be checked.
+  const b = live?.resources?.bindings;
+  if (!Array.isArray(b) || b.some((x) => typeof x?.name !== 'string' || typeof x?.type !== 'string')) return ['live version has no readable binding list (resources.bindings with a name and type each); refusing'];
   const by = (type) => b.filter((x) => x.type === type);
-  const liveVars = Object.fromEntries(by('plain_text').map((x) => [x.name, x.text]));
+  // Names only: a forbidden binding's value never enters a message (it is left out of liveVars and its drift line).
+  for (const x of b) if (isForbiddenSetting(x.name)) p.push(forbiddenSetting(`live Worker ${x.type === 'secret_text' ? 'secret' : x.type === 'plain_text' ? 'var' : `${x.type} binding`}`, x.name));
+  const liveVars = withoutForbidden(Object.fromEntries(by('plain_text').map((x) => [x.name, x.text])));
   // Drift refuses: a live var that the target lacks or sets differently (e.g. a dashboard edit), and a target var that
   // is missing live (it may have been removed on purpose, e.g. a kill switch). The one exception is a reviewed change
   // listed in `pendingVars` as { NAME: <exact value it replaces, or null if the var is new> }. The deploy applies it
@@ -106,7 +132,7 @@ export function checkLiveVersion(live, target) {
   }
   const drift = Object.keys(liveVars).filter((k) => !pending.has(k) && (!Object.hasOwn(target.vars, k) || target.vars[k] !== liveVars[k]));
   if (drift.length) p.push(`live vars differ from target (${drift.sort().join(', ')}): live=${JSON.stringify(sortObj(liveVars))}; if this deploy changes them on purpose, list them in the target's pendingVars`);
-  const missing = Object.keys(target.vars).filter((k) => !Object.hasOwn(liveVars, k) && !pending.has(k));
+  const missing = Object.keys(target.vars).filter((k) => !isForbiddenSetting(k) && !Object.hasOwn(liveVars, k) && !pending.has(k));
   if (missing.length) p.push(`target vars missing in production (${missing.sort().join(', ')}); if this deploy adds them, list them in the target's pendingVars`);
   const liveSecrets = by('secret_text').map((x) => x.name).sort();
   for (const s of target.requiredSecrets) if (!liveSecrets.includes(s)) p.push(`required Worker secret missing in production: ${s}`);

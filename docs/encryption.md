@@ -33,8 +33,9 @@ A Worker refuses every request with `500 encryption_unsupported` while any of th
 
 The server log names the setting it found (`encryption_unsupported` with `setting`), never its value. Remove the
 setting to recover. These settings belonged to a content-encryption design that is not part of this release; with
-them set, some content would be encrypted and the rest would not, so the Worker refuses instead. The 15-minute cron
-keeps running meanwhile ([operations.md](operations.md#monitoring)).
+them set, some content would be encrypted and the rest would not, so the Worker refuses instead. The optional deploy
+pipeline refuses to deploy while one of these names is present ([deploy-pipeline.md](deploy-pipeline.md#what-a-deploy-does)).
+The 15-minute cron keeps running meanwhile ([operations.md](operations.md#monitoring)).
 
 ## Unused database schema
 

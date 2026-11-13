@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
-import { decideRelease, effectiveLive, checkLiveVersion, checkConfigAgainstTarget, hostedConfig, loadTarget, loadWrangler, loadExampleTarget, loadExampleWrangler, planMigrations, nonAdditiveStatements, tagFor } from '../scripts/deploy/lib.mjs';
+import { decideRelease, effectiveLive, checkLiveVersion, checkLiveSecretNames, checkConfigAgainstTarget, hostedConfig, loadTarget, loadWrangler, loadExampleTarget, loadExampleWrangler, planMigrations, nonAdditiveStatements, tagFor } from '../scripts/deploy/lib.mjs';
 
 // Synthetic installation: the examples with their placeholders replaced by fake but well-formed IDs.
 const SYN = { d1: 'abcdef12-1234-4234-8234-123456789abc', kv: 'bcde'.repeat(8) };
@@ -221,4 +221,75 @@ test('FTS5 virtual indexes are additive only with IF NOT EXISTS; other virtual m
   assert.deepEqual(nonAdditiveStatements('CREATE VIRTUAL TABLE IF NOT EXISTS search_idx USING fts5(title, body);'), []);
   assert.equal(nonAdditiveStatements('CREATE VIRTUAL TABLE search_idx USING fts5(title);').length, 1);
   assert.equal(nonAdditiveStatements('CREATE VIRTUAL TABLE IF NOT EXISTS idx USING other(title);').length, 1);
+});
+
+// Forbidden setting names (lib.mjs FORBIDDEN_SETTING_NAMES): refused by name in the target and live, values never shown.
+const FORBIDDEN = ['CONTENT_MASTER_KEY_VERSION', 'CONTENT_ENCRYPTION_REQUIRED', 'CONTENT_MASTER_KEY_V1', 'CONTENT_MASTER_KEY_V12', 'AC_TEST_HOOKS', 'V1_TEST_ENDPOINTS'];
+const NEAR_MISSES = ['CONTENT_HOST', 'CONTENT_MASTER_KEY_VX', 'CONTENT_MASTER_KEY_V', 'CONTENT_MASTER_KEY_V1X', 'XCONTENT_MASTER_KEY_V1', 'CONTENT_MASTER_KEY_VERSIONS', 'AC_TEST_HOOKS_OFF', 'V1_TEST_ENDPOINTS_X'];
+const SENTINEL = 'sentinel-value-must-never-print.invalid';
+const noSentinel = (problems, why) => assert.ok(!problems.join('\n').includes(SENTINEL), `${why}: a value leaked into ${JSON.stringify(problems)}`);
+const namesIt = (problems, name, why) => assert.ok(problems.some((m) => m.includes(name) && /remove it/.test(m)), `${why}: ${JSON.stringify(problems)}`);
+
+test('a forbidden setting name in the config or the deploy target refuses, naming it and never its value', () => {
+  const good = hostedConfig(loadWranglerSynthetic());
+  for (const name of FORBIDDEN) {
+    for (const value of [SENTINEL, '0', '']) {
+      const vars = { ...good.vars, [name]: value };
+      const both = checkConfigAgainstTarget({ ...good, vars }, { ...target, vars: { ...target.vars, [name]: value } });
+      namesIt(both, name, `${name}=${JSON.stringify(value)} in both`); noSentinel(both, name);
+      const cfgOnly = checkConfigAgainstTarget({ ...good, vars }, target);
+      namesIt(cfgOnly, name, `${name} in wrangler.toml only`); noSentinel(cfgOnly, name);
+    }
+    namesIt(checkConfigAgainstTarget(good, { ...target, requiredSecrets: [...target.requiredSecrets, name] }), name, `${name} in requiredSecrets`);
+    namesIt(checkConfigAgainstTarget(good, { ...target, pendingVars: { [name]: null } }), name, `${name} in pendingVars`);
+  }
+});
+
+test('near-miss names (CONTENT_HOST and look-alikes) are not forbidden settings', () => {
+  for (const name of NEAR_MISSES) {
+    const good = hostedConfig(loadWranglerSynthetic());
+    const t = { ...target, vars: { ...target.vars, [name]: 'x.example.com' } };
+    assert.deepEqual(checkConfigAgainstTarget({ ...good, vars: { ...good.vars, [name]: 'x.example.com' } }, t), [], name);
+    assert.deepEqual(checkLiveVersion(liveFixture((b) => [...b, { type: 'plain_text', name, text: 'x.example.com' }]), t), [], name);
+    assert.deepEqual(checkLiveVersion(liveFixture((b) => [...b, { type: 'secret_text', name }]), target), [], `${name} as a secret`);
+  }
+});
+
+test('a forbidden setting on the live Worker (var, secret or other binding) refuses, naming it and never its value', () => {
+  for (const name of FORBIDDEN) {
+    for (const value of [SENTINEL, '0', '']) {
+      const asVar = checkLiveVersion(liveFixture((b) => [...b, { type: 'plain_text', name, text: value }]), target);
+      namesIt(asVar, name, `live var ${name}=${JSON.stringify(value)}`); noSentinel(asVar, `live var ${name}`);
+    }
+    const asSecret = checkLiveVersion(liveFixture((b) => [...b, { type: 'secret_text', name, text: SENTINEL }]), target);
+    namesIt(asSecret, name, `live secret ${name}`); noSentinel(asSecret, `live secret ${name}`);
+    const asJson = checkLiveVersion(liveFixture((b) => [...b, { type: 'json', name, json: SENTINEL }]), target);
+    namesIt(asJson, name, `live json binding ${name}`); noSentinel(asJson, `live json binding ${name}`);
+    // Listed in the target too (pendingVars cannot make it pass): still refused, still no value.
+    const listed = checkLiveVersion(liveFixture((b) => [...b, { type: 'plain_text', name, text: SENTINEL }]), { ...target, vars: { ...target.vars, [name]: SENTINEL } });
+    namesIt(listed, name, `live and target ${name}`); noSentinel(listed, `live and target ${name}`);
+  }
+});
+
+test('an unreadable live binding list refuses instead of passing', () => {
+  const cases = {
+    'no resources': {},
+    'no bindings': { resources: { script_runtime: { compatibility_date: target.compatibilityDate } } },
+    'bindings not a list': { resources: { bindings: { DB: { type: 'd1' } } } },
+    'binding without a name': liveFixture((b) => [...b, { type: 'secret_text' }]),
+    'binding without a type': liveFixture((b) => [...b, { name: 'CONTENT_MASTER_KEY_V1' }]),
+    'null live': null,
+  };
+  for (const [why, live] of Object.entries(cases)) assert.deepEqual(checkLiveVersion(live, target), ['live version has no readable binding list (resources.bindings with a name and type each); refusing'], why);
+});
+
+test('the live secret list refuses a forbidden name, passes near-misses, and refuses when unreadable', () => {
+  assert.deepEqual(checkLiveSecretNames([{ name: 'ACCESS_OIDC_CLIENT_SECRET', type: 'secret_text' }, ...NEAR_MISSES.map((name) => ({ name, type: 'secret_text' }))]), []);
+  assert.deepEqual(checkLiveSecretNames([]), [], 'no secrets is a readable answer');
+  for (const name of FORBIDDEN) {
+    const p = checkLiveSecretNames([{ name: 'OTHER', type: 'secret_text' }, { name, type: 'secret_text', text: SENTINEL }]);
+    assert.equal(p.length, 1, name); namesIt(p, name, `secret ${name}`); noSentinel(p, `secret ${name}`);
+  }
+  for (const [why, list] of Object.entries({ 'null': null, 'an object': { result: [] }, 'an entry without a name': [{ type: 'secret_text' }], 'a string entry': ['X'] }))
+    assert.deepEqual(checkLiveSecretNames(list), ['live secret list is not readable (a list with a name each); refusing'], why);
 });
