@@ -6,7 +6,7 @@ request's authenticated connection. There is no identity parameter. Existing
 live authorization, project scope and rate limiting run before diagnostics.
 OAuth uses the same connection projects and token/project write intersection
 as `list_projects`; keys use `verifyApiKey`; legacy grants use `authenticate`
-and `listProjects`; publishers use `livePublisher` and their sole destination. Their write flag also calls the existing `assertStillAuthorized` gate, so a disabled app or missing/foreign destination folder reports blocked writes while authorized metadata reads remain available.
+and `listProjects`; publishers use `livePublisher` and their sole destination. Their write flag also calls the existing `assertStillAuthorized` gate, so a missing/foreign destination folder reports blocked writes while authorized metadata reads remain available. A disabled app gets no diagnostic: `connection-info` answers `401` like every other publisher route.
 Only IDs, labels, permitted project metadata, capabilities and timestamps are
 serialized; credential records, owner identity and secrets never enter results.
 

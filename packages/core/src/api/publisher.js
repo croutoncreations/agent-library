@@ -5,7 +5,7 @@ import { CONTENT_TYPE, MIME, byteLength, checkFile } from "../formats.js";
 import { appOrigin, artifactWebUrl, previewWebUrl } from "../links.js";
 import { addressLinksResponse } from "../paths.js";
 import { explainLimit, projectLimitGuard, projectWorkspaceId } from "../limits.js";
-import { SCOPES, clientAllows, livePublisher } from "../oauth/server.js";
+import { SCOPES, livePublisher } from "../oauth/server.js";
 import { appFilesDrainsInUse, appFilesSlotsInUse, baseParams, baseSql, isAppFileContentPath, isAppFilesPath, routeAppFiles } from "./app-files.js";
 import { LIMITS, connectionInfo, idemLookup } from "../service.js";
 import { memberRoleSql, readOnlyError } from "../tenancy.js";
@@ -170,9 +170,9 @@ var beginView = (g) => ({
   snapshot_id: g.snapshot_id ?? null
 });
 /**
- * The publisher's current authorization, re-read now. Write mode (default): an active workspace, the creator a member,
- * an enabled app client. Read mode ({ read: true }): a suspended workspace stays readable and a disabled client may
- * read (DISABLED_CLIENT_BLOCKS). Both: not revoked, same token epoch, the destination unchanged and valid.
+ * The publisher's current authorization, re-read now. Write mode (default): an active workspace and the creator a
+ * member. Read mode ({ read: true }): a suspended workspace stays readable. Both: not revoked, same token epoch, an
+ * enabled app client, the destination unchanged and valid.
  */
 async function assertStillAuthorized(env, p, { read = false } = {}) {
   const row = await env.DB.prepare(`SELECT pb.token_epoch,pb.revoked_at,pb.project_id,pb.folder_id,ac.disabled_at AS client_disabled,
@@ -180,7 +180,8 @@ async function assertStillAuthorized(env, p, { read = false } = {}) {
     ${memberRoleSql("pj.id", "member", "COALESCE(pb.created_by, pb.owner_principal_id)")} AS creator_ok,
     ${memberRoleSql("pj.id", "member", "COALESCE(pb.created_by, pb.owner_principal_id)", true)} AS creator_ok_suspended,CASE WHEN pb.folder_id IS NULL THEN 1 ELSE EXISTS(SELECT 1 FROM folders f WHERE f.id=pb.folder_id AND f.project_id=pb.project_id) END AS folder_valid
     FROM publishers pb JOIN app_clients ac ON ac.id=pb.app_client_id JOIN projects pj ON pj.id=pb.project_id WHERE pb.id=?`).bind(p.id).first();
-  if (!row || row.revoked_at !== null || !clientAllows(row, !read) || row.token_epoch !== p.token_epoch) throw new HttpError(401, "unauthenticated", "Publisher/client revoked or token superseded; reconnect required");
+  if (!row || row.revoked_at !== null || row.token_epoch !== p.token_epoch) throw new HttpError(401, "unauthenticated", "Publisher/client revoked or token superseded; reconnect required");
+  if (row.client_disabled !== null) throw new HttpError(401, "unauthenticated", APP_DISABLED);
   const scopeOk = row.project_id === p.project_id && (row.folder_id ?? null) === (p.folder_id ?? null) && row.folder_valid;
   // Only a publisher that would otherwise be allowed learns the workspace is suspended.
   if (!read && row.ws_status === "suspended" && scopeOk && row.creator_ok_suspended) throw readOnlyError();
@@ -530,7 +531,6 @@ async function abandon(env, p, id, req) {
 }
 async function routeGeneration(req, env, p, requestId) {
   const path = new URL(req.url).pathname.replace(/\/$/, "");
-  if ((path === "/v1/publisher/generations" || path.startsWith("/v1/publisher/generations/")) && !clientAllows(p, true)) throw new HttpError(401, "unauthenticated", "App client is disabled; generation access requires an enabled client");
   if (path === "/v1/publisher/generations") {
     if (req.method !== "POST")
       throw new HttpError(405, "method_not_allowed", "Method not allowed");
@@ -563,6 +563,7 @@ async function routeGeneration(req, env, p, requestId) {
 var MAX_BODY = 65e5;
 var NAME_RE = /^[A-Za-z0-9._-]{1,64}$/;
 var MANIFEST = "manifest.json";
+var APP_DISABLED = "This app has been disabled by the owner of this library";
 var ID = "([A-Za-z0-9_-]{1,64})";
 var R = {
   me: /^\/v1\/publisher\/me$/,
@@ -868,6 +869,7 @@ async function commitSnapshot(env, p, req, requestId) {
     const fresh = await livePublisher(env, { publisher_id: p.id, epoch: p.token_epoch });
     if (fresh?.revoked) throw new HttpError(401, "publisher_revoked", "This publisher has been revoked by the owner");
     if (!fresh) throw new HttpError(401, "unauthenticated", "Token is no longer valid; reconnect the app");
+    if (fresh.disabled) throw new HttpError(401, "unauthenticated", APP_DISABLED);
     for (const x of existingTargets) {
       const now2 = await env.DB.prepare("SELECT trashed_at FROM artifacts WHERE id = ?").bind(x.id).first();
       if (now2?.trashed_at) throw new HttpError(409, "destination_file_trashed", "The owner moved this app's file to trash; ask the owner to restore it", { name: x.export_name, file_id: x.id });
@@ -910,7 +912,7 @@ async function route(req, env, execCtx, p, requestId) {
     catch (e) {
       if (!(e instanceof HttpError) || ![401, 403].includes(e.status)) throw e;
       canWrite = false;
-      writeRestrictions.push(p.client_disabled !== null ? "Writes blocked: app client disabled; ask the owner to inspect this app." : "Writes blocked: " + e.message);
+      writeRestrictions.push("Writes blocked: " + e.message);
     }
     return json(connectionInfo("publisher", p.id, p.display_name, [], null, null, {
       destination: { project_id: project.id, title: project.title, folder_id: p.folder_id, can_read_own_files: true, can_write_own_files: canWrite },
@@ -1002,6 +1004,7 @@ async function handlePublisherApi(req, env, ctx) {
     const p = await livePublisher(env, ctx.props).catch(() => null);
     if (!p) throw new HttpError(401, "unauthenticated", "Token is no longer valid; reconnect the app");
     if (p.revoked) throw new HttpError(401, "publisher_revoked", "This publisher has been revoked by the owner");
+    if (p.disabled) throw new HttpError(401, "unauthenticated", APP_DISABLED);
     const pathname = new URL(req.url).pathname;
     const routed = await route(req, env, ctx, p, requestId);
     // App Files content carries stored bytes: never rewritten (lists are, like every other JSON answer).

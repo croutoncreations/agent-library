@@ -154,7 +154,9 @@ These never go down: deleting a file does not give them back. They are separate 
 
 ### What a disabled app can do
 
-When you disable an app client, its existing connections can still **read** (App Files, `/v1/publisher/files*`, `/snapshots*`, `/me`) and refresh their tokens. Every **write** is refused with `401`: App Files `PUT` and `DELETE`, snapshot commits and all generation calls, including a write that was already in progress. New connections are refused. Revoking a publisher stops everything.
+When you disable an app, every connection it has stops at once: reads and writes fail with `401` ("This app has been disabled by the owner of this library"), including a write already in progress, and token renewal is refused. A read that has already started finishes. The app's next token renewal ends that connection for good, so disabling cannot be undone; register the app again if you need it back. New connections are refused.
+
+A disabled app's connections still count toward your connected-agents limit, and its web origins stay allowed for cross-origin requests, until you revoke each connection.
 
 ### Operator notes
 

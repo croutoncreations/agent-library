@@ -83,9 +83,10 @@ App Connect publishers use `GET https://<MCP_HOST>/v1/publisher/connection-info`
 with their existing publisher token. Match its publisher ID under **Publishing
 apps**. The response has an empty `projects` array and a `destination` with
 `can_read_own_files` and `can_write_own_files`: this is not a general project
-browser. If its app is disabled or its destination folder is unavailable,
-`can_write_own_files` is false with a restriction explaining why; this metadata
-check may still succeed even though a write would fail. Publisher credentials do not use the reader MCP tool or API-key route.
+browser. If its destination folder is unavailable, `can_write_own_files` is
+false with a restriction explaining why; this metadata check may still succeed
+even though a write would fail. If the owner has disabled the app, this route
+answers `401` like every other publisher route. Publisher credentials do not use the reader MCP tool or API-key route.
 OAuth reader tokens and legacy grants retain their existing MCP transports;
 this feature does not make them API keys.
 

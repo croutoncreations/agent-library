@@ -18,6 +18,8 @@ function originFor(host) {
   // Loopback (local dev and tests; *.localhost names a second local site, e.g. the user-content host) is plain http.
   return /^(127\.0\.0\.1|([a-z0-9-]+\.)?localhost)(:\d+)?$/.test(host) ? `http://${host}` : `https://${host}`;
 }
+/** N-A2: the OAuth error_description when a disabled app refreshes or exchanges a code. */
+const APP_DISABLED_GRANT = "App disabled by the owner";
 function servers(origin, appConnect = false) {
   const cacheKey = origin + (appConnect ? "#ac" : "");
   let s = cache.get(cacheKey);
@@ -39,6 +41,14 @@ function servers(origin, appConnect = false) {
     clientRegistrationTTL: 10 * 365 * 24 * 3600,
     // Every refresh rechecks the D1 connection; revoked or expired connections cannot refresh.
     tokenExchangeCallback: async ({ grantType, props, env }) => {
+  if (grantType === "authorization_code") {
+    if (!props?.publisher_id) return;
+    // A code minted before the app was disabled must not mint a grant afterwards. A storage error issues the
+    // tokens as before: every request they make still passes the disabled gate.
+    const publisher = await livePublisher(env, props).catch(() => null);
+    if (publisher?.disabled) throw new OAuthError("invalid_grant", { description: APP_DISABLED_GRANT });
+    return;
+  }
   if (grantType !== "refresh_token") return;
   const retry = () => new OAuthError("temporarily_unavailable", {
     description: "Token renewal is temporarily unavailable. Retry shortly.",
@@ -48,6 +58,7 @@ function servers(origin, appConnect = false) {
     if (props?.publisher_id) {
       const publisher = await livePublisher(env, props);
       if (!publisher || publisher.revoked) throw new OAuthError("invalid_grant", { description: "Publisher revoked or token superseded" });
+      if (publisher.disabled) throw new OAuthError("invalid_grant", { description: APP_DISABLED_GRANT });
       if (env.__oauthRefreshClaimBusy) throw retry();
       return;
     }
@@ -98,12 +109,10 @@ function servers(origin, appConnect = false) {
   cache.set(cacheKey, s);
   return s;
 }
-// What disabling an app client stops for its existing publishers: "writes" (recommended) or "all". Owner decision.
-const DISABLED_CLIENT_BLOCKS = "writes";
-/** Does the publisher row's app client allow this request? (A disabled client blocks writes, or everything under "all".) */
-function clientAllows(p, write, mode = DISABLED_CLIENT_BLOCKS) { return p.client_disabled === null || (mode === "writes" && !write); }
-/** The same rule as SQL over the app_clients row aliased `ac`. */
-function clientLiveSql(write, mode = DISABLED_CLIENT_BLOCKS) { return write || mode === "all" ? "ac.disabled_at IS NULL" : "1"; }
+/**
+ * The publisher row for token props, or null (unknown publisher, creator not a member, superseded epoch).
+ * A row may carry `revoked: true` or `disabled: true`: callers must check `revoked` and `disabled`.
+ */
 async function livePublisher(env, p) {
   if (!p || typeof p.publisher_id !== "string" || !/^pub_[A-Za-z0-9_-]{10,64}$/.test(p.publisher_id)) return null;
   const row = await env.DB.prepare(
@@ -114,7 +123,7 @@ async function livePublisher(env, p) {
   if (!row) return null;
   if (row.revoked_at !== null) return { ...row, revoked: true };
   if (row.token_epoch !== p.epoch) return null;
-  if (!clientAllows(row, false)) return null;
+  if (row.client_disabled !== null) return { ...row, disabled: true };
   return row;
 }
 function toClient(location, headers, clientHost) {
@@ -1088,4 +1097,4 @@ function statusPage(title, msg, { status = 200, icon = "alert", actions = [], he
     .map((a) => `<a class="btnlink${a.primary ? " primary" : ""}" href="${esc(a.href)}">${esc(a.label)}</a>`).join("");
   return page(title, cxShell(`<div class="state${icon === "alert" ? " off" : icon === "check" ? " on" : " neutral"}"><span class="big" aria-hidden="true">${cxIcon(icon)}</span><h1>${esc(title)}</h1><p class="lede">${esc(msg)}</p></div>${links ? `<div class="bar">${links}</div>` : ""}`, false), headers, status);
 }
-export { DISABLED_CLIENT_BLOCKS, SCOPES, _servers, clientAllows, clientLiveSql, handleOAuthHost, liveConnection, livePublisher, originFor, servers, statusPage };
+export { SCOPES, _servers, handleOAuthHost, liveConnection, livePublisher, originFor, servers, statusPage };

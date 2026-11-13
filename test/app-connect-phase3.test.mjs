@@ -427,21 +427,27 @@ test("revocation: publisher revoked -> 401 publisher_revoked, refresh invalid_gr
   assert.ok(!blocked.code && /disabled/.test(blocked.html));
 });
 
-test("review F1: disabling an app client stops new connections and all writes; reads and refresh continue", async () => {
+const APP_DISABLED_TEXT = "This app has been disabled by the owner of this library";
+test("review F1: disabling an app client blocks every route and refresh for its existing connections; the browser can still read why", async () => {
   const app3 = await h.registerApp({ display_name: "Disable probe", redirect_uris: ["http://127.0.0.1:5175/cb"], origins: ["http://127.0.0.1:5175"] });
   const D = await h.connectPublisher(app3, { project_id: "other-test", destination: "root" });
   assert.equal((await commit(D.access_token, snapBody(1, synthMeasurements(2, { seed: 80 })))).status, 201);
   assert.equal((await owner.req("POST", `/api/app-clients/${app3.app_client_id}/disable`, {})).status, 200);
-  assert.equal((await h.pub(D.access_token, "GET", "/publisher/me")).status, 200);
-  assert.equal((await h.pub(D.access_token, "GET", "/publisher/files")).status, 200, "reads continue");
-  assert.equal((await h.pub(D.access_token, "GET", "/publisher/snapshots/current")).status, 200, "reads continue");
+  for (const path of ["/publisher/me", "/publisher/files", "/publisher/snapshots/current"]) {
+    const r = await h.pub(D.access_token, "GET", path);
+    assert.equal(r.status, 401, `${path}: ${r.text}`); assert.equal(r.json.error.code, "unauthenticated", path);
+    assert.equal(r.json.error.message, APP_DISABLED_TEXT, path);
+    assert.match(r.headers.get("www-authenticate"), /^Bearer error="invalid_token"$/, path);
+  }
   const w = await commit(D.access_token, snapBody(2, synthMeasurements(2, { seed: 81 })));
-  assert.equal(w.status, 401, w.text); assert.equal(w.json.error.code, "unauthenticated");
-  assert.equal((await h.pub(D.access_token, "GET", "/publisher/me")).json.current_source_revision, 1, "nothing written");
+  assert.equal(w.status, 401, w.text); assert.equal(w.json.error.code, "unauthenticated"); assert.equal(w.json.error.message, APP_DISABLED_TEXT);
+  assert.equal((await rows(`SELECT current_source_revision AS r FROM publishers WHERE id = '${D.publisher_id}'`))[0].r, 1, "nothing written");
   const t = await h.token({ grant_type: "refresh_token", refresh_token: D.refresh_token, client_id: app3.client_id });
-  assert.equal(t.status, 200, JSON.stringify(t.body));
+  assert.equal(t.status, 400, JSON.stringify(t.body)); assert.equal(t.body.error, "invalid_grant"); assert.equal(t.body.error_description, "App disabled by the owner");
   const pre = await fetch(`${h.api}/publisher/me`, { method: "OPTIONS", headers: { origin: "http://127.0.0.1:5175", "access-control-request-method": "GET" } });
   assert.equal(pre.status, 204, "CORS kept for a disabled app's live publisher");
+  const cors = await h.pub(D.access_token, "GET", "/publisher/me", { headers: { origin: "http://127.0.0.1:5175" } });
+  assert.equal(cors.status, 401); assert.equal(cors.headers.get("access-control-allow-origin"), "http://127.0.0.1:5175", "the browser can read the 401 body");
   assert.ok(!(await h.authorize(app3, { project_id: "other-test", destination: "root" })).code, "no new connection");
 });
 
@@ -456,9 +462,47 @@ test("review F1: a snapshot commit in flight when the app client is disabled ans
   await barrier.entered;
   assert.equal((await owner.req("POST", `/api/app-clients/${app5.app_client_id}/disable`, {})).status, 200);
   const s = await slow;
-  assert.equal(s.status, 401, s.text); assert.equal(s.json.error.code, "unauthenticated");
+  assert.equal(s.status, 401, s.text); assert.equal(s.json.error.code, "unauthenticated"); assert.equal(s.json.error.message, APP_DISABLED_TEXT);
   assert.equal(await revCount(), r0, "no revisions written");
-  assert.equal((await h.pub(D.access_token, "GET", "/publisher/me")).json.current_source_revision, 1, "pointer unchanged");
+  assert.equal((await rows(`SELECT current_source_revision AS r FROM publishers WHERE id = '${D.publisher_id}'`))[0].r, 1, "pointer unchanged");
+});
+
+// Addendum B, D 2.
+test("refresh of a disabled app's connection: invalid_grant, and the grant is gone", async () => {
+  const appR = await h.registerApp({ display_name: "Disable refresh", redirect_uris: ["http://127.0.0.1:5179/cb"], origins: [] });
+  const D = await h.connectPublisher(appR, { project_id: "other-test", destination: "root" });
+  assert.equal((await owner.req("POST", `/api/app-clients/${appR.app_client_id}/disable`, {})).status, 200);
+  const t = await h.token({ grant_type: "refresh_token", refresh_token: D.refresh_token, client_id: appR.client_id });
+  assert.equal(t.status, 400, JSON.stringify(t.body)); assert.equal(t.body.error, "invalid_grant"); assert.equal(t.body.error_description, "App disabled by the owner");
+  const t2 = await h.token({ grant_type: "refresh_token", refresh_token: D.refresh_token, client_id: appR.client_id });
+  assert.equal(t2.status, 400, JSON.stringify(t2.body)); assert.equal(t2.body.error, "invalid_grant");
+  assert.equal(t2.body.error_description, "Refresh token is no longer current", "the first refusal revoked the grant");
+  assert.equal((await rows(`SELECT revoked_at FROM publishers WHERE id = '${D.publisher_id}'`))[0].revoked_at, null);
+});
+
+// Addendum B, D 3.
+test("a code minted before the disable cannot be exchanged after it", async () => {
+  const appC = await h.registerApp({ display_name: "Disable code", redirect_uris: ["http://127.0.0.1:5180/cb"], origins: [] });
+  const a = await h.authorize(appC, { project_id: "other-test", destination: "root" });
+  assert.ok(a.code, JSON.stringify(a.html ?? a.error));
+  assert.equal((await owner.req("POST", `/api/app-clients/${appC.app_client_id}/disable`, {})).status, 200);
+  const exchange = () => h.token({ grant_type: "authorization_code", code: a.code, redirect_uri: a.redirect_uri, client_id: appC.client_id, code_verifier: a.verifier, resource: h.resource });
+  const t = await exchange();
+  assert.equal(t.status, 400, JSON.stringify(t.body)); assert.equal(t.body.error, "invalid_grant"); assert.equal(t.body.error_description, "App disabled by the owner");
+  assert.ok(t.body.access_token === undefined && t.body.refresh_token === undefined, "no token issued");
+  const t2 = await exchange();
+  assert.equal(t2.status, 400, JSON.stringify(t2.body)); assert.equal(t2.body.error, "invalid_grant"); assert.equal(t2.body.error_description, "Authorization code already used");
+  assert.ok(t2.body.access_token === undefined && t2.body.refresh_token === undefined, "still no token");
+});
+
+// Addendum B, D 5.
+test("revoked wins over disabled", async () => {
+  const appV = await h.registerApp({ display_name: "Revoked then disabled", redirect_uris: ["http://127.0.0.1:5181/cb"], origins: [] });
+  const D = await h.connectPublisher(appV, { project_id: "other-test", destination: "root" });
+  assert.equal((await owner.req("POST", `/api/publishers/${D.publisher_id}/revoke`, {})).status, 200);
+  assert.equal((await owner.req("POST", `/api/app-clients/${appV.app_client_id}/disable`, {})).status, 200);
+  const r = await h.pub(D.access_token, "GET", "/publisher/me");
+  assert.equal(r.status, 401, r.text); assert.equal(r.json.error.code, "publisher_revoked");
 });
 
 test("/v1/publisher/files lists only rows with an export name (rows released by App Files are not this API's files)", async () => {

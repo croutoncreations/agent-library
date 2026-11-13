@@ -1,27 +1,34 @@
 // Unit checks of the App Files and publisher-liveness helpers, on the real bundled source (test/load-worker.mjs).
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync, readdirSync, statSync } from "node:fs";
+import { join } from "node:path";
 import { loadWorker } from "./load-worker.mjs";
+import { ROOT } from "./helpers.mjs";
 
 const W = await loadWorker({
-  "oauth/server.js": ["DISABLED_CLIENT_BLOCKS", "clientAllows", "clientLiveSql"],
   "api/app-files.js": ["parseAppPath", "reservedAppPath", "conflictCheck", "etagMatches", "createSlotTable", "APP_FILES_SLOT_RECLAIM_MS", "APP_FILES_OVERRUN_MAX"],
   "api/publisher.js": ["testHooksOn"],
 });
 
-test("disabled-client rule: 'writes' (shipped) blocks writes only; 'all' blocks everything; an enabled client is never blocked", () => {
-  assert.equal(W.DISABLED_CLIENT_BLOCKS, "writes");
-  const on = { client_disabled: null }, off = { client_disabled: "2026-11-11T00:00:00Z" };
-  for (const mode of ["writes", "all"]) for (const write of [false, true]) assert.equal(W.clientAllows(on, write, mode), true, `${mode} ${write}`);
-  assert.equal(W.clientAllows(off, false, "writes"), true);
-  assert.equal(W.clientAllows(off, true, "writes"), false);
-  assert.equal(W.clientAllows(off, false, "all"), false);
-  assert.equal(W.clientAllows(off, true, "all"), false);
-  assert.equal(W.clientAllows(off, false), true, "default is the shipped setting");
-  assert.equal(W.clientLiveSql(false, "writes"), "1");
-  assert.equal(W.clientLiveSql(true, "writes"), "ac.disabled_at IS NULL");
-  assert.equal(W.clientLiveSql(false, "all"), "ac.disabled_at IS NULL");
-  assert.equal(W.clientLiveSql(true, "all"), "ac.disabled_at IS NULL");
+function jsFiles(dir) {
+  return readdirSync(dir).flatMap((n) => {
+    const p = join(dir, n);
+    if (statSync(p).isDirectory()) return n === "web" ? [] : jsFiles(p);
+    return p.endsWith(".js") ? [p] : [];
+  });
+}
+
+// Addendum B, D 17.
+test("livePublisher call sites: exactly the four known callers, each checking revoked and disabled", () => {
+  const sites = jsFiles(join(ROOT, "packages", "core", "src")).flatMap((f) => {
+    const src = readFileSync(f, "utf8").replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "").replace(/function livePublisher\(/g, "");
+    return [...src.matchAll(/\blivePublisher\(/g)].map((m) => ({ file: f.slice(ROOT.length + 1), after: src.slice(m.index, m.index + 600) }));
+  });
+  // oauth/server.js: refresh and code exchange; api/publisher.js: the request gate and the snapshot zero-change re-check.
+  assert.deepEqual(sites.map((s) => s.file).sort(), ["packages/core/src/api/publisher.js", "packages/core/src/api/publisher.js",
+    "packages/core/src/oauth/server.js", "packages/core/src/oauth/server.js"]);
+  for (const s of sites) assert.match(s.after, /\.disabled\b/, `${s.file}: a livePublisher caller checks disabled`);
 });
 
 test("parseAppPath: kinds come only from the four text extensions (no inherited object keys)", () => {

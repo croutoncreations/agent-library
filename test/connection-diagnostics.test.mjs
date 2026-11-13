@@ -97,7 +97,23 @@ test("publisher: only its own destination, no project browser or credential deta
   assert.equal((await h.pub(pub.access_token, "GET", "/publisher/connection-info?connection_id=other")).status, 400);
 });
 
-test("publisher diagnostic follows the actual write gate for disabled apps and missing or foreign folders", async () => {
+test("publisher diagnostic of a disabled app: connection-info and writes answer 401 with the disabled message", async () => {
+  const disabledApp = await h.registerApp({ display_name: "Disabled diagnostic publisher", redirect_uris: ["http://localhost:5174/cb"], origins: [] });
+  const connection = await h.connectPublisher(disabledApp, { project_id: "diag-b", destination: "root" });
+  const token = connection.access_token;
+  assert.equal((await h.pub(token, "GET", "/publisher/connection-info")).json.destination.can_write_own_files, true);
+  assert.equal((await owner.req("POST", `/api/app-clients/${disabledApp.app_client_id}/disable`, {})).status, 200);
+  const r = await h.pub(token, "GET", "/publisher/connection-info");
+  assert.equal(r.status, 401); assert.equal(r.json.error.code, "unauthenticated");
+  assert.equal(r.json.error.message, "This app has been disabled by the owner of this library");
+  const w = await h.pub(token, "POST", "/publisher/generations", { idem: key("disabled"), body: {
+    generation_id: "g_diagnostic_disabled", source_revision: 1, expected_current_snapshot_id: null,
+    root_name: "root.json", root_sha256: "a".repeat(64), part_count: 1, total_bytes: 16
+  } });
+  assert.equal(w.status, 401); assert.equal(w.json.error.message, "This app has been disabled by the owner of this library");
+});
+
+test("publisher diagnostic follows the actual write gate for missing or foreign folders", async () => {
   // Own fixtures: failure of the ordinary publisher diagnostic test cannot cascade here.
   const publisherApp = await h.registerApp({ display_name: "Write gate publisher", redirect_uris: ["http://localhost:5174/cb"], origins: [] });
   const publisherConnection = await h.connectPublisher(publisherApp, { project_id: "diag-b", destination: "new", new_folder_name: "Write gate exports" });
@@ -118,10 +134,6 @@ test("publisher diagnostic follows the actual write gate for disabled apps and m
     assert.match(r.json.restrictions.join(" "), reason);
     assert.equal((await write()).status, status);
   };
-  assert.equal((await owner.req("POST", `/api/app-clients/${publisherApp.app_client_id}/disable`, {})).status, 200);
-  await blocked(/app client disabled/, 401);
-  sql(`UPDATE app_clients SET disabled_at = NULL WHERE id = '${publisherApp.app_client_id}'`);
-  assert.equal((await info()).json.destination.can_write_own_files, true);
   sql(`UPDATE folders SET project_id = 'diag-a' WHERE id = '${folder}'`);
   await blocked(/destination unavailable or changed/, 403);
   sql(`UPDATE folders SET project_id = 'diag-b' WHERE id = '${folder}'`);

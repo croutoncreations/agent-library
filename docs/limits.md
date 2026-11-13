@@ -219,7 +219,7 @@ free tier's starting numbers, D22 the current keys.)
 | `projects` | Live projects | workspace | unlimited |
 | `members` | Accepted members | workspace | unlimited |
 | `pending_invites` | Invitations not yet accepted, revoked or expired | workspace | unlimited |
-| `agents` | Live OAuth connections, API keys, publishing apps and project grant tokens | workspace | unlimited |
+| `agents` | Live OAuth connections, API keys, publishing apps and project grant tokens (a disabled app's connections count until revoked) | workspace | unlimited |
 | `owned_workspaces` | Shared workspaces a person created (not deleted) | person | unlimited |
 | `items_per_project` | Documents and files in one project, including trashed ones and upload placeholders | project | `PROJECT_ITEMS_MAX`, default 10,000 |
 | `file_bytes` | Size of one file version | file | `FILE_MAX_BYTES`, default 25 MiB; never above 90 MiB |

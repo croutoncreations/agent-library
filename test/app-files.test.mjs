@@ -21,6 +21,8 @@ const sql = (q) => JSON.parse(execFileSync("wrangler", ["d1", "--config", LOCAL_
   { cwd: ROOT, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], env: { ...process.env, CI: "1", NO_COLOR: "1" } }))[0].results;
 const ok = (r, status = 200) => { assert.equal(r.status, status, JSON.stringify(r.body ?? r.json)); return r.body ?? r.json; };
 const uniq = (p) => `${p}-${++n}`;
+/** N-A1: every publisher route of a disabled app. */
+const APP_DISABLED = "This app has been disabled by the owner of this library";
 
 /** A one-part generation begin body (staged only; never committed here). */
 const beginBody = (gid) => ({ generation_id: gid, source_revision: 1, expected_current_snapshot_id: null, root_name: `${gid}-root.json`,
@@ -115,6 +117,7 @@ test("abandon: disabled client and revoked publisher are refused (401); the gene
   ok(await owner.req("POST", `/api/app-clients/${d.app.app_client_id}/disable`, {}));
   const r1 = await abandon(d.tok, d.gid);
   assert.equal(r1.status, 401, r1.text); assert.equal(genState(d.gid), "staged");
+  assert.equal(r1.json.error.message, "This app has been disabled by the owner of this library");
   const v = await staged("files-own");
   ok(await owner.req("POST", `/api/publishers/${v.P.publisher_id}/revoke`, {}));
   const r2 = await abandon(v.tok, v.gid);
@@ -448,19 +451,91 @@ test("the path never chooses the destination; publishers never see each other's 
 });
 
 // Design test 13 (reads): liveness and authorization on every read.
-test("reads with a disabled client keep working (list, GET, Range, HEAD, 304); refresh and /me too", async () => {
+test("a disabled client: every read 401 (list, GET, Range, HEAD, conditional GET), /me 401, refresh invalid_grant and the grant is revoked", async () => {
   const c = await connect("files-own");
   const [f] = insertFiles(c.P.publisher_id, [{ path: "kept.md", content: "synthetic kept" }]);
   ok(await owner.req("POST", `/api/app-clients/${c.app.app_client_id}/disable`, {}));
-  assert.deepEqual(ok(await files(c.tok)).files.map((x) => x.path), ["kept.md"]);
-  assert.equal((await file(c.tok, "kept.md")).status, 200);
-  assert.equal((await file(c.tok, "kept.md", { range: "bytes=0-2" })).status, 206);
-  assert.equal((await file(c.tok, "kept.md", {}, "HEAD")).status, 200);
-  assert.equal((await file(c.tok, "kept.md", { "if-none-match": `"${f.sha256}"` })).status, 304);
-  assert.equal((await h.pub(c.tok, "GET", "/publisher/me")).status, 200);
+  const reads = [["list", await files(c.tok)], ["GET", await file(c.tok, "kept.md")], ["Range", await file(c.tok, "kept.md", { range: "bytes=0-2" })],
+    ["HEAD", await file(c.tok, "kept.md", {}, "HEAD")], ["conditional GET", await file(c.tok, "kept.md", { "if-none-match": `"${f.sha256}"` })], ["/me", await h.pub(c.tok, "GET", "/publisher/me")]];
+  for (const [label, r] of reads) {
+    assert.equal(r.status, 401, `${label}: no 200, 206 or 304`);
+    if (label !== "HEAD") err(r, 401, "unauthenticated", APP_DISABLED);
+  }
   const t = await h.token({ grant_type: "refresh_token", refresh_token: c.P.refresh_token, client_id: c.app.client_id });
-  assert.equal(t.status, 200, JSON.stringify(t.body));
-  assert.equal((await files(t.body.access_token)).status, 200);
+  assert.equal(t.status, 400, JSON.stringify(t.body)); assert.equal(t.body.error, "invalid_grant"); assert.equal(t.body.error_description, "App disabled by the owner");
+  const t2 = await h.token({ grant_type: "refresh_token", refresh_token: c.P.refresh_token, client_id: c.app.client_id });
+  assert.equal(t2.status, 400, JSON.stringify(t2.body)); assert.equal(t2.body.error, "invalid_grant");
+  assert.equal(t2.body.error_description, "Refresh token is no longer current", "the grant was revoked by the first refusal");
+});
+
+// Addendum B, D 1.
+test("disable blocks every publisher route, old and new", async () => {
+  const c = await connect("files-own");
+  const pub = c.P.publisher_id;
+  ok(await put(c.tok, "kept.md", "synthetic kept", { create: true }), 201);
+  const snap = ok(await snapshot(c.tok, 1), 201).snapshot;
+  const gid = "g_" + uniq("disabled").replace(/-/g, "_");
+  ok(await h.pub(c.tok, "POST", "/publisher/generations", { body: beginBody(gid), idem: uniq("begin-key") }), 201);
+  const fid = snap.files[0].file_id;
+  // A refused 1 MiB PUT drains until the (shortened) idle deadline while the client is enabled: the baseline.
+  const half = async () => {
+    const t0 = Date.now();
+    const x = partialPut(c.tok, "kept.md", { length: 1048576, send: 524288, headers: { "x-test-receive-deadline-ms": "1500" } });
+    const a = await Promise.race([x.response, new Promise((r) => setTimeout(() => r("(no answer in 5 s)"), 5000))]);
+    x.socket.destroy();
+    return [a, Date.now() - t0];
+  };
+  const [b, authMs] = await half();
+  assert.match(b, /^HTTP\/1\.1 412 /, b.slice(0, 200));
+  const before = [appRows(pub), revCount(pub), counters(pub), sql(`SELECT current_source_revision AS r FROM publishers WHERE id = '${pub}'`)[0].r];
+  ok(await owner.req("POST", `/api/app-clients/${c.app.app_client_id}/disable`, {}));
+  const calls = {
+    "GET connection-info": () => h.pub(c.tok, "GET", "/publisher/connection-info"),
+    "GET me": () => h.pub(c.tok, "GET", "/publisher/me"),
+    "GET files": () => h.pub(c.tok, "GET", "/publisher/files"),
+    "GET file": () => h.pub(c.tok, "GET", `/publisher/files/${fid}`),
+    "GET file content": () => h.pub(c.tok, "GET", `/publisher/files/${fid}/content`),
+    "GET snapshots": () => h.pub(c.tok, "GET", "/publisher/snapshots"),
+    "GET snapshots/current": () => h.pub(c.tok, "GET", "/publisher/snapshots/current"),
+    "GET snapshot": () => h.pub(c.tok, "GET", `/publisher/snapshots/${snap.snapshot_id}`),
+    "GET generation": () => h.pub(c.tok, "GET", `/publisher/generations/${gid}`),
+    "POST snapshots": () => snapshot(c.tok, 2),
+    "POST generations": () => h.pub(c.tok, "POST", "/publisher/generations", { body: beginBody(gid + "_2"), idem: uniq("begin-key") }),
+    "App Files list": () => files(c.tok),
+    "App Files GET": () => file(c.tok, "kept.md"),
+    "App Files HEAD": () => file(c.tok, "kept.md", {}, "HEAD"),
+    "App Files conditional GET": () => file(c.tok, "kept.md", { "if-none-match": `"${sha("synthetic kept")}"` }),
+    "App Files PUT": () => put(c.tok, "new.md", "x", { create: true }),
+    "App Files DELETE": () => del(c.tok, "kept.md", { match: "rev:1" }),
+  };
+  for (const [label, call] of Object.entries(calls)) {
+    const r = await call();
+    assert.equal(r.status, 401, `${label}: ${r.text}`);
+    assert.equal(r.headers.get("www-authenticate"), 'Bearer error="invalid_token"', label);
+    if (label !== "App Files HEAD") { assert.equal(r.json.error.code, "unauthenticated", label); assert.equal(r.json.error.message, APP_DISABLED, label); }
+  }
+  const [dis, disMs] = await half();
+  assert.match(dis, /^HTTP\/1\.1 401 /, dis.slice(0, 200)); assert.match(dis, new RegExp(APP_DISABLED));
+  assert.ok(disMs < authMs - 500, `disabled 401 took ${disMs} ms against ${authMs} ms drained: the gate answers before any body is read`);
+  assert.deepEqual([appRows(pub), revCount(pub), counters(pub), sql(`SELECT current_source_revision AS r FROM publishers WHERE id = '${pub}'`)[0].r], before, "nothing written");
+  assert.equal(genState(gid), "staged");
+});
+
+// Addendum B, D 4.
+test("a write in flight when the client is disabled: 401 N-A1", async () => {
+  const disable = (c) => async () => ok(await owner.req("POST", `/api/app-clients/${c.app.app_client_id}/disable`, {}));
+  const a = await connect("files-own");
+  err(await during((hd) => put(a.tok, "mid.md", "x", { create: true, headers: hd }), disable(a)), 401, "unauthenticated", APP_DISABLED);
+  assert.equal(appRows(a.P.publisher_id), 0); assert.deepEqual(counters(a.P.publisher_id), [0, 0, 0]);
+  const s = await connect("files-own");
+  ok(await snapshot(s.tok, 1), 201);
+  const r0 = revCount(s.P.publisher_id);
+  err(await during((hd) => snapshot(s.tok, 2, undefined, hd), disable(s)), 401, "unauthenticated", APP_DISABLED);
+  assert.equal(revCount(s.P.publisher_id), r0);
+  assert.equal(sql(`SELECT current_source_revision AS r FROM publishers WHERE id = '${s.P.publisher_id}'`)[0].r, 1);
+  const g = await staged("files-own");
+  err(await during((hd) => abandon(g.tok, g.gid, hd), disable(g)), 401, "unauthenticated", APP_DISABLED);
+  assert.equal(genState(g.gid), "staged");
 });
 
 test("reads: suspended workspace 200; deleted destination folder 403; creator removed or project deleted 401", async () => {
@@ -797,7 +872,7 @@ test("PUT paths: raw path refusals write nothing; case and file/folder conflicts
 });
 
 // Design test 13 (writes).
-test("PUT liveness: revoked 401; disabled client 401 (reads continue); suspended 403 workspace_read_only; folder deleted 403; nothing written", async () => {
+test("PUT liveness: revoked 401; disabled client 401 (reads refused too); suspended 403 workspace_read_only; folder deleted 403; nothing written", async () => {
   const pid = ok(await bob.req("POST", "/api/projects", { title: uniq("Put live"), workspace_id: WSA }), 201).id;
   const c = await connect(pid, { destination: "new" });
   ok(await put(c.tok, "a.md", "x", { create: true }), 201);
@@ -806,7 +881,7 @@ test("PUT liveness: revoked 401; disabled client 401 (reads continue); suspended
   finally { sql(`UPDATE workspaces SET status = 'active' WHERE id = '${WSA}'`); }
   ok(await owner.req("POST", `/api/app-clients/${c.app.app_client_id}/disable`, {}));
   err(await put(c.tok, "b.md", "x", { create: true }), 401, "unauthenticated");
-  assert.equal((await file(c.tok, "a.md")).status, 200);
+  assert.equal((await file(c.tok, "a.md")).status, 401);
   const d = await connect(pid, { destination: "new" });
   sql(`DELETE FROM folders WHERE id = '${folderOf(d.P.publisher_id)}'`);
   err(await put(d.tok, "b.md", "x", { create: true }), 403, "scope_mismatch");
