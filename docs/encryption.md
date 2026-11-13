@@ -17,17 +17,18 @@ In the browser, unsaved drafts and offline copies are stored unencrypted in that
 ## Who can read content
 
 The installation's operator, meaning anyone who can read its D1 database or R2 bucket (for example through the
-Cloudflare dashboard, Wrangler or an API token), can read the content stored there. New text and files are in R2; D1
-holds titles, older inline text and the search index, which keeps up to the first 1 MiB of each current document's
-text. So can anyone who holds a database export, a D1 Time Travel restore point or a project backup. Project backups
-are plain JSON; store them privately and encrypted yourself ([operations.md](operations.md#backup-and-recovery)).
+Cloudflare dashboard, Wrangler or an API token), can read the content stored there, and so can anyone who holds a
+database export, a D1 Time Travel restore point or a project backup. New text and files are in R2; D1 holds titles,
+older inline text and the search index, which keeps up to the first 1 MiB of each current document's text. Project
+backups are plain JSON; store them privately and encrypted yourself
+([operations.md](operations.md#backup-and-recovery)).
 
 ## Encryption settings are refused
 
 A Worker refuses every request with `500 encryption_unsupported` while any of these is present:
 
 - the var `CONTENT_MASTER_KEY_VERSION` (any value other than empty);
-- any secret named `CONTENT_MASTER_KEY_V<n>` (n a number);
+- any var or secret named `CONTENT_MASTER_KEY_V<n>` (n a number) with a non-empty value;
 - the var `CONTENT_ENCRYPTION_REQUIRED` with any value other than empty or `0`.
 
 The server log names the setting it found (`encryption_unsupported` with `setting`), never its value. Remove the
@@ -39,6 +40,7 @@ keeps running meanwhile ([operations.md](operations.md#monitoring)).
 
 Migrations `0029` to `0032` (`0029_workspace_keys.sql`, `0030_content_fences.sql`, `0031_encrypted_blobs.sql`,
 `0032_blind_search.sql`) add tables, columns, indexes and a view for that design. They are applied like every other
-migration and are harmless: nothing in this release writes content to them. (`0032` seeds one bookkeeping row in
-`search_tokens_state` and also adds a view and an index on `projects`; an installation that ran an earlier
-development build may hold rows from it.) Don't remove them by hand.
+migration: nothing in this release writes content to them. (`0032` seeds one bookkeeping row in
+`search_tokens_state` and also adds a view and an index on `projects`.) An installation that ran an earlier
+development build may hold rows in these tables; if `workspace_keys` holds a key, file uploads, imports and restores
+answer `500 encryption_misconfigured`. Don't remove the tables or columns by hand.
