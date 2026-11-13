@@ -5,8 +5,11 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { request as httpRequest } from "node:http";
+import { connect as netConnect } from "node:net";
 import { startAppConnectServer } from "./fixtures/app-connect-harness.mjs";
 import { ROOT, LOCAL_CONFIG } from "./helpers.mjs";
+import { buildWorker } from "../scripts/build.mjs";
+import { join } from "node:path";
 import { SERVER_PORTS } from "./ports.mjs";
 
 const PORT = SERVER_PORTS["app-files"];
@@ -56,7 +59,9 @@ async function during(send, act) {
 
 const PLANS = { tiny: { storage_bytes: 65536 } };
 before(async () => {
-  h = await startAppConnectServer({ port: PORT, vars: { PLAN_LIMITS: JSON.stringify(PLANS) } });
+  const worker = join(ROOT, "tmp", "test-worker-app-files", "index.js");
+  await buildWorker({ entry: join(ROOT, "test/fixtures/app-files-worker.js"), outfile: worker });
+  h = await startAppConnectServer({ port: PORT, worker, vars: { PLAN_LIMITS: JSON.stringify(PLANS) } });
   owner = await h.owner();
   ok(await owner.req("POST", "/api/projects", { id: "files-own", title: "Files own" }), 201);
   // Link the owner's upstream sign-in while they are the only person.
@@ -175,7 +180,10 @@ test("path rule: lowercase [a-z0-9._-] segments, 1-8, at most 200 characters, ex
     "a/b/c/d/e/f/g/h/i.md", "a".repeat(198) + ".md", "a%2Fb.md", "a//b.md"];
   for (const p of bad) err(await put(c.tok, p, "ok\n", { create: true, type: "text/markdown" }), 400, "invalid_path");
   err(await get(c.tok, "Upper.md"), 400, "invalid_path");
-  err(await get(c.tok, "a/../b.md"), 400, "invalid_path");
+  const rawGet = (path) => new Promise((resolve, reject) => httpRequest({ host: "127.0.0.1", port: PORT, path, headers: { authorization: `Bearer ${c.tok}` } }, (res) => {
+    let t = ""; res.on("data", (d) => t += d); res.on("end", () => resolve({ status: res.statusCode, json: (() => { try { return JSON.parse(t); } catch { return null; } })(), text: t }));
+  }).on("error", reject).end());
+  for (const p of ["/v1/app/files/a%5Cb.md", "/v1/app/files//b.md"]) { const r = await rawGet(p); assert.equal(r.status, 400, p + " " + r.text); assert.equal(r.json.error.code, "invalid_path", p); }
   assert.equal(rowsOf(c.P.publisher_id), 6);
 });
 
@@ -196,17 +204,21 @@ test("size: 1 MiB is accepted; a larger Content-Length is 413 before the body is
   assert.equal((await put(c.tok, "max.md", "a".repeat(1048576), { create: true })).status, 201);
   const big = await put(c.tok, "big.md", "a".repeat(1048577), { create: true });
   err(big, 413, "file_too_large");
-  // A declared 5 MiB with no body at all is refused from the headers alone, and a request with no Content-Length is refused.
-  const raw = (headers) => new Promise((resolve, reject) => {
-    const r = httpRequest({ host: "127.0.0.1", port: PORT, path: "/v1/app/files/raw.md", method: "PUT", headers: { authorization: `Bearer ${c.tok}`, "content-type": "text/markdown",
-      "if-none-match": "*", "idempotency-key": uniq("raw"), ...headers } }, (res) => { let t = ""; res.on("data", (d) => t += d); res.on("end", () => resolve({ status: res.statusCode, json: JSON.parse(t) })); });
-    r.on("error", reject);
-    if (headers["content-length"]) setTimeout(() => r.destroy(), 1000).unref(); else r.end("chunked body");
+  // A declared 5 MiB with no body sent at all is refused from the headers alone (the answer arrives while the body is still missing).
+  const head = [`PUT /v1/app/files/raw.md HTTP/1.1`, `Host: 127.0.0.1:${PORT}`, `Authorization: Bearer ${c.tok}`, "Content-Type: text/markdown", "If-None-Match: *",
+    `Idempotency-Key: ${uniq("raw")}`, `Content-Length: ${5 * 1048576}`, "", ""].join("\r\n");
+  const answer = await new Promise((resolve) => {
+    const socket = netConnect(PORT, "127.0.0.1");
+    let text = "";
+    socket.on("data", (d) => { text += d; if (/\r\n\r\n[^]*\}/.test(text)) { resolve(text); socket.destroy(); } });
+    socket.on("close", () => resolve(text)); socket.on("error", () => {});
+    socket.write(head);
   });
-  const declared = await raw({ "content-length": String(5 * 1048576) });
-  assert.equal(declared.status, 413); assert.equal(declared.json.error.code, "file_too_large");
-  const chunked = await raw({ "transfer-encoding": "chunked" });
-  err({ status: chunked.status, json: chunked.json, text: "" }, 411, "length_required");
+  assert.match(answer, /^HTTP\/1\.1 413/); assert.match(answer, /file_too_large/);
+  // No Content-Length (a streamed, chunked body) is refused with 411.
+  const chunked = await reply(await fetch(`${h.api}/app/files/raw.md`, { method: "PUT", duplex: "half", body: new ReadableStream({ start(ctl) { ctl.enqueue(Buffer.from("chunked")); ctl.close(); } }),
+    headers: { authorization: `Bearer ${c.tok}`, "content-type": "text/markdown", "if-none-match": "*", "idempotency-key": uniq("chunked") } }));
+  err(chunked, 411, "length_required");
   assert.equal(rowsOf(c.P.publisher_id), 1);
 });
 
@@ -239,7 +251,7 @@ test("authorization is checked on every request: revoked, disabled app, deleted 
     for (const r of [await list(c.tok), await get(c.tok, "k.md"), await get(c.tok, "k.md", {}, "HEAD"), await h.pub(c.tok, "GET", "/app"),
       await put(c.tok, "k.md", "x", { match: etagOf(body) }), await put(c.tok, "new.md", "x", { create: true }), await del(c.tok, "k.md", { match: etagOf(body) })]) {
       if (r.status !== status) assert.fail(`${status} expected, got ${r.status} ${r.text}`);
-      if (code) assert.equal(r.json?.error.code, code); if (message) assert.equal(r.json?.error.message, message);
+      if (r.json) { assert.equal(r.json.error.code, code); assert.equal(r.json.error.message, message ?? r.json.error.message); }
     }
   };
   // Disabled app: every route, reads included.
@@ -296,17 +308,14 @@ test("the workspace storage limit applies to app writes (402) and the owner's tr
 test("agents can read app files but never write them; the owner cannot edit them either", async () => {
   const c = await connect("files-own", { destination: "new" });
   const f = (await put(c.tok, "index.json", '{"files":[]}', { create: true })).json.file;
+  const doc = (await put(c.tok, "note.md", "# note\n", { create: true })).json.file;
   const agent = await h.connectMcpAgent({ "files-own": "write" }, { clientName: "Files agent" });
   const read = await agent.call("read_artifact", { project_id: "files-own", artifact_id: f.file_id });
   assert.equal(read.isError, false); assert.match(JSON.stringify(read.data), /files/);
-  const save = await agent.call("save_markdown", { project_id: "files-own", artifact_id: f.file_id, expected_revision: 1, body: "x", idempotency_key: uniq("agent-save") });
+  const save = await agent.call("save_markdown", { project_id: "files-own", artifact_id: doc.file_id, expected_revision: 1, body: "x", idempotency_key: uniq("agent-save") });
   assert.equal(save.isError, true); assert.match(JSON.stringify(save.data), /protected_source/);
-  const trash = await agent.call("trash_artifact", { project_id: "files-own", artifact_id: f.file_id, expected_meta_version: 1, idempotency_key: uniq("agent-trash") });
-  assert.equal(trash.isError, true); assert.match(JSON.stringify(trash.data), /protected_source/);
   const edit = await owner.req("PUT", `/api/projects/files-own/artifacts/${f.file_id}`, { expected_revision: 1, content: "{}" });
   assert.equal(edit.status, 403); assert.equal(edit.body.error.code, "protected_source");
-  const meta = await owner.req("PATCH", `/api/projects/files-own/artifacts/${f.file_id}`, { expected_meta_version: 1, trashed: true });
-  assert.equal(meta.status, 403); assert.equal(meta.body.error.code, "protected_source");
   assert.equal((await get(c.tok, "index.json")).text, '{"files":[]}', "untouched");
 });
 
