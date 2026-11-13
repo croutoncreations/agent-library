@@ -264,9 +264,12 @@ async function history(ctx, projectId, artifactId, opts = {}) {
   await loadArtifact(ctx, projectId, artifactId, { allowTrashed: ctx.principal.kind === "human" });
   return historyPage(ctx, projectId, artifactId, opts);
 }
+function mdFits(text) {
+  return text.length <= LIMITS.markdownBytes && new TextEncoder().encode(text).length <= LIMITS.markdownBytes;
+}
 function mdBody(v, kind = "markdown") {
   const body2 = typeof v === "string" ? v : str(v, "body", LIMITS.markdownBytes);
-  if (body2.length > LIMITS.markdownBytes || new TextEncoder().encode(body2).length > LIMITS.markdownBytes) throw new HttpError(413, "too_large", (kind === "html" ? "HTML" : "Markdown") + " exceeds 10 MiB");
+  if (!mdFits(body2)) throw new HttpError(413, "too_large", (kind === "html" ? "HTML" : "Markdown") + " exceeds 10 MiB");
   return body2;
 }
 /**
@@ -440,14 +443,20 @@ async function publishRevision(ctx, projectId, artifactId, expected, i, rev, ext
 async function saveMarkdown(ctx, projectId, artifactId, input, key) {
   await authorizeProject(ctx, projectId, true);
   const expected = int(input.expected_revision, "expected_revision", 1);
-  const body2 = mdBody(input.body);
-  const i = { op: "artifact.save:" + artifactId, key, projectId, digest: await sha256Hex(JSON.stringify([expected, body2])) };
-  const prior = await idemLookup(ctx, i);
-  if (prior) return prior;
+  // An oversized body is refused after the document is loaded, so the message names its kind (HTML or Markdown); a
+  // missing, wrong-kind or protected document answers that refusal instead. This function never hashes it (saveFile's
+  // own early idempotency check may).
+  const fits = typeof input.body !== "string" || mdFits(input.body);
+  const body2 = fits ? mdBody(input.body) : input.body;
+  const i = fits ? { op: "artifact.save:" + artifactId, key, projectId, digest: await sha256Hex(JSON.stringify([expected, body2])) } : null;
+  if (i) {
+    const prior = await idemLookup(ctx, i);
+    if (prior) return prior;
+  }
   const a = await loadArtifact(ctx, projectId, artifactId);
   if (a.kind !== "markdown" && a.kind !== "html") throw new HttpError(400, "invalid_input", "Not a Markdown or HTML document");
   assertWritable(ctx, a, "content");
-  if (a.kind === "html") mdBody(body2, "html");
+  if (!fits) mdBody(body2, a.kind);
   return publishRevision(
     ctx,
     projectId,
