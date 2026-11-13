@@ -1,5 +1,5 @@
 // Scene: undo any agent's change. The launch plan's History: ChatGPT's v6 "condensed" Claude's plan down to a few
-// lines (clearly destructive). Open v5 → "Compare with current" shows everything v6 removed (red) → "Restore this
+// lines (clearly destructive). Open v5 (compared with current) shows everything v6 removed (red) → "Restore this
 // version" → v7 brings it all back (green), "Restored version 5 as version 7". Nothing is deleted.
 // Clip timeline (history-restore, 7.8 s): list 0–1.3 · red diff 1.6–3.8 · back to list/Restore 4.0–5.4 ·
 // green restored diff + toast 5.6–7.8.

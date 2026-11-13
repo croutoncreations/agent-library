@@ -187,8 +187,8 @@ try {
     }
     if (want("restore")) {
       // Claude's good v5 (the runbook, the same change the video's MCP scene hands to Codex), then ChatGPT makes a
-      // clearly destructive v6 ("condensed" the plan down to almost nothing). History: open v5 → "Compare with
-      // current" shows the wipe-out in red → "Restore this version" brings v5 back as v7 (nothing is deleted).
+      // clearly destructive v6 ("condensed" the plan down to almost nothing). History: open v5 (compared with
+      // current by default) shows the wipe-out in red → "Restore this version" brings v5 back as v7 (nothing is deleted).
       if (rev === 4) {
         const body = PLAN_V4.replace("IMG_CHART", ids.chart) + `\n## Launch-day runbook\n\n| Time (PT) | Step | Owner |\n| --- | --- | --- |\n| 8:30 | Final smoke test | Claude Code |\n| 9:00 | Publish landing page | Codex |\n| 9:05 | Post Show HN | Maya |\n| 9:30 | First metrics check | Claude |\n`;
         await save("claude", "tidepool", ids.plan, rev, body, "Turned the checklist into a launch-day runbook"); rev++;
@@ -202,7 +202,6 @@ try {
         await sleep(900);
         await (await p.$(`.vh-row[data-rev="${goodRev}"] button.vh-open`)).click();
         await p.waitForSelector(".vh-diff"); await sleep(500);
-        await (await btnByText(p, "Compare with current")).click();
         await p.waitForFunction((g) => new RegExp(`compared with v${g}|Changes from v${g} to v${g + 1}`).test(document.body.innerText), {}, goodRev); await sleep(300);
         await p.evaluate(() => { const t = document.querySelector(".vh-diff .vh-line.del"); t && window.scrollTo({ top: t.getBoundingClientRect().top + window.scrollY - 330, behavior: "smooth" }); });
         await sleep(2000);
