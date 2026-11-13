@@ -2,7 +2,7 @@ import { TEXT_MAX_BYTES } from "./text-limits.js";
 import { commitTextWrites, fenceRefusal, getText, isTextWriteFenceError, keyFence, mapContent, stageTextWrite, textWriteComplete } from "./content-store.js";
 import { authorizeProject, authzSql, contentWriteSql, credentialGate, protectSql, requireHuman } from "./auth.js";
 import { chQuery, cleanupChanges, listChanges } from "./changes/service.js";
-import { MEASUREMENTS, MIME, checkFile, isCalendarDate, measurementRecords } from "./formats.js";
+import { CONTENT_TYPE, MEASUREMENTS, MIME, checkFile, isCalendarDate, measurementRecords } from "./formats.js";
 import { diffRevisions, historyPage, lineDiff, metaBaselineInsert, metaHistory, metaVersionInsert, provenance, restoreMetadata } from "./history/service.js";
 import { RT_ID_TOO_LONG, RT_KINDS_ALL, RT_KINDS_DOCS, readTextChunk, rtChunkLimit, rtFit, rtIdBytes, rtQuery, rtReadAuthzSql } from "./reads/service.js";
 import { __name } from "./runtime.js";
@@ -268,6 +268,15 @@ function mdBody(v, kind = "markdown") {
   const body2 = typeof v === "string" ? v : str(v, "body", LIMITS.markdownBytes);
   if (body2.length > LIMITS.markdownBytes || new TextEncoder().encode(body2).length > LIMITS.markdownBytes) throw new HttpError(413, "too_large", (kind === "html" ? "HTML" : "Markdown") + " exceeds 10 MiB");
   return body2;
+}
+/**
+ * The content type a stored version is served with: its text type's, a supported file type as stored, otherwise
+ * application/octet-stream. Own keys only: the previous Worker stored some uploads under names every object inherits
+ * ("constructor", "toString", ...).
+ */
+function servedContentType(mime) {
+  if (Object.hasOwn(CONTENT_TYPE, mime)) return CONTENT_TYPE[mime];
+  return Object.hasOwn(BINARY_TYPES, mime) ? mime : "application/octet-stream";
 }
 async function createFile(ctx, projectId, input, key) {
   const kind = input.kind === void 0 || input.kind === null ? "markdown" : input.kind;
@@ -768,4 +777,4 @@ artifactView = (a, appConnect = true) => ({
 });
 ART_COLS = "a.*, (SELECT display_name FROM publishers WHERE id = a.publisher_id) AS pub_name";
 
-export { BINARY_TYPES, FOLDERS_PER_PROJECT, FOLDER_ROOM_SQL, IMAGE_TYPES, LIMITS, RS_SCHEMA, RT_ID_TOO_LONG, RT_KINDS_ALL, RT_KINDS_DOCS, VIDEO_TYPES, addComment, appConnectEnabled, assertWritable, audit, auditDenied, chQuery, cleanupChanges, connectionInfo, createFile, createFolder, createFromTemplate, createGrant, createMarkdown, createProject, updateProject, db, diffRevisions, folderCheck, folderName, getArtifact, history, idemInsert, idemLookup, legacyConnectionInfo, listArtifacts, listAudit, listChanges, listComments, listFolders, listGrants, listProjects, listTemplates, loadArtifact, textCreateMetadata, mdBody, metaHistory, previewTemplate, provenance, publishRevision, readRecords, readRecordsPage, readTextChunk, requireAppConnect, restoreMetadata, restoreRevision, rsQuery, rsReady, rsToolReady, rtChunkLimit, rtFit, rtIdBytes, rtQuery, rtReadAuthzSql, runBatch, saveAsTemplate, saveFile, saveMarkdown, searchArtifacts, tplDate, tplTools, tooManyFolders, updateGrant, updateMetadata };
+export { BINARY_TYPES, FOLDERS_PER_PROJECT, FOLDER_ROOM_SQL, IMAGE_TYPES, LIMITS, RS_SCHEMA, RT_ID_TOO_LONG, RT_KINDS_ALL, RT_KINDS_DOCS, VIDEO_TYPES, addComment, appConnectEnabled, assertWritable, audit, auditDenied, chQuery, cleanupChanges, connectionInfo, createFile, createFolder, createFromTemplate, createGrant, createMarkdown, createProject, updateProject, db, diffRevisions, folderCheck, folderName, getArtifact, history, idemInsert, idemLookup, legacyConnectionInfo, listArtifacts, listAudit, listChanges, listComments, listFolders, listGrants, listProjects, listTemplates, loadArtifact, textCreateMetadata, mdBody, metaHistory, previewTemplate, provenance, publishRevision, readRecords, readRecordsPage, readTextChunk, requireAppConnect, restoreMetadata, restoreRevision, rsQuery, rsReady, rsToolReady, rtChunkLimit, rtFit, rtIdBytes, rtQuery, rtReadAuthzSql, runBatch, saveAsTemplate, saveFile, saveMarkdown, searchArtifacts, servedContentType, tplDate, tplTools, tooManyFolders, updateGrant, updateMetadata };

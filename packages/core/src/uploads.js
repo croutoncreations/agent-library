@@ -4,7 +4,7 @@ import { PUT_MARGIN_MS, reconcileUploads } from "./cleanup.js";
 import { CONTENT_TYPE, MEASUREMENTS, checkFile, spreadsheetSafeCsv } from "./formats.js";
 import { __name } from "./runtime.js";
 import { FILE_BYTES_CEILING, explainLimit, fileTooLarge, guardSql, projectLimitGuard, projectWorkspaceId } from "./limits.js";
-import { BINARY_TYPES, IMAGE_TYPES, VIDEO_TYPES, appConnectEnabled, assertWritable, audit, idemLookup, loadArtifact, mdBody, provenance, publishRevision, requireAppConnect, textCreateMetadata } from "./service.js";
+import { BINARY_TYPES, IMAGE_TYPES, VIDEO_TYPES, appConnectEnabled, assertWritable, audit, idemLookup, loadArtifact, mdBody, provenance, publishRevision, requireAppConnect, servedContentType, textCreateMetadata } from "./service.js";
 import { TEXT_MAX_BYTES } from "./text-limits.js";
 import { HttpError, int, nowIso, nowMs, randomId, sha256Hex, str } from "./util.js";
 
@@ -584,10 +584,10 @@ async function serveContent(ctx, req, projectId, artifactId, revParam) {
     "text/csv": ".csv"
   };
   let safeName = a.title.replace(/[^A-Za-z0-9._ -]/g, "_").slice(0, 100) || "download";
-  if (ext[r.mime] && !safeName.toLowerCase().endsWith(ext[r.mime])) safeName += ext[r.mime];
+  if (Object.hasOwn(ext, r.mime) && !safeName.toLowerCase().endsWith(ext[r.mime])) safeName += ext[r.mime];
   const headers = {
     // JSON/CSV: data, never rendered by the browser (always attachment, sandbox CSP, nosniff).
-    "content-type": CONTENT_TYPE[r.mime] ?? r.mime,
+    "content-type": servedContentType(r.mime),
     "x-content-type-options": "nosniff",
     "cache-control": "private, no-store",
     "content-security-policy": "default-src 'none'; img-src 'self'; media-src 'self'; style-src 'unsafe-inline'; frame-ancestors 'self'; sandbox",

@@ -1,13 +1,13 @@
 import { commitTextWrites, getText, stageTextWrites, storeText, textKey, textWriteComplete } from "../content-store.js";
 import { textSearchBridge } from "../search/service.js";
 import { agentRate, authzSql, rateLimit } from "../auth.js";
-import { CONTENT_TYPE, MIME, byteLength, checkFile } from "../formats.js";
+import { MIME, byteLength, checkFile } from "../formats.js";
 import { appOrigin, artifactWebUrl, previewWebUrl } from "../links.js";
 import { addressLinksResponse } from "../paths.js";
 import { explainLimit, projectLimitGuard, projectWorkspaceId } from "../limits.js";
 import { SCOPES, livePublisher } from "../oauth/server.js";
 import { appFilesDrainsInUse, appFilesSlotsInUse, baseParams, baseSql, firstCaseTwin, generationConflict, generationNameConflictRows, generationNameConflictSql, isAppFileContentPath, isAppFilesPath, newNameConflictRows, newNameConflictSql, pathConflictAt, routeAppFiles } from "./app-files.js";
-import { LIMITS, connectionInfo, idemLookup } from "../service.js";
+import { LIMITS, connectionInfo, idemLookup, servedContentType } from "../service.js";
 import { memberRoleSql, readOnlyError } from "../tenancy.js";
 import { HttpError, errorBody, idemKey, int, json, nowIso, randomId, sha256Hex, str } from "../util.js";
 
@@ -971,7 +971,7 @@ async function route(req, env, execCtx, p, requestId) {
     if (!r) throw new HttpError(404, "not_found", "File not found");
     const bytes = new TextEncoder().encode(await getText(env, r));
     return new Response(m === "HEAD" ? null : bytes, { status: 200, headers: {
-      "content-type": CONTENT_TYPE[r.mime] ?? r.mime,
+      "content-type": servedContentType(r.mime),
       "content-length": String(bytes.length),
       etag: `"${r.sha256}"`,
       "content-disposition": `attachment; filename="${a.export_name}"`,

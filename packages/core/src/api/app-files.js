@@ -2,9 +2,9 @@
 // A file's path is artifacts.export_name (unique per publisher); generation rows and the snapshot manifest are
 // invisible here. Every request re-checks the publisher's current authorization (assertStillAuthorized).
 import { authzSql } from "../auth.js";
-import { CONTENT_TYPE, MIME, checkFile } from "../formats.js";
+import { MIME, checkFile } from "../formats.js";
 import { explainLimit, limitGuard, projectLimitGuard } from "../limits.js";
-import { audit, createMarkdown, idemInsert, idemLookup, mdBody, publishRevision, runBatch } from "../service.js";
+import { audit, createMarkdown, idemInsert, idemLookup, mdBody, publishRevision, runBatch, servedContentType } from "../service.js";
 import { metaBaselineInsert, metaVersionInsert } from "../history/service.js";
 import { nowIso } from "../util.js";
 import { appOrigin, artifactWebUrl, previewWebUrl } from "../links.js";
@@ -436,7 +436,7 @@ function fileItem(env, a) {
     path: a.export_name,
     file_id: a.id,
     kind: a.kind,
-    content_type: CONTENT_TYPE[a.mime] ?? a.mime,
+    content_type: servedContentType(a.mime),
     revision: a.head_rev,
     etag: `"${a.sha256}"`,
     sha256: a.sha256,

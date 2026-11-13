@@ -1718,7 +1718,7 @@ function uploadForm(pid, target, onDone, accept) {
 }
 
 function kindLabel(a) {
-  if (a.kind === "binary") { var m = typeof a.mime === "string" ? a.mime.toLowerCase() : ""; return FILE_MIME_LABELS[m] || m || "File"; }
+  if (a.kind === "binary") { var m = typeof a.mime === "string" ? a.mime.toLowerCase() : ""; return Object.prototype.hasOwnProperty.call(FILE_MIME_LABELS, m) ? FILE_MIME_LABELS[m] : m || "File"; }
   return a.kind === "markdown" ? "Doc" : a.kind === "html" ? "Page" : a.kind === "csv" ? "CSV" : a.kind === "json" ? "JSON" : "File";
 }
 function isTextDoc(kind) { return kind === "markdown" || kind === "html"; }
@@ -3060,7 +3060,7 @@ function renderBinary(A, data, ui) {
   function draw(d) {
     A.rev = d.revision.rev; A.meta = d.artifact;
     var kinds = { "application/pdf": "PDF", "image/png": "PNG image", "image/jpeg": "JPEG image", "image/webp": "WebP image", "image/gif": "GIF image", "video/mp4": "MP4 video", "video/webm": "WebM video" };
-    info.textContent = (kinds[d.revision.mime] || d.revision.mime) + " · " + fmtBytes(d.revision.size) + " · rev " + d.revision.rev + " · updated " + fmtDate(d.revision.created_at);
+    info.textContent = (Object.prototype.hasOwnProperty.call(kinds, d.revision.mime) ? kinds[d.revision.mime] : d.revision.mime) + " · " + fmtBytes(d.revision.size) + " · rev " + d.revision.rev + " · updated " + fmtDate(d.revision.created_at);
     info.title = "sha256 " + d.revision.sha256;
     holder.replaceChildren(mediaFor(d.revision.mime, d.content_url, d.artifact.title));
   }
