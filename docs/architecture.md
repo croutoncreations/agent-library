@@ -44,7 +44,29 @@ OAuth redirect URIs are exact-match only:
 
 Artifact kinds are `markdown`, `html` (sanitized and rendered sandboxed, never executed on the app origin), `json`, `csv` and `binary` (PNG, JPEG, WebP, GIF, PDF, MP4 and WebM, signature-checked). Every save appends an immutable version. A save must name the expected revision, and on conflict the client keeps the unsaved draft. Mutations carry idempotency keys, so a retried request replays the stored result. Version history records who saved each version (browser, OAuth client, API key or publisher), which client it came through, and an optional change note. Restoring an old version appends a copy of it. See [version-history.md](version-history.md).
 
+Unsaved text in the browser editor (Markdown and HTML documents) is kept in that browser's local storage as you type,
+when a save fails, on a conflict and when you leave the page, under the signed-in person, project and document. When
+you open the document again, a draft based on the current version is put back into the editor and saved; a draft
+based on an older version opens in the conflict view next to the latest text. If your session ends, the draft stays
+and is offered again after you sign in as the same person. Signing out removes all drafts from that browser, and
+another person signing in removes yours. Drafts are not recovered on another device or browser, and a draft that no
+longer fits in the browser's storage for this site is not kept, without a warning; the last draft that fitted stays
+instead. JSON and CSV files have no editor and no drafts.
+
 Binary uploads go through `upload_begin`, then an authenticated PUT of the bytes, then `upload_finish`. PUT streams once to its fixed immutable key; finish verifies size, SHA-256 and the file signature without moving or rewriting the object. Published upload objects cannot be overwritten through the upload endpoints. The app API, `/v1` and both MCP transports (`upload_begin`) also accept text uploads: finish validates UTF-8 and publishes through the ordinary text writer. OAuth (MCP) connections use the same flow; their `put_url` and file `download_url` are short-lived single-purpose links on the MCP host (`/files/u/…`, `/files/d/…`, stored hashed in `transfer_links`, migration `0013`), re-authorized against the live connection on every request. See [upload-finalization.md](upload-finalization.md).
+
+New Markdown, HTML, JSON and CSV versions live in immutable R2 objects at `text/{project}/{artifact}/{revision}`;
+D1 keeps `revisions.body = NULL` and `body_key` names the object. Versions written before text moved to R2 stay
+inline in D1 and are read where they are: all JavaScript version reads go through `getText` or `getTextRange`
+(`packages/core/src/content-store.js`), which fall back to the inline body. New comments are stored the same way at
+`text/{project}/{artifact}/{comment}` (`comments.body = ''`). Publisher generation commits keep their bodies inline.
+
+Text writes record a `content_writes` intent before the object is written, and the publication batch clears it. Every
+text publication batch first asserts that each of its intents still exists and is at most ten minutes old; otherwise
+the whole batch rolls back with a retryable `503 text_write_expired`. The cron sweeps intents older than one hour,
+deleting their unreferenced R2 objects before the rows; the sweep never deletes an object that a version or comment
+refers to. Restore keeps revision ids but adds a random attempt segment to each text key, so a retry never overwrites
+another attempt's objects.
 
 Every artifact has a stable owner URL: `https://APP_HOST/p/<project>/a/<artifact>` (add `?v=N` for a specific version). MCP and API responses include it, so agents can hand links to people or to each other.
 
@@ -88,7 +110,7 @@ The Worker is ordinary ES modules in two packages. `packages/core/src/` holds ev
 
 - `packages/core/src/web/*.txt` are the browser assets (UI shell, styles, app script, Home loader, prebuilt CodeMirror editor). They are imported as text and served verbatim; `app.js.txt` has three build-free placeholders filled in `packages/core/src/ui.js`.
 - `packages/core/src/service.js` is the shared service layer used by the browser API, `/v1`, MCP and App Connect. Focused modules split from it: `search/`, `changes/`, `reads/`, `history/`, `templates/`.
-- `packages/core/src/content-store.js` is the only module that touches R2 (`BLOBS`); it is the seam for per-workspace encryption ([encryption.md](encryption.md)) and builds the publication fences (`keyFence`, `plaintextFence`, `fenceRefusal`) that make a batch fail when its key was shredded or encryption started.
+- `packages/core/src/content-store.js` is the only module that touches R2 (`BLOBS`). It still contains unused content-encryption code, reachable only with the encryption settings that make the Worker refuse every request ([encryption.md](encryption.md)).
 - `packages/core/src/oauth/` is the OAuth server, consent pages and MCP-over-OAuth; `packages/core/src/api/` holds `/v1`, API keys, app clients and the publisher API.
 
 `npm run check:bundle` builds twice in fresh directories and fails if the outputs differ, if the bundle imports anything but `cloudflare:workers`, or if an installation-specific value appears. The editor bundle's provenance is checked separately (`npm run check:editor`).
@@ -107,7 +129,7 @@ The modules were recovered mechanically from the previous byte-pinned bundle (Ph
 | `lifecycle`: `workspaceCreated`, `workspaceDeleted`, `inviteCreated` | None | Billing customer, invitation email | None |
 | `routes`: `{ method?, path, handler }` | None | Billing, sign-up, legal pages | None |
 | `mailer.send` | Logs only | Not used (invitation email is sent by `lifecycle.inviteCreated`, SendGrid) | Logs only |
-| `keyProvider`: `configured`, `currentVersion`, `wrap`, `unwrap` (workspace data keys; [encryption.md](encryption.md#workspace-keys)) | Worker secrets `CONTENT_MASTER_KEY_V<n>` (`packages/core/src/crypto/worker-secret-keys.js`) | Same, later an external KMS | Worker secrets; not configured when `CONTENT_MASTER_KEY_VERSION` is unset. A supplied provider replaces the default whole (all four methods). Nothing is encrypted yet |
+| `keyProvider` | Not supported | Not supported | None. Supplying one makes the Worker refuse every request (`500 encryption_unsupported`; [encryption.md](encryption.md)) |
 
 Not yet adapters (deferred from the plan's interface list): an external `AuditSink`/metrics (phase 5; audits stay in D1), UI slots such as settings tabs (phase 3/4, with the hosted billing UI) and a `workspaceSuspended` hook (core has no suspend operation yet). Core doesn't call `mailer` yet; hosted mail is sent from lifecycle hooks. The plan's `createWorker(config, adapters)` became `createWorker(adapters)`: configuration stays in Worker vars.
 

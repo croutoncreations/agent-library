@@ -34,7 +34,7 @@ Restore stores a backup's values as given. A hand-edited backup can therefore pu
 
 If a restore answers `store_not_empty` (409) after you started it on an empty store, it may have completed despite the error. Reload the app and check your projects before retrying.
 
-With encryption configured, restore and import re-encrypt every file under the target workspace's key; restored file keys carry a per-attempt suffix. A failure whose outcome is unknown (for example a lost connection after the database committed) deletes nothing and logs `backup_cleanup_skipped`; such unreferenced objects are not reclaimed by this release (see [encryption.md](encryption.md#files)).
+Restored file keys carry a per-attempt suffix, so a retried restore never overwrites an earlier attempt's objects. A restore or import failure whose outcome is unknown (for example a lost connection after the database committed) deletes nothing and logs `backup_cleanup_skipped`; such unreferenced objects are not reclaimed by this release.
 
 ## Rollback
 
@@ -44,16 +44,25 @@ Note the current Worker version ID before each upgrade. To roll back the code, r
 
 ## Monitoring
 
-Log events and reasons added with file encryption (ids, counts and codes only; never keys, headers or content):
+File storage and backup log events (ids, counts and codes only; never headers or content):
 
 | Event | Meaning |
 |---|---|
-| `blob_corrupt` with `reason` | a file read refused stored bytes (`prefix`, `header_invalid`, `header_length_mismatch`, `key_id_mismatch`, `encrypted_row_plaintext_object`, `plaintext_row_encrypted_object`, `stored_size_mismatch`, `half_column_pair`, `header_pin`, `first_chunk`, `later_chunk`, …); the client gets `500 blob_corrupt` |
-| `blob_corrupt` with `reason: "read_failed"` | the storage read itself failed while reading a file (not a verification failure); the client gets the same `500 blob_corrupt` |
-| `upload_blob_inconsistent` | upload finish found the stored object's metadata, size or first chunk unlike what the PUT recorded; the upload ends `500 publish_failed` |
-| `upload_blob_write_inconsistent` | an encrypted PUT's own consistency check failed after the put; the object is deleted and the upload returns to pending |
-| `upload_finish_key_error` with `code` | finish found the upload's key id unknown to its workspace or its key row malformed; the upload ends `500 publish_failed` |
+| `blob_corrupt` with `reason` | a file read found the stored object inconsistent with its database row (`reason` names the check); the client gets `500 blob_corrupt` |
+| `upload_blob_inconsistent` with `reason` | upload finish found the stored object unlike the upload's record; the upload ends `500 publish_failed` |
 | `backup_cleanup_skipped` with `count`, `reason` | a backup import or restore left `count` written file objects in place: `outcome_unknown` (the batch may have committed), `reference_query_failed` or `delete_failed` |
+
+Five catch-all log lines record an unexpected error. `unhandled` (the app and its API on the app host),
+`file_transfer_error` (`/files/` transfer links on the MCP host) and `content_host_error` (view links on the content
+host) carry the request id, the error's name (or its type, if it has none) and its message; a parse error
+(`SyntaxError`) is logged without its message, because the message quotes the input. `v1_unhandled` (`/v1`) and
+`publisher_unhandled` (the publisher and App Connect API) carry the request id and the error's name only. Every reply
+except the content host's includes the same request id as `request_id`.
+
+While a Worker refuses every request because an encryption setting is present ([encryption.md](encryption.md)), the
+15-minute cron keeps running and logs `encryption_unsupported` each run. That includes removing deleted projects and
+workspaces whose 30 days have ended. Owners can't restore anything during that time, because the app refuses them
+too, so remove the setting promptly.
 
 Watch Worker errors and your D1, R2 and KV usage in the Cloudflare dashboard, and check that the 15-minute cleanup job runs. Each run also removes, at most 5,000 rows per table, expired sign-in sessions, idempotency records older than 30 days (a retried request older than that is treated as new) and audit rows older than `AUDIT_RETENTION_DAYS` (default 365; `0` keeps them forever). A `retention_cleanup_batch_full` warning means a table had more to remove; the next runs catch up. Free tiers cover a typical personal library, but usage above them is billed to your account. Review connected agents now and then, and revoke the ones you no longer use. Never widen your Access policy to work around a sign-in problem.
 

@@ -166,7 +166,7 @@ A disabled app's connections still count toward your connected-agents limit, and
 
 - Watch the log events `app_files_drain_skipped` (`scope`, `count`; at most once a minute per instance: refused bodies were cut off because the discard budget was full) and `app_files_drain_reclaimed` (a discard's place was dropped after 60 seconds; it should never appear, and means a discard was cut short by the runtime). Neither carries ids, paths or content.
 - Alert on the log events `app_files_slot_reclaimed` and `app_files_slots_stuck`. They mean a request held an upload slot for over 10 minutes; at most 2 such slots are set aside per instance, and if more stay stuck that instance answers `503 app_files_busy` to every upload until it is recycled. `app_files_slots_stuck` repeats at most every 10 minutes while it lasts. The events carry no ids, paths or content.
-- App Files are stored as text and are **not encrypted** in this release (text encryption is a later slice).
+- App Files are stored as text like any other document; Agent Library adds no encryption of its own ([encryption.md](encryption.md)).
 - The memory used per upload (6–10 MiB for a 1 MiB body) is an estimate; it has not been measured anywhere.
 - The release of an upload slot when a client disconnects mid-upload has been observed in local development only.
 

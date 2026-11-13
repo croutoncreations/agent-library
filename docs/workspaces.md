@@ -145,7 +145,7 @@ Owners delete a shared workspace on its page by typing its name. The personal wo
   (`purgeDeletingWorkspaces`, `workspace-purge.js`) first marks the workspace (`purge_marked_at`), then marks every
   live project of it deleted and due. The project purge ([above](#deleting-a-project)) removes their content:
   documents, versions, comments, files and their R2 objects, and the rest it lists. Projects that were already in
-  Recently deleted when the workspace was deleted keep their own date: each is removed when its own 30 days end, which
+  Recently deleted when the workspace was deleted keep their own date: each is removed from when its own 30 days end, which
   is before the workspace's 30 days do. Once no project is left, the workspace gets `purged_at`.
 - **For projects that were live when the workspace was deleted, 30 days is the earliest, not an exact time.** The
   project purge handles 5 projects per run across the whole installation, in the order they fell due, so a large

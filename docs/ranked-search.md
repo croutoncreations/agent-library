@@ -43,10 +43,11 @@ The service budgets the full 64 KiB JSON-RPC envelope, including the duplicated 
    Use `--persist-to <directory>` for a test installation. For an operator-authorized production rollout, use `--remote` instead of `--local`. For a configuration with an `[env.hosted]` section, also pass `--env hosted`; for the generated flat `dist/self-host/wrangler.json`, omit `--env`. No remote operation was run for this PR. Repeat with `--after <next_after_rowid>` until `processed=0` **and `ready=1`**. Each invocation touches at most 50 artifacts (default 25). Repeating a batch is safe; metadata versions, revisions and timestamps are unchanged. A completeness check controls activation, so skipping ahead or reaching an empty batch cannot enable an incomplete index. The index may become ready earlier if all remaining heads were already indexed by live writes. If a pass ends with `ready=0`, restart from zero to repair any missing/stale entries.
 4. After any database restore/import, restart the backfill from zero. Search uses explicit `INTEGER PRIMARY KEY` identities from `artifact_search_keys` and joins by artifact ID; VACUUM or changes to the implicit `artifacts.rowid` do not break result identity. The scan's `--after` value is a temporary maintenance cursor: do not reuse it across a restore/import.
 
-**Between PR2 slices 2a and 4b:** this SQL-only backfill (including restore-then-backfill) rebuilds bodies only for
-legacy inline rows. R2 text remains searchable by title, but not body, until saved again; the temporary live-write
-bridge does not repair a SQL backfill. The write/refresh bridge indexes only the first 1 MiB (1,048,576 UTF-8 bytes, cut at a character boundary) of each document. Larger documents match their title and words in that prefix, not words only in the suffix, until the blind-index search slice. Readiness still reports ready because it compares revision id, hash and title,
-not the body. Slice 4b replaces this with the token backfill.
+**SQL backfill and R2 text:** this SQL-only backfill (including restore-then-backfill) rebuilds bodies only for
+legacy inline rows. R2 text remains searchable by title, but not body, until saved again; the live-write bridge does
+not repair a SQL backfill. The write/refresh bridge indexes only the first 1 MiB (1,048,576 UTF-8 bytes, cut at a
+character boundary) of each document. Larger documents match their title and words in that prefix, not words only in
+the suffix. Readiness still reports ready because it compares revision id, hash and title, not the body.
 
 The previous Worker remains compatible. Its ordinary writes maintain the index, but generation insert triggers are deliberately excluded to preserve exact D1 commit-count checks. The new Worker indexes generations in the publication transaction. If a rollback's old Worker publishes a generation, the completeness probe suppresses search after re-upgrade until backfill repairs it. Worker rollback leaves the derived index in place.
 

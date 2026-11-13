@@ -139,7 +139,8 @@ const cutLists = (flags) => Object.keys(flags).filter((k) => flags[k]);
 /** expires_at for credentials that never expire (OAuth connections, "never" API keys): 9999-01-01. */
 const NEVER_EXPIRES_AT = Date.UTC(9999, 0, 1);
 /** An error's fields for a server log line: its name (or type) and message, except a SyntaxError's message, which
- *  quotes the input it failed to parse (content). Used by every catch-all logger. */
+ *  quotes the input it failed to parse (content). Used by the catch-all loggers `unhandled` (index.js),
+ *  `file_transfer_error` (oauth/mcp.js) and `content_host_error` (view-links.js). */
 function errorLogFields(e) {
   return [e?.name ?? typeof e, e?.name === "SyntaxError" ? "" : e?.message];
 }
