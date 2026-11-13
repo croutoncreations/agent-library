@@ -1,7 +1,7 @@
 # Connection diagnostics implementation
 
 `connection_info` (both MCP implementations), `GET /v1/connection-info`
-(API keys) and `GET /v1/publisher/connection-info` (App Connect) report only the
+(API keys) and `GET /v1/app/connection-info` (App Connect) report only the
 request's authenticated connection. There is no identity parameter. Existing
 live authorization, project scope and rate limiting run before diagnostics.
 OAuth uses the same connection projects and token/project write intersection

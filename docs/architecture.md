@@ -31,7 +31,7 @@ A `*/15` cron cleans up expired uploads and their staging objects (bounded and i
   - **OAuth MCP connection.** For example ChatGPT, Claude or Cursor adding `https://MCP_HOST/mcp`. The owner picks projects and read/write access on the consent page. The connection lasts until it is revoked (access tokens are 15 minutes; refresh slides).
   - **API key** (`alk_…`). Expiring, per-project read or read/write, for scripts and REST clients.
   - **Legacy grant token.** A project-scoped bearer token for `/mcp`.
-- **Publishers (App Connect):** apps the owner registers. A publisher can create files and read or update only the files it created, inside one owner-chosen project and folder: as snapshots and staged generations (`/v1/publisher/*`) or file by file by path (App Files, `/v1/app/files`). Every App Files request re-checks the publisher's authorization and is fenced in the same D1 statement that writes; request bodies (at most 1 MiB) are held in Worker memory under per-instance upload slots. See [app-connect.md](app-connect.md).
+- **Publishers (App Connect):** apps the owner registers. A publisher can create files and read or update only the files it created, inside one owner-chosen project and folder: file by file by path (App Files, `/v1/app/files`). Every App Files request re-checks the publisher's authorization and is fenced in the same D1 statement that writes; request bodies are at most 1 MiB and are refused from `Content-Length` before they are read. See [app-connect.md](app-connect.md).
 
 Every request re-checks the current grant and project scope. Nothing caches authorization in a way that would delay revocation. API, MCP and App Connect call the same service layer. Every request is authenticated, checked against its grant and project, validated, applied as a revision-guarded mutation and audited.
 
@@ -59,7 +59,7 @@ New Markdown, HTML, JSON and CSV versions live in immutable R2 objects at `text/
 D1 keeps `revisions.body = NULL` and `body_key` names the object. Versions written before text moved to R2 stay
 inline in D1 and are read where they are: all JavaScript version reads go through `getText` or `getTextRange`
 (`packages/core/src/content-store.js`), which fall back to the inline body. New comments are stored the same way at
-`text/{project}/{artifact}/{comment}` (`comments.body = ''`). Publisher generation commits keep their bodies inline.
+`text/{project}/{artifact}/{comment}` (`comments.body = ''`). Only older versions and comments may still hold inline bodies.
 
 Text writes record a `content_writes` intent before the object is written, and the publication batch clears it. Every
 text publication batch first asserts that each of its intents still exists and is at most ten minutes old; otherwise

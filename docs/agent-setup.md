@@ -79,7 +79,7 @@ For API-key clients, send the existing bearer credential to
 API keys**. It accepts no query parameters and returns `Cache-Control: no-store`.
 Do not paste credentials or request headers into chat.
 
-App Connect publishers use `GET https://<MCP_HOST>/v1/publisher/connection-info`
+App Connect publishers use `GET https://<MCP_HOST>/v1/app/connection-info`
 with their existing publisher token. Match its publisher ID under **Publishing
 apps**. The response has an empty `projects` array and a `destination` with
 `can_read_own_files` and `can_write_own_files`: this is not a general project

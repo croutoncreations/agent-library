@@ -17,7 +17,7 @@ Project backups cover projects, documents and files you and your agents create, 
 
 **Projects with more than 16 MB of files can't be backed up as one file yet.** A backup embeds every file (base64) in one JSON response built in Worker memory, so the export is refused (`413 backup_too_large`) when the project's distinct file versions add up to more than 16 MB; download large files individually. (A streamed backup format is planned.)
 
-**Projects that contain App Connect files can't be backed up yet.** If any file in a project was created by a publishing app, the whole project's export is refused (`backup_unsupported`), even after you revoke the app or trash the file. Keep app data in its own project, and don't use App Connect for content you need to restore from these backups. (Exporting app files safely needs a new backup format that preserves which app owns each file; that's planned.)
+**App Connect files are backed up as ordinary files.** An app's file is exported with `app: { name, path }` (the path is null once the file is trashed; backup schema 3). Restoring or importing such a backup creates ordinary, editable files in the project: the title is the path, the tag is `app:<name>`, and they are no longer tied to any app, so a re-connected app writes fresh files beside them.
 
 ## Backup and recovery
 
@@ -25,7 +25,7 @@ Project backups cover projects, documents and files you and your agents create, 
 
 Limits:
 - It's one project at a time, held in memory, so projects with more than 16 MB of files are refused (see above and [Limits](limits.md#import--export)). There's no whole-account backup yet.
-- Folders and App Connect data aren't included (see above).
+- Folders aren't included (see above).
 - Cloudflare D1's own point-in-time recovery restores the database but not R2 files, so it isn't a complete backup on its own.
 
 Restoring has no UI yet. Send the backup JSON to `POST /api/restore` from a signed-in owner session (with the CSRF header); `test/a12-durability.test.mjs` shows a full round trip. Restore only into an **empty** library, such as a fresh installation. It refuses a library that already has content, checks every hash and creates no agent access. Reconnect your agents afterwards.
