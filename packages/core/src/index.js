@@ -29,7 +29,7 @@ import { __name } from "./runtime.js";
 import { IMAGE_TYPES, VIDEO_TYPES, addComment, appConnectEnabled, chQuery, cleanupChanges, createFile, createFolder, createFromTemplate, createGrant, createMarkdown, createProject, updateProject, diffRevisions, getArtifact, history, listArtifacts, listAudit, listChanges, listComments, listFolders, listGrants, listProjects, listTemplates, metaHistory, previewTemplate, readRecords, readTextChunk, requireAppConnect, restoreMetadata, restoreRevision, rsQuery, rsReady, rtQuery, saveAsTemplate, saveFile, saveMarkdown, searchArtifacts, updateGrant, updateMetadata } from "./service.js";
 import { APP_CSS, APP_HTML, APP_JS } from "./ui.js";
 import { serveContent, uploadBegin, uploadFinish, uploadPut } from "./uploads.js";
-import { HttpError, errorBody, idemKey, json, nowIso, nowMs, randomId, readTextCapped, sha256Hex, str } from "./util.js";
+import { HttpError, errorBody, errorLogFields, idemKey, json, nowIso, nowMs, randomId, readTextCapped, sha256Hex, str } from "./util.js";
 
 var SEC_HEADERS = {
   "x-content-type-options": "nosniff",
@@ -445,7 +445,7 @@ var coreWorker = {
         if (e.status === 429 && e.extra?.retry_after_seconds) h["retry-after"] = String(e.extra.retry_after_seconds);
         return withSec(json(errorBody(e), e.status, h));
       }
-      console.error("unhandled", requestId, e?.message);
+      console.error("unhandled", requestId, ...errorLogFields(e));
       return withSec(json({ error: { code: "internal", message: "Internal error", request_id: requestId } }, 500));
     }
   }

@@ -138,4 +138,9 @@ const cutLists = (flags) => Object.keys(flags).filter((k) => flags[k]);
 
 /** expires_at for credentials that never expire (OAuth connections, "never" API keys): 9999-01-01. */
 const NEVER_EXPIRES_AT = Date.UTC(9999, 0, 1);
-export { NEVER_EXPIRES_AT, CHANGE_NOTE_MAX, CHANGE_NOTE_SCHEMA, DRAIN_BYTES, HttpError, b64url, cutLists, errorBody, hex, idemKey, int, json, mcpClientInfo, nowIso, nowMs, randomId, readTextCapped, rememberClientInfo, sha256Hex, sha256HexStream, str };
+/** An error's fields for a server log line: its name (or type) and message, except a SyntaxError's message, which
+ *  quotes the input it failed to parse (content). Used by every catch-all logger. */
+function errorLogFields(e) {
+  return [e?.name ?? typeof e, e?.name === "SyntaxError" ? "" : e?.message];
+}
+export { NEVER_EXPIRES_AT, CHANGE_NOTE_MAX, CHANGE_NOTE_SCHEMA, DRAIN_BYTES, HttpError, b64url, cutLists, errorBody, errorLogFields, hex, idemKey, int, json, mcpClientInfo, nowIso, nowMs, randomId, readTextCapped, rememberClientInfo, sha256Hex, sha256HexStream, str };

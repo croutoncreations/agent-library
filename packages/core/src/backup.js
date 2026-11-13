@@ -264,6 +264,12 @@ async function restoreBackup(ctx, backup) {
   };
   const fileRevisions = backup.revisions.filter((r) => r.blob_key);
   for (const r of fileRevisions) restoreKey(r);
+  // A lone surrogate cannot be URI-encoded into a text key (textKey); refuse before any write instead of a 500.
+  const unstorable = (v) => typeof v === "string" && storedText(v) !== v;
+  for (const x of [...backup.revisions.filter((r) => r.blob_key === null), ...backup.comments]) {
+    if (unstorable(x.artifact_id)) throw new HttpError(400, "bad_backup", "A document id in this backup cannot be stored");
+    if (unstorable(x.id)) throw new HttpError(400, "bad_backup", "A version or comment id in this backup cannot be stored");
+  }
   // Validate every resulting key, including the attempt segment, before writing any bytes or intents.
   for (const r of backup.revisions) if (r.blob_key === null) textKey(pid, r.artifact_id, r.id, attempt);
   for (const c of backup.comments) textKey(pid, c.artifact_id, c.id, attempt);

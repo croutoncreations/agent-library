@@ -555,7 +555,7 @@ export async function getTextRange(env, row, offset, length) {
   if (!row.body_key) return new TextEncoder().encode(readText(row.body)).slice(offset, offset + length);
   if (length === 0) return new Uint8Array();
   const object = await getBlob(env, row.body_key, { offset, length });
-  if (!object) throw new Error("Missing text object");
+  if (!object) throw blobMissing();
   return new Uint8Array(await object.arrayBuffer());
 }
 
@@ -563,7 +563,7 @@ export async function getTextRange(env, row, offset, length) {
 export async function getText(env, row) {
   if (!row.body_key) return readText(row.body);
   const bytes = await getBlobBytes(env, row.body_key);
-  if (!bytes) throw new Error("Missing text object");
+  if (!bytes) throw blobMissing();
   return new TextDecoder().decode(bytes);
 }
 

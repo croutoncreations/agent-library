@@ -729,3 +729,49 @@ test("concurrent restores publish once and refuse the loser cleanly without over
   }
   assert.deepEqual((await target.lib.exportBackup(target.ctx, "proj-s")).revisions, backup.revisions);
 });
+
+test("a missing text object is 500 blob_missing for a document read, a chunked read and a Range read", async () => {
+  const h = await harness();
+  const made = await h.lib.createMarkdown(h.ctx, "proj-s", { title: "Gone", body: "soon gone words" }, "missing-1");
+  const id = made.body.artifact_id;
+  const key = h.sql.prepare("SELECT body_key FROM revisions WHERE artifact_id = ?").get(id).body_key;
+  h.objects.delete(key);
+  const blobMissing = (e) => e.status === 500 && e.code === "blob_missing";
+  await assert.rejects(h.lib.getArtifact(h.ctx, "proj-s", id), blobMissing);
+  await assert.rejects(h.lib.readTextChunk(h.ctx, "proj-s", id, { maxBytes: 4096 }), blobMissing);
+  await assert.rejects(h.lib.serveContent(h.ctx, new Request("https://example.test/content", { headers: { range: "bytes=0-1" } }), "proj-s", id), blobMissing);
+});
+
+test("restore refuses a lone-surrogate document, version or comment id with 400 bad_backup before any write; import still succeeds", async () => {
+  const at = "2026-01-01T00:00:00.000Z", body = "synthetic words";
+  const sha256 = Buffer.from(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(body))).toString("hex");
+  const fixture = ({ id, rev = "rev_s_0001", ref = id, cmt, cref = id }) => ({
+    schema: "agent-library-backup/1", exported_at: at, project: { id: "src-proj", title: "Synthetic", created_at: at },
+    artifacts: [{ id, kind: "markdown", title: "Synthetic", folder: "", tags: "[]", head_rev: 1, head_revision_id: rev, meta_version: 1, trashed_at: null, created_at: at, updated_at: at }],
+    revisions: [{ id: rev, artifact_id: ref, rev_no: 1, author_id: "hum_s", body, blob_key: null, size: Buffer.byteLength(body), sha256, mime: "text/markdown", restored_from: null, created_at: at }],
+    comments: cmt === undefined ? [] : [{ id: cmt, artifact_id: cref, rev_no: 1, author_id: "hum_s", body: "c", created_at: at }],
+    meta_versions: [], blobs: {}
+  });
+  const DOCUMENT = "A document id in this backup cannot be stored", VERSION_OR_COMMENT = "A version or comment id in this backup cannot be stored";
+  const cases = [
+    ["(a) document id", fixture({ id: "lone\ud800x" }), DOCUMENT],
+    ["(b) revision id", fixture({ id: "art_s_0001", rev: "rev\ud800" }), VERSION_OR_COMMENT],
+    ["(c) comment id", fixture({ id: "art_s_0001", cmt: "c\udc00" }), VERSION_OR_COMMENT],
+    ["(d) comment's document id", fixture({ id: "x\ud800", ref: "x\ufffd", cmt: "cmt_s_0001", cref: "x\udc00" }), DOCUMENT],
+  ];
+  for (const [label, backup, message] of cases) {
+    const h = await harness();
+    h.sql.exec("DELETE FROM projects");
+    await assert.rejects(h.lib.restoreBackup(h.ctx, backup), (e) => e.status === 400 && e.code === "bad_backup" && e.message === message, label);
+    assert.equal(h.objects.size, 0, label);
+    assert.equal(h.sql.prepare("SELECT COUNT(*) AS n FROM content_writes").get().n, 0, label);
+    assert.equal(h.sql.prepare("SELECT COUNT(*) AS n FROM projects").get().n, 0, label);
+  }
+  // Import replaces every id with a fresh one, so the same backup imports.
+  const h = await harness();
+  const ws = h.sql.prepare("SELECT id FROM workspaces LIMIT 1").get().id;
+  const result = await h.lib.importBackup(h.ctx, ws, { backup: cases[0][1] }, "lone-surrogate-import");
+  const artifact = h.sql.prepare("SELECT id FROM artifacts WHERE project_id = ?").all(result.project_id);
+  assert.equal(artifact.length, 1);
+  assert.equal((await h.lib.getArtifact(h.ctx, result.project_id, artifact[0].id)).body, "synthetic words");
+});

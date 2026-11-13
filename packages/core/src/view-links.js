@@ -7,7 +7,7 @@ import { originFor } from "./oauth/server.js";
 import { IMAGE_TYPES, VIDEO_TYPES } from "./service.js";
 import { getRenderSource } from "./render-source.js";
 import { serveContent } from "./uploads.js";
-import { HttpError, nowIso, nowMs, randomId, sha256Hex } from "./util.js";
+import { HttpError, errorLogFields, nowIso, nowMs, randomId, sha256Hex } from "./util.js";
 
 // A link works for whoever holds it until it expires (like a signed URL), so it is short: a page frame asks for a new
 // one each time it opens; a PDF tab keeps its link for the viewer's range requests.
@@ -105,7 +105,7 @@ export async function handleContentHost(req, env, url) {
   } catch (e) {
     if (e instanceof HttpError && e.code === "render_too_large") return textPage(env, 413, e.message + " Open it in Agent Library to see its source.");
     if (e instanceof HttpError) return textPage(env, e.status === 429 ? 429 : 404, e.status === 429 ? "Too many requests" : "Not found");
-    console.error("content_host_error", requestId, e?.message);
+    console.error("content_host_error", requestId, ...errorLogFields(e));
     return textPage(env, 500, "Internal error");
   }
 }

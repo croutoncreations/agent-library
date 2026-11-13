@@ -9,7 +9,7 @@ import { __name } from "../runtime.js";
 import { FILE_BYTES_CEILING } from "../limits.js";
 import { BINARY_TYPES, IMAGE_TYPES, RS_SCHEMA, RT_ID_TOO_LONG, RT_KINDS_ALL, RT_KINDS_DOCS, appConnectEnabled, connectionInfo, createMarkdown, db, diffRevisions, getArtifact, history, listArtifacts, listChanges, loadArtifact, provenance, readRecords, readTextChunk, restoreMetadata, restoreRevision, rsToolReady, rtChunkLimit, rtFit, rtIdBytes, saveMarkdown, searchArtifacts, tplTools } from "../service.js";
 import { TEXT_UPLOAD_KINDS, UPLOAD_BEGIN_DESCRIPTION, UPLOAD_FINISH_DESCRIPTION, serveContent, uploadBegin, uploadBeginFields, uploadFinish, uploadPut } from "../uploads.js";
-import { CHANGE_NOTE_SCHEMA, HttpError, errorBody, idemKey, json, mcpClientInfo, nowIso, nowMs, randomId, readTextCapped, rememberClientInfo, sha256Hex, str } from "../util.js";
+import { CHANGE_NOTE_SCHEMA, HttpError, errorBody, errorLogFields, idemKey, json, mcpClientInfo, nowIso, nowMs, randomId, readTextCapped, rememberClientInfo, sha256Hex, str } from "../util.js";
 
 function truncateUtf8(s, max) {
   if (byteLength(s) <= max) return { text: s, truncated: false };
@@ -686,7 +686,7 @@ async function handleFileTransfer(req, env, url) {
     return await uploadPut(req, env, requestId, row.upload_id, { ...ctx, principal: ftUploadPrincipal(conn) });
   } catch (e) {
     if (e instanceof HttpError) return json(errorBody(e), e.status, { "x-request-id": requestId });
-    console.error("file_transfer_error", requestId, e?.message);
+    console.error("file_transfer_error", requestId, ...errorLogFields(e));
     return json({ error: { code: "internal", message: "Internal error", request_id: requestId } }, 500);
   }
 }
