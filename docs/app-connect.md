@@ -173,7 +173,7 @@ A disabled app's connections still count toward your connected-agents limit, and
 ## Current limits
 
 - **Formats.** Snapshots and generations write JSON and CSV only; App Files adds Markdown and HTML (text). Binary publishing is planned.
-- **Backup.** The built-in project backup doesn't yet cover projects that contain App Connect files (`backup_unsupported`). See [operations.md](operations.md#supported-release-scope).
+- **Backup.** The built-in project backup doesn't yet cover projects that contain App Connect files (`backup_unsupported`). See [operations.md](operations.md#what-backups-cover).
 - **One destination.** Each connection writes into one project and folder. To publish somewhere else, connect again (a new publisher).
 
 ## Roadmap toward "app data folder" parity
