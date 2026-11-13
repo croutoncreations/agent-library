@@ -544,7 +544,14 @@ var pathSeq = 0;
 async function logout() {
   signingOut = true;
   if (renewing) await renewing;
-  try { await api("POST", "/api/logout", {}, { noAuthRedirect: true }); } catch (e) {}
+  try { await api("POST", "/api/logout", {}, { noAuthRedirect: true }); }
+  catch (e) {
+    // The cookie names a session this page has no CSRF token for (a renewal finished after a 401 cleared it, or
+    // another tab renewed): read the current token and sign out once more.
+    if (e.status === 403 && e.code === "csrf") {
+      try { S.csrf = (await api("GET", "/api/me", undefined, { noAuthRedirect: true })).csrf; await api("POST", "/api/logout", {}, { noAuthRedirect: true }); } catch (e2) {}
+    }
+  }
   clearAllDrafts();
   HOME.cacheClear(null); thumbClear();
   resumeClear();

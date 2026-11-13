@@ -33,7 +33,7 @@ function jwt(claims) {
 }
 
 let jwks, access, s, browser, page;
-const accessState = { expired: false, sub: "user-owner-1", xhr401: 0, logoutDelayMs: 0 };
+const accessState = { expired: false, sub: "user-owner-1", xhr401: 0, logoutDelayMs: 0, delayMs: {} };
 const SIGNIN_TITLE = "Stand-in Cloudflare Access sign-in";
 
 function startAccess() {
@@ -44,7 +44,7 @@ function startAccess() {
       return res.end(`<!doctype html><title>${SIGNIN_TITLE}</title><h1>${SIGNIN_TITLE}</h1>`);
     }
     const headers = { ...req.headers, "cf-access-jwt-assertion": jwt({ sub: accessState.sub, email: OWNER }) };
-    const delay = req.url === "/api/logout" ? accessState.logoutDelayMs : 0;
+    const delay = req.url === "/api/logout" ? accessState.logoutDelayMs : (accessState.delayMs[req.url] ?? 0);
     setTimeout(() => forward(req, res, headers), delay);
   }).listen(ACCESS_PORT, "127.0.0.1");
 }
@@ -190,6 +190,44 @@ test("sign-out with an expired session and a request in flight finishes clearing
   assert.equal(await page.evaluate(() => window.__sameDocument), true, "no reload cut sign-out short");
   assert.equal(await page.evaluate(() => Object.keys(localStorage).filter((k) => k.startsWith("al:draft:")).length), 0, "drafts cleared");
   assert.equal(liveSessions(), 0);
+});
+
+test("sign-out while a renewal is in flight and a second request's 401 arrives revokes the renewed session", { skip }, async () => {
+  await openHome();
+  endAppSessions();
+  // Forced order: /api/projects answers 401 at once and starts a renewal; Sign out is clicked while the renewal's
+  // access-login is held; /api/workspaces' 401 then arrives (signing out: no renewal, the page drops its CSRF token);
+  // only then does access-login reach the Worker and set a new session cookie.
+  accessState.delayMs = { "/api/workspaces": 1500, "/auth/access-login": 3000 };
+  const logoutStatuses = [];
+  const onLogout = (r) => { if (new URL(r.url()).pathname === "/api/logout") logoutStatuses.push(r.status()); };
+  page.on("response", onLogout);
+  try {
+    const renewal = page.waitForRequest((r) => new URL(r.url()).pathname === "/auth/access-login");
+    await page.evaluate(() => { location.hash = "#/projects"; });
+    await renewal;
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => /Sign out/.test(b.textContent)).click());
+    await page.waitForFunction(() => /Signed out/.test(document.body.innerText), { timeout: 20000 });
+  } finally { accessState.delayMs = {}; page.off("response", onLogout); }
+  assert.equal(await page.evaluate(() => window.__sameDocument), true, "no reload");
+  assert.equal(liveSessions(), 0, "no session survives sign-out");
+  assert.deepEqual(logoutStatuses, [403, 200], "the stale-token order was reproduced and sign-out was sent again");
+});
+
+test("sign-out after another tab renewed the session (this page's CSRF token is stale) revokes it", { skip }, async () => {
+  await openHome();
+  // Another tab of the same browser signs in again: the shared cookie now names a session this page has no token for.
+  assert.equal(await page.evaluate(async () => (await fetch("/auth/access-login", { method: "POST", headers: { "x-requested-with": "XMLHttpRequest" } })).status), 200);
+  assert.ok(liveSessions() >= 2, "this page's session and the other tab's are live");
+  const logoutStatuses = [];
+  const onLogout = (r) => { if (new URL(r.url()).pathname === "/api/logout") logoutStatuses.push(r.status()); };
+  page.on("response", onLogout);
+  try {
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => /Sign out/.test(b.textContent)).click());
+    await page.waitForFunction(() => /Signed out/.test(document.body.innerText), { timeout: 20000 });
+  } finally { page.off("response", onLogout); }
+  assert.equal(liveSessions(), 0, "no session survives sign-out");
+  assert.deepEqual(logoutStatuses, [403, 200], "sign-out was refused for the stale token and sent again");
 });
 
 test("server: a new Access user ID for the owner email keeps the same owner account and library", async () => {
