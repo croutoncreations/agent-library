@@ -88,13 +88,16 @@ export async function updateWorkspace(ctx, id, input) {
 }
 
 /** Marks a shared workspace 'deleting' and records when (clearing any purge marker an operator left on it): closed to everyone immediately; the cron removes its content WORKSPACE_PURGE_GRACE_DAYS later (workspace-purge.js). */
-export async function deleteWorkspace(ctx, id) {
+export async function deleteWorkspace(ctx, id, input) {
   requireHuman(ctx);
   // Owners can delete a suspended workspace too (e.g. after a billing suspension).
-  const ws = await ctx.env.DB.prepare("SELECT w.id, w.personal, w.status, m.role FROM workspaces w JOIN workspace_members m ON m.workspace_id = w.id AND m.principal_id = ? WHERE w.id = ?").bind(ctx.principal.id, id).first();
+  const ws = await ctx.env.DB.prepare("SELECT w.id, w.name, w.personal, w.status, m.role FROM workspaces w JOIN workspace_members m ON m.workspace_id = w.id AND m.principal_id = ? WHERE w.id = ?").bind(ctx.principal.id, id).first();
   if (!ws || ws.status === "deleting") throw new HttpError(404, "not_found", "Workspace not found");
   if (ws.role !== "owner") throw new HttpError(403, "forbidden", "Needs the owner role in this workspace");
   if (ws.personal) throw new HttpError(409, "personal_workspace", "Your personal workspace can't be deleted");
+  // The caller types the workspace's name (as in the app) so a stray request can't delete the wrong workspace.
+  if (typeof input?.confirm_name !== "string" || input.confirm_name.trim() !== String(ws.name).trim())
+    throw new HttpError(400, "confirmation_required", "Type the workspace's name to confirm");
   const [r] = await ctx.env.DB.batch([
     ctx.env.DB.prepare(`UPDATE workspaces AS w SET status = 'deleting', deleting_at = ?, purge_marked_at = NULL, purged_at = NULL WHERE w.id = ? AND w.personal = 0 AND w.status <> 'deleting'
         AND EXISTS (SELECT 1 FROM workspace_members m WHERE m.workspace_id = w.id AND m.principal_id = ? AND m.role = 'owner')`).bind(nowMs(), id, ctx.principal.id),

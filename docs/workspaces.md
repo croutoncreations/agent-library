@@ -72,7 +72,7 @@ shared workspace exists, or accept this for the rollback window.
 
 - `GET /api/workspaces`: workspaces I belong to, with my role and member count.
 - `POST /api/workspaces` `{name}`: create a shared workspace (I'm its owner). Self-host: allowed for the owner.
-- `PATCH /api/workspaces/:id` `{name?, handle?}` (owner); `DELETE` marks it `deleting` and records when (owner; not the personal one); its content is deleted from 30 days later.
+- `PATCH /api/workspaces/:id` `{name?, handle?}` (owner); `DELETE` `{confirm_name}` marks it `deleting` and records when (owner; not the personal one; the workspace's name must be typed, else 400 `confirmation_required`); its content is deleted from 30 days later.
 - `GET /api/workspaces/:id/members`, `PATCH …/members/:principal` `{role}`, `DELETE …/members/:principal`
   (admin+; can't remove or demote the last owner; admins can't change owners; anyone may remove themselves except
   the last owner).

@@ -76,7 +76,7 @@ const EMPTY = { marked: 0, recovered: 0, projects_marked: 0, pending: 0, finishe
 test("(a) deleteWorkspace sets deleting_at; an empty run issues exactly four statements and logs nothing", async () => {
   const s = setup();
   team(s, { ws: "wsp_a" });
-  await lib.deleteWorkspace(ctxOf(s.env, "hum_a"), "wsp_a");
+  await lib.deleteWorkspace(ctxOf(s.env, "hum_a"), "wsp_a", { confirm_name: "Synthetic team" });
   const w = row(s, "SELECT status, deleting_at, purge_marked_at, purged_at FROM workspaces WHERE id = 'wsp_a'");
   assert.equal(w.status, "deleting"); assert.ok(Math.abs(w.deleting_at - Date.now()) < 60e3); assert.equal(w.purge_marked_at, null); assert.equal(w.purged_at, null);
   const t = setup();
@@ -91,7 +91,7 @@ test("(a) deleteWorkspace sets deleting_at; an empty run issues exactly four sta
 test("(b) 29 days: untouched; 31 days: marker set, then the projects are marked deleted and due", async () => {
   const s = setup();
   team(s, { ws: "wsp_a", projects: [{ id: "prj_1", slug: "one" }] });
-  await lib.deleteWorkspace(ctxOf(s.env, "hum_a"), "wsp_a");
+  await lib.deleteWorkspace(ctxOf(s.env, "hum_a"), "wsp_a", { confirm_name: "Synthetic team" });
   const t0 = row(s, "SELECT deleting_at FROM workspaces WHERE id = 'wsp_a'").deleting_at;
   await lib.purgeDeletingWorkspaces(s.env, { now: t0 + 29 * DAY });
   assert.deepEqual(row(s, "SELECT deleted_at, slug FROM projects WHERE id = 'prj_1'"), { deleted_at: null, slug: "one" });
@@ -212,7 +212,7 @@ test("(v) off-script: a marked workspace forced back to active and deleted again
   s.world.before = null;
   assert.ok(row(s, "SELECT purge_marked_at FROM workspaces WHERE id = 'wsp_a'").purge_marked_at > 0);
   s.sql("UPDATE workspaces SET status = 'active' WHERE id = 'wsp_a'");
-  await lib.deleteWorkspace(ctxOf(s.env, "hum_a"), "wsp_a");
+  await lib.deleteWorkspace(ctxOf(s.env, "hum_a"), "wsp_a", { confirm_name: "Synthetic team" });
   assert.deepEqual(row(s, "SELECT purge_marked_at, purged_at FROM workspaces WHERE id = 'wsp_a'"), { purge_marked_at: null, purged_at: null });
   const t0 = row(s, "SELECT deleting_at FROM workspaces WHERE id = 'wsp_a'").deleting_at;
   await lib.purgeDeletingWorkspaces(s.env);
@@ -311,7 +311,7 @@ test("(s) a suspended workspace deleted by its owner is purged like an active on
   const s = setup();
   team(s, { ws: "wsp_a", projects: ["prj_1"] });
   s.sql("UPDATE workspaces SET status = 'suspended' WHERE id = 'wsp_a'");
-  await lib.deleteWorkspace(ctxOf(s.env, "hum_a"), "wsp_a");
+  await lib.deleteWorkspace(ctxOf(s.env, "hum_a"), "wsp_a", { confirm_name: "Synthetic team" });
   s.sql("UPDATE workspaces SET deleting_at = deleting_at - ? WHERE id = 'wsp_a'", 31 * DAY);
   assert.ok(await purgeUntilFinished(s, "wsp_a") > 0);
 });
@@ -349,4 +349,22 @@ test("(j) the cron calls purgeDeletingWorkspaces(env) and nothing else calls it;
 test("(k) the delete-workspace dialog states the grace period", () => {
   const app = readFileSync(join(ROOT, "packages/core/src/web/app.js.txt"), "utf8");
   assert.ok(app.includes(`Export any project you need first (project backup). Its documents and files start being deleted after ${lib.WORKSPACE_PURGE_GRACE_DAYS} days; this can't be undone from the app.`));
+});
+
+test("(x) deleteWorkspace requires the workspace's name: missing, wrong, padded, renamed; earlier checks come first", async () => {
+  const s = setup();
+  team(s, { ws: "wsp_a", name: "Synthetic team" });
+  s.sql("INSERT INTO principals (id, kind, issuer, subject, label, created_at) VALUES ('hum_m', 'human', 'synthetic', 'hum_m', 'Synthetic', ?)", AT);
+  s.sql("INSERT INTO principals (id, kind, issuer, subject, label, created_at) VALUES ('hum_o', 'human', 'synthetic', 'hum_o', 'Synthetic', ?)", AT);
+  s.sql("INSERT INTO workspace_members (workspace_id, principal_id, role, added_by, created_at) VALUES ('wsp_a', 'hum_m', 'admin', 'hum_a', ?)", AT);
+  const del = (input, who = "hum_a", ws = "wsp_a") => lib.deleteWorkspace(ctxOf(s.env, who), ws, input);
+  for (const input of [undefined, {}, { confirm_name: "synthetic team" }, { confirm_name: 3 }])
+    await assert.rejects(del(input), (e) => e.status === 400 && e.code === "confirmation_required" && e.message === "Type the workspace's name to confirm");
+  await assert.rejects(del({ confirm_name: "Synthetic team" }, "hum_m"), (e) => e.status === 403);
+  await assert.rejects(del({ confirm_name: "Personal" }, "hum_a", "wsp_hum_a"), (e) => e.status === 409);
+  await assert.rejects(del({ confirm_name: "Synthetic team" }, "hum_o"), (e) => e.status === 404);
+  assert.equal(row(s, "SELECT status FROM workspaces WHERE id = 'wsp_a'").status, "active");
+  s.sql("UPDATE workspaces SET name = 'Renamed team' WHERE id = 'wsp_a'");
+  await assert.rejects(del({ confirm_name: "Synthetic team" }), (e) => e.code === "confirmation_required");
+  assert.deepEqual(await del({ confirm_name: "  Renamed team " }), { ok: true, status: "deleting" });
 });

@@ -254,7 +254,7 @@ test("a deleted workspace's content is removed by the cron 30 days later; the wo
   const ws = ok(await owner.req("POST", "/api/workspaces", { name: "Purge Team" }), 201).id;
   const q = ok(await owner.req("POST", "/api/projects", { title: "Purge Me", workspace_id: ws }), 201).id;
   const d = ok(await owner.req("POST", `/api/projects/${q}/artifacts`, { title: "Synthetic purge doc", body: "synthetic purge body" }), 201).artifact_id;
-  ok(await owner.req("DELETE", `/api/workspaces/${ws}`));
+  ok(await owner.req("DELETE", `/api/workspaces/${ws}`, { confirm_name: "Purge Team" }));
   // The DELETE set deleting_at (checked before the test moves it back).
   const at = (await sql(`SELECT deleting_at FROM workspaces WHERE id = '${ws}'`))[0].deleting_at;
   assert.ok(Math.abs(at - Date.now()) < 60e3, `deleting_at ${at}`);

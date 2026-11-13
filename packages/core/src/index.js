@@ -188,7 +188,7 @@ async function route3(req, env, url, requestId, seen = {}) {
     if (seg.length === 1 && m === "POST") return json(await createWorkspace(ctx, await body(req)), 201);
     const wid = str(seg[1], "workspace", 80);
     if (seg.length === 2 && m === "PATCH") return json(await updateWorkspace(ctx, wid, await body(req)));
-    if (seg.length === 2 && m === "DELETE") return json(await deleteWorkspace(ctx, wid));
+    if (seg.length === 2 && m === "DELETE") return json(await deleteWorkspace(ctx, wid, await body(req)));
     if (seg[2] === "members" && seg.length === 3 && m === "GET") return json(await listMembers(ctx, wid));
     if (seg[2] === "members" && seg.length === 4 && m === "PATCH") return json(await setMemberRole(ctx, wid, str(seg[3], "member", 80), await body(req)));
     if (seg[2] === "members" && seg.length === 4 && m === "DELETE") return json(await removeMember(ctx, wid, str(seg[3], "member", 80)));
