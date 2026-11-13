@@ -202,11 +202,14 @@ The cron job runs every 15 minutes. Each step is bounded per run and later runs 
 | Sign-in sessions | removed once expired | installation | fixed | up to 5,000 per run |
 | Change feed | 30 days, up to 10,000 rows per run | project | fixed | `410 cursor_expired` for older cursors |
 | Deleted projects | purged after 30 days | project | fixed | large projects take several runs |
+| Deleted workspaces | content deleted from 30 days after deletion | workspace | fixed | its projects go through the project purge, 5 per run; at most 5 workspaces marked and 10 checked per run |
 | Abandoned uploads | removed after their reservation plus a 10-minute grace | upload | `UPLOAD_CLEANUP_GRACE_SECONDS` | — |
 | A new document or file whose upload never finished | its hidden placeholder is removed a day after the upload expired, up to 100 per run | project | fixed | until then it counts toward `items_per_project` |
 
 A full batch logs a warning (`retention_cleanup_batch_full`, `project_changes_cleanup_batch_full`); a failed
 retention run logs `retention_failed` and the next run tries again.
+
+The deleted-workspace step makes 4 D1 queries per run when there is nothing to do, 14 while 10 deleted workspaces wait for their projects, and at most 29. Workers Free allows 50 D1 queries per Worker invocation, shared by all the cron's steps, so on Free a busy run can stop early and later runs continue; on Workers Free a large deleted workspace takes many more runs.
 
 ## Plan limits (entitlements)
 
@@ -256,7 +259,7 @@ keeps everything and stays readable; it just can't grow until it's under the lim
   keys must fit `max_key_lifetime_days`; a lower `rate_multiplier` applies at once.
 
 Deleting a project (Project settings) frees its projects slot at once; its storage is freed when it's removed for good
-(after 30 days, or with Delete permanently). A failed payment is different: the workspace becomes read-only (D11 B /
+(after 30 days, or with Delete permanently). Deleting a shared workspace stops it counting toward `owned_workspaces` at once; its content is deleted from 30 days later. A failed payment is different: the workspace becomes read-only (D11 B /
 D13 A).
 
 ### Rolling back the Worker

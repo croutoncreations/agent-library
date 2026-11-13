@@ -170,8 +170,9 @@ For the slices that wire this into reads and writes:
 - Worker versions from before these conditions existed do not honour them, so encryption may be configured only
   after a Worker that fences its writes is fully deployed. Set `CONTENT_ENCRYPTION_REQUIRED="1"` in the same deploy
   as the master-key settings: set earlier, it refuses every request until they arrive.
-- Only the operator purge of a deleted workspace (a later slice) may call `shredWorkspaceKeys`. It is safe on an
-  installation without encryption: its tombstone does not make `encryptionEnabled` refuse.
+- Nothing calls `shredWorkspaceKeys`. The deleted-workspace purge (`workspace-purge.js`) removes content without it. If
+  something calls it later, it is safe on an installation without encryption: its tombstone does not make
+  `encryptionEnabled` refuse.
 - A project's content is under the key of the workspace it belonged to when it was written. Nothing moves projects
   between workspaces today; if that is ever added, the moved content must be re-encrypted.
 - **Rollback.** A Worker from before decryption existed would serve stored ciphertext as if it were content. Once

@@ -56,3 +56,28 @@ Log events and reasons added with file encryption (ids, counts and codes only; n
 | `backup_cleanup_skipped` with `count`, `reason` | a backup import or restore left `count` written file objects in place: `outcome_unknown` (the batch may have committed), `reference_query_failed` or `delete_failed` |
 
 Watch Worker errors and your D1, R2 and KV usage in the Cloudflare dashboard, and check that the 15-minute cleanup job runs. Each run also removes, at most 5,000 rows per table, expired sign-in sessions, idempotency records older than 30 days (a retried request older than that is treated as new) and audit rows older than `AUDIT_RETENTION_DAYS` (default 365; `0` keeps them forever). A `retention_cleanup_batch_full` warning means a table had more to remove; the next runs catch up. Free tiers cover a typical personal library, but usage above them is billed to your account. Review connected agents now and then, and revoke the ones you no longer use. Never widen your Access policy to work around a sign-in problem.
+
+Deleted workspaces (workspaces.md#deleting-a-workspace) log ids, counts and error codes only:
+- `workspace_purge` `{marked, recovered, projects_marked, pending, finished}` once per run when any count is non-zero
+  (`recovered`: workspaces whose failed project marking was completed; `pending`: marked workspaces still waiting for
+  their projects to be purged);
+- `workspace_purge_skipped` `{workspaceId, reason: "no_longer_due"}` when a workspace was undone, or marked by
+  another run, between selection and marking;
+- `workspace_purge_failed` `{workspaceId, step: "mark" | "mark_projects" | "recover" | "finish", code}` or
+  `{step: "run", code}`; later runs try again.
+A run marks at most 5 workspaces, completes at most 5 failed project markings and checks at most 10 marked workspaces
+for the finish. A workspace whose marking always fails holds one of the 5 marking slots and is logged every run (five
+such would block the ones behind them). A workspace whose project marking failed is retried by the recovery step, at
+most 5 per run. Ten unfinished workspaces delay only the finish marker of later ones, not the removal of their content.
+
+Content is deleted from 30 days after a workspace is deleted, not exactly then; database rows stay recoverable through
+D1 Time Travel for its retention window, and in any export or backup you made (see workspaces.md for what is deleted
+and what stays).
+
+To undo a workspace deletion:
+`UPDATE workspaces SET status = 'active', deleting_at = NULL WHERE id = '<workspace id>' AND status = 'deleting' AND purge_marked_at IS NULL;`
+(use `'suspended'` if billing had suspended it). 1 row changed = undone; nothing of the workspace was marked. 0 rows:
+the id is wrong, the workspace is not deleting, or it is already marked and cannot be undone; check with
+`SELECT status, deleting_at, purge_marked_at FROM workspaces WHERE id = '<workspace id>';`. Never change `status` of
+a workspace whose `purge_marked_at` is set. Before upgrading to the version with migration 0035, check
+`SELECT id, name FROM workspaces WHERE status = 'deleting'`: those workspaces' 30 days start at the upgrade.
