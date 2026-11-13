@@ -124,7 +124,7 @@ test("connections: publishing apps are separate; only a connected publisher show
   await page.waitForFunction(() => document.querySelectorAll("article.conn").length === 2);
   const cards = await page.$$eval("article.conn", (cs) => Object.fromEntries(cs.map((c) => [c.getAttribute("aria-label"), { badge: c.querySelector(".badge").textContent, access: [...c.querySelectorAll(".conn-access li")].map((l) => l.textContent), text: c.innerText }])));
   assert.equal(cards["Publisher Connected"].badge, "Active");
-  assert.deepEqual(cards["Publisher Connected"].access, ["Soloown folder · no exports yet"]);
+  assert.deepEqual(cards["Publisher Connected"].access, ["Soloown folder"]);
   assert.equal(cards["Publisher Unconnected"].badge, "Registered");
   assert.deepEqual(cards["Publisher Unconnected"].access, []);
   assert.match(cards["Publisher Unconnected"].text, /Not connected to any project yet/);
