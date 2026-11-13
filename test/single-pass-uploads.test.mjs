@@ -14,7 +14,7 @@ import { moduleScript } from "./module-source.mjs";
 
 test("uploads.js: no direct byte buffering or stream hashing; one binary write call site and one plaintext text PUT call site", () => {
   const src = readFileSync(join(ROOT, "packages", "core", "src", "uploads.js"), "utf8");
-  assert.doesNotMatch(src, /DigestStream|sha256HexStream|getBlobBytes|\.arrayBuffer\(\)/);
+  assert.doesNotMatch(src, /DigestStream|getBlobBytes|\.arrayBuffer\(\)/);
   // Stored bytes are read only through content-store's checked readers (readBlob, inspectUploadedBlob, getUploadedText).
   assert.doesNotMatch(src, /\b(?:getBlob|getBlobHead|headBlob|blobSha256Hex)\b/, "a raw R2 reader in uploads.js");
   assert.equal([...src.matchAll(/writeUploadBlob\(/g)].length, 1, "exactly one writeUploadBlob call site (the binary PUT)");

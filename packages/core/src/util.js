@@ -15,13 +15,6 @@ async function sha256Hex(data) {
   const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
   return hex(await crypto.subtle.digest("SHA-256", bytes));
 }
-/** SHA-256 (hex) of a byte stream, consumed chunk by chunk without buffering it (workerd DigestStream). */
-// Unused since single-pass uploads (R2 checks the PUT's sha256); kept for slice 3 (encryption), which hashes plaintext.
-async function sha256HexStream(stream) {
-  const d = new crypto.DigestStream("SHA-256");
-  await stream.pipeTo(d);
-  return hex(await d.digest);
-}
 function json(data, status = 200, headers = {}) {
   return new Response(JSON.stringify(data), {
     status,
@@ -144,4 +137,4 @@ const NEVER_EXPIRES_AT = Date.UTC(9999, 0, 1);
 function errorLogFields(e) {
   return [e?.name ?? typeof e, e?.name === "SyntaxError" ? "" : e?.message];
 }
-export { NEVER_EXPIRES_AT, CHANGE_NOTE_MAX, CHANGE_NOTE_SCHEMA, DRAIN_BYTES, HttpError, b64url, cutLists, errorBody, errorLogFields, hex, idemKey, int, json, mcpClientInfo, nowIso, nowMs, randomId, readTextCapped, rememberClientInfo, sha256Hex, sha256HexStream, str };
+export { NEVER_EXPIRES_AT, CHANGE_NOTE_MAX, CHANGE_NOTE_SCHEMA, DRAIN_BYTES, HttpError, b64url, cutLists, errorBody, errorLogFields, hex, idemKey, int, json, mcpClientInfo, nowIso, nowMs, randomId, readTextCapped, rememberClientInfo, sha256Hex, str };

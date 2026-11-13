@@ -59,11 +59,6 @@ host) carry the request id, the error's name (or its type, if it has none) and i
 `publisher_unhandled` (the publisher and App Connect API) carry the request id and the error's name only. Every reply
 except the content host's includes the same request id as `request_id`.
 
-While a Worker refuses every request because an encryption setting is present ([encryption.md](encryption.md)), the
-15-minute cron keeps running and logs `encryption_unsupported` each run. That includes removing deleted projects and
-workspaces whose 30 days have ended. Owners can't restore anything during that time, because the app refuses them
-too, so remove the setting promptly.
-
 Watch Worker errors and your D1, R2 and KV usage in the Cloudflare dashboard, and check that the 15-minute cleanup job runs. Each run also removes, at most 5,000 rows per table, expired sign-in sessions, idempotency records older than 30 days (a retried request older than that is treated as new) and audit rows older than `AUDIT_RETENTION_DAYS` (default 365; `0` keeps them forever). A `retention_cleanup_batch_full` warning means a table had more to remove; the next runs catch up. Free tiers cover a typical personal library, but usage above them is billed to your account. Review connected agents now and then, and revoke the ones you no longer use. Never widen your Access policy to work around a sign-in problem.
 
 Deleted workspaces (workspaces.md#deleting-a-workspace) log ids, counts and error codes only:

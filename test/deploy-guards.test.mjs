@@ -224,8 +224,8 @@ test('FTS5 virtual indexes are additive only with IF NOT EXISTS; other virtual m
 });
 
 // Forbidden setting names (lib.mjs FORBIDDEN_SETTING_NAMES): refused by name in the target and live, values never shown.
-const FORBIDDEN = ['CONTENT_MASTER_KEY_VERSION', 'CONTENT_ENCRYPTION_REQUIRED', 'CONTENT_MASTER_KEY_V1', 'CONTENT_MASTER_KEY_V12', 'AC_TEST_HOOKS', 'V1_TEST_ENDPOINTS'];
-const NEAR_MISSES = ['CONTENT_HOST', 'CONTENT_MASTER_KEY_VX', 'CONTENT_MASTER_KEY_V', 'CONTENT_MASTER_KEY_V1X', 'XCONTENT_MASTER_KEY_V1', 'CONTENT_MASTER_KEY_VERSIONS', 'AC_TEST_HOOKS_OFF', 'V1_TEST_ENDPOINTS_X'];
+const FORBIDDEN = ['AC_TEST_HOOKS', 'V1_TEST_ENDPOINTS'];
+const NEAR_MISSES = ['CONTENT_HOST', 'AC_TEST_HOOKS_OFF', 'V1_TEST_ENDPOINTS_X'];
 const SENTINEL = 'sentinel-value-must-never-print.invalid';
 const noSentinel = (problems, why) => assert.ok(!problems.join('\n').includes(SENTINEL), `${why}: a value leaked into ${JSON.stringify(problems)}`);
 const namesIt = (problems, name, why) => assert.ok(problems.some((m) => m.includes(name) && /remove it/.test(m)), `${why}: ${JSON.stringify(problems)}`);
@@ -288,7 +288,7 @@ test('an unreadable live binding list refuses instead of passing', () => {
     'no bindings': { resources: { script_runtime: { compatibility_date: target.compatibilityDate } } },
     'bindings not a list': { resources: { bindings: { DB: { type: 'd1' } } } },
     'binding without a name': liveFixture((b) => [...b, { type: 'secret_text' }]),
-    'binding without a type': liveFixture((b) => [...b, { name: 'CONTENT_MASTER_KEY_V1' }]),
+    'binding without a type': liveFixture((b) => [...b, { name: 'AC_TEST_HOOKS' }]),
     'null live': null,
   };
   for (const [why, live] of Object.entries(cases)) assert.deepEqual(checkLiveVersion(live, target), ['live version has no readable binding list (resources.bindings with a name and type each); refusing'], why);

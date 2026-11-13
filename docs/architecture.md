@@ -110,7 +110,7 @@ The Worker is ordinary ES modules in two packages. `packages/core/src/` holds ev
 
 - `packages/core/src/web/*.txt` are the browser assets (UI shell, styles, app script, Home loader, prebuilt CodeMirror editor). They are imported as text and served verbatim; `app.js.txt` has three build-free placeholders filled in `packages/core/src/ui.js`.
 - `packages/core/src/service.js` is the shared service layer used by the browser API, `/v1`, MCP and App Connect. Focused modules split from it: `search/`, `changes/`, `reads/`, `history/`, `templates/`.
-- `packages/core/src/content-store.js` is the only module that touches R2 (`BLOBS`). It still contains unused content-encryption code, reachable only with the encryption settings that make the Worker refuse every request ([encryption.md](encryption.md)).
+- `packages/core/src/content-store.js` is the only module that touches R2 (`BLOBS`). Stored data relies on Cloudflare's at-rest encryption for D1 and R2; Agent Library adds no encryption of its own.
 - `packages/core/src/oauth/` is the OAuth server, consent pages and MCP-over-OAuth; `packages/core/src/api/` holds `/v1`, API keys, app clients and the publisher API.
 
 `npm run check:bundle` builds twice in fresh directories and fails if the outputs differ, if the bundle imports anything but `cloudflare:workers`, or if an installation-specific value appears. The editor bundle's provenance is checked separately (`npm run check:editor`).
@@ -129,7 +129,6 @@ The modules were recovered mechanically from the previous byte-pinned bundle (Ph
 | `lifecycle`: `workspaceCreated`, `workspaceDeleted`, `inviteCreated` | None | Billing customer, invitation email | None |
 | `routes`: `{ method?, path, handler }` | None | Billing, sign-up, legal pages | None |
 | `mailer.send` | Logs only | Not used (invitation email is sent by `lifecycle.inviteCreated`, SendGrid) | Logs only |
-| `keyProvider` | Not supported | Not supported | None. Supplying one makes the Worker refuse every request (`500 encryption_unsupported`; [encryption.md](encryption.md)) |
 
 Not yet adapters (deferred from the plan's interface list): an external `AuditSink`/metrics (phase 5; audits stay in D1), UI slots such as settings tabs (phase 3/4, with the hosted billing UI) and a `workspaceSuspended` hook (core has no suspend operation yet). Core doesn't call `mailer` yet; hosted mail is sent from lifecycle hooks. The plan's `createWorker(config, adapters)` became `createWorker(adapters)`: configuration stays in Worker vars.
 

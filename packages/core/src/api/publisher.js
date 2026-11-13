@@ -440,7 +440,7 @@ async function commit(env, p, id, req, requestId) {
   q.push(env.DB.prepare(`INSERT INTO artifacts (id, project_id, kind, title, folder, folder_id, schema_id, publisher_id, export_name, generation_id, head_rev, head_revision_id, created_at, updated_at)
   SELECT json_extract(j.value, '$.a'), ?, 'json', t.name, '', ?, NULL, ?, t.name, ?, 1, json_extract(j.value, '$.r'), ?, ?
   FROM json_each(?) j JOIN publisher_generation_parts t ON t.publisher_id = ? AND t.generation_id = ? AND t.name = j.key WHERE ${gate}`).bind(p.project_id, p.folder_id ?? null, p.id, id, now, now, idsJson, p.id, id, ...gp));
-  // content-store: sql-side copy of staged part bodies (docs/encryption.md); needs its own change for encryption.
+  // content-store: sql-side copy of staged part bodies (inline, as before the text-in-R2 change).
   q.push(env.DB.prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, size, sha256, mime, created_at, via_kind, via_id, via_label)
   SELECT json_extract(j.value, '$.r'), json_extract(j.value, '$.a'), ?, 1, ?, t.body, t.bytes, t.sha256, 'application/json', ?, 'publisher', ?, ?
   FROM json_each(?) j JOIN publisher_generation_parts t ON t.publisher_id = ? AND t.generation_id = ? AND t.name = j.key WHERE ${gate}`).bind(p.project_id, p.principal_id, now, p.id, String(p.display_name ?? "").slice(0, 120) || null, idsJson, p.id, id, ...gp));

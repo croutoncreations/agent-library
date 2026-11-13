@@ -1,4 +1,4 @@
-import { blobRef, readBlobBytes } from "../content-store.js";
+import { readBlobBytes } from "../content-store.js";
 import { insufficientScope } from "@cloudflare/workers-oauth-provider";
 import { agentRate, limitsFor, rateLimit } from "../auth.js";
 import { byteLength } from "../formats.js";
@@ -404,10 +404,10 @@ async function ftReadFile(c, p, a) {
   const wantInline = canInline && a.include_image !== false;
   const blocks = [];
   if (wantInline) {
-    const row = await db(c).prepare("SELECT blob_key, blob_key_id, blob_header, size FROM revisions WHERE id = ? AND project_id = ?").bind(rev.id, p).first();
+    const row = await db(c).prepare("SELECT blob_key FROM revisions WHERE id = ? AND project_id = ?").bind(rev.id, p).first();
     if (!row?.blob_key) throw new HttpError(500, "blob_missing", "Stored bytes missing");
-    // Buffered (at most FT_INLINE_IMAGE_BYTES) and fully authenticated before any of it is output.
-    const bytes = await readBlobBytes(c.env, await blobRef(c.env, row, { projectId: p, artifactId: a.artifact_id }));
+    // Buffered: at most FT_INLINE_IMAGE_BYTES.
+    const bytes = await readBlobBytes(c.env, row.blob_key);
     blocks.push({ type: "image", data: ftBase64(bytes), mimeType: rev.mime });
   }
   blocks.push({ type: "resource_link", uri: url, name: r.artifact.title, mimeType: rev.mime, size: rev.size, description: "Short-lived download link for this version (expires in minutes; not a share link)" });
@@ -691,5 +691,4 @@ async function handleFileTransfer(req, env, url) {
   }
 }
 
-// ftReadFile is exported for the World test of the encrypted read_file path (test/encrypted-blobs.test.mjs).
-export { ftReadFile, handleFileTransfer, handleOAuthMcp };
+export { handleFileTransfer, handleOAuthMcp };

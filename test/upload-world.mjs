@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { ROOT } from "./helpers.mjs";
 import { loadWorker } from "./load-worker.mjs";
 
-export const lib = await loadWorker({ "uploads.js": ["quotaUsedSql", "uploadBegin", "uploadFinish", "uploadPut", "serveContent"], "cleanup.js": ["reconcileUploads"], "project-deletion.js": ["purgeDueProjects"], "adapters.js": ["withAdapters", "defaultAdapters"], "service.js": ["loadArtifact", "createMarkdown", "saveMarkdown", "saveFile", "restoreRevision", "getArtifact", "updateMetadata"], "templates/service.js": ["saveAsTemplate"], "backup.js": ["exportBackup", "restoreBackup", "importBackup"], "content-store.js": ["blobRef", "readBlob", "readBlobBytes", "writeUploadBlob", "writeBlobBytes", "isBlobWriteError", "inspectUploadedBlob", "blobKeyFits", "dropUnreferencedBlobs", "keyFence", "plaintextFence"], "crypto/keys.js": ["workspaceDataKey", "shredWorkspaceKeys", "withDataKeyMemo"], "oauth/mcp.js": ["ftReadFile"] });
+export const lib = await loadWorker({ "uploads.js": ["quotaUsedSql", "uploadBegin", "uploadFinish", "uploadPut", "serveContent"], "cleanup.js": ["reconcileUploads"], "project-deletion.js": ["purgeDueProjects"], "adapters.js": ["withAdapters", "defaultAdapters"], "service.js": ["loadArtifact", "createMarkdown", "saveMarkdown", "saveFile", "restoreRevision", "getArtifact", "updateMetadata"], "templates/service.js": ["saveAsTemplate"], "backup.js": ["exportBackup", "restoreBackup", "importBackup"], "content-store.js": ["readBlob", "readBlobBytes", "writeUploadBlob", "writeBlobBytes", "isBlobWriteError", "inspectUploadedBlob", "blobKeyFits", "dropUnreferencedBlobs"] });
 // The workerd stream class uploadPut uses, a minimal Node stand-in with workerd's messages: FixedLengthStream (errors
 // unless exactly n bytes).
 globalThis.FixedLengthStream ??= class extends TransformStream {
@@ -19,23 +19,6 @@ globalThis.FixedLengthStream ??= class extends TransformStream {
   }
 };
 
-// workerd's crypto.DigestStream (a WritableStream whose `digest` promise resolves to the ArrayBuffer digest once
-// closed), a minimal Node stand-in for the encrypted PUT path.
-globalThis.crypto.DigestStream ??= class extends WritableStream {
-  constructor(algorithm) {
-    if (algorithm !== "SHA-256") throw new TypeError("stand-in supports SHA-256 only");
-    const hash = createHash("sha256");
-    let resolve, reject;
-    const digest = new Promise((res, rej) => { resolve = res; reject = rej; });
-    super({ write(c) { hash.update(c); }, close() { const d = hash.digest(); resolve(d.buffer.slice(d.byteOffset, d.byteOffset + d.byteLength)); }, abort(e) { reject(e); } });
-    digest.catch(() => {});
-    this.digest = digest;
-  }
-};
-
-/** Synthetic content-encryption settings: a random master key, generated per world, never printed. */
-export const keyVars = () => ({ CONTENT_MASTER_KEY_VERSION: "1", CONTENT_MASTER_KEY_V1: Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64"), CONTENT_ENCRYPTION_REQUIRED: "1" });
-
 export const PNG = Buffer.from("89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000b49444154789c636000020000050001a5f645400000000049454e44ae426082", "hex");
 export const SHA = createHash("sha256").update(PNG).digest("hex");
 export const P = "prj_synthetic";
@@ -43,7 +26,7 @@ export const P = "prj_synthetic";
 /**
  * D1's bind for a list, as workerd's D1 shim does it (probed on local D1): a list whose every element is a number
  * >= 0 and < 256 binds as a BLOB of Uint8Array.from(list) (fractions truncated); any other list throws D1_TYPE_ERROR at
- * bind. Other values pass through unchanged. Pinned by test/encrypted-backup.test.mjs ("the World's D1 double binds lists").
+ * bind. Other values pass through unchanged.
  */
 export function d1BindArray(v) {
   if (!Array.isArray(v)) return v;
@@ -51,8 +34,7 @@ export function d1BindArray(v) {
   throw new Error(`D1_TYPE_ERROR: Type 'object' not supported for value '${v}'`);
 }
 
-/** encryption: add synthetic key vars (keyVars) to env. */
-export function world({ encryption = false } = {}) {
+export function world() {
   const sql = new DatabaseSync(":memory:");
   for (const f of readdirSync(join(ROOT, "migrations")).filter((f) => f.endsWith(".sql")).sort()) sql.exec(readFileSync(join(ROOT, "migrations", f), "utf8"));
   // beforeBatch runs before BEGIN (reject before the commit); afterBatch runs after COMMIT (throw after the commit).
@@ -112,8 +94,8 @@ export function world({ encryption = false } = {}) {
   const at = new Date().toISOString();
   sql.prepare("INSERT INTO principals (id, kind, issuer, subject, label, created_at) VALUES ('hum_synthetic','human','synthetic','owner','Synthetic owner',?)").run(at);
   sql.prepare("INSERT INTO projects (id, owner_id, title, created_at) VALUES (?,'hum_synthetic','Synthetic project',?)").run(P, at);
-  // With the default adapters attached, as createWorker does for every request (encryptionEnabled needs them).
-  const env = lib.withAdapters({ DB, BLOBS, ...encryption ? keyVars() : {} }, lib.defaultAdapters());
+  // With the default adapters attached, as createWorker does for every request.
+  const env = lib.withAdapters({ DB, BLOBS }, lib.defaultAdapters());
   const ctx = { env, principal: { id: "hum_synthetic", kind: "human", label: "Synthetic owner" }, requestId: "req_synthetic" };
   let n = 0;
   const upload = ({ state = "received", expiresAt = Date.now() + 900000 } = {}) => {

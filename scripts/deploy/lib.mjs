@@ -31,12 +31,10 @@ export const loadExampleWrangler = (root = '.') => parseToml(readFileSync(join(r
 const PLACEHOLDER = /^0+(-0+)*$|^replace-with-|example\.(com|net|org)$/;
 
 // Setting names an installation must never have, checked by name only (a value is never read, logged or stored):
-// content encryption, which the Worker refuses on every request (encryptionSetting in packages/core/src/index.js;
-// docs/encryption.md), and the test switches that act only on localhost. Refused whatever the value, even
-// CONTENT_ENCRYPTION_REQUIRED = "0": none of these names has a use on an installation. The deploy never removes one.
-export const FORBIDDEN_SETTING_NAMES = ['CONTENT_MASTER_KEY_VERSION', 'CONTENT_ENCRYPTION_REQUIRED', 'AC_TEST_HOOKS', 'V1_TEST_ENDPOINTS'];
-const FORBIDDEN_MASTER_KEY = /^CONTENT_MASTER_KEY_V\d+$/;
-export const isForbiddenSetting = (name) => FORBIDDEN_SETTING_NAMES.includes(name) || FORBIDDEN_MASTER_KEY.test(name);
+// the test switches that act only on localhost. Refused whatever the value: none of these names has a use on an
+// installation. The deploy never removes one.
+export const FORBIDDEN_SETTING_NAMES = ['AC_TEST_HOOKS', 'V1_TEST_ENDPOINTS'];
+export const isForbiddenSetting = (name) => FORBIDDEN_SETTING_NAMES.includes(name);
 const forbiddenSetting = (where, name) => `${where} has ${name}, a setting this release must never have: remove it (the deploy never removes or changes it for you)`;
 const withoutForbidden = (vars) => Object.fromEntries(Object.entries(vars ?? {}).filter(([k]) => !isForbiddenSetting(k)));
 

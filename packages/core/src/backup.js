@@ -1,6 +1,6 @@
 import { TEXT_MAX_BYTES } from "./text-limits.js";
 import { personalWorkspaceId } from "./tenancy.js";
-import { blobKeyFits, blobPrefix, blobRef, commitTextWrites, deleteBlobs, dropUnreferencedBlobs, fenceRefusal, getText, isTextWriteFenceError, keyFence, mapContent, plaintextFence, readBlobBytes, stageTextWrites, storedText, textKey, textWriteComplete, writeBlobBytes } from "./content-store.js";
+import { blobKeyFits, blobPrefix, commitTextWrites, deleteBlobs, dropUnreferencedBlobs, getText, isTextWriteFenceError, mapContent, readBlobBytes, stageTextWrites, storedText, textKey, textWriteComplete, writeBlobBytes } from "./content-store.js";
 import { textSearchBridge } from "./search/service.js";
 import { limitsFor, requireHuman } from "./auth.js";
 import { BINARY_TYPES, LIMITS, tplDate } from "./service.js";
@@ -37,14 +37,14 @@ async function exportBackup(ctx, projectId) {
   if (textBytes > BACKUP_EXPORT_TEXT_BYTES) throw new HttpError(413, "backup_too_large", "This project's text versions exceed 32 MiB for a single backup. Download documents individually or export a smaller project.");
   const [arts, revs, comments] = await DB.batch([
     DB.prepare("SELECT id, kind, title, folder, tags, head_rev, head_revision_id, meta_version, trashed_at, created_at, updated_at, is_template, template_description, source_artifact_id, source_revision, source_role, template_date FROM artifacts WHERE project_id = ? AND head_rev > 0").bind(projectId),
-    DB.prepare("SELECT id, artifact_id, rev_no, author_id, body, body_key, blob_key, blob_key_id, blob_header, size, sha256, mime, restored_from, created_at, via_kind, via_id, via_label, client_info, change_note FROM revisions WHERE project_id = ?").bind(projectId),
+    DB.prepare("SELECT id, artifact_id, rev_no, author_id, body, body_key, blob_key, size, sha256, mime, restored_from, created_at, via_kind, via_id, via_label, client_info, change_note FROM revisions WHERE project_id = ?").bind(projectId),
     DB.prepare("SELECT id, artifact_id, rev_no, author_id, body, body_key, created_at FROM comments WHERE project_id = ?").bind(projectId),
     DB.prepare("SELECT id, artifact_id, version, title, folder, tags, trashed, author_id, via_kind, via_id, via_label, client_info, change_note, restored_from, created_at, template_description FROM meta_versions WHERE project_id = ?").bind(projectId)
   ]).then(([a, r, c, mv]) => (metaVersionsExport = mv.results, [a, r, c]));
   const blobs = {};
   for (const r of revs.results) {
     if (!r.blob_key || blobs[r.blob_key]) continue;
-    const bytes = await readBlobBytes(ctx.env, await blobRef(ctx.env, r, { projectId, artifactId: r.artifact_id }));
+    const bytes = await readBlobBytes(ctx.env, r.blob_key);
     const sha2 = await sha256Hex(bytes);
     if (sha2 !== r.sha256) throw new HttpError(500, "blob_corrupt", "Stored blob hash mismatch");
     blobs[r.blob_key] = { sha256: sha2, data: b64(bytes) };
@@ -56,8 +56,7 @@ async function exportBackup(ctx, projectId) {
     exported_at: nowIso(),
     project: { id: p.id, title: p.title, created_at: p.created_at },
     artifacts: arts.results,
-    // The format is unchanged: blobs are plaintext, and the encryption columns stay in this database.
-    revisions: await mapContent(revs.results, async ({ body_key, blob_key_id, blob_header, ...r }) => ({ ...r, body: r.blob_key ? null : await getText(ctx.env, { ...r, body_key }) })),
+    revisions: await mapContent(revs.results, async ({ body_key, ...r }) => ({ ...r, body: r.blob_key ? null : await getText(ctx.env, { ...r, body_key }) })),
     comments: await mapContent(comments.results, async ({ body_key, ...c }) => ({ ...c, body: await getText(ctx.env, { ...c, body_key }) })),
     meta_versions: metaVersionsExport,
     blobs
@@ -174,40 +173,32 @@ async function storedDocumentIds(DB, backup) {
   }
   return stored;
 }
-/** Every storage key an attempt will write must fit the encrypted format's object-key limit (checked before any put). */
+/** Every storage key an attempt will write must fit R2's object-key limit (checked before any put). */
 function checkKeysFit(keys) {
   for (const k of keys) if (!blobKeyFits(k)) throw new HttpError(400, "bad_backup", "A file key is too long");
 }
 const CONSTRAINT = /FOREIGN KEY|UNIQUE|PRIMARY KEY|NOT NULL constraint|CHECK constraint/;
 /**
- * Write a backup's file objects, then publish them in ONE batch with the fences last (docs/encryption.md), and clean
- * up by phase and source of a failure, never by a later exception's text:
- *  - failure before the batch is sent (an object write, a statement build, a fence): delete every object written;
- *  - the batch call itself rejected with a fence refusal, the text deadline or a constraint error (D1 rolled it
- *    back), or the caller reports it resolved without publishing: delete only the written keys no revision refers to;
+ * Write a backup's file objects, then publish them in ONE batch, and clean up by phase and source of a failure, never
+ * by a later exception's text:
+ *  - failure before the batch is sent (an object write, a statement build): delete every object written;
+ *  - the batch call itself rejected with the text deadline or a constraint error (D1 rolled it back), or the caller
+ *    reports it resolved without publishing: delete only the written keys no revision refers to;
  *  - anything else may have committed (a lost acknowledgement): delete nothing, log backup_cleanup_skipped.
- * objects: [[key, bytes, contentType]] with explicit workspaceId; build(descriptors) returns the statements (the revision
- * INSERTs bind descriptors.get(key).keyId/header). Returns { res } or { error, batchError, cleanup(published) }.
+ * objects: [[key, bytes]]; build() returns the statements. Returns { res } or { error, batchError, cleanup(published) }.
  */
-async function publishBackup(env, { objects, workspaceId, textKeys, build }) {
-  const written = [], descriptors = new Map();
+async function publishBackup(env, { objects, textKeys, build }) {
+  const written = [];
   let sent = false, batchError = null;
   const log = (reason, count) => console.error(JSON.stringify({ event: "backup_cleanup_skipped", count, reason }));
   // Outcome 2: settled as not published. dropUnreferencedBlobs never throws (it logs and deletes nothing on failure).
   const dropSettled = () => dropUnreferencedBlobs(env, written);
   try {
-    for (const [key, bytes, contentType] of objects) {
-      descriptors.set(key, await writeBlobBytes(env, { key, bytes, contentType, workspaceId }));
+    for (const [key, bytes] of objects) {
+      await writeBlobBytes(env, { key, bytes });
       written.push(key);
     }
-    const pairs = new Set(), fences = [];
-    let plain = false;
-    for (const d of descriptors.values()) {
-      if (d.keyId === null) plain = true;
-      else if (!pairs.has(d.keyId)) { pairs.add(d.keyId); fences.push(keyFence(env, { keyId: d.keyId, workspaceId })); }
-    }
-    if (plain) fences.push(plaintextFence(env));
-    const all = [...build(descriptors), ...fences];
+    const all = build();
     const res = await commitTextWrites(env, textKeys, (guarded) => {
       // Addendum: build the guarded statements, THEN mark the batch as sent, then send it.
       const guardedStmts = guarded(all);
@@ -219,9 +210,9 @@ async function publishBackup(env, { objects, workspaceId, textKeys, build }) {
     if (!sent) {
       // Only file objects are deleted here. Text staged before this call (stageTextWrites) stays with its
       // content_writes intents: unreferenced, it is reclaimed by the content-writes sweep (cleanup.js
-      // sweepContentWrites) once older than TEXT_WRITE_STALE_MS. Pinned by test/encrypted-backup.test.mjs.
+      // sweepContentWrites) once older than TEXT_WRITE_STALE_MS.
       try { await deleteBlobs(env, written); } catch { log("delete_failed", written.length); }
-    } else if (batchError && (fenceRefusal(batchError) || isTextWriteFenceError(batchError) || CONSTRAINT.test(String(batchError?.message ?? batchError)))) {
+    } else if (batchError && (isTextWriteFenceError(batchError) || CONSTRAINT.test(String(batchError?.message ?? batchError)))) {
       await dropSettled();
     } else if (written.length) {
       log("outcome_unknown", written.length);
@@ -247,10 +238,9 @@ async function restoreBackup(ctx, backup) {
   // IDs stay stable, but each attempt owns fresh immutable objects, even after a lost acknowledgement: text keys carry
   // the attempt segment, file keys end in _<attempt> (not stripped: stripping could make x and x_restore_… collide).
   const attempt = randomId("restore");
-  // Each file object is written under the revision's OWN document (blobs/<project>/<document>/…), which every read
-  // checks before decrypting (blobPrefix: the document id as stored, URI-encoded). Export never pairs a revision with
-  // another document's key, but restore accepted such a hand-made pair before (its plaintext read did not check the
-  // prefix), and accepted any document id, so it must keep restoring both: when the key's document segment is the
+  // Each file object is written under the revision's OWN document (blobs/<project>/<document>/…; blobPrefix: the
+  // document id as stored, URI-encoded). Export never pairs a revision with another document's key, but restore
+  // accepted such a hand-made pair before, and accepted any document id, so it must keep restoring both: when the key's document segment is the
   // revision's stored document id (always a [A-Za-z0-9_-] segment, which encoding leaves unchanged) the key keeps
   // today's name (`<key>_<attempt>`); otherwise the object is copied to a fresh name under the revision's own
   // document's prefix, once per (source key, document).
@@ -274,7 +264,7 @@ async function restoreBackup(ctx, backup) {
   for (const r of backup.revisions) if (r.blob_key === null) textKey(pid, r.artifact_id, r.id, attempt);
   for (const c of backup.comments) textKey(pid, c.artifact_id, c.id, attempt);
   checkKeysFit(new Set(targets.values()));
-  // The restored project is the principal's personal workspace's, so its files go under that workspace's key.
+  // The restored project is the principal's personal workspace's.
   const workspaceId = personalWorkspaceId(ctx.principal.id);
   const authors = new Set([...backup.revisions, ...backup.comments, ...backup.meta_versions ?? []].map((x) => x.author_id));
   const head = [];
@@ -284,8 +274,7 @@ async function restoreBackup(ctx, backup) {
   for (const a of backup.artifacts)
     head.push(DB.prepare(`INSERT INTO artifacts (id, project_id, kind, title, folder, tags, head_rev, head_revision_id, meta_version, trashed_at, created_at, updated_at, is_template, template_description, source_artifact_id, source_revision, source_role, template_date)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(a.id, pid, a.kind, a.title, a.folder, a.tags, a.head_rev, a.head_revision_id, a.meta_version, a.trashed_at, a.created_at, a.updated_at, a.is_template ?? 0, a.template_description ?? "", a.source_artifact_id ?? null, a.source_revision ?? null, a.source_role ?? null, a.template_date ?? null));
-  // Split revision loop, part 1: text keys, text writes and bridges before stageTextWrites. Only the revision INSERTs
-  // wait for the file writes (they bind each object's key id and header).
+  // Revision loop, part 1: text keys, text writes and bridges before stageTextWrites.
   const textKeys = [], textWrites = [], bridges = [], bodyKeys = new Map();
   for (const r of backup.revisions) {
     if (r.blob_key) continue;
@@ -307,14 +296,12 @@ async function restoreBackup(ctx, backup) {
   tail.push(DB.prepare("INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id) VALUES (?, ?, ?, 'backup.restore', ?, 'ok', ?)").bind(nowIso(), ctx.principal.id, pid, pid, ctx.requestId));
   await stageTextWrites(ctx.env, textWrites);
   const objects = new Map();
-  for (const r of fileRevisions) if (!objects.has(restoreKey(r))) objects.set(restoreKey(r), [restoreKey(r), decoded.get(r.blob_key), r.mime]);
+  for (const r of fileRevisions) if (!objects.has(restoreKey(r))) objects.set(restoreKey(r), [restoreKey(r), decoded.get(r.blob_key)]);
   const out = await publishBackup(ctx.env, {
-    objects: [...objects.values()], workspaceId, textKeys,
-    // Split revision loop, part 2: the revision INSERTs, binding each object's descriptor (never the backup's fields).
-    build: (descriptors) => [...head, ...backup.revisions.map((r) => {
-      const d = r.blob_key ? descriptors.get(restoreKey(r)) : null;
-      return DB.prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, body_key, blob_key, blob_key_id, blob_header, size, sha256, mime, restored_from, created_at, via_kind, via_id, via_label, client_info, change_note)
-      VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(r.id, r.artifact_id, pid, r.rev_no, r.author_id, bodyKeys.get(r.id) ?? null, r.blob_key ? restoreKey(r) : null, d?.keyId ?? null, d?.header ?? null, r.size, r.sha256, r.mime, r.restored_from ?? null, r.created_at, r.via_kind ?? null, r.via_id ?? null, r.via_label ?? null, r.client_info ?? null, r.change_note ?? null);
+    objects: [...objects.values()], textKeys,
+    build: () => [...head, ...backup.revisions.map((r) => {
+      return DB.prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, body_key, blob_key, size, sha256, mime, restored_from, created_at, via_kind, via_id, via_label, client_info, change_note)
+      VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(r.id, r.artifact_id, pid, r.rev_no, r.author_id, bodyKeys.get(r.id) ?? null, r.blob_key ? restoreKey(r) : null, r.size, r.sha256, r.mime, r.restored_from ?? null, r.created_at, r.via_kind ?? null, r.via_id ?? null, r.via_label ?? null, r.client_info ?? null, r.change_note ?? null);
     }), ...tail, ...bridges],
   });
   if (out.error) {
@@ -427,7 +414,7 @@ async function importBackup(ctx, workspaceId, input, idemKeyValue, digest = "") 
     return `blobs/${pid}/${artId.get(m[2])}/${m[3]}`;
   };
   const keyMap = new Map([...decoded.keys()].map((k) => [k, newKey(k)]));
-  // A file version's key must lie in its own document (reads check that prefix before decrypting). Export never
+  // A file version's key must lie in its own document. Export never
   // produces another pairing; a hand-made backup that does is refused before anything is written.
   for (const r of backup.revisions) if (r.blob_key !== null && !keyMap.get(r.blob_key).startsWith(blobPrefix(pid, artId.get(r.artifact_id))))
     throw new HttpError(400, "bad_backup", "A file key does not match its document");
@@ -451,8 +438,7 @@ async function importBackup(ctx, workspaceId, input, idemKeyValue, digest = "") 
     stmts.push(DB.prepare(`INSERT INTO artifacts (id, project_id, kind, title, folder, tags, head_rev, head_revision_id, meta_version, trashed_at, created_at, updated_at, is_template, template_description, source_artifact_id, source_revision, source_role, template_date)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(artId.get(a.id), pid, a.kind, a.title, a.folder ?? "", a.tags ?? "[]", a.head_rev, revId.get(a.head_revision_id) ?? null, a.meta_version, a.trashed_at ?? null, a.created_at, a.updated_at, a.is_template ?? 0, a.template_description ?? "", src ? artId.get(a.source_artifact_id) : null, src ? a.source_revision : null, src ? a.source_role : null, a.template_date ?? null));
   }
-  // Split revision loop, part 1: text keys, text writes and bridges are computed before stageTextWrites (moving the
-  // whole loop after the file writes would leave text intents unstaged). Only the revision INSERTs are built later.
+  // Text keys, text writes and bridges are computed before stageTextWrites.
   const textKeys = [], textWrites = [];
   const bridges = [], bodyKeys = new Map();
   for (const r of backup.revisions) {
@@ -463,8 +449,8 @@ async function importBackup(ctx, workspaceId, input, idemKeyValue, digest = "") 
     textWrites.push({ projectId: pid, artifactId: aid, revisionId: rid, text: r.body });
     textKeys.push(bodyKey); bridges.push(textSearchBridge(ctx.env, aid, rid, r.body), textWriteComplete(ctx.env, bodyKey));
   }
-  const revisionStmt = (r, d) => DB.prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, body_key, blob_key, blob_key_id, blob_header, size, sha256, mime, restored_from, created_at, via_kind, via_id, via_label, client_info, change_note)
-      VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(revId.get(r.id), artId.get(r.artifact_id), pid, r.rev_no, me, bodyKeys.get(r.id) ?? null, r.blob_key === null ? null : keyMap.get(r.blob_key), d?.keyId ?? null, d?.header ?? null, r.size, r.sha256, r.mime, r.restored_from ?? null, r.created_at, r.via_kind ?? null, null, r.via_label ? `${r.via_label} (imported)` : "imported", r.client_info ?? null, r.change_note ?? null);
+  const revisionStmt = (r) => DB.prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, body_key, blob_key, size, sha256, mime, restored_from, created_at, via_kind, via_id, via_label, client_info, change_note)
+      VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(revId.get(r.id), artId.get(r.artifact_id), pid, r.rev_no, me, bodyKeys.get(r.id) ?? null, r.blob_key === null ? null : keyMap.get(r.blob_key), r.size, r.sha256, r.mime, r.restored_from ?? null, r.created_at, r.via_kind ?? null, null, r.via_label ? `${r.via_label} (imported)` : "imported", r.client_info ?? null, r.change_note ?? null);
   const head = stmts.splice(0);
   for (const v of backup.meta_versions ?? [])
     stmts.push(DB.prepare(`INSERT INTO meta_versions (id, artifact_id, project_id, version, title, folder, tags, trashed, author_id, via_kind, via_id, via_label, client_info, change_note, restored_from, created_at, template_description)
@@ -481,12 +467,10 @@ async function importBackup(ctx, workspaceId, input, idemKeyValue, digest = "") 
   if (idemKeyValue) stmts.push(DB.prepare(`INSERT INTO idempotency (principal_id, project_id, op, key, digest, status, response, created_at) SELECT ?, ?, 'backup.import', ?, ?, 201, ?, ? WHERE ${exists}`)
     .bind(me, workspaceId, idemKeyValue, digest, JSON.stringify(result), at, pid));
   await stageTextWrites(ctx.env, textWrites);
-  // The file bytes go under the authorized target workspace's key (never anything named in the backup).
-  const mimeOf = new Map(backup.revisions.filter((r) => r.blob_key).map((r) => [r.blob_key, r.mime]));
   const out = await publishBackup(ctx.env, {
-    objects: [...decoded].map(([k, bytes]) => [keyMap.get(k), bytes, mimeOf.get(k)]), workspaceId, textKeys,
-    // res[0] stays the project INSERT: head[0] is it, and the fences go last.
-    build: (descriptors) => [...head, ...backup.revisions.map((r) => revisionStmt(r, r.blob_key === null ? null : descriptors.get(keyMap.get(r.blob_key)))), ...stmts, ...bridges],
+    objects: [...decoded].map(([k, bytes]) => [keyMap.get(k), bytes]), textKeys,
+    // res[0] stays the project INSERT: head[0] is it.
+    build: () => [...head, ...backup.revisions.map(revisionStmt), ...stmts, ...bridges],
   });
   if (out.error) {
     const m = String(out.batchError?.message ?? out.batchError ?? "");
