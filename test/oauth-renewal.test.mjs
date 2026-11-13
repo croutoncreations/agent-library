@@ -17,17 +17,18 @@ class KV {
  async delete(k){this.rows.delete(k);}
  async list({prefix='' }={}){return {keys:[...this.rows.keys()].filter(k=>k.startsWith(prefix)).map(name=>({name})),list_complete:true};}
 }
-async function fixture({publisher=false}={}){
+async function fixture({publisher=false,before,expectIssued=200}={}){
  const origin='https://library-'+crypto.randomUUID()+'.example.test',resource=origin+'/mcp',redirect='http://127.0.0.1/callback';
  const connection={id:'oac_synthetic12345',owner_principal_id:'human',revoked_at:null,expires_at:Date.now()+30*86400000};
  let fail,revokedDuringRenewal=false;
+ let clientDisabled=null;
  const claims=new Map();
  const DB={prepare(q){return {bind(...p){return {async first(){
   if(q.includes('rate_counters'))return 1;
   if(q.includes('UPDATE oauth_code_redemptions')){const old=claims.get(p[1]);if(old===undefined||old>p[2])return null;claims.set(p[1],p[0]);return {code_hash:p[1]};}
   const stage=q.startsWith('UPDATE')?'renew':'read';if(fail===stage)throw Error('synthetic database outage');
   if(q.startsWith('UPDATE')){if(revokedDuringRenewal)connection.revoked_at=1;if(connection.revoked_at!==null||connection.expires_at<=p[2])return null;connection.expires_at=p[0];return {id:connection.id};}
-  if(q.includes('FROM publishers'))return {id:'pub_synthetic12345',revoked_at:connection.revoked_at,token_epoch:1};
+  if(q.includes('FROM publishers'))return {id:'pub_synthetic12345',revoked_at:connection.revoked_at,token_epoch:1,client_disabled:clientDisabled};
   return {...connection};
  },async run(){
   if(q.startsWith('INSERT INTO oauth_code_redemptions')){if(claims.has(p[0]))return {meta:{changes:0}};claims.set(p[0],p[1]);return {meta:{changes:1}};}
@@ -38,9 +39,11 @@ async function fixture({publisher=false}={}){
  const verifier='v'.repeat(64),challenge=createHash('sha256').update(verifier).digest('base64url');
  const complete=await api.completeAuthorization({request:{clientId:client.clientId,redirectUri:redirect,responseType:'code',resource,scope:['agentlib:read','offline_access'],codeChallenge:challenge,codeChallengeMethod:'S256',state:'synthetic'},userId:connection.id,metadata:{},scope:['agentlib:read','offline_access'],props:publisher?{publisher_id:'pub_synthetic12345',epoch:1}:{connection_id:connection.id}});
  const send=async fields=>{const response=await handleOAuthHost(new Request(origin+'/oauth/token',{method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},body:new URLSearchParams({client_id:client.clientId,resource,...fields})}),env,{},new URL(origin).host);return {status:response.status,body:await response.json(),retryAfter:response.headers.get('retry-after')};};
+ const disableClient=()=>{clientDisabled='2026-11-12T00:00:00.000Z';};
+ if(before)await before({setFailure:v=>{fail=v;},disableClient});
  const issued=await send({grant_type:'authorization_code',code:new URL(complete.redirectTo).searchParams.get('code'),code_verifier:verifier,redirect_uri:redirect});
- assert.equal(issued.status,200,JSON.stringify(issued.body));
- return {env,connection,issued,as,client,send,claims,expireClaims:()=>{for(const [key,value] of claims)claims.set(key,value-300001);},setFailure:v=>{fail=v;},raceRevocation:()=>{revokedDuringRenewal=true;},refresh:token=>send({grant_type:'refresh_token',refresh_token:token??issued.body.refresh_token})};
+ assert.equal(issued.status,expectIssued,JSON.stringify(issued.body));
+ return {env,connection,issued,as,client,send,claims,expireClaims:()=>{for(const [key,value] of claims)claims.set(key,value-300001);},setFailure:v=>{fail=v;},raceRevocation:()=>{revokedDuringRenewal=true;},disableClient,refresh:token=>send({grant_type:'refresh_token',refresh_token:token??issued.body.refresh_token})};
 }
 for(const stage of ['read','projects','renew'])test('temporary '+stage+' failure preserves the grant and original refresh token',async()=>{
  const f=await fixture();f.setFailure(stage);
@@ -84,4 +87,29 @@ test('confirmed revocation takes priority over a pending refresh claim',async()=
  const f=await fixture({publisher:true});f.setFailure('read');assert.equal((await f.refresh()).status,503);
  f.setFailure(undefined);f.connection.revoked_at=1;
  const revoked=await f.refresh();assert.equal(revoked.status,400);assert.equal(revoked.body.error,'invalid_grant');
+});
+
+// Addendum B (5a commit 1): a disabled app's publisher connections end at the next renewal or code exchange.
+test("a disabled app's publisher cannot refresh: invalid_grant, App disabled by the owner; the grant is gone",async()=>{
+ const f=await fixture({publisher:true});
+ assert.ok([...f.env.OAUTH_KV.rows.keys()].some(k=>k.startsWith('grant:')),'a grant exists before the refresh');
+ f.disableClient();
+ const r=await f.refresh();assert.equal(r.status,400);assert.equal(r.body.error,'invalid_grant');assert.equal(r.body.error_description,'App disabled by the owner');
+ assert.ok(![...f.env.OAUTH_KV.rows.keys()].some(k=>k.startsWith('grant:')),'the library revoked the grant on invalid_grant');
+ const again=await f.refresh();assert.equal(again.status,400);assert.equal(again.body.error,'invalid_grant');
+});
+test('revoked wins over disabled on refresh',async()=>{
+ const f=await fixture({publisher:true});f.connection.revoked_at=1;f.disableClient();
+ const r=await f.refresh();assert.equal(r.status,400);assert.equal(r.body.error,'invalid_grant');assert.equal(r.body.error_description,'Publisher revoked or token superseded');
+});
+test('a storage error during the disabled check on code exchange still issues tokens (fail open), and the next refresh is refused once storage answers',async()=>{
+ const f=await fixture({publisher:true,before:({setFailure,disableClient})=>{disableClient();setFailure('read');}});
+ assert.equal(f.issued.status,200);assert.ok(f.issued.body.refresh_token);
+ f.setFailure(undefined);
+ const r=await f.refresh();assert.equal(r.status,400);assert.equal(r.body.error,'invalid_grant');assert.equal(r.body.error_description,'App disabled by the owner');
+});
+test('a code minted before the disable cannot be exchanged after it',async()=>{
+ const f=await fixture({publisher:true,expectIssued:400,before:({disableClient})=>{disableClient();}});
+ assert.equal(f.issued.body.error,'invalid_grant');assert.equal(f.issued.body.error_description,'App disabled by the owner');
+ assert.equal(f.issued.body.access_token,undefined);assert.equal(f.issued.body.refresh_token,undefined);
 });
