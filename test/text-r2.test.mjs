@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { putText, getText, getTextRange, textKey } from "../packages/core/src/content-store.js";
+import { putText, getText, getTextPrefix, getTextRange, textKey } from "../packages/core/src/content-store.js";
 import { DatabaseSync } from "node:sqlite";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
@@ -9,6 +9,10 @@ import { loadWorker } from "./load-worker.mjs";
 import { SERVER_PORTS } from "./ports.mjs";
 import { MARKDOWN_PREVIEW_MAX_BYTES } from "../packages/core/src/text-limits.js";
 import { commitTextWrites, isTextWriteFenceError } from "../packages/core/src/content-store.js";
+
+// Documents the index currently matches for a word, as search joins them (current revision, hash and title).
+const hits = (sql, word) => sql.prepare(`SELECT COUNT(*) AS n FROM artifact_search s JOIN artifact_search_keys k ON k.search_id = s.rowid JOIN artifacts a ON a.id = k.artifact_id
+  JOIN revisions r ON r.id = a.head_revision_id WHERE artifact_search MATCH ? AND a.trashed_at IS NULL AND k.revision_id = r.id AND k.sha256 = r.sha256 AND k.indexed_title = a.title`).get(word).n;
 
 async function harness() {
   const lib = await loadWorker({ "service.js": ["createMarkdown", "saveMarkdown", "getArtifact", "restoreRevision", "updateMetadata", "listArtifacts", "addComment", "listComments"], "reads/service.js": ["readTextChunk"], "uploads.js": ["serveContent"], "history/service.js": ["diffRevisions"], "backup.js": ["exportBackup", "restoreBackup", "importBackup"], "cleanup.js": ["reconcileUploads"], "project-deletion.js": ["purgeDueProjects"], "render-source.js": ["getRenderSource"], "content-store.js": ["stageTextWrites", "commitTextWrites"], "adapters.js": ["withAdapters", "defaultAdapters"] });
@@ -26,26 +30,48 @@ async function harness() {
   return { lib, sql, ctx, env, objects };
 }
 
-test("search bridge caps UTF-8 at 1 MiB on real local D1 (known suffix search gap)", async () => {
+test("indexDocument caps indexed text at 1 MiB (UTF-8) on real local D1; the suffix is not searchable", async () => {
   const { Miniflare, convertV4MiniflareOptions } = await import("miniflare");
   const mf = new Miniflare(convertV4MiniflareOptions({ port: SERVER_PORTS["text-r2"], name: "bridge-bound", modules: true, script: "export default { fetch() { return new Response('test'); } }", compatibilityDate: "2026-10-24", d1Databases: { DB: "bridge-bound" } }));
   try {
     const DB = await mf.getD1Database("DB");
+    // The real migrations, so the real contentless table, keys and the completeness view.
+    const migrations = readdirSync(join(ROOT, "migrations")).filter(f => f.endsWith(".sql")).sort();
+    for (const f of migrations) await DB.exec(readFileSync(join(ROOT, "migrations", f), "utf8").replace(/--[^\n]*\n/g, "").replace(/\s*\n\s*/g, " "));
     await DB.batch([
-      DB.prepare("CREATE TABLE artifact_search (rowid INTEGER PRIMARY KEY, body TEXT, revision_id TEXT)"),
-      DB.prepare("CREATE TABLE artifact_search_keys (artifact_id TEXT, search_id INTEGER)"),
-      DB.prepare("CREATE TABLE artifacts (id TEXT, head_revision_id TEXT)"),
-      DB.prepare("INSERT INTO artifact_search (rowid, body, revision_id) VALUES (1, '', 'r')"),
-      DB.prepare("INSERT INTO artifact_search_keys (artifact_id, search_id) VALUES ('a', 1)"),
-      DB.prepare("INSERT INTO artifacts (id, head_revision_id) VALUES ('a', 'r')")
+      DB.prepare("INSERT INTO principals (id, kind, issuer, subject, label, created_at) VALUES ('p','human','synthetic','p','P','2026-01-01')"),
+      DB.prepare("INSERT INTO projects (id, owner_id, title, created_at) VALUES ('proj','p','P','2026-01-01')"),
+      DB.prepare("INSERT INTO artifacts (id, project_id, kind, title, head_rev, head_revision_id, created_at, updated_at) VALUES ('a','proj','markdown','Cap title',1,'r','2026-01-01','2026-01-01')"),
+      DB.prepare("INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, size, sha256, mime, created_at) VALUES ('r','a','proj',1,'p','',1,'h','text/markdown','2026-01-01')")
     ]);
-    const lib = await loadWorker({ "search/service.js": ["textSearchBridge"] });
+    const lib = await loadWorker({ "search/indexing.js": ["indexDocument", "unindexDocument", "unindexMany"] });
     const prefix = "firstneedle " + "a".repeat(1048576 - 14);
-    await lib.textSearchBridge({ DB }, "a", "r", prefix + "🙂 suffixneedle " + "z".repeat(3 * 1048576)).run();
-    const stored = await DB.prepare("SELECT body FROM artifact_search").first("body");
-    assert.equal(stored, prefix);
-    assert.ok(Buffer.byteLength(stored) <= 1048576);
-    assert.ok(!stored.includes("\ufffd"));
+    await DB.batch(lib.indexDocument(DB, { artifactId: "a", revisionId: "r", sha256: "h", text: prefix + "\u{1F642} suffixneedle " + "z".repeat(3 * 1048576) }));
+    const found = async (w) => (await DB.prepare("SELECT COUNT(*) AS n FROM artifact_search WHERE artifact_search MATCH ?").bind(w).first("n"));
+    assert.equal(await found("firstneedle"), 1);
+    assert.equal(await found("suffixneedle"), 0);
+    assert.equal(await found("cap"), 1, "the title is indexed");
+    assert.equal(await DB.prepare("SELECT COUNT(*) AS n FROM artifact_search_missing").first("n"), 0);
+    // contentless_delete=1 on D1's SQLite: re-indexing the same document removes its previous words.
+    await DB.batch(lib.indexDocument(DB, { artifactId: "a", revisionId: "r", sha256: "h", text: "replacementneedle" }));
+    assert.equal(await found("firstneedle"), 0);
+    assert.equal(await found("replacementneedle"), 1);
+    assert.equal(await found("cap"), 1);
+    await DB.batch(lib.unindexDocument(DB, "a"));
+    assert.equal(await found("replacementneedle"), 1, "still an untrashed head: unindexDocument leaves it");
+    // A project's purge removes entries whatever their state, a bounded number at a time.
+    await DB.batch(lib.unindexMany(DB, "a.project_id = ?1", ["other", 10], "?2"));
+    assert.equal(await found("replacementneedle"), 1, "another project's purge leaves it");
+    await DB.batch(lib.unindexMany(DB, "a.project_id = ?1", ["proj", 10], "?2"));
+    assert.equal(await found("replacementneedle"), 0);
+    assert.equal(await DB.prepare("SELECT COUNT(*) AS n FROM artifact_search_keys").first("n"), 0);
+    await DB.batch(lib.indexDocument(DB, { artifactId: "a", revisionId: "r", sha256: "h", text: "replacementneedle" }));
+    assert.equal(await found("replacementneedle"), 1);
+    await DB.prepare("UPDATE artifacts SET trashed_at = '2026-01-02' WHERE id = 'a'").run();
+    await DB.batch(lib.unindexDocument(DB, "a"));
+    assert.equal(await found("replacementneedle"), 0);
+    assert.equal(await found("cap"), 0);
+    assert.equal(await DB.prepare("SELECT COUNT(*) AS n FROM artifact_search_keys").first("n"), 0);
   } finally { await mf.dispose(); }
 });
 
@@ -225,7 +251,7 @@ test("new saves store only R2 keys, conflicts leave no orphan, search and backup
   assert.equal(row.body, null);
   assert.equal(row.body_key, `text/proj-s/${id}/${row.id}`);
   assert.equal(new TextDecoder().decode(objects.get(row.body_key)), "quasarneedle café🙂");
-  assert.equal(sql.prepare("SELECT COUNT(*) AS n FROM artifact_search WHERE artifact_search MATCH 'quasarneedle'").get().n, 1);
+  assert.equal(hits(sql, 'quasarneedle'), 1);
   const before = [...objects.keys()].sort();
   await assert.rejects(lib.saveMarkdown(ctx, "proj-s", id, { expected_revision: 1, body: "loser" }, "conflict-r2"), e => e.code === "revision_conflict");
   const remove = env.BLOBS.delete;
@@ -242,16 +268,18 @@ test("new saves store only R2 keys, conflicts leave no orphan, search and backup
   assert.deepEqual([...objects.keys()].sort(), before);
   assert.equal(sql.prepare("SELECT COUNT(*) AS n FROM content_writes").get().n, 0);
   await lib.updateMetadata(ctx, "proj-s", id, { expected_meta_version: 1, title: "Renamed title" }, "rename-r2");
-  assert.equal(sql.prepare("SELECT COUNT(*) AS n FROM artifact_search WHERE artifact_search MATCH 'quasarneedle'").get().n, 1);
+  assert.equal(hits(sql, 'quasarneedle'), 1);
   await lib.updateMetadata(ctx, "proj-s", id, { expected_meta_version: 2, trashed: true }, "trash-r2");
-  assert.equal(sql.prepare("SELECT COUNT(*) AS n FROM artifact_search WHERE artifact_search MATCH 'quasarneedle'").get().n, 0);
+  assert.equal(hits(sql, 'quasarneedle'), 0);
   await lib.updateMetadata(ctx, "proj-s", id, { expected_meta_version: 3, trashed: false }, "untrash-r2");
-  assert.equal(sql.prepare("SELECT COUNT(*) AS n FROM artifact_search WHERE artifact_search MATCH 'quasarneedle'").get().n, 1);
+  assert.equal(hits(sql, 'quasarneedle'), 1);
   const backup = await lib.exportBackup(ctx, "proj-s");
   const other = await harness();
   other.sql.exec("DELETE FROM projects");
   await other.lib.restoreBackup(other.ctx, backup);
   assert.equal((await other.lib.getArtifact(other.ctx, "proj-s", id)).body, "quasarneedle café🙂");
+  assert.equal(hits(other.sql, 'quasarneedle'), 1, "restore indexes the restored head in the same batch");
+  assert.equal(other.sql.prepare("SELECT COUNT(*) AS n FROM artifact_search_missing").get().n, 0);
   assert.deepEqual((await other.lib.exportBackup(other.ctx, "proj-s")).revisions, backup.revisions);
 });
 
@@ -715,4 +743,19 @@ test("restore refuses a lone-surrogate document, version or comment id with 400 
   const artifact = h.sql.prepare("SELECT id FROM artifacts WHERE project_id = ?").all(result.project_id);
   assert.equal(artifact.length, 1);
   assert.equal((await h.lib.getArtifact(h.ctx, result.project_id, artifact[0].id)).body, "synthetic words");
+});
+
+test("getTextPrefix: the first N characters of R2 and inline text, never a split character", async () => {
+  const objects = new Map(), reads = [];
+  const env = { BLOBS: { async get(k, o) { reads.push(o?.range); let b = objects.get(k); if (!b) return null; if (o?.range) b = b.slice(o.range.offset, o.range.offset + o.range.length); return { async arrayBuffer() { return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength); } }; } } };
+  for (const text of ["", "short", "ascii ".repeat(50), "café🙂 ".repeat(40), "🙂".repeat(100), "日本語".repeat(40)]) {
+    objects.set("k", new TextEncoder().encode(text));
+    for (const n of [1, 2, 3, 7, 16, 100, 1000]) {
+      const want = Array.from(text).slice(0, n).join("");
+      assert.equal(await getTextPrefix(env, { body_key: "k" }, n), want, `R2 ${JSON.stringify(text.slice(0, 8))} n=${n}`);
+      assert.equal(await getTextPrefix(env, { body_key: null, body: text }, n), want, `inline n=${n}`);
+    }
+  }
+  assert.deepEqual(reads.at(-1), { offset: 0, length: 4000 }, "one ranged read of at most 4 bytes per character");
+  await assert.rejects(getTextPrefix(env, { body_key: "missing" }, 5), e => e.code === "blob_missing");
 });

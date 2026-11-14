@@ -24,7 +24,18 @@ test('migration filenames are well formed and unique by full name', () => {
 test('released migration history is a prefix of the repository order', () => {
   // wrangler applies files in filename order; every installation's d1_migrations order must match.
   assert.deepEqual(names.slice(0, target.appliedMigrationsAtBaseline.length), target.appliedMigrationsAtBaseline);
-  assert.deepEqual(planMigrations(target.appliedMigrationsAtBaseline, repo).map((m) => m.name), names.slice(target.appliedMigrationsAtBaseline.length));
+  // An owner-approved destructive migration is never auto-applied: the plan refuses until the owner has run it in a manual
+  // window (docs/deploy-pipeline.md#destructive-migrations), and continues after it.
+  const base = target.appliedMigrationsAtBaseline.length, search = names.indexOf('0031_search_contentless.sql');
+  assert.deepEqual(planMigrations(target.appliedMigrationsAtBaseline, repo.slice(0, search)).map((m) => m.name), names.slice(base, search));
+  assert.throws(() => planMigrations(target.appliedMigrationsAtBaseline, repo), /manual owner-run window.*0031_search_contentless\.sql/);
+  assert.deepEqual(planMigrations(names.slice(0, search + 1), repo).map((m) => m.name), names.slice(search + 1));
+});
+
+test('0031_search_contentless.sql drops only the derived search index and carries the owner approval', () => {
+  const m = repo.find((x) => x.name === '0031_search_contentless.sql');
+  assert.ok(m.destructive && m.approved);
+  assert.deepEqual(repo.filter((x) => x.destructive && !HISTORIC.includes(x.name)).map((x) => x.name), ['0031_search_contentless.sql']);
 });
 
 test('both 0009 migrations exist, in production order (html_documents before publisher_generations)', () => {

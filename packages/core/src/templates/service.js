@@ -1,5 +1,5 @@
 import { commitTextWrites, getText, stageTextWrite, textWriteComplete } from "../content-store.js";
-import { textSearchBridge } from "../search/service.js";
+import { indexDocument } from "../search/indexing.js";
 import { authorizeProject, authzSql, requireHuman } from "../auth.js";
 import { provenance } from "../history/service.js";
 import { appOrigin, artifactWebUrl, previewWebUrl } from "../links.js";
@@ -106,7 +106,7 @@ async function tplCopy(ctx, projectId, input, key, definition = false) {
       SELECT ?, ?, ?, 1, ?, NULL, ?, ?, ?, 'text/markdown', ?, ?, ?, ?, ?, ? WHERE ${created}`)
       .bind(rid, id, projectId, ctx.principal.id, bodyKey, new TextEncoder().encode(body).length, hash, now, ...provenance(ctx, { change_note: note }), id),
     audit(ctx, projectId, definition ? "template.create" : "template.use", id, 1, "ok", created, [id]),
-    textSearchBridge(ctx.env, id, rid, body), textWriteComplete(ctx.env, bodyKey)
+    ...indexDocument(db(ctx), { artifactId: id, revisionId: rid, sha256: hash, text: body }), textWriteComplete(ctx.env, bodyKey)
   ]), i));
   if (!Array.isArray(out)) return out;
   if (!out[1].meta.changes) {

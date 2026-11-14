@@ -1,5 +1,7 @@
 // Search excerpts are rebuilt in JavaScript (rsExcerpt) instead of FTS5 snippet(). Compare the shipped code with real
-// snippet() in node:sqlite, on an index with the tokenizer and column layout of migrations/0014_ranked_search.sql.
+// snippet() in node:sqlite. snippet() needs stored text, so the reference is a stored-copy table (the former
+// migrations/0014_ranked_search.sql layout) with the tokenizer of today's contentless index (0031); the shipped Worker
+// no longer calls snippet() and now reads the excerpt's text from R2 (getTextPrefix) or inline.
 // Latin, digits and CJK must be identical. For every script, an excerpt that differs must be the start of the text:
 // JavaScript may match fewer words than the index (then it falls back), never words the index did not match.
 import { test } from "node:test";

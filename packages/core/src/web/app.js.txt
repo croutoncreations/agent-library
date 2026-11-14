@@ -1144,7 +1144,7 @@ async function viewSearch() {
     var availability = await api("GET", "/api/search/status");
     if (!alive) return;
     if (!availability.ready) {
-      shell([{t:"Home",href:"#/"},{t:"Search"}], stateBox("", "search", "Search is being prepared", "An administrator needs to finish indexing existing documents. Refresh after indexing is complete."));
+      shell([{t:"Home",href:"#/"},{t:"Search"}], stateBox("", "search", "Search is being prepared", "Existing documents are being indexed in the background. Refresh in a few minutes."));
       return;
     }
   } catch(e) { if (alive) shell([{t:"Search"}], stateBox("error", "alert", "Search unavailable", "Refresh to check again.")); return; }

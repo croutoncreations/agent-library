@@ -11,6 +11,7 @@
 import { requireHuman } from "./auth.js";
 import { staleWritesBefore } from "./cleanup.js";
 import { deleteBlob, listBlobKeys } from "./content-store.js";
+import { unindexMany } from "./search/indexing.js";
 import { explainLimit, limitGuard } from "./limits.js";
 import { ensureSlug } from "./paths.js";
 import { memberRoleSql, projectWorkspaceSql, requireWorkspaceRole, workspaceRoleSql } from "./tenancy.js";
@@ -205,6 +206,15 @@ export async function purgeDueProjects(env, { projectId, rowBudget = 5000, blobB
         env.DB.prepare("UPDATE uploads SET final_purged_at = ? WHERE project_id = ? AND final_key IN (SELECT value FROM json_each(?))").bind(now, id, JSON.stringify(keys))
       ]);
     }
+    // The full-text index goes first (its entries are keyed by artifact id), in the same bounded steps as the rows.
+    for (;;) {
+      if (rowBudget <= 0) return out;
+      const n = Math.min(500, rowBudget);
+      const gone = await env.DB.batch(unindexMany(env.DB, `a.project_id = ?1 AND ${STILL_DUE}`, [id, n, now], "?2"));
+      const k = gone[1].meta.changes ?? 0;
+      rowBudget -= k; out.rows += k;
+      if (k < n) break;
+    }
     for (const [table, where] of STEPS) {
       for (;;) {
         if (rowBudget <= 0) return out;
@@ -229,7 +239,7 @@ export async function purgeDueProjects(env, { projectId, rowBudget = 5000, blobB
         blobBudget -= keys.length; out.files += keys.length;
       }
     }
-    // Search index rows go with their artifacts (trigger). Publishers stop for good; API keys and OAuth connections
+    // Search index entries went above, before their artifacts. Publishers stop for good; API keys and OAuth connections
     // whose every project is purged are revoked (they can't reach anything and would hold an agents slot forever). A
     // project still in Recently deleted counts as live here, so restoring it brings its credentials back.
     const noLive = (table, col) => `NOT EXISTS (SELECT 1 FROM ${table} x JOIN projects pj ON pj.id = x.project_id WHERE x.${col} = c.id AND x.project_id <> ?2 AND pj.purged_at IS NULL)`;

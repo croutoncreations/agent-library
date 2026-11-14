@@ -1,30 +1,9 @@
-import { getText } from "../content-store.js";
+import { getTextPrefix, mapContent } from "../content-store.js";
 import { appOrigin, artifactWebUrl, previewWebUrl } from "../links.js";
 import { appConnectEnabled, db, rtReadAuthzSql } from "../service.js";
 import { HttpError, nowMs, sha256Hex } from "../util.js";
 import { addressLinks, resolveProjectRef } from "../paths.js";
 import { U61_TOKEN, u61FoldToken } from "./unicode61.js";
-
-/** Temporary plaintext FTS bridge: only the first 1 MiB, safely below D1's 2,000,000-byte value ceiling. */
-export function textSearchBridge(env, artifactId, revisionId, text) {
-  const bytes = new TextEncoder().encode(text.slice(0, 1048576));
-  let end = Math.min(bytes.length, 1048576);
-  while (end < bytes.length && (bytes[end] & 0xc0) === 0x80) end--;
-  const prefix = new TextDecoder().decode(bytes.subarray(0, end));
-  return env.DB.prepare(`UPDATE artifact_search SET body = ? WHERE rowid =
-    (SELECT search_id FROM artifact_search_keys WHERE artifact_id = ?) AND revision_id = ?
-    AND EXISTS (SELECT 1 FROM artifacts WHERE id = ? AND head_revision_id = ?)`)
-    .bind(prefix, artifactId, revisionId, artifactId, revisionId);
-}
-
-/** Metadata triggers rebuild FTS from the legacy column; restore its R2 body without overwriting a newer head. */
-export async function refreshTextSearch(env, artifactId) {
-  try {
-    const row = await env.DB.prepare(`SELECT r.* FROM artifacts a JOIN revisions r ON r.id = a.head_revision_id
-      WHERE a.id = ? AND a.trashed_at IS NULL AND r.blob_key IS NULL AND r.body_key IS NOT NULL`).bind(artifactId).first();
-    if (row) await textSearchBridge(env, artifactId, row.id, await getText(env, row)).run();
-  } catch { console.error(JSON.stringify({ event: "text_search_refresh_failed" })); }
-}
 
 // Ranked lexical search. See docs/ranked-search.md for semantics, rollout and live pagination.
 const RS_SCHEMA = { type: "object", additionalProperties: false, required: ["query"], properties: {
@@ -164,7 +143,7 @@ async function searchArtifacts(ctx, args, transport = "api") {
     args = { ...args, project_ids: await Promise.all(args.project_ids.map((x) => typeof x === "string" && x.length <= 110 ? resolveProjectRef(ctx.env, x) : x)) };
   const a = rsNormalize(args), scope = rsScope(ctx);
   const searchState = await rsSearchState(ctx.env);
-  if (!searchState?.ready) throw new HttpError(503, "search_initializing", "Search is being prepared; finish the bounded search backfill and retry");
+  if (!searchState?.ready) throw new HttpError(503, "search_initializing", "Search is being prepared; the index is rebuilding in the background, retry shortly");
   const kinds = ["markdown", "html", ...(appConnectEnabled(ctx.env) ? ["json", "csv"] : []), ...(!ctx.oauthConnection || ctx.ftConn?.file_access === 1 ? ["binary"] : [])];
   if (a.kind && !kinds.includes(a.kind)) rsInvalid("kind is unavailable on this connection");
   if (a.project_ids?.length) {
@@ -176,7 +155,7 @@ async function searchArtifacts(ctx, args, transport = "api") {
   if (a.project_ids?.length === 0) return { results: [], has_more: false, next_cursor: null };
   const match = a.terms.map(t => '"' + t + '"').join(" AND ");
   const titleScore = a.terms.map(() => "CASE WHEN instr(lower(a.title),?)>0 THEN 1 ELSE 0 END").join(" + ");
-  const where = [scope.sql, "a.trashed_at IS NULL", "a.head_rev>0", "s.revision_id=r.id", "s.sha256=r.sha256", "s.title=a.title",
+  const where = [scope.sql, "a.trashed_at IS NULL", "a.head_rev>0", "k.revision_id=r.id", "k.sha256=r.sha256", "k.indexed_title=a.title",
     "a.kind IN (SELECT value FROM json_each(?))"];
   const values = [...scope.params, JSON.stringify(a.kind ? [a.kind] : kinds)];
   if (a.project_ids !== null) { where.push("p.id IN (SELECT value FROM json_each(?))"); values.push(JSON.stringify(a.project_ids)); }
@@ -186,22 +165,30 @@ async function searchArtifacts(ctx, args, transport = "api") {
     SELECT a.id, a.project_id, p.title AS project_title, a.title, a.kind, a.updated_at, r.rev_no, r.sha256, r.mime,
       (CASE WHEN lower(a.title)=lower(?) THEN 1000 ELSE 0 END + (${titleScore})) AS score,
       CASE WHEN (${titleScore})>0 THEN 'title' ELSE 'body' END AS matched_field,
-      s.rowid AS search_id
-    FROM artifact_search s JOIN artifacts a ON a.id=s.artifact_id JOIN projects p ON p.id=a.project_id
+      r.id AS revision_id
+    FROM artifact_search s JOIN artifact_search_keys k ON k.search_id=s.rowid JOIN artifacts a ON a.id=k.artifact_id JOIN projects p ON p.id=a.project_id
       JOIN revisions r ON r.id=a.head_revision_id AND r.artifact_id=a.id AND r.project_id=a.project_id AND r.rev_no=a.head_rev
     WHERE artifact_search MATCH ? AND ${where.join(" AND ")}
   ), page AS (SELECT * FROM hits ${after ? "WHERE score < ? OR (score = ? AND (updated_at < ? OR (updated_at = ? AND id > ?)))" : ""}
     ORDER BY score DESC, updated_at DESC, id ASC LIMIT ?)
-  -- Only the returned page reads a bounded prefix of its indexed text, for the excerpt.
-  SELECT page.*, CASE WHEN page.kind='binary' THEN NULL ELSE
-      (SELECT substr(x.body,1,${RS_EXCERPT_PREFIX_CHARS + 1}) FROM artifact_search x WHERE x.rowid=page.search_id) END AS excerpt_source
-    FROM page ORDER BY score DESC, updated_at DESC, id ASC`;
+  -- The index holds no text. Only the returned page reads (below) a bounded prefix of its current text for the excerpt:
+  -- legacy inline bodies here, R2 text by a ranged read.
+  SELECT page.*, rv.body_key, CASE WHEN rv.body_key IS NULL AND page.kind<>'binary' THEN substr(rv.body,1,${RS_EXCERPT_PREFIX_CHARS + 1}) END AS inline_prefix
+    FROM page JOIN revisions rv ON rv.id=page.revision_id ORDER BY score DESC, updated_at DESC, id ASC`;
   const tail = after ? [after[0], after[0], after[1], after[1], after[2]] : [];
   const rows = (await db(ctx).prepare(sql).bind(a.query, ...a.terms, ...a.terms, match, ...values, ...tail, a.limit + 1).all()).results;
   const origin = appOrigin(ctx.env.APP_HOST);
-  const results = rows.slice(0, a.limit).map(r => ({
+  const page = rows.slice(0, a.limit);
+  // Excerpt sources: at most one ranged R2 read per R2-backed result, a few at a time. A missing object shows the title.
+  const sources = await mapContent(page, async (r) => {
+    if (r.kind === "binary") return "";
+    if (!r.body_key) return r.inline_prefix ?? "";
+    try { return await getTextPrefix(ctx.env, { body_key: r.body_key }, RS_EXCERPT_PREFIX_CHARS + 1); }
+    catch (error) { if (error?.code === "blob_missing") return ""; throw error; }
+  });
+  const results = page.map((r, n) => ({
     project_id: r.project_id, project_title: r.project_title, artifact_id: r.id, title: r.title, kind: r.kind,
-    matched_field: r.matched_field, snippet: (r.kind === "binary" ? r.title : rsExcerpt(r.excerpt_source ?? "", a.terms) || r.title).slice(0,500), indexed_body: r.kind !== "binary",
+    matched_field: r.matched_field, snippet: (r.kind === "binary" ? r.title : rsExcerpt(sources[n], a.terms) || r.title).slice(0,500), indexed_body: r.kind !== "binary",
     revision: r.rev_no, sha256: r.sha256, updated_at: r.updated_at, ...(ctx.principal?.kind === "human" && !ctx.oauthConnection && !ctx.apiCredential ? { mime: r.mime } : {}),
     web_url: origin ? artifactWebUrl(origin,r.project_id,r.id) + "?v=" + r.rev_no : null,
     preview_url: origin ? previewWebUrl(origin,r.project_id,r.id) + "?v=" + r.rev_no : null
