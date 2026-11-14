@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { putText, getText, getTextRange, textKey } from "../packages/core/src/content-store.js";
+import { putText, getText, getTextPrefix, getTextRange, textKey } from "../packages/core/src/content-store.js";
 import { DatabaseSync } from "node:sqlite";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
@@ -44,7 +44,7 @@ test("indexDocument caps indexed text at 1 MiB (UTF-8) on real local D1; the suf
       DB.prepare("INSERT INTO artifacts (id, project_id, kind, title, head_rev, head_revision_id, created_at, updated_at) VALUES ('a','proj','markdown','Cap title',1,'r','2026-01-01','2026-01-01')"),
       DB.prepare("INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, size, sha256, mime, created_at) VALUES ('r','a','proj',1,'p','',1,'h','text/markdown','2026-01-01')")
     ]);
-    const lib = await loadWorker({ "search/indexing.js": ["indexDocument"] });
+    const lib = await loadWorker({ "search/indexing.js": ["indexDocument", "unindexDocument", "unindexMany"] });
     const prefix = "firstneedle " + "a".repeat(1048576 - 14);
     await DB.batch(lib.indexDocument(DB, { artifactId: "a", revisionId: "r", sha256: "h", text: prefix + "\u{1F642} suffixneedle " + "z".repeat(3 * 1048576) }));
     const found = async (w) => (await DB.prepare("SELECT COUNT(*) AS n FROM artifact_search WHERE artifact_search MATCH ?").bind(w).first("n"));
@@ -52,6 +52,26 @@ test("indexDocument caps indexed text at 1 MiB (UTF-8) on real local D1; the suf
     assert.equal(await found("suffixneedle"), 0);
     assert.equal(await found("cap"), 1, "the title is indexed");
     assert.equal(await DB.prepare("SELECT COUNT(*) AS n FROM artifact_search_missing").first("n"), 0);
+    // contentless_delete=1 on D1's SQLite: re-indexing the same document removes its previous words.
+    await DB.batch(lib.indexDocument(DB, { artifactId: "a", revisionId: "r", sha256: "h", text: "replacementneedle" }));
+    assert.equal(await found("firstneedle"), 0);
+    assert.equal(await found("replacementneedle"), 1);
+    assert.equal(await found("cap"), 1);
+    await DB.batch(lib.unindexDocument(DB, "a"));
+    assert.equal(await found("replacementneedle"), 1, "still an untrashed head: unindexDocument leaves it");
+    // A project's purge removes entries whatever their state, a bounded number at a time.
+    await DB.batch(lib.unindexMany(DB, "a.project_id = ?1", ["other", 10], "?2"));
+    assert.equal(await found("replacementneedle"), 1, "another project's purge leaves it");
+    await DB.batch(lib.unindexMany(DB, "a.project_id = ?1", ["proj", 10], "?2"));
+    assert.equal(await found("replacementneedle"), 0);
+    assert.equal(await DB.prepare("SELECT COUNT(*) AS n FROM artifact_search_keys").first("n"), 0);
+    await DB.batch(lib.indexDocument(DB, { artifactId: "a", revisionId: "r", sha256: "h", text: "replacementneedle" }));
+    assert.equal(await found("replacementneedle"), 1);
+    await DB.prepare("UPDATE artifacts SET trashed_at = '2026-01-02' WHERE id = 'a'").run();
+    await DB.batch(lib.unindexDocument(DB, "a"));
+    assert.equal(await found("replacementneedle"), 0);
+    assert.equal(await found("cap"), 0);
+    assert.equal(await DB.prepare("SELECT COUNT(*) AS n FROM artifact_search_keys").first("n"), 0);
   } finally { await mf.dispose(); }
 });
 
@@ -721,4 +741,19 @@ test("restore refuses a lone-surrogate document, version or comment id with 400 
   const artifact = h.sql.prepare("SELECT id FROM artifacts WHERE project_id = ?").all(result.project_id);
   assert.equal(artifact.length, 1);
   assert.equal((await h.lib.getArtifact(h.ctx, result.project_id, artifact[0].id)).body, "synthetic words");
+});
+
+test("getTextPrefix: the first N characters of R2 and inline text, never a split character", async () => {
+  const objects = new Map(), reads = [];
+  const env = { BLOBS: { async get(k, o) { reads.push(o?.range); let b = objects.get(k); if (!b) return null; if (o?.range) b = b.slice(o.range.offset, o.range.offset + o.range.length); return { async arrayBuffer() { return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength); } }; } } };
+  for (const text of ["", "short", "ascii ".repeat(50), "café🙂 ".repeat(40), "🙂".repeat(100), "日本語".repeat(40)]) {
+    objects.set("k", new TextEncoder().encode(text));
+    for (const n of [1, 2, 3, 7, 16, 100, 1000]) {
+      const want = Array.from(text).slice(0, n).join("");
+      assert.equal(await getTextPrefix(env, { body_key: "k" }, n), want, `R2 ${JSON.stringify(text.slice(0, 8))} n=${n}`);
+      assert.equal(await getTextPrefix(env, { body_key: null, body: text }, n), want, `inline n=${n}`);
+    }
+  }
+  assert.deepEqual(reads.at(-1), { offset: 0, length: 4000 }, "one ranged read of at most 4 bytes per character");
+  await assert.rejects(getTextPrefix(env, { body_key: "missing" }, 5), e => e.code === "blob_missing");
 });
