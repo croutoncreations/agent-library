@@ -143,7 +143,7 @@ async function searchArtifacts(ctx, args, transport = "api") {
     args = { ...args, project_ids: await Promise.all(args.project_ids.map((x) => typeof x === "string" && x.length <= 110 ? resolveProjectRef(ctx.env, x) : x)) };
   const a = rsNormalize(args), scope = rsScope(ctx);
   const searchState = await rsSearchState(ctx.env);
-  if (!searchState?.ready) throw new HttpError(503, "search_initializing", "Search is being prepared; finish the bounded search backfill and retry");
+  if (!searchState?.ready) throw new HttpError(503, "search_initializing", "Search is being prepared; the index is rebuilding in the background, retry shortly");
   const kinds = ["markdown", "html", ...(appConnectEnabled(ctx.env) ? ["json", "csv"] : []), ...(!ctx.oauthConnection || ctx.ftConn?.file_access === 1 ? ["binary"] : [])];
   if (a.kind && !kinds.includes(a.kind)) rsInvalid("kind is unavailable on this connection");
   if (a.project_ids?.length) {

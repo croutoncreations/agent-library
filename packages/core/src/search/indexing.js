@@ -107,8 +107,8 @@ export async function reindexArtifact(env, artifactId) {
 
 /**
  * After a metadata change, re-index the artifact if the index no longer matches it (a concurrent save moved the head
- * between reading its text and the batch). Never throws: on failure it turns search off (ready = 0), for the cron's
- * rebuild, instead of leaving a gap behind a ready flag.
+ * between reading its text and the batch). Never throws: a failure leaves the entry reported missing, which search
+ * answers with 503 until the cron's rebuild repairs it.
  */
 export async function repairIfStale(env, artifactId) {
   try {
@@ -116,13 +116,12 @@ export async function repairIfStale(env, artifactId) {
     await reindexArtifact(env, artifactId);
   } catch {
     console.error(JSON.stringify({ event: "search_repair_failed" }));
-    try { await env.DB.prepare("UPDATE artifact_search_state SET ready = 0 WHERE id = 1").run(); } catch { /* the probe still reports the gap */ }
   }
 }
 
 /**
- * Bootstrap and repair (cron, while search is not ready): re-index up to `limit` documents the completeness probe reports
- * missing or stale, then mark search ready once none is. After migration 0031 every existing document is missing, so
+ * Bootstrap and repair (cron, every run): re-index up to `limit` documents the completeness probe reports
+ * missing or stale, then mark search ready once none is (the probe is the same metadata-only scan every search runs). After migration 0031 every existing document is missing, so
  * repeated runs rebuild the whole index from R2 (or legacy inline) text. Safe to repeat and to run concurrently: each
  * document is one atomic batch. A document that fails stays missing and is retried by the next run. The limit keeps a run
  * within a Free plan Worker's 50 subrequests (a read and a batch per document, at most one R2 read each).
@@ -138,10 +137,4 @@ export async function rebuildSearchIndex(env, { limit = 15 } = {}) {
   await env.DB.prepare("UPDATE artifact_search_state SET ready = 1 WHERE id = 1 AND NOT EXISTS (SELECT 1 FROM artifact_search_missing)").run();
   const ready = !!await env.DB.prepare("SELECT ready FROM artifact_search_state WHERE id = 1").first("ready");
   return { processed: rows.length, failed, ready };
-}
-
-/** Cron entry: rebuild only while search is not ready (the singleton flag; no corpus scan otherwise). */
-export async function rebuildSearchIfNotReady(env) {
-  if (await env.DB.prepare("SELECT ready FROM artifact_search_state WHERE id = 1").first("ready")) return null;
-  return rebuildSearchIndex(env);
 }

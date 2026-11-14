@@ -8,7 +8,7 @@ import { handleV1, isV1Path } from "./api/v1.js";
 import { authenticate, enforceRate, requireCsrf, requireHuman, sessionCookie } from "./auth.js";
 import { exportBackup, importBackup, restoreBackup } from "./backup.js";
 import { pruneExpiredRows, reconcileUploads } from "./cleanup.js";
-import { rebuildSearchIfNotReady } from "./search/indexing.js";
+import { rebuildSearchIndex } from "./search/indexing.js";
 import { EDITOR_JS, EDITOR_JS_SHA256 } from "./editor-bundle.js";
 import { RENDER_CSP, htmlRefs, renderHtmlDocument } from "./html.js";
 import { WEB_ROUTE } from "./links.js";
@@ -386,8 +386,8 @@ var coreWorker = {
     ctx.waitUntil(purgeDueProjects(env).then((r) => { if (r.projects || r.rows || r.files) console.log("project_purge", JSON.stringify({ projects: r.projects, rows: r.rows, files: r.files })); }));
     // Deleted workspaces past their 30 days: their projects are marked due for the purge above (workspace-purge.js).
     ctx.waitUntil(purgeDeletingWorkspaces(env));
-    // Search index bootstrap and repair: only while the singleton flag says it is not ready (migration 0031 resets it).
-    ctx.waitUntil(rebuildSearchIfNotReady(env).then((r) => { if (r) console.log("search_rebuild", JSON.stringify(r)); },
+    // Search index bootstrap and repair: re-indexes what the completeness probe reports missing (migration 0031 empties the index).
+    ctx.waitUntil(rebuildSearchIndex(env).then((r) => { if (r.processed) console.log("search_rebuild", JSON.stringify(r)); },
       (e) => console.error(JSON.stringify({ event: "search_rebuild_failed", message: String(e?.message ?? e).slice(0, 200) }))));
   },
   async fetch(req, env, ctx) {
