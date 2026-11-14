@@ -15,7 +15,7 @@ const require = createRequire(import.meta.url);
 const CHROME = process.env.CHROME_PATH ?? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 const PUPPETEER = `${process.env.HOME}/.npm-packages/lib/node_modules/puppeteer`;
 const haveChrome = existsSync(CHROME) && existsSync(PUPPETEER);
-let h, owner, browser, page, docId, APP;
+let h, owner, browser, page, docId, APP, PUB;
 
 before(async () => {
   h = await startAppConnectServer({ port: SERVER_PORTS["design-reader"] });
@@ -25,7 +25,11 @@ before(async () => {
   docId = (await owner.req("POST", "/api/projects/read-a/artifacts", { title: "Long read", body: "# Long read\n\n" + "word ".repeat(400) + "\n" })).body.artifact_id;
   await h.connectMcpAgent({ "read-a": "write", "read-b": "read" });
   const app = await h.registerApp({ display_name: "Publisher Connected", redirect_uris: ["http://localhost:5173/cb"], origins: ["http://localhost:5173"] });
-  await h.connectPublisher(app, { project_id: "solo", destination: "new", new_folder_name: "Exports" });
+  PUB = await h.connectPublisher(app, { project_id: "solo", destination: "new", new_folder_name: "Exports" });
+  const put = await fetch(`${h.api}/app/files/summary/day.json`, { method: "PUT", body: '{"steps":1}',
+    headers: { authorization: `Bearer ${PUB.access_token}`, "content-type": "application/json", "idempotency-key": "design-folder-put-1", "if-none-match": "*" } });
+  assert.equal(put.status, 201);
+  assert.equal((await owner.req("POST", "/api/projects/solo/artifacts", { title: "Loose note", body: "# Loose\n" })).status, 201);
   await h.registerApp({ display_name: "Publisher Unconnected", redirect_uris: ["http://localhost:5174/cb"], origins: [] });
   if (!haveChrome) return;
   browser = await require(PUPPETEER).launch({ executablePath: CHROME, headless: true, args: ["--no-first-run"] });
@@ -129,6 +133,26 @@ test("connections: publishing apps are separate; only a connected publisher show
   assert.deepEqual(cards["Publisher Unconnected"].access, []);
   assert.match(cards["Publisher Unconnected"].text, /Not connected to any project yet/);
   assert.equal(await page.$eval(".tabs a[aria-current=page]", (b) => b.textContent), "Publishing apps");
+});
+
+test("project list: an app's files show their folder, and the folder filter narrows the list", { skip: !haveChrome && "Chrome not installed" }, async () => {
+  await page.goto(`${APP}/#/p/solo`);
+  await page.waitForFunction(() => document.querySelectorAll("ul.list li").length === 2);
+  const rows = await page.$$eval("ul.list li", (ls) => Object.fromEntries(ls.map((l) => [l.querySelector(".grow a, .grow span").textContent, l.querySelector(".meta").textContent])));
+  assert.match(rows["summary/day.json"], / · in Exports$/);
+  assert.doesNotMatch(rows["Loose note"], / in /);
+  const sel = "select[aria-label='Filter by folder']";
+  assert.deepEqual(await page.$eval(sel, (s) => [...s.options].map((o) => o.text)), ["All folders", "Not in a folder", "Exports"]);
+  const pick = (label) => page.evaluate((sel, label) => { const s = document.querySelector(sel); s.value = [...s.options].find((o) => o.text === label).value; s.dispatchEvent(new Event("change")); }, sel, label);
+  await pick("Exports");
+  await page.waitForFunction(() => [...document.querySelectorAll("ul.list li")].map((l) => l.textContent).join() .includes("summary/day.json") && document.querySelectorAll("ul.list li").length === 1);
+  await pick("Not in a folder");
+  await page.waitForFunction(() => document.querySelectorAll("ul.list li").length === 1 && document.querySelector("ul.list li").textContent.includes("Loose note"));
+  // A project without folders shows no folder filter.
+  await page.goto(`${APP}/#/p/read-b`);
+  await page.waitForSelector(".toolbar input[type=search]");
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal(await page.$eval(sel, (s) => s.hidden), true);
 });
 
 test("connections: API key project picker is one aligned list with a live selected count", { skip: !haveChrome && "Chrome not installed" }, async () => {

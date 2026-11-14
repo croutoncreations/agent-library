@@ -1733,9 +1733,18 @@ async function viewList(pid, trash) {
   var more = h("button", { type: "button", class: "secondary", hidden: true }, "Load more");
   var q = h("input", { type: "search", placeholder: trash ? "Filter trash by title" : "Filter titles", "aria-label": trash ? "Filter trash by title" : "Filter titles in this project" });
   var cursor = null, seq = 0, qTimer = null;
+  // Folders (App Connect: an app's files live in its folder). Shown on each row and as a filter when the project has
+  // any; the list without App Connect (404) or offline simply has none.
+  var folderNames = {};
+  var folderSel = h("select", { "aria-label": "Filter by folder", hidden: true, onchange: function () { load(true); } }, h("option", { value: "", text: "All folders" }), h("option", { value: "root", text: "Not in a folder" }));
+  var foldersReady = trash ? Promise.resolve() : api("GET", "/api/projects/" + enc(pid) + "/folders", undefined, { noAuthRedirect: true }).then(function (r) {
+    (r.folders || []).forEach(function (f) { folderNames[f.id] = f.name; folderSel.append(h("option", { value: f.id, text: f.name })); });
+    folderSel.hidden = !(r.folders || []).length;
+  }, function () {});
 
   function row(a) {
-    var info = h("span", { class: "meta", text: (a.is_template ? "Template" : kindLabel(a)) + " · Updated " + fmtDate(a.updated_at) + " · rev " + a.revision + (a.folder ? " · " + a.folder : "") + (a.tags && a.tags.length ? " · #" + a.tags.join(" #") : "") });
+    var where = a.folder_id && folderNames[a.folder_id] ? " · in " + folderNames[a.folder_id] : a.folder ? " · " + a.folder : "";
+    var info = h("span", { class: "meta", text: (a.is_template ? "Template" : kindLabel(a)) + " · Updated " + fmtDate(a.updated_at) + " · rev " + a.revision + where + (a.tags && a.tags.length ? " · #" + a.tags.join(" #") : "") });
     var href = "#/p/" + enc(pid) + "/a/" + enc(a.id);
     var main = h("div", { class: "grow" }, trash ? h("span", { text: a.title }) : rowLink(href, a.title), info);
     var li = h("li", trash ? null : { class: "link" }, fileThumb(a, pid, trash), main, h("span", { class: "badge", text: a.is_template ? "Template" : kindLabel(a) }));
@@ -1747,6 +1756,8 @@ async function viewList(pid, trash) {
     return li;
   }
   function emptyFor(term) {
+    if (!term && folderSel.value) return stateBox("", "folder", "Nothing here", "No items in this project match the folder filter.",
+      h("button", { type: "button", class: "secondary", onclick: function () { folderSel.value = ""; load(true); } }, "Show all folders"));
     if (term) return stateBox("", "search", "No matches for \u201C" + term + "\u201D", trash ? "Nothing in trash matches. Try a different word." : "The filter matches titles in this project. Try a different word or clear the filter.",
       h("button", { type: "button", class: "secondary", onclick: function () { q.value = ""; load(true); q.focus(); } }, "Clear filter"));
     if (trash) return stateBox("", "trash", "Trash is empty", "Items you move to trash stay here with their history until you restore them.");
@@ -1758,8 +1769,10 @@ async function viewList(pid, trash) {
     var my = ++seq;
     if (reset) { cursor = null; list.hidden = false; empty.hidden = true; if (!list.children.length) skeletonRows(list, 3); else list.setAttribute("aria-busy", "true"); }
     var term = q.value.trim();
-    var qs = "?q=" + enc(term) + (cursor ? "&cursor=" + enc(cursor) : "") + (trash ? "&trashed=1" : "") + "&include=mime";
     try {
+      await foldersReady;
+      if (my !== seq) return;
+      var qs = "?q=" + enc(term) + (cursor ? "&cursor=" + enc(cursor) : "") + (trash ? "&trashed=1" : "") + (folderSel.value ? "&folder_id=" + enc(folderSel.value) : "") + "&include=mime";
       var r = await api("GET", "/api/projects/" + enc(pid) + "/artifacts" + qs);
       if (my !== seq) return;
       doneLoading(list);
@@ -1920,7 +1933,7 @@ async function viewList(pid, trash) {
   }
   shell(projCrumbs(pid, trash ? [{ t: "Trash" }] : []),
     pageHead(titleH1, { eyebrow: trash ? (projectTitles[pid] || "Project") : "Project", actions: actions }),
-    addr, panel, h("div", { class: "toolbar" }, projectTabs(pid, trash ? "trash" : "list"), h("label", { class: "search" }, icon("search"), q)), msg, list, empty, more);
+    addr, panel, h("div", { class: "toolbar" }, projectTabs(pid, trash ? "trash" : "list"), h("label", { class: "search" }, icon("search"), q), folderSel), msg, list, empty, more);
   ensureProjectTitle(pid).then(showAddr);
   if (resumePending && resumePending.hash === location.hash && resumePending.q) q.value = resumePending.q;
   load(true);

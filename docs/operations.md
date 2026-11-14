@@ -17,7 +17,7 @@ Project backups cover projects, documents and files you and your agents create, 
 
 **Projects with more than 16 MB of files can't be backed up as one file yet.** A backup embeds every file (base64) in one JSON response built in Worker memory, so the export is refused (`413 backup_too_large`) when the project's distinct file versions add up to more than 16 MB; download large files individually. (A streamed backup format is planned.)
 
-**App Connect files are backed up as ordinary files.** An app's file is exported with `app: { name, path }` (the path is null once the file is trashed; backup schema 3). Restoring or importing such a backup creates ordinary, editable files in the project: the title is the path, the tag is `app:<name>`, and they are no longer tied to any app, so a re-connected app writes fresh files beside them.
+**App Connect files are backed up as ordinary files.** An app's file is exported with `app: { name, path }` (the path is null once the file is trashed; backup schema 3). Restoring or importing such a backup creates ordinary, editable files in the project: the title is the path, the tag is `app:<name>`, they stay in a folder of the same name (a document's folder is exported as `folder_name` and recreated by name), and they are no longer tied to any app, so a re-connected app writes fresh files beside them.
 
 ## Backup and recovery
 

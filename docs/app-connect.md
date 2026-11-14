@@ -64,7 +64,7 @@ A `412` on the index means another writer won: re-read the index, rebuild and re
 
 ## Backup
 
-A project backup includes app files as ordinary files, each marked `app: { name, path }` (`path` is null for a trashed file; backup schema 3). Restoring or importing makes them ordinary, editable files in your project: title = the path, tag `app:<name>`, no connection to an app. See [operations.md](operations.md#what-backups-cover).
+A project backup includes app files as ordinary files, each marked `app: { name, path }` (`path` is null for a trashed file; backup schema 3). Restoring or importing makes them ordinary, editable files in your project: title = the path, tag `app:<name>`, in a folder of the same name as before (`folder_name` in the backup; recreated, owned by you), no connection to an app. See [operations.md](operations.md#what-backups-cover).
 
 ## Limits
 

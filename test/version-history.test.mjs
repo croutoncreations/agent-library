@@ -318,7 +318,12 @@ test("backup round-trips who/why and details versions", async () => {
   const s2 = await startServer("a12-restore", SERVER_PORTS["a12-restore"]);
   try {
     const h2 = await s2.login();
-    assert.equal((await h2.req("POST", "/api/restore", b)).status, 201);
+    // A document's folder (backup schema 3 `folder_name`) comes back as a folder of that name, owned by the restorer.
+    const withFolder = { ...b, schema: "agent-library-backup/3", artifacts: b.artifacts.map((a) => a.id === doc ? { ...a, folder_name: "Synthetic exports" } : a) };
+    assert.equal((await h2.req("POST", "/api/restore", withFolder)).status, 201);
+    const placed = JSON.parse(execFileSync("wrangler", ["d1", "--config", LOCAL_CONFIG, "execute", "DB", "--local", "--persist-to", s2.dir, "--json", "--command",
+      `SELECT a.id, f.name, f.publisher_id FROM artifacts a LEFT JOIN folders f ON f.id = a.folder_id`], { cwd: ROOT, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], env: { ...process.env, CI: "1", NO_COLOR: "1" } }))[0].results;
+    assert.deepEqual(placed.filter((r) => r.name).map((r) => [r.id, r.name, r.publisher_id]), [[doc, "Synthetic exports", null]]);
     const hist = (await h2.req("GET", docUrl(doc) + "/history")).body;
     assert.equal(hist.revisions.find((v) => v.rev === 2).change_note, "Capitalised beta");
     assert.ok(hist.meta_versions.some((m) => m.change_note === "Title was right before" && m.restored_from === 1));

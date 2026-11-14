@@ -360,6 +360,8 @@ test("backup: a project with app files exports them with app:{name,path}; import
   assert.deepEqual(byId[kept.file_id].app, { name: appName, path: "summary/steps.json" });
   assert.deepEqual(byId[gone.file_id].app, { name: appName, path: null }, "a trashed app file has no path");
   assert.ok(!("publisher_id" in byId[kept.file_id]) && !("export_name" in byId[kept.file_id]));
+  const folder = sql(`SELECT f.name FROM artifacts a JOIN folders f ON f.id = a.folder_id WHERE a.id = '${kept.file_id}'`)[0].name;
+  assert.equal(byId[kept.file_id].folder_name, folder, "the app's folder is exported by name");
 
   const personal = ok(await owner.req("GET", "/api/workspaces")).workspaces.find((w) => w.personal).id;
   const imported = ok(await owner.req("POST", `/api/workspaces/${personal}/import`, { backup, title: "Imported app project" }), 201);
@@ -367,6 +369,13 @@ test("backup: a project with app files exports them with app:{name,path}; import
   assert.equal(rows.length, 2);
   const restored = rows.find((r) => r.title === "summary/steps.json");
   assert.deepEqual([restored.publisher_id, restored.export_name, JSON.parse(restored.tags)], [null, null, [`app:${appName}`]]);
+  // The folder is recreated by name in the new project, owned by the owner (no app), and both files sit in it.
+  const placed = sql(`SELECT a.title, f.name, f.publisher_id, f.project_id FROM artifacts a JOIN folders f ON f.id = a.folder_id WHERE a.project_id = '${imported.project_id}' ORDER BY a.title`);
+  assert.deepEqual(placed.map((r) => [r.name, r.publisher_id, r.project_id]), [[folder, null, imported.project_id], [folder, null, imported.project_id]]);
+  assert.equal(sql(`SELECT COUNT(*) AS n FROM folders WHERE project_id = '${imported.project_id}'`)[0].n, 1);
+  // A backup naming an invalid folder is refused before anything is written.
+  const badFolder = { ...backup, artifacts: backup.artifacts.map((a) => ({ ...a, folder_name: "a/b" })) };
+  assert.equal((await owner.req("POST", `/api/workspaces/${personal}/import`, { backup: badFolder })).status, 400);
   assert.equal(rows.find((r) => r.trashed).publisher_id, null);
   // Ordinary and editable: the owner can save a new version of the restored file.
   const doc = rows.find((r) => r.title === "summary/steps.json");
