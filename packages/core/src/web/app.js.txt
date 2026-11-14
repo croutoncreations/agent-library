@@ -3790,7 +3790,7 @@ async function offSave(pid, aid) {
   var base = "/api/projects/" + enc(pid) + "/artifacts/" + enc(aid);
   var d = await api("GET", base, undefined, { noAuthRedirect: true });
   var it = { key: offKey(pid, aid), pid: pid, aid: aid, title: d.artifact.title, kind: d.artifact.kind, mime: d.revision.mime,
-    rev: d.revision.rev, updated_at: d.artifact.updated_at, saved_at: Date.now(), project_title: projectTitles[pid] || pid, size: 0 };
+    rev: d.revision.rev, updated_at: d.artifact.updated_at, saved_at: Date.now(), project_title: projectTitles[pid] || pid, path: projectPaths[pid] || null, size: 0 };
   if (d.artifact.kind === "markdown") {
     it.body = d.body;
     var pv = await api("GET", base + "/preview?rev=" + d.revision.rev, undefined, { noAuthRedirect: true });
@@ -3998,8 +3998,18 @@ async function viewOfflineItem(pid, aid, tab) {
     h("div", { class: "titlebar" }, h("h1", { text: it.title }), isTextDoc(it.kind) || isDataKind(it.kind) ? copyIcon("copy", "Copy contents", function () { return it.body || ""; }) : null), info, body);
   resumeApply("artifact");
 }
+// An address link (#/p/<workspace>%2F<project>/a/<doc>) offline: saved copies remember their project's address, so the
+// link opens the copy. The address only selects among copies already on this device; nothing is looked up online.
+async function viewOfflineAddress(p) {
+  var it = null;
+  try { it = (await OFF.all("items")).find(function (x) { return x.path === p[1] && x.aid === p[3]; }) || null; } catch (e) {}
+  if (it) return viewOfflineItem(it.pid, it.aid, p[4] === "preview" ? "preview" : null);
+  if (p[3]) return viewOfflineItem(p[1], p[3], null);
+  return viewOfflineHome();
+}
 function offlineRoute() {
-  var p = location.hash.replace(/^#\/?/, "").split("/").filter(Boolean).map(decodeURIComponent);
+  var p = location.hash.replace(/^#\/?/, "").replace(/\?.*$/, "").split("/").filter(Boolean).map(decodeURIComponent);
+  if (p[0] === "p" && p[1] && p[1].indexOf("/") > 0) return viewOfflineAddress(p);
   if (p[0] === "p" && p[1] && p[2] === "a" && p[3]) return viewOfflineItem(p[1], p[3], p[4] === "preview" ? "preview" : null);
   if (p[0] === "settings" && p[1] === "publishing") return viewPublishingApps();
   if (p[0] === "settings" && p[1] === "device") return viewDevice();
@@ -4304,10 +4314,11 @@ async function bootHasSaved() {
 // Sign in through Cloudflare Access: a real network navigation (?al_net=1 bypasses the cached shell; the
 // timestamp makes it a new URL even if the current one is the same). Boot strips the parameter again.
 function signInNavigate() { location.replace("/?al_net=1&t=" + Date.now() + (location.hash || "")); }
-// Sign in again from the offline page: Access (a network navigation), or the installation's own sign-in screen, which
-// is part of the shell (it offers every sign-in choice and then goes to /auth/signin).
+// Sign in again from the offline page: Access (a network navigation), or the sign-in screen, which is part of the shell
+// (an installation with its own sign-in offers its choices there and goes to /auth/signin; local development asks for
+// the passphrase).
 function signInHere() {
-  if (!redirectSignIn()) return signInNavigate();
+  if (accessSignIn()) return signInNavigate();
   bootState = null; S.offline = false; S.me = null;
   route();
 }
@@ -4319,9 +4330,11 @@ function bootSettle(r, explicit) {
     bootIdentity = r.me; bootState = "ready";
     if (explicit || !bootHasCopies) return goOnline();
   } else if (bootSignedOut(r.err)) {
-    if (hostedApp() && bootHasCopies) bootState = "signin"; // the saved copies are on screen: they stay, with a sign-in link
+    // The saved copies are already on screen (the link was slow), so they stay, with a sign-in link. Without copies there
+    // is nothing to read: Access goes to its sign-in page, the others show their sign-in screen.
+    if (bootHasCopies) bootState = "signin";
     else if (accessSignIn()) { bootState = "signin"; if (reloadForSignIn()) return; }
-    else { bootState = null; S.offline = false; return route(); } // the sign-in screen (hosted) or the local passphrase form
+    else { bootState = null; S.offline = false; return route(); }
   } else if (bootRefused(r.err)) {
     bootError = r.err.message;
     if (!bootHasCopies) { bootState = null; S.offline = false; return viewLogin(bootError); }
@@ -4398,11 +4411,11 @@ async function goOnline() {
     var e = r.err;
     S.me = null; retryCtl = null;
     if (bootSignedOut(e)) {
-      // Hosted and signed out (the cached shell never passed Access, and a session can end while offline): saved copies
-      // stay readable with a sign-in link, since the sign-in page may not load on a poor connection. Without saved
-      // copies, Access goes to its sign-in page (at most once a minute; otherwise the Sign in view offers it) and the
-      // installation's own sign-in (hosted) shows its sign-in screen below, as does the local passphrase form.
-      if (hostedApp() && hasSaved) { S.offline = true; bootState = "signin"; }
+      // Behind Cloudflare Access (the cached shell never passed it): saved copies stay readable with a sign-in link, since
+      // Access's page may not load on a poor connection; without copies, go to its sign-in page (at most once a minute;
+      // otherwise the Sign in view offers it). An installation with its own sign-in (hosted) shows its sign-in screen, which
+      // leads to /auth/signin, and local development its passphrase form: the server answered, so a sign-in is reachable.
+      if (accessSignIn() && hasSaved) { S.offline = true; bootState = "signin"; }
       else if (accessSignIn() && reloadForSignIn()) return;
     } else if (bootRefused(e)) {
       // The library answered with a definite error: show it (with the saved copies, if any). No automatic retries.
