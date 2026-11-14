@@ -162,4 +162,41 @@ async function sweepContentWrites(env, { projectId, limit = 50 } = {}) {
   }
 }
 
-export { PUT_MARGIN_MS, pruneExpiredRows, reconcileUploads, staleWritesBefore };
+// Database size (cron, every 15 minutes). D1 reports the database size in bytes in result.meta.size_after of any query,
+// so one SELECT 1 measures it (local miniflare may omit it: size_bytes is then null). Logs {event:"db_size", size_bytes}
+// every run and, when DB_SIZE_WARN_BYTES (a positive integer) is set and reached, {event:"db_size_warning", ...}. An
+// unset or invalid DB_SIZE_WARN_BYTES means no warning; invalid logs one db_size_config_invalid per isolate.
+// Installation-wide numbers only. The first sample of each UTC day is kept in db_size_samples (migration 0031) for 400
+// days. Never throws: a failure here must not stop the other cron steps.
+var DB_SIZE_SAMPLE_RETENTION_DAYS = 400;
+var dbSizeConfigErrorLogged = false;
+function dbSizeWarnBytes(env) {
+  const v = env.DB_SIZE_WARN_BYTES;
+  if (v === void 0 || v === null || v === "") return null;
+  const n = typeof v === "string" && /^[1-9]\d{0,15}$/.test(v.trim()) ? Number(v) : typeof v === "number" ? v : NaN;
+  if (Number.isSafeInteger(n) && n > 0) return n;
+  if (!dbSizeConfigErrorLogged) {
+    dbSizeConfigErrorLogged = true;
+    console.error(JSON.stringify({ event: "db_size_config_invalid", var: "DB_SIZE_WARN_BYTES", message: "must be a positive integer number of bytes; no warning is logged" }));
+  }
+  return null;
+}
+async function recordDbSize(env) {
+  try {
+    const warnBytes = dbSizeWarnBytes(env);
+    const res = await env.DB.prepare("SELECT 1").run();
+    const raw = res?.meta?.size_after;
+    const sizeBytes = typeof raw === "number" && Number.isFinite(raw) && raw >= 0 ? raw : null;
+    console.log(JSON.stringify({ event: "db_size", size_bytes: sizeBytes }));
+    if (sizeBytes === null) return;
+    if (warnBytes !== null && sizeBytes >= warnBytes) console.warn(JSON.stringify({ event: "db_size_warning", size_bytes: sizeBytes, warn_bytes: warnBytes }));
+    const now = nowMs();
+    const day = new Date(now).toISOString().slice(0, 10);
+    const kept = await env.DB.prepare("INSERT OR IGNORE INTO db_size_samples (day, size_bytes, sampled_at) VALUES (?, ?, ?)").bind(day, sizeBytes, new Date(now).toISOString()).run();
+    if (kept.meta?.changes) await env.DB.prepare("DELETE FROM db_size_samples WHERE day < ?").bind(new Date(now - DB_SIZE_SAMPLE_RETENTION_DAYS * 864e5).toISOString().slice(0, 10)).run();
+  } catch (e) {
+    console.error(JSON.stringify({ event: "db_size_failed", message: String(e?.message ?? e).slice(0, 200) }));
+  }
+}
+
+export { PUT_MARGIN_MS, pruneExpiredRows, reconcileUploads, recordDbSize, staleWritesBefore };

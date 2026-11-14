@@ -61,6 +61,31 @@ except the content host's includes the same request id as `request_id`.
 
 Watch Worker errors and your D1, R2 and KV usage in the Cloudflare dashboard, and check that the 15-minute cleanup job runs. Each run also removes, at most 5,000 rows per table, expired sign-in sessions, idempotency records older than 30 days (a retried request older than that is treated as new) and audit rows older than `AUDIT_RETENTION_DAYS` (default 365; `0` keeps them forever). A `retention_cleanup_batch_full` warning means a table had more to remove; the next runs catch up. Free tiers cover a typical personal library, but usage above them is billed to your account. Review connected agents now and then, and revoke the ones you no longer use. Never widen your Access policy to work around a sign-in problem.
 
+### Database size
+
+Each 15-minute cleanup run measures the D1 database with one trivial query (`SELECT 1`) and reads the size D1 reports
+with it. It logs one line per run, with no workspace, project or user data:
+
+| Event | Meaning |
+|---|---|
+| `db_size` `{size_bytes}` | the database size in bytes; `size_bytes` is `null` when the platform did not report one (local development) |
+| `db_size_warning` `{size_bytes, warn_bytes}` | `size_bytes` reached `DB_SIZE_WARN_BYTES` (logged on every run while it does) |
+| `db_size_config_invalid` | `DB_SIZE_WARN_BYTES` is set but is not a positive integer; no warning is logged (once per Worker isolate) |
+| `db_size_failed` `{message}` | the measurement failed; the other cleanup steps are not affected and the next run tries again |
+
+`DB_SIZE_WARN_BYTES` is optional (a Worker var in bytes, see `wrangler.example.toml`); unset means `db_size` is logged
+and nothing warns. A D1 database is capped at 10 GB and cannot grow past it. On Workers Paid, 3 GB, 5 GB and 7 GB are
+reasonable thresholds: set `3221225472` for an early notice, and move it up (or watch `size_bytes` yourself) as you
+plan a split or an export. On Workers Free (500 MB per database) use about 400 MB (`419430400`).
+
+To alert, turn on [Workers Logs](https://developers.cloudflare.com/workers/observability/logs/workers-logs/)
+(`[observability] enabled = true` in your `wrangler.toml`), then in the dashboard's Observability section filter on the
+event name (`db_size_warning`), save the query and add a notification, or watch `size_bytes` over time from `db_size`.
+The first run of each UTC day also stores its size in the `db_size_samples` table (`day`, `size_bytes`, `sampled_at`;
+migration 0031), pruned after 400 days: `SELECT day, size_bytes FROM db_size_samples ORDER BY day DESC LIMIT 30;`.
+The step costs two D1 queries per run (three on the first run of a day), counted with the other cleanup steps
+(limits.md#retention--cleanup).
+
 Deleted workspaces (workspaces.md#deleting-a-workspace) log ids, counts and error codes only:
 - `workspace_purge` `{marked, recovered, projects_marked, pending, finished}` once per run when any count is non-zero
   (`recovered`: workspaces whose failed project marking was completed; `pending`: marked workspaces still waiting for

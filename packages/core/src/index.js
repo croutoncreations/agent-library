@@ -7,7 +7,7 @@ import { createApiKey, listApiKeys, replaceApiKey, revokeApiKey, setApiKeyScope 
 import { handleV1, isV1Path } from "./api/v1.js";
 import { authenticate, enforceRate, requireCsrf, requireHuman, sessionCookie } from "./auth.js";
 import { exportBackup, importBackup, restoreBackup } from "./backup.js";
-import { pruneExpiredRows, reconcileUploads } from "./cleanup.js";
+import { pruneExpiredRows, reconcileUploads, recordDbSize } from "./cleanup.js";
 import { EDITOR_JS, EDITOR_JS_SHA256 } from "./editor-bundle.js";
 import { RENDER_CSP, htmlRefs, renderHtmlDocument } from "./html.js";
 import { WEB_ROUTE } from "./links.js";
@@ -385,6 +385,8 @@ var coreWorker = {
     ctx.waitUntil(purgeDueProjects(env).then((r) => { if (r.projects || r.rows || r.files) console.log("project_purge", JSON.stringify({ projects: r.projects, rows: r.rows, files: r.files })); }));
     // Deleted workspaces past their 30 days: their projects are marked due for the purge above (workspace-purge.js).
     ctx.waitUntil(purgeDeletingWorkspaces(env));
+    // Database size: one log line per run, optional warning at DB_SIZE_WARN_BYTES (cleanup.js recordDbSize never throws).
+    ctx.waitUntil(recordDbSize(env));
   },
   async fetch(req, env, ctx) {
     const url = new URL(req.url);

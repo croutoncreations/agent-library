@@ -196,10 +196,13 @@ The cron job runs every 15 minutes. Each step is bounded per run and later runs 
 | Deleted projects | purged after 30 days | project | fixed | large projects take several runs |
 | Deleted workspaces | content deleted from 30 days after deletion | workspace | fixed | its projects go through the project purge, 5 per run; at most 5 workspaces marked and 10 checked per run |
 | Abandoned uploads | removed after their reservation plus a 10-minute grace | upload | `UPLOAD_CLEANUP_GRACE_SECONDS` | — |
+| Database size | measured every run, logged as `db_size` | installation | `DB_SIZE_WARN_BYTES` (unset = no warning) | `db_size_warning` is logged while the size is at or above it (operations.md#database-size) |
 | A new document or file whose upload never finished | its hidden placeholder is removed a day after the upload expired, up to 100 per run | project | fixed | until then it counts toward `items_per_project` |
 
 A full batch logs a warning (`retention_cleanup_batch_full`, `project_changes_cleanup_batch_full`); a failed
 retention run logs `retention_failed` and the next run tries again.
+
+The database-size step makes 2 D1 queries per run, 3 on the first run of a UTC day (it keeps one sample a day for 400 days).
 
 The deleted-workspace step makes 4 D1 queries per run when there is nothing to do, 14 while 10 deleted workspaces wait for their projects, and at most 29. Workers Free allows 50 D1 queries per Worker invocation, shared by all the cron's steps, so on Free a busy run can stop early and later runs continue; on Workers Free a large deleted workspace takes many more runs.
 
