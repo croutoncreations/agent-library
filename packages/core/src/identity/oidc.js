@@ -5,9 +5,10 @@ import { HttpError } from "../util.js";
 import { s256, verifyJwt } from "./jwt.js";
 
 /**
- * config: { issuer, clientId, clientSecret, authorization, token, jwks, scope = "openid email" }
+ * config: { issuer, clientId, clientSecret, authorization, token, jwks, scope = "openid email", issuerAliases?: [other spellings
+ *   of the same issuer an ID token may carry, e.g. Google's "accounts.google.com"], trustEmail? }
  * Returns { start({ redirectUri, state, verifier, nonce }) -> URL string, finish({ url, redirectUri, verifier, nonce }) -> identity, origins() }
- * identity: { issuer, subject, email (lower-case) | null, emailVerified: boolean }
+ * identity: { issuer (always config.issuer, whichever spelling the token used), subject, email (lower-case) | null, emailVerified: boolean }
  */
 export function oidcClient(config) {
   const c = config;
@@ -26,7 +27,8 @@ export function oidcClient(config) {
     async finish(p) {
       const code = p.url.searchParams.get("code") ?? "";
       if (!/^[A-Za-z0-9._~-]{43,128}$/.test(p.verifier)) throw new HttpError(401, "upstream_denied", "Login transaction is missing its PKCE verifier");
-      if (!/^[A-Za-z0-9._~-]{1,2048}$/.test(code)) throw new HttpError(401, "upstream_denied", "Malformed upstream code");
+      // "/" is allowed: Google's codes look like "4/0A..." (the code only ever travels form-encoded to the token endpoint).
+      if (!/^[A-Za-z0-9._~/-]{1,2048}$/.test(code)) throw new HttpError(401, "upstream_denied", "Malformed upstream code");
       const r = await fetch(c.token, {
         method: "POST",
         headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json",
@@ -37,7 +39,7 @@ export function oidcClient(config) {
       if (!r.ok || text.length > 64 * 1024) throw new HttpError(401, "upstream_denied", "Upstream sign-in failed");
       let body;
       try { body = JSON.parse(text); } catch { throw new HttpError(401, "upstream_denied", "Upstream sign-in failed"); }
-      const claims = await verifyJwt(typeof body.id_token === "string" ? body.id_token : "", { jwks: c.jwks, issuer: c.issuer, audience: c.clientId, azp: c.clientId });
+      const claims = await verifyJwt(typeof body.id_token === "string" ? body.id_token : "", { jwks: c.jwks, issuer: [c.issuer, ...(c.issuerAliases ?? [])], audience: c.clientId, azp: c.clientId });
       if (typeof claims.iat !== "number") throw new HttpError(401, "upstream_denied", "ID token lacks iat");
       if (typeof claims.nonce !== "string" || claims.nonce !== p.nonce) throw new HttpError(401, "upstream_denied", "ID token nonce mismatch");
       const email = typeof claims.email === "string" && claims.email.length <= 254 ? claims.email.toLowerCase() : null;
@@ -45,7 +47,7 @@ export function oidcClient(config) {
       // verified email decides sign-up (SIGNUP_ALLOWLIST) and invitation matching. OIDC_TRUST_EMAIL=1 is the opt-in for
       // providers that only ever issue verified addresses but never send the claim.
       const verified = claims.email_verified === true || claims.email_verified === "true" || (c.trustEmail === true && claims.email_verified === undefined);
-      return { issuer: claims.iss, subject: claims.sub, email, emailVerified: !!email && verified };
+      return { issuer: c.issuer, subject: claims.sub, email, emailVerified: !!email && verified };
     }
   };
 }

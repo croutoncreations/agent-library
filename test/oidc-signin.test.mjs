@@ -35,7 +35,7 @@ before(async () => {
     if (u.pathname === "/authorize") {
       const q = Object.fromEntries(u.searchParams);
       if (q.client_id !== CLIENT || q.code_challenge_method !== "S256" || !q.nonce) return send(400, { error: "invalid_request" });
-      const code = "c" + randomBytes(12).toString("hex");
+      const code = "4/0c" + randomBytes(12).toString("hex");   // Google's codes contain a slash
       codes.set(code, { ...q, who: next });
       res.writeHead(302, { location: `${q.redirect_uri}?code=${code}&state=${encodeURIComponent(q.state)}` }); return res.end();
     }

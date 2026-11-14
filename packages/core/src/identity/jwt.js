@@ -46,7 +46,8 @@ async function keyFor(url, kid, alg) {
 
 /**
  * Verify a JWT's signature, issuer, audience and lifetime. Returns its claims.
- * opts: { jwks, issuer, audience, algs = ["RS256","ES256"], azp?: clientId (required when aud has several values) }
+ * opts: { jwks, issuer (a string, or an array when the provider writes its issuer in more than one form), audience,
+ *         algs = ["RS256","ES256"], azp?: clientId (required when aud has several values) }
  */
 export async function verifyJwt(token, opts) {
   const parts = typeof token === "string" ? token.split(".") : [];
@@ -63,7 +64,7 @@ export async function verifyJwt(token, opts) {
     throw deny("Bad token signature");
   const now = Math.floor(Date.now() / 1e3);
   const aud = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
-  if (claims.iss !== opts.issuer) throw deny("Token issuer mismatch");
+  if (!(Array.isArray(opts.issuer) ? opts.issuer : [opts.issuer]).includes(claims.iss)) throw deny("Token issuer mismatch");
   if (!aud.includes(opts.audience) || (opts.azp && (aud.length > 1 || claims.azp !== undefined) && claims.azp !== opts.azp)) throw deny("Token audience mismatch");
   if (typeof claims.exp !== "number" || claims.exp <= now) throw deny("Token expired");
   if (typeof claims.iat === "number" && claims.iat > now + 120) throw deny("Token issued in the future");
