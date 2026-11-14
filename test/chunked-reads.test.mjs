@@ -64,7 +64,7 @@ test("small reads keep their exact previous shape on every transport", async () 
     const r = await m.call("read_artifact", { project_id: PA, artifact_id: id });
     assert.equal(r.data.body, "# hello\nsmall"); assert.equal(r.data.revision.rev, 1); assert.equal(r.data.text, undefined);
     const tool = (await m.client.listTools()).tools.find((t) => t.name === "read_artifact");
-    assert.deepEqual(Object.keys(tool.inputSchema.properties).sort(), ["artifact_id", "cursor", "max_bytes", "project_id", "revision"]);
+    assert.deepEqual(Object.keys(tool.inputSchema.properties).sort(), ["artifact_id", "cursor", "max_bytes", "project_id", "reviewed", "revision"]);
     // Clients that send null for optional arguments still get the whole-body read.
     const nul = await m.call("read_artifact", { project_id: PA, artifact_id: id, cursor: null, max_bytes: null });
     assert.equal(nul.data.body, "# hello\nsmall");

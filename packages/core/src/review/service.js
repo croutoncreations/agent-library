@@ -15,12 +15,12 @@
 import { commitTextWrites, deleteBlob, getText, getTextPrefix, readBlob, stageTextWrite, textKey, textWriteComplete } from "../content-store.js";
 import { authorizeProject, authzSql, contentWriteSql, protectSql, requireHuman } from "../auth.js";
 import { chKinds } from "../changes/service.js";
-import { CONTENT_TYPE, checkFile } from "../formats.js";
+import { checkFile } from "../formats.js";
 import { lineDiff, metaBaselineInsert, provenance, whoLabel } from "../history/service.js";
 import { explainLimit, projectLimitGuard } from "../limits.js";
 import { rtReadAuthzSql } from "../reads/service.js";
 import { headIndexInput, indexDocument, repairIfStale } from "../search/indexing.js";
-import { audit, db, folderCheck, idemInsert, idemLookup, IMAGE_TYPES, loadArtifact, mdBody, runBatch, VIDEO_TYPES } from "../service.js";
+import { audit, db, folderCheck, idemInsert, idemLookup, IMAGE_TYPES, loadArtifact, mdBody, runBatch, servedContentType, VIDEO_TYPES } from "../service.js";
 import { tplDenyPublisher } from "../templates/service.js";
 import { memberRoleSql, requireProjectRole } from "../tenancy.js";
 import { CHANGE_NOTE_MAX, HttpError, int, nowIso, nowMs, randomId, sha256Hex, str } from "../util.js";
@@ -424,7 +424,7 @@ async function serveProposalContent(ctx, req, projectId, proposalId) {
   const inline2 = !isText && new URL(req.url).searchParams.get("download") !== "1" && (IMAGE_TYPES.includes(p.mime) || VIDEO_TYPES.includes(p.mime));
   // Text proposals are served as plain text and binaries by their checked type: never rendered as HTML here.
   const headers = {
-    "content-type": isText ? "text/plain; charset=utf-8" : CONTENT_TYPE[p.mime] ?? "application/octet-stream", "x-content-type-options": "nosniff", "cache-control": "private, no-store",
+    "content-type": isText ? "text/plain; charset=utf-8" : servedContentType(p.mime), "x-content-type-options": "nosniff", "cache-control": "private, no-store",
     "content-security-policy": "default-src 'none'; img-src 'self'; media-src 'self'; frame-ancestors 'self'; sandbox", "cross-origin-resource-policy": "same-origin",
     etag: `"${p.sha256}"`, "content-disposition": `${inline2 ? "inline" : "attachment"}; filename="proposal-${p.id.slice(4, 16)}"`, "content-length": String(p.size)
   };
