@@ -26,6 +26,7 @@ export const SERVER_PORTS = range({
   // Used by the hosted (private) repository's tests, which run its bundle through this harness.
   "hosted-supabase": 21055,
   addresses: 21056, "addresses-browser": 21057, "plan-limits": 21058, "project-deletion": 21059, "content-host": 21060, "large-uploads": 21061, "list-limits": 21062, "single-pass-uploads": 21063, "text-r2": 21064, "list-artifacts-filter": 21065, "text-limit": 21066, "render-limit": 21067, "text-uploads": 21068, "text-uploads-oauth": 21069, "text-uploads-v1": 21070, "search-excerpt-bounds": 21071, "list-filter-long": 21072, "text-uploads-mcp": 21073, "text-uploads-mcp-off": 21074, "app-files": 21076, "app-files-hooks-off": 21078,
+  "offline-shell": 21080, "offline-network": 21081, "offline-hosted": 21082,
 });
 
 /** Plain node:http listeners that tests start next to a server. */
@@ -33,6 +34,7 @@ export const AUX_PORTS = range({
   hostedJwks: 23100, oauthBrowserOidc: 23101, oauthBrowserCallback: 23102, oauthBrowserHop: 23103,
   chatgptOidc: 23104, chatgptCallback: 23105, hostedSessionJwks: 23106, hostedSessionAccess: 23107,
   hostedTurnstile: 23108, hostedStripe: 23109, hostedSendgrid: 23110,
+  offlineShellProxy: 23111, offlineNetworkJwks: 23112, offlineNetworkAccess: 23113, offlineHostedProxy: 23114,
 });
 
 /** Every port bound during a run, for the uniqueness check. */
