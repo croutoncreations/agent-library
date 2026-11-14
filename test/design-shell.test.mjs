@@ -293,20 +293,26 @@ test("loading skeleton: screen-reader text stays visually hidden; every row is a
 
 
 test("reader connections show until disconnected instead of the storage sentinel date", { skip: !haveChrome && "Chrome not installed" }, async () => {
-  const intercept = (r) => {
-    if (new URL(r.url()).pathname !== "/api/access") return r.continue();
-    return r.respond({ status: 200, contentType: "application/json", body: JSON.stringify({ connections: [{
-      id: "oac_synthetic12345", client_name: "Synthetic enduring reader", redirect_host: "reader.example.test",
-      status: "active", projects: [{title: "Alpha notes", access: "read"}],
-      created_at: new Date().toISOString(), expires_at: "9999-01-01T00:00:00.000Z", last_used_at: null
-    }] }) });
-  };
-  await page.setRequestInterception(true); page.on("request", intercept);
+  // Its own sign-in: the sign-out test above revokes every session of this person, including the shared page's.
+  const ctx = await browser.createBrowserContext(); const p = await ctx.newPage();
   try {
-    await page.goto(ORIGIN + "/#/settings/apps");
-    await page.waitForFunction(() => document.body.innerText.includes("Synthetic enduring reader"));
-    const text = await page.evaluate(() => document.body.innerText);
+    await p.setViewport({ width: 1440, height: 900 });
+    await p.goto(ORIGIN + "/"); await p.waitForSelector('input[name="passphrase"]');
+    await p.type('input[name="passphrase"]', s.passphrase());
+    await Promise.all([p.waitForFunction(() => document.querySelectorAll("#nav a").length === 5), p.click('button[type="submit"]')]);
+    await p.setRequestInterception(true);
+    p.on("request", (r) => {
+      if (new URL(r.url()).pathname !== "/api/access") return r.continue();
+      return r.respond({ status: 200, contentType: "application/json", body: JSON.stringify({ connections: [{
+        id: "oac_synthetic12345", client_name: "Synthetic enduring reader", redirect_host: "reader.example.test",
+        status: "active", projects: [{title: "Alpha notes", access: "read"}],
+        created_at: new Date().toISOString(), expires_at: "9999-01-01T00:00:00.000Z", last_used_at: null
+      }] }) });
+    });
+    await p.goto(ORIGIN + "/#/settings/apps");
+    await p.waitForFunction(() => document.body.innerText.includes("Synthetic enduring reader"));
+    const text = await p.evaluate(() => document.body.innerText);
     assert.match(text, /Until you disconnect/); assert.doesNotMatch(text, /9999/);
-    await page.screenshot({ path: new URL("../tmp/test-evidence/mcp-until-disconnected.png", import.meta.url).pathname, fullPage: true });
-  } finally { page.off("request", intercept); await page.setRequestInterception(false); }
+    await p.screenshot({ path: new URL("../tmp/test-evidence/mcp-until-disconnected.png", import.meta.url).pathname, fullPage: true });
+  } finally { await ctx.close(); }
 });
