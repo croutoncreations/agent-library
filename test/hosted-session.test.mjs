@@ -33,11 +33,13 @@ function jwt(claims) {
 }
 
 let jwks, access, s, browser, page;
-const accessState = { expired: false, sub: "user-owner-1", xhr401: 0, logoutDelayMs: 0, delayMs: {} };
+// unreachable: every connection is dropped, like a phone with no signal that still thinks it is online.
+const accessState = { expired: false, unreachable: false, sub: "user-owner-1", xhr401: 0, logoutDelayMs: 0, delayMs: {} };
 const SIGNIN_TITLE = "Stand-in Cloudflare Access sign-in";
 
 function startAccess() {
   return createServer((req, res) => {
+    if (accessState.unreachable) { req.socket.destroy(); return; }
     if (accessState.expired) {
       if ((req.headers["x-requested-with"] || "").toLowerCase() === "xmlhttprequest") { accessState.xhr401++; res.writeHead(401); return res.end(); }
       res.writeHead(200, { "content-type": "text/html" });
@@ -83,7 +85,8 @@ before(async () => {
   access = startAccess();
   if (!haveChrome) return;
   browser = await require(PUPPETEER).launch({ executablePath: CHROME, headless: true,
-    args: ["--no-first-run", `--host-resolver-rules=MAP ${HOST} 127.0.0.1`] });
+    // Treat the plain-HTTP test host as secure so the service worker (cached shell) runs, as it does in production.
+    args: ["--no-first-run", `--host-resolver-rules=MAP ${HOST} 127.0.0.1`, `--unsafely-treat-insecure-origin-as-secure=${APP}`] });
   page = await browser.newPage();
   await page.setViewport({ width: 1200, height: 900 });
 });
@@ -228,6 +231,61 @@ test("sign-out after another tab renewed the session (this page's CSRF token is 
   } finally { page.off("response", onLogout); }
   assert.equal(liveSessions(), 0, "no session survives sign-out");
   assert.deepEqual(logoutStatuses, [403, 200], "sign-out was refused for the stale token and sent again");
+});
+
+test("cached shell with saved copies: Access expired opens the copies with a sign-in link that reaches Access", { skip }, async () => {
+  await openHome();
+  // The app registers its worker on https (and loopback) only; this plain-HTTP test host registers it directly.
+  await page.evaluate(async () => { await navigator.serviceWorker.register("/sw.js", { scope: "/" }); await navigator.serviceWorker.ready; });
+  await openHome();
+  const pid = "offline-trip";
+  const r = await page.evaluate(async (p) => {
+    const csrf = (await (await fetch("/api/me", { headers: { "x-requested-with": "XMLHttpRequest" } })).json()).csrf;
+    const post = (u, b) => fetch(u, { method: "POST", headers: { "content-type": "application/json", "x-csrf-token": csrf, "idempotency-key": "off-" + Math.random() }, body: JSON.stringify(b) });
+    await post("/api/projects", { id: p, title: "Offline trip" });
+    return (await fetch("/api/projects/" + p + "/artifacts", { method: "POST", headers: { "content-type": "application/json", "x-csrf-token": csrf, "idempotency-key": "off-" + Date.now() }, body: JSON.stringify({ title: "Saved note", body: "# Saved\n\nReadable offline.\n" }) })).json();
+  }, pid);
+  await page.goto(APP + "/#/p/" + pid + "/a/" + r.artifact_id); await page.waitForFunction(() => /Readable offline/.test(document.body.innerText));
+  await page.click('button[aria-label="Make available offline"]');
+  await page.waitForFunction(() => /Available offline/.test(document.body.innerText));
+  await page.evaluate(() => sessionStorage.removeItem("al:signin-reload"));
+  endAppSessions();
+  accessState.expired = true;
+  try {
+    await page.goto("about:blank");
+    const nav = await page.goto(APP + "/");
+    assert.equal(nav.fromServiceWorker(), true, "the shell came from the cache");
+    await page.waitForFunction(() => /Saved note/.test(document.body.innerText) && /Sign in to open the live library/.test(document.body.innerText), { timeout: 10000 });
+    assert.notEqual(await page.title(), SIGNIN_TITLE, "no navigation away from the saved copies");
+    await Promise.all([page.waitForNavigation(), page.evaluate(() => [...document.querySelectorAll("a")].find((a) => a.textContent === "Sign in to open the live library").click())]);
+    assert.equal(await page.title(), SIGNIN_TITLE, "the sign-in link reaches Access, not the cached shell");
+  } finally { accessState.expired = false; }
+  // The background shell refresh ran while Access was signed out: its sign-in page must not have replaced the
+  // cached shell, so the next launch is still the app.
+  await page.goto(APP + "/#/"); await page.waitForSelector("#nav a");
+  assert.notEqual(await page.title(), SIGNIN_TITLE);
+});
+
+test("cached shell, unreachable network, nothing saved: the offline page, never the Sign in screen", { skip }, async () => {
+  await openHome();
+  await page.evaluate(async () => { await navigator.serviceWorker.register("/sw.js", { scope: "/" }); await navigator.serviceWorker.ready; });
+  await openHome();
+  await page.evaluate(async () => { await new Promise((res) => { const r = indexedDB.open("al-offline", 1); r.onsuccess = () => { const d = r.result; const t = d.transaction(["items", "projects"], "readwrite"); t.objectStore("items").clear(); t.objectStore("projects").clear(); t.oncomplete = () => res(); }; }); });
+  await page.evaluate(() => sessionStorage.removeItem("al:signin-reload"));
+  accessState.unreachable = true;
+  try {
+    await page.goto("about:blank");
+    const nav = await page.goto(APP + "/?source=pwa");
+    assert.equal(nav.fromServiceWorker(), true, "the shell came from the cache");
+    assert.equal(await page.evaluate(() => navigator.onLine), true, "the browser still thinks it is online");
+    await page.waitForFunction(() => /Nothing is saved on this device yet/.test(document.body.innerText), { timeout: 15000 });
+    const text = await page.evaluate(() => document.body.innerText);
+    assert.match(text, /Offline: showing copies saved on this device/);
+    assert.doesNotMatch(text, /Sign in with your Cloudflare Access account/);
+    assert.notEqual(await page.title(), SIGNIN_TITLE);
+  } finally { accessState.unreachable = false; }
+  // Back online: the next launch opens the live library as before.
+  await openHome();
 });
 
 test("server: a new Access user ID for the owner email keeps the same owner account and library", async () => {
