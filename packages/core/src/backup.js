@@ -1,7 +1,7 @@
 import { TEXT_MAX_BYTES } from "./text-limits.js";
 import { personalWorkspaceId } from "./tenancy.js";
 import { blobKeyFits, blobPrefix, commitTextWrites, deleteBlobs, dropUnreferencedBlobs, getText, isTextWriteFenceError, mapContent, readBlobBytes, stageTextWrites, storedText, textKey, textWriteComplete, writeBlobBytes } from "./content-store.js";
-import { textSearchBridge } from "./search/service.js";
+import { indexDocument } from "./search/indexing.js";
 import { limitsFor, requireHuman } from "./auth.js";
 import { BINARY_TYPES, LIMITS, tplDate } from "./service.js";
 import { requireProjectRole, requireWorkspaceRole, workspaceRoleSql } from "./tenancy.js";
@@ -237,6 +237,18 @@ async function publishBackup(env, { objects, textKeys, build }) {
   }
 }
 
+// Index entries for the restored or imported documents, after their rows in the same batch: one per untrashed published
+// document, from its head version's text (a file is indexed by its title only). `ids` maps backup ids to stored ids.
+function searchStatements(DB, backup, artifactIdOf = (id) => id, revisionIdOf = (id) => id) {
+  const revisions = new Map(backup.revisions.map((r) => [r.id, r]));
+  const out = [];
+  for (const a of backup.artifacts) {
+    const head = a.head_rev > 0 && !a.trashed_at ? revisions.get(a.head_revision_id) : null;
+    if (head) out.push(...indexDocument(DB, { artifactId: artifactIdOf(a.id), revisionId: revisionIdOf(head.id), sha256: head.sha256, text: head.blob_key ? "" : head.body ?? "" }));
+  }
+  return out;
+}
+
 async function restoreBackup(ctx, backup) {
   requireHuman(ctx);
   const DB = ctx.env.DB;
@@ -299,7 +311,7 @@ async function restoreBackup(ctx, backup) {
     const bodyKey = textKey(pid, r.artifact_id, r.id, attempt);
     bodyKeys.set(r.id, bodyKey);
     textWrites.push({ projectId: pid, artifactId: r.artifact_id, revisionId: r.id, text: r.body, attempt });
-    textKeys.push(bodyKey); bridges.push(textSearchBridge(ctx.env, r.artifact_id, r.id, r.body), textWriteComplete(ctx.env, bodyKey));
+    textKeys.push(bodyKey); bridges.push(textWriteComplete(ctx.env, bodyKey));
   }
   const tail = [];
   for (const v of backup.meta_versions ?? [])
@@ -320,7 +332,7 @@ async function restoreBackup(ctx, backup) {
     build: () => [...head, ...backup.revisions.map((r) => {
       return DB.prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, body_key, blob_key, size, sha256, mime, restored_from, created_at, via_kind, via_id, via_label, client_info, change_note)
       VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(r.id, r.artifact_id, pid, r.rev_no, r.author_id, bodyKeys.get(r.id) ?? null, r.blob_key ? restoreKey(r) : null, r.size, r.sha256, r.mime, r.restored_from ?? null, r.created_at, r.via_kind ?? null, r.via_id ?? null, r.via_label ?? null, r.client_info ?? null, r.change_note ?? null);
-    }), ...tail, ...bridges],
+    }), ...tail, ...searchStatements(DB, backup), ...bridges],
   });
   if (out.error) {
     // A lost race, or a commit whose acknowledgement was lost: either way the store now holds a project. In the second
@@ -466,7 +478,7 @@ async function importBackup(ctx, workspaceId, input, idemKeyValue, digest = "") 
     const bodyKey = textKey(pid, aid, rid);
     bodyKeys.set(r.id, bodyKey);
     textWrites.push({ projectId: pid, artifactId: aid, revisionId: rid, text: r.body });
-    textKeys.push(bodyKey); bridges.push(textSearchBridge(ctx.env, aid, rid, r.body), textWriteComplete(ctx.env, bodyKey));
+    textKeys.push(bodyKey); bridges.push(textWriteComplete(ctx.env, bodyKey));
   }
   const revisionStmt = (r) => DB.prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, body_key, blob_key, size, sha256, mime, restored_from, created_at, via_kind, via_id, via_label, client_info, change_note)
       VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(revId.get(r.id), artId.get(r.artifact_id), pid, r.rev_no, me, bodyKeys.get(r.id) ?? null, r.blob_key === null ? null : keyMap.get(r.blob_key), r.size, r.sha256, r.mime, r.restored_from ?? null, r.created_at, r.via_kind ?? null, null, r.via_label ? `${r.via_label} (imported)` : "imported", r.client_info ?? null, r.change_note ?? null);
@@ -489,7 +501,7 @@ async function importBackup(ctx, workspaceId, input, idemKeyValue, digest = "") 
   const out = await publishBackup(ctx.env, {
     objects: [...decoded].map(([k, bytes]) => [keyMap.get(k), bytes]), textKeys,
     // res[0] stays the project INSERT: head[0] is it.
-    build: () => [...head, ...backup.revisions.map(revisionStmt), ...stmts, ...bridges],
+    build: () => [...head, ...backup.revisions.map(revisionStmt), ...stmts, ...searchStatements(DB, backup, (id) => artId.get(id), (id) => revId.get(id)), ...bridges],
   });
   if (out.error) {
     const m = String(out.batchError?.message ?? out.batchError ?? "");

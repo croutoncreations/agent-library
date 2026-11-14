@@ -229,6 +229,27 @@ export async function getTextRange(env, row, offset, length) {
   return new Uint8Array(await object.arrayBuffer());
 }
 
+/**
+ * At most the first `chars` characters (code points) of a text version, for search excerpts: one ranged R2 read of
+ * `4 * chars` bytes (UTF-8 is at most four bytes a character), cut at a character boundary. A legacy inline row is
+ * sliced in memory. Throws 500 blob_missing like getText.
+ */
+export async function getTextPrefix(env, row, chars) {
+  if (!row.body_key) return Array.from(readText(row.body ?? "")).slice(0, chars).join("");
+  const want = chars * 4;
+  const bytes = await getBlobHead(env, row.body_key, want);
+  if (!bytes) throw blobMissing();
+  let end = bytes.length;
+  if (end === want) {
+    // The read may stop inside a character: drop a trailing incomplete sequence rather than decode it as U+FFFD.
+    let lead = end - 1;
+    while (lead > 0 && (bytes[lead] & 0xc0) === 0x80) lead--;
+    const need = bytes[lead] >= 0xf0 ? 4 : bytes[lead] >= 0xe0 ? 3 : bytes[lead] >= 0xc0 ? 2 : 1;
+    if (end - lead < need) end = lead;
+  }
+  return Array.from(new TextDecoder().decode(bytes.subarray(0, end))).slice(0, chars).join("");
+}
+
 /** Legacy inline rows remain readable while new versions store only a key in D1. */
 export async function getText(env, row) {
   if (!row.body_key) return readText(row.body);

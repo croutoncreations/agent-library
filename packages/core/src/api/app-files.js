@@ -6,6 +6,7 @@ import { authzSql } from "../auth.js";
 import { MIME, checkFile } from "../formats.js";
 import { audit, createMarkdown, idemInsert, idemLookup, mdBody, publishRevision, runBatch, servedContentType } from "../service.js";
 import { metaBaselineInsert, metaVersionInsert } from "../history/service.js";
+import { unindexDocument } from "../search/indexing.js";
 import { appOrigin, artifactWebUrl, previewWebUrl } from "../links.js";
 import { serveContent } from "../uploads.js";
 import { HttpError, b64url, idemKey, int, json, nowIso, randomId, sha256Hex } from "../util.js";
@@ -322,7 +323,8 @@ async function remove({ req, env, db, p, requestId }, rest) {
     metaBaselineInsert(ctx, a, gate, gp),
     metaVersionInsert(ctx, a, next, { title: a.title, folder: a.folder, tags: a.tags, trashed: true, description: a.template_description, restoredFrom: null }, {}, gate, gp),
     idemInsert(ctx, i, 200, body, gate, gp),
-    audit(ctx, p.project_id, "artifact.trash", a.id, null, "ok", gate, gp)
+    audit(ctx, p.project_id, "artifact.trash", a.id, null, "ok", gate, gp),
+    ...unindexDocument(db, a.id)
   ], i);
   if (!Array.isArray(out)) return json(out.body, out.status);
   if (!out[0].meta.changes) {

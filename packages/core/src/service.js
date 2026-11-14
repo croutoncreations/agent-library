@@ -6,7 +6,8 @@ import { CONTENT_TYPE, MEASUREMENTS, MIME, checkFile, isCalendarDate, measuremen
 import { diffRevisions, historyPage, lineDiff, metaBaselineInsert, metaHistory, metaVersionInsert, provenance, restoreMetadata } from "./history/service.js";
 import { RT_ID_TOO_LONG, RT_KINDS_ALL, RT_KINDS_DOCS, readTextChunk, rtChunkLimit, rtFit, rtIdBytes, rtQuery, rtReadAuthzSql } from "./reads/service.js";
 import { __name } from "./runtime.js";
-import { RS_SCHEMA, refreshTextSearch, rsQuery, rsReady, rsToolReady, searchArtifacts, textSearchBridge } from "./search/service.js";
+import { headIndexInput, indexDocument, repairIfStale, unindexDocument } from "./search/indexing.js";
+import { RS_SCHEMA, rsQuery, rsReady, rsToolReady, searchArtifacts } from "./search/service.js";
 import { createFromTemplate, listTemplates, previewTemplate, saveAsTemplate, tplAssertMaintenance, tplDate, tplProvenance, tplTools } from "./templates/service.js";
 import { ROLE_RANK, memberRoleSql, personalWorkspaceId, projectRole, workspaceRoleSql, requireProjectRole, requireWorkspaceRole, visibleProjects } from "./tenancy.js";
 import { HttpError, b64url, cutLists, int, nowIso, nowMs, randomId, sha256Hex, str } from "./util.js";
@@ -354,7 +355,7 @@ async function createMarkdown(ctx, projectId, input, key, kind = "markdown", int
       SELECT ?, ?, ?, 1, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM artifacts WHERE id = ?)`).bind(revId, artId, projectId, ctx.principal.id, bodyKey, new TextEncoder().encode(body2).length, sha2, mime, now, ...provenance(ctx, input), artId),
     audit(ctx, projectId, "artifact.create", artId, 1, "ok", "EXISTS (SELECT 1 FROM artifacts WHERE id = ?)", [artId]),
     ...internal?.extra ?? [],
-    textSearchBridge(ctx.env, artId, revId, body2), textWriteComplete(ctx.env, bodyKey)
+    ...indexDocument(db(ctx), { artifactId: artId, revisionId: revId, sha256: sha2, text: body2 }), textWriteComplete(ctx.env, bodyKey)
   ]), i));
   if (!Array.isArray(out2)) return out2;
   if (!out2[1].meta.changes) {
@@ -412,7 +413,9 @@ async function publishRevision(ctx, projectId, artifactId, expected, i, rev, ext
     idemInsert(ctx, i, 200, body2, gate, [revId]),
     audit(ctx, projectId, action, artifactId, next, "ok", gate, [revId]),
     ...extra.map((s) => s),
-    ...bodyKey ? [textSearchBridge(ctx.env, artifactId, revId, rev.body), textWriteComplete(ctx.env, bodyKey)] : []
+    // A file version (no text) is indexed by its title only.
+    ...indexDocument(db(ctx), { artifactId, revisionId: revId, sha256: rev.sha256, text: rev.body ?? "" }),
+    ...bodyKey ? [textWriteComplete(ctx.env, bodyKey)] : []
     // callers gate their own extra statements on the same predicate
   ]), i));
   if (!Array.isArray(out2)) return out2;
@@ -537,6 +540,14 @@ async function updateMetadata(ctx, projectId, artifactId, input, key, internal) 
   const gate = "EXISTS (SELECT 1 FROM artifacts WHERE id = ? AND meta_version = ? AND meta_request_id = ?)";
   const gp = [artifactId, next, ctx.requestId];
   const body2 = { artifact_id: artifactId, meta_version: next, title, folder, tags: JSON.parse(tags), trashed: !!trashed, ...a.is_template ? { template_description: description } : {} };
+  // The index follows the title and the trash: out of the trash it goes at once, back into it (or under a new title) with
+  // the head's text, which is read first. A head that moves meanwhile makes these no-ops; repairIfStale below fixes that.
+  let searchStatements = [];
+  if (trashed) searchStatements = unindexDocument(db(ctx), artifactId);
+  else if (title !== a.title || a.trashed_at) {
+    const head = await headIndexInput(ctx.env, artifactId);
+    if (head) searchStatements = indexDocument(db(ctx), { artifactId, revisionId: head.revisionId, sha256: head.sha256, text: head.text });
+  }
   const out2 = await runBatch(ctx, [
     db(ctx).prepare(`UPDATE artifacts SET title = ?, folder = ?, tags = ?, trashed_at = ?, template_description = ?, meta_version = ?, meta_request_id = ?, updated_at = ?
       WHERE id = ? AND project_id = ? AND meta_version = ? AND ${az.sql}`).bind(title, folder, tags, trashed, description, next, ctx.requestId, nowIso(), artifactId, projectId, expected, ...az.params),
@@ -552,7 +563,8 @@ async function updateMetadata(ctx, projectId, artifactId, input, key, internal) 
       "ok",
       gate,
       gp
-    )
+    ),
+    ...searchStatements.map((st) => st)
   ], i);
   if (!Array.isArray(out2)) return out2;
   if (!out2[0].meta.changes) {
@@ -563,7 +575,7 @@ async function updateMetadata(ctx, projectId, artifactId, input, key, internal) 
     if (cur === expected) throw new HttpError(403, "forbidden", "Grant no longer valid");
     throw new HttpError(409, "metadata_conflict", "Expected metadata version is stale", { current_meta_version: cur });
   }
-  await refreshTextSearch(ctx.env, artifactId);
+  if (!trashed) await repairIfStale(ctx.env, artifactId);
   return { status: 200, body: body2 };
 }
 // Folders per project: checked inside the INSERT (FOLDER_ROOM_SQL binds the project id, then the cap) on every path
