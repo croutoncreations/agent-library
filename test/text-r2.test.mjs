@@ -10,6 +10,10 @@ import { SERVER_PORTS } from "./ports.mjs";
 import { MARKDOWN_PREVIEW_MAX_BYTES } from "../packages/core/src/text-limits.js";
 import { commitTextWrites, isTextWriteFenceError } from "../packages/core/src/content-store.js";
 
+// Documents the index currently matches for a word, as search joins them (current revision, hash and title).
+const hits = (sql, word) => sql.prepare(`SELECT COUNT(*) AS n FROM artifact_search s JOIN artifact_search_keys k ON k.search_id = s.rowid JOIN artifacts a ON a.id = k.artifact_id
+  JOIN revisions r ON r.id = a.head_revision_id WHERE artifact_search MATCH ? AND a.trashed_at IS NULL AND k.revision_id = r.id AND k.sha256 = r.sha256 AND k.indexed_title = a.title`).get(word).n;
+
 async function harness() {
   const lib = await loadWorker({ "service.js": ["createMarkdown", "saveMarkdown", "getArtifact", "restoreRevision", "updateMetadata", "listArtifacts", "addComment", "listComments"], "reads/service.js": ["readTextChunk"], "uploads.js": ["serveContent"], "history/service.js": ["diffRevisions"], "backup.js": ["exportBackup", "restoreBackup", "importBackup"], "cleanup.js": ["reconcileUploads"], "project-deletion.js": ["purgeDueProjects"], "render-source.js": ["getRenderSource"], "content-store.js": ["stageTextWrites", "commitTextWrites"], "adapters.js": ["withAdapters", "defaultAdapters"] });
   const sql = new DatabaseSync(":memory:");
@@ -26,26 +30,28 @@ async function harness() {
   return { lib, sql, ctx, env, objects };
 }
 
-test("search bridge caps UTF-8 at 1 MiB on real local D1 (known suffix search gap)", async () => {
+test("indexDocument caps indexed text at 1 MiB (UTF-8) on real local D1; the suffix is not searchable", async () => {
   const { Miniflare, convertV4MiniflareOptions } = await import("miniflare");
   const mf = new Miniflare(convertV4MiniflareOptions({ port: SERVER_PORTS["text-r2"], name: "bridge-bound", modules: true, script: "export default { fetch() { return new Response('test'); } }", compatibilityDate: "2026-10-24", d1Databases: { DB: "bridge-bound" } }));
   try {
     const DB = await mf.getD1Database("DB");
+    // The real migrations, so the real contentless table, keys and the completeness view.
+    const migrations = readdirSync(join(ROOT, "migrations")).filter(f => f.endsWith(".sql")).sort();
+    for (const f of migrations) await DB.exec(readFileSync(join(ROOT, "migrations", f), "utf8").replace(/--[^\n]*\n/g, "").replace(/\s*\n\s*/g, " "));
     await DB.batch([
-      DB.prepare("CREATE TABLE artifact_search (rowid INTEGER PRIMARY KEY, body TEXT, revision_id TEXT)"),
-      DB.prepare("CREATE TABLE artifact_search_keys (artifact_id TEXT, search_id INTEGER)"),
-      DB.prepare("CREATE TABLE artifacts (id TEXT, head_revision_id TEXT)"),
-      DB.prepare("INSERT INTO artifact_search (rowid, body, revision_id) VALUES (1, '', 'r')"),
-      DB.prepare("INSERT INTO artifact_search_keys (artifact_id, search_id) VALUES ('a', 1)"),
-      DB.prepare("INSERT INTO artifacts (id, head_revision_id) VALUES ('a', 'r')")
+      DB.prepare("INSERT INTO principals (id, kind, issuer, subject, label, created_at) VALUES ('p','human','synthetic','p','P','2026-01-01')"),
+      DB.prepare("INSERT INTO projects (id, owner_id, title, created_at) VALUES ('proj','p','P','2026-01-01')"),
+      DB.prepare("INSERT INTO artifacts (id, project_id, kind, title, head_rev, head_revision_id, created_at, updated_at) VALUES ('a','proj','markdown','Cap title',1,'r','2026-01-01','2026-01-01')"),
+      DB.prepare("INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, size, sha256, mime, created_at) VALUES ('r','a','proj',1,'p','',1,'h','text/markdown','2026-01-01')")
     ]);
-    const lib = await loadWorker({ "search/service.js": ["textSearchBridge"] });
+    const lib = await loadWorker({ "search/indexing.js": ["indexDocument"] });
     const prefix = "firstneedle " + "a".repeat(1048576 - 14);
-    await lib.textSearchBridge({ DB }, "a", "r", prefix + "🙂 suffixneedle " + "z".repeat(3 * 1048576)).run();
-    const stored = await DB.prepare("SELECT body FROM artifact_search").first("body");
-    assert.equal(stored, prefix);
-    assert.ok(Buffer.byteLength(stored) <= 1048576);
-    assert.ok(!stored.includes("\ufffd"));
+    await DB.batch(lib.indexDocument(DB, { artifactId: "a", revisionId: "r", sha256: "h", text: prefix + "\u{1F642} suffixneedle " + "z".repeat(3 * 1048576) }));
+    const found = async (w) => (await DB.prepare("SELECT COUNT(*) AS n FROM artifact_search WHERE artifact_search MATCH ?").bind(w).first("n"));
+    assert.equal(await found("firstneedle"), 1);
+    assert.equal(await found("suffixneedle"), 0);
+    assert.equal(await found("cap"), 1, "the title is indexed");
+    assert.equal(await DB.prepare("SELECT COUNT(*) AS n FROM artifact_search_missing").first("n"), 0);
   } finally { await mf.dispose(); }
 });
 
@@ -225,7 +231,7 @@ test("new saves store only R2 keys, conflicts leave no orphan, search and backup
   assert.equal(row.body, null);
   assert.equal(row.body_key, `text/proj-s/${id}/${row.id}`);
   assert.equal(new TextDecoder().decode(objects.get(row.body_key)), "quasarneedle café🙂");
-  assert.equal(sql.prepare("SELECT COUNT(*) AS n FROM artifact_search WHERE artifact_search MATCH 'quasarneedle'").get().n, 1);
+  assert.equal(hits(sql, 'quasarneedle'), 1);
   const before = [...objects.keys()].sort();
   await assert.rejects(lib.saveMarkdown(ctx, "proj-s", id, { expected_revision: 1, body: "loser" }, "conflict-r2"), e => e.code === "revision_conflict");
   const remove = env.BLOBS.delete;
@@ -242,11 +248,11 @@ test("new saves store only R2 keys, conflicts leave no orphan, search and backup
   assert.deepEqual([...objects.keys()].sort(), before);
   assert.equal(sql.prepare("SELECT COUNT(*) AS n FROM content_writes").get().n, 0);
   await lib.updateMetadata(ctx, "proj-s", id, { expected_meta_version: 1, title: "Renamed title" }, "rename-r2");
-  assert.equal(sql.prepare("SELECT COUNT(*) AS n FROM artifact_search WHERE artifact_search MATCH 'quasarneedle'").get().n, 1);
+  assert.equal(hits(sql, 'quasarneedle'), 1);
   await lib.updateMetadata(ctx, "proj-s", id, { expected_meta_version: 2, trashed: true }, "trash-r2");
-  assert.equal(sql.prepare("SELECT COUNT(*) AS n FROM artifact_search WHERE artifact_search MATCH 'quasarneedle'").get().n, 0);
+  assert.equal(hits(sql, 'quasarneedle'), 0);
   await lib.updateMetadata(ctx, "proj-s", id, { expected_meta_version: 3, trashed: false }, "untrash-r2");
-  assert.equal(sql.prepare("SELECT COUNT(*) AS n FROM artifact_search WHERE artifact_search MATCH 'quasarneedle'").get().n, 1);
+  assert.equal(hits(sql, 'quasarneedle'), 1);
   const backup = await lib.exportBackup(ctx, "proj-s");
   const other = await harness();
   other.sql.exec("DELETE FROM projects");

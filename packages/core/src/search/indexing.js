@@ -123,7 +123,7 @@ export async function repairIfStale(env, artifactId) {
  * Bootstrap and repair (cron, every run): re-index up to `limit` documents the completeness probe reports
  * missing or stale, then mark search ready once none is (the probe is the same metadata-only scan every search runs). After migration 0031 every existing document is missing, so
  * repeated runs rebuild the whole index from R2 (or legacy inline) text. Safe to repeat and to run concurrently: each
- * document is one atomic batch. A document that fails stays missing and is retried by the next run. The limit keeps a run
+ * document is one atomic batch. A text object that is gone is indexed by title only; any other failure leaves the document missing for the next run. The limit keeps a run
  * within a Free plan Worker's 50 subrequests (a read and a batch per document, at most one R2 read each).
  * @returns {Promise<{ processed: number, failed: number, ready: boolean }>}
  */
