@@ -1,8 +1,8 @@
 {
   "base_changes_sha256": "98026a1d3d662b49ef52b1796174de931a22dc2c0aeda557f7c115943d876b64",
-  "integrated_sha256": "9178dfeb479a0b94e7ff080d3e90b3b1996d2eeefa68d041b9e673cbcc3051e7",
+  "integrated_sha256": "dba1075f9e7dc6de1603f7c650674eb56dad3535ed8da0e62af8675010ec4aa0",
   "sources": {
-    "src/templates/service.js": "0fd91f2fade24c824789bd0da643f1c1152920319531610d7e2adf1fa83728fd",
+    "src/templates/service.js": "0891655bfa00a3f3c2bb21e1dc6231ac0a2bffe79185795cfeb78d2ddb102ba2",
     "src/templates/tools.js": "a3aae7f9d4fca0f7af22dbee37b7b09d12efbe9643a3c21d0fd83819d89e014b"
   },
   "patches": [
@@ -10,7 +10,7 @@
       "module": "// src/service.ts",
       "name": "shared template service and schemas",
       "find_sha256": "990995796303ae28bc68934e504c2b6e7f0f96c0f983ddbb77909c58bbaead9f",
-      "replace_sha256": "6bd6579c0e2aefd0cdcdac3004e01614280cfa60cf63cfeda3c0b2aae53963ec"
+      "replace_sha256": "5151f7d11c96dff663dd2a692a71235d2a050159c9d9dd19df72bf476a4e4c86"
     },
     {
       "module": "// src/service.ts",

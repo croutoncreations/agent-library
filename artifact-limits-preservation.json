@@ -1,0 +1,31 @@
+{
+  "base_sha256": "983abf5d4ea3984e36ec5ee9b20c935f84b78bd5af1cd79e664af09c38b37531",
+  "integrated_sha256": "17b4483cffa310e7dd709ae04b0362e3e3698330531662923231827c58d15c39",
+  "preserved_bytes_sha256": "d13eed31beff364e8089094b49111f5e6dba2439eda5c283a5d527215340962d",
+  "patches": [
+    {
+      "module": "// src/auth.ts",
+      "find_sha256": "55f026ff13868eaf2a2a427ddf507310ca421851e3389c89b460ebcfba0e9834",
+      "replace_sha256": "b8904777ebbe13f421368c46b2870f1b81135142cc346e471776a14a116407cf",
+      "count": 1
+    },
+    {
+      "module": "// src/auth.ts",
+      "find_sha256": "483f72bb01643ad244d1812427b40e9488cd7219b9bc033e157293fb02afadbf",
+      "replace_sha256": "9fdfda43b462a182b9b0619a6e65afedbeb640c4f631611c876227a3662eeecb",
+      "count": 1
+    },
+    {
+      "module": "// src/service.ts",
+      "find_sha256": "b51e1a25cdcb45d0573fc2080e7184fa7aab9314938cb4cbfc186257e3992277",
+      "replace_sha256": "834e5c80c348acc3ec2ccfd4e7b428b81ef353bffc34c5aa1eabdba1159bf759",
+      "count": 1
+    },
+    {
+      "module": "// src/service.ts",
+      "find_sha256": "ed7941354be3e797b3d522c96206c9c04bd42a6f5d5b34b1bc3a79f1e683d885",
+      "replace_sha256": "12a85fdebeac92cb2dc5c66252aff3b084323c3c73d5e19b44e2373846391ef3",
+      "count": 1
+    }
+  ]
+}

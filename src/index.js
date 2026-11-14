@@ -175,9 +175,26 @@ var init_access = __esm({
 });
 
 // src/auth.ts
+// Per-project document cap (PROJECT_ARTIFACT_LIMIT): a positive integer from 1 to 10000, default 1000. The ceiling is
+// a supported boundary, not a storage one: list paging, offline sync (stops at 2,000 items) and project backup are
+// not designed for more. Anything else falls back to the default, with one config warning per Worker instance.
+var ARTIFACTS_PER_PROJECT_DEFAULT = 1000, ARTIFACTS_PER_PROJECT_MAX = 10000, artifactCapWarned = false;
+function artifactCapFor(env) {
+  const raw = env.PROJECT_ARTIFACT_LIMIT;
+  if (raw === void 0 || raw === null || raw === "") return ARTIFACTS_PER_PROJECT_DEFAULT;
+  const text = String(raw);
+  const n = /^[1-9]\d{0,4}$/.test(text) ? Number(text) : 0;
+  if (n >= 1 && n <= ARTIFACTS_PER_PROJECT_MAX) return n;
+  if (!artifactCapWarned) {
+    artifactCapWarned = true;
+    console.warn(JSON.stringify({ event: "config_invalid", name: "PROJECT_ARTIFACT_LIMIT", value: text.slice(0, 40), using: ARTIFACTS_PER_PROJECT_DEFAULT, allowed: "integer 1-10000" }));
+  }
+  return ARTIFACTS_PER_PROJECT_DEFAULT;
+}
 function limitsFor(env) {
   const n = /* @__PURE__ */ __name((v, d) => v && /^\d{1,12}$/.test(v) ? Number(v) : d, "n");
   return {
+    artifactsPerProject: artifactCapFor(env),
     readsPerMin: n(env.RATE_READS_PER_MIN, 60),
     writesPerMin: n(env.RATE_WRITES_PER_MIN, 20),
     authFailPerMin: n(env.RATE_AUTHFAIL_PER_MIN, 30),
@@ -5872,7 +5889,7 @@ async function tplCopy(ctx, projectId, input, key, definition = false) {
     AND trashed_at IS NULL AND publisher_id IS NULL ${definition ? "" : "AND is_template = 1"})
     AND (? IS NULL OR EXISTS (SELECT 1 FROM folders WHERE id = ? AND project_id = ?))
     AND (SELECT COUNT(*) FROM artifacts WHERE project_id = ? AND publisher_id IS NULL AND pending_review = 0) < ?`;
-  const gp = [...az.params, sourceId, projectId, folderId, folderId, projectId, projectId, LIMITS.artifactsPerProject];
+  const gp = [...az.params, sourceId, projectId, folderId, folderId, projectId, projectId, limitsFor(ctx.env).artifactsPerProject];
   const result = { status: 201, body: { artifact_id: id, kind: "markdown", revision: 1, revision_id: rid, sha256: hash,
     ...tplLinks(ctx, projectId, id), source_artifact_id: sourceId, source_revision: revision,
     ...definition ? { is_template: true } : { source_template_id: sourceId, source_template_revision: revision, date } } };
@@ -5896,7 +5913,7 @@ async function tplCopy(ctx, projectId, input, key, definition = false) {
     await tplSource(ctx, projectId, sourceId, revision, !definition);
     await folderCheck(ctx, projectId, folderId);
     const n = await db(ctx).prepare("SELECT COUNT(*) AS n FROM artifacts WHERE project_id = ? AND publisher_id IS NULL AND pending_review = 0").bind(projectId).first("n");
-    if (n >= LIMITS.artifactsPerProject) throw new HttpError(413, "quota_exceeded", "Artifact limit reached");
+    if (n >= limitsFor(ctx.env).artifactsPerProject) throw new HttpError(413, "quota_exceeded", "Artifact limit reached");
     throw new HttpError(403, "forbidden", "Grant no longer valid");
   }
   return result;
@@ -6461,7 +6478,7 @@ async function reviewProposal(ctx, projectId, proposalId, input, key) {
     db(ctx).prepare(`UPDATE proposals SET status = 'approving' WHERE id = ? AND status = 'pending' AND ${rz.sql}
       AND EXISTS (SELECT 1 FROM artifacts WHERE id = ? AND project_id = ? AND trashed_at IS NULL AND (? IS NULL OR head_rev = ?) AND (? IS NULL OR meta_version = ?))
       AND (? = 0 OR (SELECT COUNT(*) FROM artifacts WHERE project_id = ? AND publisher_id IS NULL AND pending_review = 0) < ?)`).bind(
-      p.id, ...rz.params, p.artifact_id, projectId, guardRev, guardRev, guardMeta, guardMeta, p.is_new ? 1 : 0, projectId, LIMITS.artifactsPerProject)
+      p.id, ...rz.params, p.artifact_id, projectId, guardRev, guardRev, guardMeta, guardMeta, p.is_new ? 1 : 0, projectId, limitsFor(ctx.env).artifactsPerProject)
   ];
   if (meta && p.is_new) {
     // Title written while the head is still 0 (no feed or search event), then the head moves: one "created" event.
@@ -6505,7 +6522,7 @@ async function rvExplain(ctx, i, p, guardRev = null, guardMeta = null) {
   if (a?.trashed_at) throw new HttpError(409, "trashed", "Artifact is in trash");
   if (a && (guardRev !== null && a.head_rev !== guardRev || guardMeta !== null && a.meta_version !== guardMeta))
     throw new HttpError(409, "proposal_stale", "The document changed since this proposal was made; approve with edits against the current version, or reject it", rvStaleExtra(p, a));
-  if (p.is_new && ((await db(ctx).prepare("SELECT COUNT(*) AS n FROM artifacts WHERE project_id = ? AND publisher_id IS NULL AND pending_review = 0").bind(p.project_id).first("n")) ?? 0) >= LIMITS.artifactsPerProject)
+  if (p.is_new && ((await db(ctx).prepare("SELECT COUNT(*) AS n FROM artifacts WHERE project_id = ? AND publisher_id IS NULL AND pending_review = 0").bind(p.project_id).first("n")) ?? 0) >= limitsFor(ctx.env).artifactsPerProject)
     throw new HttpError(413, "quota_exceeded", "Artifact limit reached");
   throw new HttpError(403, "review_forbidden", "Review permission no longer valid");
 }
@@ -7742,7 +7759,7 @@ async function createMarkdown(ctx, projectId, input, key, kind = "markdown") {
   const prior = await idemLookup(ctx, i);
   if (prior) return prior;
   const count = await db(ctx).prepare("SELECT COUNT(*) AS n FROM artifacts WHERE project_id = ? AND publisher_id IS NULL AND pending_review = 0").bind(projectId).first("n");
-  if ((count ?? 0) >= LIMITS.artifactsPerProject) throw new HttpError(413, "quota_exceeded", "Artifact limit reached");
+  if ((count ?? 0) >= limitsFor(ctx.env).artifactsPerProject) throw new HttpError(413, "quota_exceeded", "Artifact limit reached");
   if (await rvNewGated(ctx, projectId, kind)) return rvCreateNew(ctx, projectId, kind, { title, folder, folderId, schema, body: body2, mime, sha256: await sha256Hex(body2), size: new TextEncoder().encode(body2).length }, i, input);
   const artId = randomId("art");
   const revId = randomId("rev");
@@ -8319,7 +8336,7 @@ var init_service = __esm({
       binaryBytes: 5 * 1024 * 1024,
       // owner envelope: <= 5 MiB synthetic fixtures
       projectBinaryBytes: 100 * 1024 * 1024,
-      artifactsPerProject: 100,
+      artifactsPerProject: 1000,
       pageSize: 50,
       uploadTtlMs: 15 * 60 * 1e3,
       commentChars: 1e4

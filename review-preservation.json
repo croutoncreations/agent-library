@@ -1,9 +1,9 @@
 {
-  "base_file_types_sha256": "5956f8bae2a5a3552b23bcaee79d77e27de29b9ae2065de37903e25ea1710a7d",
-  "integrated_sha256": "cf5719b3129f45c49045485ba5b7737289edbc2ce9884ed4ffcbbb1212e41a79",
-  "preserved_outside_patches_sha256": "fb29dcbe31b31eed8337498cdc245ebc0cfc905c20b7500aa1b0699ac4d0af32",
+  "base_file_types_sha256": "92d1d382faf4611eb018b0807bc3f1979e93f8d738f75aedd86d256c80ca7791",
+  "integrated_sha256": "98186ab54c16fb623ce0f36275cb2bce9f81a1e95f431a718a000e980067c7ca",
+  "preserved_outside_patches_sha256": "9bf99c8390440ea6808b54c4f1ef020cd85053ca5f043fd9daad771abff0bf92",
   "sources_sha256": {
-    "src/review/service.js": "66aaa5d16763149e719c5aa57ede9b5ba078fade0945a5a75328f9a0074ed146",
+    "src/review/service.js": "6a58e947fdcb81056ce9b15f3dfb2a9093e7f0a7c352a09ae44a340478e2d58c",
     "src/review/tools.js": "192903fbdd905f4b632a23a22263874502c8691d02a394ddb1596aa8b43d2991",
     "src/review/browser.js": "11ee5fab244a5b9d51602fb4cf71ff61d58f0c2df7cfb379523807ced8b76987",
     "src/review/browser.css": "d0eb76c0fb98004466bec9e9d6f1f36a97d8d92afa91726e3be350ee909b9536"
@@ -14,7 +14,7 @@
       "module": "// src/service.ts",
       "count": 1,
       "find_sha256": "990995796303ae28bc68934e504c2b6e7f0f96c0f983ddbb77909c58bbaead9f",
-      "replace_sha256": "d9d9624f29104bb6cca5086a05a4664a8fa184712f9441495e8227e77888553a"
+      "replace_sha256": "3a36f3617c62b17f9c099f3ba9f64436b206eacf011d45f52b53cbb86255cbcb"
     },
     {
       "name": "hidden new documents exist only for their proposer (writes) and nobody (reads)",

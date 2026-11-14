@@ -18,12 +18,33 @@ export interface Env {
   RATE_AUTHFAIL_PER_MIN?: string;
   UPLOAD_TTL_SECONDS?: string;
   PROJECT_BINARY_BYTES?: string;
+  PROJECT_ARTIFACT_LIMIT?: string;
+}
+
+// Per-project document cap (PROJECT_ARTIFACT_LIMIT): a positive integer from 1 to 10000, default 1000. The ceiling is
+// a supported boundary, not a storage one: list paging, offline sync (stops at 2,000 items) and project backup are
+// not designed for more. Anything else falls back to the default, with one config warning per Worker instance.
+// The shipped copy of this logic is patched into src/index.js by build-artifact-limits.mjs.
+const ARTIFACTS_PER_PROJECT_DEFAULT = 1000, ARTIFACTS_PER_PROJECT_MAX = 10000;
+let artifactCapWarned = false;
+function artifactCapFor(env: Env): number {
+  const raw = env.PROJECT_ARTIFACT_LIMIT;
+  if (raw === undefined || raw === null || raw === "") return ARTIFACTS_PER_PROJECT_DEFAULT;
+  const text = String(raw);
+  const n = /^[1-9]\d{0,4}$/.test(text) ? Number(text) : 0;
+  if (n >= 1 && n <= ARTIFACTS_PER_PROJECT_MAX) return n;
+  if (!artifactCapWarned) {
+    artifactCapWarned = true;
+    console.warn(JSON.stringify({ event: "config_invalid", name: "PROJECT_ARTIFACT_LIMIT", value: text.slice(0, 40), using: ARTIFACTS_PER_PROJECT_DEFAULT, allowed: "integer 1-10000" }));
+  }
+  return ARTIFACTS_PER_PROJECT_DEFAULT;
 }
 
 /** Effective limits. Defaults are per identity per minute; humans get 3x the per-identity request rate. */
 export function limitsFor(env: Env) {
   const n = (v: string | undefined, d: number) => (v && /^\d{1,12}$/.test(v) ? Number(v) : d);
   return {
+    artifactsPerProject: artifactCapFor(env),
     readsPerMin: n(env.RATE_READS_PER_MIN, 60),
     writesPerMin: n(env.RATE_WRITES_PER_MIN, 20),
     authFailPerMin: n(env.RATE_AUTHFAIL_PER_MIN, 30),

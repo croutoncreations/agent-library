@@ -1,4 +1,4 @@
-// Installed app opens instantly, offline or on a slow connection (docs/offline.md; src/offline/*). Runs last, after
+// Installed app opens instantly, offline or on a slow connection (docs/offline.md; src/offline/*). Runs after
 // build-review.mjs. Exact patches, each anchor matching exactly once and checked to sit in its named module (browser
 // patches inside APP_JS); every byte outside the patched spans is preserved (manifest hash).
 //   - PWA module: the service worker body (after its SHELL/PATHS header) becomes src/offline/sw.js: cache-first
