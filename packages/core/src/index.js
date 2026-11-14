@@ -20,7 +20,7 @@ import { handleMcp } from "./mcp.js";
 import { listAccess, listConnections, revokeConnection, revokeConnectionById } from "./oauth/connections.js";
 import { handleFileTransfer } from "./oauth/mcp.js";
 import { handleOAuthHost, originFor } from "./oauth/server.js";
-import { servePwa } from "./pwa.js";
+import { servePwa, serveShellVersion, shellVersion } from "./pwa.js";
 import { contentOrigin, handleContentHost, isContentHost, projectMedia, viewLinkRedirect, wantsContentHost } from "./view-links.js";
 import { deleteProject, listDeletedProjects, purgeDueProjects, purgeProjectNow, restoreProject } from "./project-deletion.js";
 import { purgeDeletingWorkspaces } from "./workspace-purge.js";
@@ -55,6 +55,11 @@ function appShellCsp(env) {
   // Frames: Turnstile's widget, and rendered pages on the user-content host.
   return { "content-security-policy": csp.replace("frame-src 'self'", ["frame-src 'self'", ts ? TURNSTILE_ORIGIN : "", co ?? ""].filter(Boolean).join(" ")) };
 }
+/** The shell files the installed app caches (docs/offline.md) answer with the shell version, so a download is never a mix of deploys. */
+function shellResponse(body, type, extra = {}) {
+  return new Response(body, { headers: { "content-type": type, "cache-control": "no-store", "x-shell-version": shellVersion(), ...extra } });
+}
+const appPage = (env) => shellResponse(APP_HTML, "text/html; charset=utf-8", appShellCsp(env));
 function withCookies(res, cookies) {
   for (const c of cookies) res.headers.append("set-cookie", c);
   return res;
@@ -133,13 +138,14 @@ async function openableProjects(ctx) {
 async function route3(req, env, url, requestId, seen = {}) {
   const path = url.pathname;
   const m = req.method;
-  if (m === "GET" && (path === "/" || path === "/index.html" || WEB_ROUTE.test(path) || /^\/invite\/inv_[A-Za-z0-9_-]{20,80}$/.test(path))) return new Response(APP_HTML, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", ...appShellCsp(env) } });
-  if (m === "GET" && path === "/app.js") return new Response(APP_JS, { headers: { "content-type": "text/javascript; charset=utf-8", "cache-control": "no-store" } });
+  if (m === "GET" && (path === "/" || path === "/index.html" || WEB_ROUTE.test(path) || /^\/invite\/inv_[A-Za-z0-9_-]{20,80}$/.test(path))) return appPage(env);
+  if (m === "GET" && path === "/shell-version") return serveShellVersion();
+  if (m === "GET" && path === "/app.js") return shellResponse(APP_JS, "text/javascript; charset=utf-8");
   if (m === "GET" && (path === "/manifest.webmanifest" || path === "/sw.js" || path.startsWith("/icons/"))) {
     const r = servePwa(path);
     if (r) return r;
   }
-  if (m === "GET" && path === "/app.css") return new Response(APP_CSS, { headers: { "content-type": "text/css; charset=utf-8", "cache-control": "no-store" } });
+  if (m === "GET" && path === "/app.css") return shellResponse(APP_CSS, "text/css; charset=utf-8");
   if (m === "GET" && path === `/editor.${EDITOR_JS_SHA256.slice(0, 16)}.js`)
     return new Response(EDITOR_JS, { headers: { "content-type": "text/javascript; charset=utf-8", "cache-control": "public, max-age=31536000, immutable" } });
   if (path === "/mcp") return handleMcp(req, env, requestId, url.origin);
@@ -165,7 +171,7 @@ async function route3(req, env, url, requestId, seen = {}) {
     // Project addresses (/<handle>/<slug>[/a/<doc>[/preview|edit]]) open the app, unless an installation route
     // claimed the path first. The app resolves the address (and the server checks access) once signed in.
     if (e instanceof HttpError && e.status === 404 && m === "GET" && ADDRESS_ROUTE.test(path) && !RESERVED_HANDLES.has(path.split("/")[1]))
-      return new Response(APP_HTML, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", ...appShellCsp(env) } });
+      return appPage(env);
     throw e;
   });
   const ctx = await authenticate(req, env, requestId);
