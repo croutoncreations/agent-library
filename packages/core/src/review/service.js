@@ -39,7 +39,6 @@ const RV_INLINE_CHARS = 262144;
 // Largest text (bytes) a proposal or version is line-diffed at; above it the diff is summarised (history/service.js).
 const RV_DIFF_BYTES = 1048576;
 const RV_OPEN = "EXISTS (SELECT 1 FROM proposals WHERE id = ? AND status = 'approving')";
-const RV_OPEN_STATUSES = "('pending','approving')";
 // A proposal's stored bytes: text in R2 (body_key) or a file (blob_key).
 const RV_KEY = "COALESCE(p.body_key, p.blob_key)";
 
@@ -841,15 +840,16 @@ async function rvAnyReview(env, kind, id) {
 }
 
 // ---------- storage: bytes of closed proposals ----------
-// Text (R2 objects under text/<project>/<artifact>/<proposal id>) and files of proposals that were closed without
-// becoming a version, 30 days after the decision (owner decision 2026-11). The proposal record (who, when, hash,
+// Text (R2 objects under text/<project>/<artifact>/<proposal id>) and files of proposals that were closed (rejected,
+// superseded, withdrawn, or approved with the reviewer's own text instead) without a version referencing them, 30 days
+// after the decision (owner decision 2026-11). The proposal record (who, when, hash,
 // note) stays and read_proposal reports the body purged. Bytes any version references (an approved proposal's text,
 // or a restore proposal's history bytes) are never purged. Every proposal that shares the bytes (a details-only
 // re-save of a pending new document keeps them) must be closed for 30 days; then all of them are marked purged in one
 // statement, re-checking references, before the delete.
 const RV_PURGEABLE = `${RV_KEY} IS NOT NULL AND p.blob_purged_at IS NULL
   AND NOT EXISTS (SELECT 1 FROM revisions r WHERE r.blob_key = ${RV_KEY} OR r.body_key = ${RV_KEY})
-  AND NOT EXISTS (SELECT 1 FROM proposals q WHERE COALESCE(q.body_key, q.blob_key) = ${RV_KEY} AND (q.status IN ${RV_OPEN_STATUSES} OR q.decided_at IS NULL OR q.decided_at >= ?))`;
+  AND NOT EXISTS (SELECT 1 FROM proposals q WHERE COALESCE(q.body_key, q.blob_key) = ${RV_KEY} AND (q.status IN ('pending','approving') OR q.decided_at IS NULL OR q.decided_at >= ?))`;
 async function rvPurge(env, now, limit, projectId) {
   const before = new Date(now - RV_PURGE_MS).toISOString();
   const r = await env.DB.prepare(`SELECT DISTINCT ${RV_KEY} AS key FROM proposals p WHERE ${RV_PURGEABLE} AND (? IS NULL OR p.project_id = ?) LIMIT ?`).bind(before, projectId ?? null, projectId ?? null, limit).all();

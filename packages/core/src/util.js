@@ -137,4 +137,10 @@ const NEVER_EXPIRES_AT = Date.UTC(9999, 0, 1);
 function errorLogFields(e) {
   return [e?.name ?? typeof e, e?.name === "SyntaxError" ? "" : e?.message];
 }
-export { NEVER_EXPIRES_AT, CHANGE_NOTE_MAX, CHANGE_NOTE_SCHEMA, DRAIN_BYTES, HttpError, b64url, cutLists, errorBody, errorLogFields, hex, idemKey, int, json, mcpClientInfo, nowIso, nowMs, randomId, readTextCapped, rememberClientInfo, sha256Hex, str };
+const b64 = (b) => {
+  let s = "";
+  for (let i = 0; i < b.length; i += 32768) s += String.fromCharCode(...b.subarray(i, i + 32768));
+  return btoa(s);
+};
+const unb64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+export { b64, unb64, NEVER_EXPIRES_AT, CHANGE_NOTE_MAX, CHANGE_NOTE_SCHEMA, DRAIN_BYTES, HttpError, b64url, cutLists, errorBody, errorLogFields, hex, idemKey, int, json, mcpClientInfo, nowIso, nowMs, randomId, readTextCapped, rememberClientInfo, sha256Hex, str };

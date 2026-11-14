@@ -5,23 +5,21 @@ import { indexDocument } from "./search/indexing.js";
 import { limitsFor, requireHuman } from "./auth.js";
 import { BINARY_TYPES, FOLDERS_PER_PROJECT, LIMITS, folderName, tplDate } from "./service.js";
 import { requireProjectRole, requireWorkspaceRole, workspaceRoleSql } from "./tenancy.js";
-import { HttpError, int, nowIso, randomId, sha256Hex, str } from "./util.js";
+import { HttpError, b64, int, nowIso, randomId, sha256Hex, str, unb64 } from "./util.js";
+import { exportReview, pendingIds, reviewAuthors, reviewStatements, validateReview } from "./review/backup.js";
 import { explainLimit, fmtBytes, limitGuard, workspaceLimits } from "./limits.js";
 
 
 var SCHEMA = "agent-library-backup/1";
 // Schema 3 adds `app: { name, path }` on the files an App Connect app wrote, and `folder_name` on documents in a
-// folder (import and restore recreate the folders by name).
+// folder (import and restore recreate the folders by name). Review gating's own /3 (on the public main branch) has
+// a `review` section instead. Schema 4 is written when either is present; /3 and /4 are read by the fields they carry:
+// `review` (review/backup.js) and app/folder fields.
 var APP_SCHEMA = "agent-library-backup/3";
+var CURRENT_SCHEMA = "agent-library-backup/4";
 /** Largest total of distinct file bytes a project export holds (exports above it refuse with 413 backup_too_large). */
 var BACKUP_EXPORT_FILE_BYTES = 16 * 1024 * 1024;
 var BACKUP_EXPORT_TEXT_BYTES = 32 * 1024 * 1024;
-var b64 = (b) => {
-  let s = "";
-  for (let i = 0; i < b.length; i += 32768) s += String.fromCharCode(...b.subarray(i, i + 32768));
-  return btoa(s);
-};
-var unb64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
 async function exportBackup(ctx, projectId) {
   requireHuman(ctx);
   let metaVersionsExport = [];
@@ -32,12 +30,15 @@ async function exportBackup(ctx, projectId) {
   if (!p) throw new HttpError(404, "not_found", "Project not found");
   // The backup is one JSON response with every file inline (base64), built in Worker memory (128 MB), so it is capped
   // before any file is read. Streamed backups are a follow-up.
-  const fileBytes = await DB.prepare("SELECT COALESCE(SUM(size),0) AS n FROM (SELECT DISTINCT blob_key, size FROM revisions WHERE project_id = ? AND blob_key IS NOT NULL)").bind(projectId).first("n");
+  const fileBytes = await DB.prepare(`SELECT COALESCE(SUM(size),0) AS n FROM (SELECT blob_key, size FROM revisions WHERE project_id = ?1 AND blob_key IS NOT NULL
+      UNION SELECT blob_key, size FROM proposals WHERE project_id = ?1 AND blob_key IS NOT NULL AND blob_purged_at IS NULL)`).bind(projectId).first("n");
   if (fileBytes > BACKUP_EXPORT_FILE_BYTES) throw new HttpError(413, "backup_too_large", "This project's files are too large for a single backup file (over 16 MB). Download large files individually.");
-  const textBytes = await DB.prepare("SELECT COALESCE(SUM(size),0) AS n FROM revisions WHERE project_id = ? AND blob_key IS NULL").bind(projectId).first("n");
+  const textBytes = await DB.prepare(`SELECT (SELECT COALESCE(SUM(size),0) FROM revisions WHERE project_id = ?1 AND blob_key IS NULL)
+      + (SELECT COALESCE(SUM(size),0) FROM proposals p WHERE project_id = ?1 AND has_content = 1 AND blob_key IS NULL AND blob_purged_at IS NULL
+           AND NOT EXISTS (SELECT 1 FROM revisions r WHERE r.body_key = p.body_key)) AS n`).bind(projectId).first("n");
   if (textBytes > BACKUP_EXPORT_TEXT_BYTES) throw new HttpError(413, "backup_too_large", "This project's text versions exceed 32 MiB for a single backup. Download documents individually or export a smaller project.");
   const [arts, revs, comments] = await DB.batch([
-    DB.prepare("SELECT id, kind, title, folder, tags, head_rev, head_revision_id, meta_version, trashed_at, created_at, updated_at, is_template, template_description, source_artifact_id, source_revision, source_role, template_date, publisher_id, export_name, (SELECT display_name FROM publishers WHERE id = artifacts.publisher_id) AS app_name, (SELECT name FROM folders WHERE id = artifacts.folder_id AND project_id = artifacts.project_id) AS folder_name FROM artifacts WHERE project_id = ? AND head_rev > 0").bind(projectId),
+    DB.prepare("SELECT id, kind, title, folder, tags, head_rev, head_revision_id, meta_version, trashed_at, created_at, updated_at, is_template, template_description, source_artifact_id, source_revision, source_role, template_date, publisher_id, export_name, (SELECT display_name FROM publishers WHERE id = artifacts.publisher_id) AS app_name, (SELECT name FROM folders WHERE id = artifacts.folder_id AND project_id = artifacts.project_id) AS folder_name FROM artifacts WHERE project_id = ? AND (head_rev > 0 OR pending_review = 1)").bind(projectId),
     DB.prepare("SELECT id, artifact_id, rev_no, author_id, body, body_key, blob_key, size, sha256, mime, restored_from, created_at, via_kind, via_id, via_label, client_info, change_note FROM revisions WHERE project_id = ?").bind(projectId),
     DB.prepare("SELECT id, artifact_id, rev_no, author_id, body, body_key, created_at FROM comments WHERE project_id = ?").bind(projectId),
     DB.prepare("SELECT id, artifact_id, version, title, folder, tags, trashed, author_id, via_kind, via_id, via_label, client_info, change_note, restored_from, created_at, template_description FROM meta_versions WHERE project_id = ?").bind(projectId)
@@ -50,13 +51,14 @@ async function exportBackup(ctx, projectId) {
     if (sha2 !== r.sha256) throw new HttpError(500, "blob_corrupt", "Stored blob hash mismatch");
     blobs[r.blob_key] = { sha256: sha2, data: b64(bytes) };
   }
+  const review = await exportReview(ctx, projectId, blobs, (key) => readBlobBytes(ctx.env, key));
   await DB.prepare("INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id) VALUES (?, ?, ?, 'backup.export', ?, 'ok', ?)").bind(nowIso(), ctx.principal.id, projectId, projectId, ctx.requestId).run();
   // An app's file is exported as an ordinary file that says which app wrote it and at which path (null once trashed).
   const artifacts = arts.results.map(({ publisher_id, export_name, app_name, folder_name, ...a }) => ({
     ...a, ...folder_name != null ? { folder_name } : {}, ...publisher_id ? { app: { name: app_name ?? "app", path: export_name ?? null } } : {}
   }));
   return {
-    schema: artifacts.some(a => a.app || a.folder_name) ? "agent-library-backup/3" : artifacts.some(a => a.is_template || a.source_artifact_id) ? "agent-library-backup/2" : SCHEMA,
+    schema: review || artifacts.some(a => a.app || a.folder_name) ? CURRENT_SCHEMA : artifacts.some(a => a.is_template || a.source_artifact_id) ? "agent-library-backup/2" : SCHEMA,
     features: ["document_templates/1"],
     exported_at: nowIso(),
     project: { id: p.id, title: p.title, created_at: p.created_at },
@@ -64,6 +66,7 @@ async function exportBackup(ctx, projectId) {
     revisions: await mapContent(revs.results, async ({ body_key, ...r }) => ({ ...r, body: r.blob_key ? null : await getText(ctx.env, { ...r, body_key }) })),
     comments: await mapContent(comments.results, async ({ body_key, ...c }) => ({ ...c, body: await getText(ctx.env, { ...c, body_key }) })),
     meta_versions: metaVersionsExport,
+    ...review ?? {},
     blobs
   };
 }
@@ -96,7 +99,7 @@ function folderRows(DB, backup, pid, me, at) {
 }
 // Checks a backup's shape, ids and every hash; returns its project id and decoded blobs (nothing is written).
 async function validateBackup(backup) {
-  if (backup?.schema !== SCHEMA && backup?.schema !== "agent-library-backup/2" && backup?.schema !== APP_SCHEMA) throw new HttpError(400, "bad_backup", "Unsupported backup schema");
+  if (backup?.schema !== SCHEMA && backup?.schema !== "agent-library-backup/2" && backup?.schema !== APP_SCHEMA && backup?.schema !== CURRENT_SCHEMA) throw new HttpError(400, "bad_backup", "Unsupported backup schema");
   for (const k of ["artifacts", "revisions", "comments"]) if (!Array.isArray(backup[k])) throw new HttpError(400, "bad_backup", `${k} must be a list`);
   if (backup.meta_versions !== void 0 && !Array.isArray(backup.meta_versions)) throw new HttpError(400, "bad_backup", "meta_versions must be a list");
   const pid = String(backup.project?.id ?? "");
@@ -134,6 +137,7 @@ async function validateBackup(backup) {
     if (await sha256Hex(bytes) !== r.sha256 || bytes.length !== r.size) throw new HttpError(400, "bad_backup", `Blob for ${r.id} hash/size mismatch`);
     decoded.set(r.blob_key, bytes);
   }
+  await validateReview(backup, blobs, decoded, pid);
   return { pid, decoded };
 }
 // Pre-write checks shared by import and restore: every value that binds into a statement after the first object
@@ -316,10 +320,13 @@ async function restoreBackup(ctx, backup) {
   checkKeysFit(new Set(targets.values()));
   // The restored project is the principal's personal workspace's.
   const workspaceId = personalWorkspaceId(ctx.principal.id);
-  const authors = new Set([...backup.revisions, ...backup.comments, ...backup.meta_versions ?? []].map((x) => x.author_id));
+  const authors = new Set([...backup.revisions, ...backup.comments, ...backup.meta_versions ?? []].map((x) => x.author_id).concat(reviewAuthors(backup)));
   const head = [];
   for (const a of authors) if (a !== ctx.principal.id)
     head.push(DB.prepare("INSERT OR IGNORE INTO principals (id, kind, issuer, subject, label, created_at) VALUES (?, 'agent', 'restored', ?, ?, ?)").bind(a, a, "restored " + a, nowIso()));
+  // History is imported as it was (agent versions from before a document required review): the review gates skip
+  // while this row exists (it is inside the batch's transaction, so no other request sees it) and it is removed last.
+  head.push(DB.prepare("INSERT OR IGNORE INTO review_restore_context (id) VALUES (1)"));
   head.push(DB.prepare("INSERT INTO projects (id, owner_id, title, created_at, workspace_id) VALUES (?, ?, ?, ?, ?)").bind(pid, ctx.principal.id, backup.project.title, backup.project.created_at, workspaceId));
   const folders = folderRows(DB, backup, pid, ctx.principal.id, nowIso());
   head.push(...folders.stmts);
@@ -347,10 +354,24 @@ async function restoreBackup(ctx, backup) {
     textKeys.push(bodyKey); bridges.push(textWriteComplete(ctx.env, bodyKey));
     tail.push(DB.prepare("INSERT INTO comments (id, project_id, artifact_id, rev_no, author_id, body, body_key, created_at) VALUES (?, ?, ?, ?, ?, '', ?, ?)").bind(c.id, pid, c.artifact_id, c.rev_no, c.author_id, bodyKey, c.created_at));
   }
+  // The review section: proposals keep their ids; their text and files get this attempt's fresh objects.
+  const proposalFiles = (backup.review?.proposals ?? []).filter((x) => x.blob_key && !x.blob_purged_at);
+  for (const x of proposalFiles) restoreKey(x);
+  const review = reviewStatements(DB, backup, pid, {
+    artifactId: (id) => id, proposalId: (id) => id, reviewId: (id) => id, authorId: (id) => id, viaId: (id) => id,
+    blobKey: (artifactId, key) => restoreKey({ artifact_id: artifactId, blob_key: key }),
+    revisionBodyKey: (revId) => bodyKeys.get(revId),
+    proposalBodyKey: (x) => textKey(pid, x.artifact_id, x.id, attempt)
+  });
+  for (const t of review.texts) {
+    textWrites.push({ projectId: pid, artifactId: t.artifactId, revisionId: t.proposalId, text: t.text, attempt });
+    textKeys.push(t.key); bridges.push(textWriteComplete(ctx.env, t.key));
+  }
+  tail.push(...review.stmts, DB.prepare("DELETE FROM review_restore_context"));
   tail.push(DB.prepare("INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id) VALUES (?, ?, ?, 'backup.restore', ?, 'ok', ?)").bind(nowIso(), ctx.principal.id, pid, pid, ctx.requestId));
   await stageTextWrites(ctx.env, textWrites);
   const objects = new Map();
-  for (const r of fileRevisions) if (!objects.has(restoreKey(r))) objects.set(restoreKey(r), [restoreKey(r), decoded.get(r.blob_key)]);
+  for (const r of [...fileRevisions, ...proposalFiles]) if (!objects.has(restoreKey(r))) objects.set(restoreKey(r), [restoreKey(r), decoded.get(r.blob_key)]);
   const out = await publishBackup(ctx.env, {
     objects: [...objects.values()], textKeys,
     build: () => [...head, ...backup.revisions.map((r) => {
@@ -381,7 +402,9 @@ const VIA_KINDS = new Set(["browser", "oauth", "api_key", "grant", "publisher"])
 var IMPORT_MAX_ROWS = 2000;
 function checkImportRows(env, backup, decoded, limits) {
   const bad = (m) => { throw new HttpError(400, "bad_backup", m); };
-  if (backup.artifacts.length > limits.items_per_project) bad(`A project holds at most ${limits.items_per_project} documents and files on this plan`);
+  // Hidden new documents (waiting for their first review) have no version yet and take no item slot until approved.
+  const hidden = pendingIds(backup);
+  if (backup.artifacts.length - hidden.size > limits.items_per_project) bad(`A project holds at most ${limits.items_per_project} documents and files on this plan`);
   if (backup.artifacts.length > IMPORT_MAX_ROWS) bad(`One import can bring in at most ${IMPORT_MAX_ROWS.toLocaleString("en-US")} documents and files`);
   if (backup.revisions.length > IMPORT_MAX_ROWS || backup.comments.length > IMPORT_MAX_ROWS || (backup.meta_versions ?? []).length > IMPORT_MAX_ROWS) bad("Too many versions or comments to import at once");
   const ids = new Set(), revKeys = new Set(), revIds = new Set();
@@ -392,7 +415,8 @@ function checkImportRows(env, backup, decoded, limits) {
     str(a.title, "title", 200, { min: 1 }); str(a.folder ?? "", "folder", 200);
     let tags; try { tags = JSON.parse(a.tags ?? "[]"); } catch { bad("tags must be a JSON list"); }
     if (!Array.isArray(tags) || tags.some((x) => typeof x !== "string" || x.length > 50) || tags.length > 20) bad("tags must be a list of short strings");
-    if (!Number.isInteger(a.head_rev) || a.head_rev < 1 || !Number.isInteger(a.meta_version) || a.meta_version < 1) bad("Bad document revision numbers");
+    if (hidden.has(a.id)) { if (a.head_rev !== 0 || a.head_revision_id != null || !Number.isInteger(a.meta_version) || a.meta_version < 1) bad("Bad hidden document"); }
+    else if (!Number.isInteger(a.head_rev) || a.head_rev < 1 || !Number.isInteger(a.meta_version) || a.meta_version < 1) bad("Bad document revision numbers");
     if (typeof a.created_at !== "string" || typeof a.updated_at !== "string") bad("Bad document timestamps");
   }
   let binBytes = 0;
@@ -420,6 +444,7 @@ function checkImportRows(env, backup, decoded, limits) {
   const cap = limitsFor(env).projectBinaryBytes; // "0" = no per-project file cap
   if (cap > 0 && binBytes > cap) bad("Files exceed the per-project storage limit");
   for (const a of backup.artifacts) {
+    if (hidden.has(a.id)) continue;
     const head = backup.revisions.find((r) => r.id === a.head_revision_id);
     if (!head || head.artifact_id !== a.id || head.rev_no !== a.head_rev) bad("A document's current version is missing or inconsistent");
     if (a.trashed_at != null && typeof a.trashed_at !== "string") bad("Bad trash timestamp");
@@ -487,6 +512,8 @@ async function importBackup(ctx, workspaceId, input, idemKeyValue, digest = "") 
     DB.prepare(`INSERT INTO projects (id, owner_id, title, created_at, workspace_id) SELECT ?, COALESCE((SELECT created_by FROM workspaces WHERE id = ?), ?), ?, ?, ? WHERE ${workspaceRoleSql("?", "admin")} AND ${lg.sql}`)
       .bind(pid, workspaceId, me, title, at, workspaceId, me, workspaceId, ...lg.params)
   ];
+  // Imported history keeps its agent versions: the review gates skip while this row exists (removed last, same batch).
+  stmts.push(DB.prepare("INSERT OR IGNORE INTO review_restore_context (id) VALUES (1)"));
   const folders = folderRows(DB, backup, pid, me, at);
   stmts.push(...folders.stmts);
   for (const a of backup.artifacts) {
@@ -518,6 +545,19 @@ async function importBackup(ctx, workspaceId, input, idemKeyValue, digest = "") 
     textKeys.push(bodyKey); bridges.push(textWriteComplete(ctx.env, bodyKey));
     stmts.push(DB.prepare("INSERT INTO comments (id, project_id, artifact_id, rev_no, author_id, body, body_key, created_at) VALUES (?, ?, ?, ?, ?, '', ?, ?)").bind(cid, pid, aid, c.rev_no, me, bodyKey, c.created_at));
   }
+  // Review section: proposals and review records get new ids; their people become the importer, as for versions.
+  const propId = new Map((backup.review?.proposals ?? []).map((x) => [x.id, randomId("prp")])), rvwId = new Map((backup.review?.reviews ?? []).map((x) => [x.id, randomId("rvw")]));
+  const review = reviewStatements(DB, backup, pid, {
+    artifactId: (id) => artId.get(id), proposalId: (id) => propId.get(id) ?? randomId("prp"), reviewId: (id) => rvwId.get(id) ?? randomId("rvw"), authorId: () => me, viaId: () => null,
+    blobKey: (artifactId, key) => keyMap.get(key),
+    revisionBodyKey: (revId2) => bodyKeys.get(revId2),
+    proposalBodyKey: (x) => textKey(pid, artId.get(x.artifact_id), propId.get(x.id))
+  });
+  for (const t of review.texts) {
+    textWrites.push({ projectId: pid, artifactId: t.artifactId, revisionId: t.proposalId, text: t.text });
+    textKeys.push(t.key); bridges.push(textWriteComplete(ctx.env, t.key));
+  }
+  stmts.push(...review.stmts, DB.prepare("DELETE FROM review_restore_context"));
   const result = { project_id: pid, workspace_id: workspaceId, title, artifacts: backup.artifacts.length, revisions: backup.revisions.length, comments: backup.comments.length, blobs: decoded.size };
   const exists = "EXISTS (SELECT 1 FROM projects WHERE id = ?)";
   stmts.push(DB.prepare(`INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id, workspace_id) SELECT ?, ?, ?, 'backup.import', ?, 'ok', ?, ? WHERE ${exists}`).bind(at, me, pid, pid, ctx.requestId, workspaceId, pid));

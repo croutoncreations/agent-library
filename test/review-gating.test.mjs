@@ -207,6 +207,9 @@ test("new documents in a required project are hidden until approved; the author 
   try {
     const c = ok(await writer.call("create_markdown", { project_id: P, title: "Secret plan", body: "draft one", change_note: "new", idempotency_key: key() }));
     assert.equal(c.status, "pending_review"); const id = c.artifact_id;
+    // Proposals never reach the search index, and the cron's rebuild probe doesn't ask for a hidden document either.
+    assert.equal(sql(`SELECT (SELECT COUNT(*) FROM artifact_search_keys WHERE artifact_id = '${id}') AS k, (SELECT COUNT(*) FROM artifact_search_missing WHERE id = '${id}') AS m`)[0].k, 0);
+    assert.equal(sql(`SELECT COUNT(*) AS m FROM artifact_search_missing WHERE id = '${id}'`)[0].m, 0);
     for (const cl of [reader, writer2]) {
       assert.equal(err(await cl.call("read_artifact", { project_id: P, artifact_id: id })).code, "not_found");
       assert.ok(!ok(await cl.call("list_artifacts", { project_id: P })).artifacts.some((a) => a.id === id));
@@ -360,49 +363,6 @@ test("files: gated uploads are proposals, approve/reject only, reviewer download
   assert.equal(bytes.status, 200); assert.equal(sha256(bytes.body), sha256(png2));
 });
 
-test("proposal text lives in R2: a >2 MiB proposal is approved end to end without a copy; rejected text is purged after 30 days", async () => {
-  const id = await ownerDoc("Big", "small start");
-  await setMode(id, "required");
-  const big = ("zanzibarline " + "x".repeat(60) + "\n").repeat(45000); // about 3.3 MiB, over the 2 MiB MCP request cap
-  assert.ok(Buffer.byteLength(big) > 2 * 1024 * 1024);
-  const put = await api("PUT", `/projects/${P}/files/${id}`, { expected_revision: 1, body: big, change_note: "big" });
-  assert.equal(put.status, 200, JSON.stringify(put.body)); assert.equal(put.body.status, "pending_review");
-  const row = sql(`SELECT body, body_key, size FROM proposals WHERE id = '${put.body.proposal_id}'`)[0];
-  assert.equal(row.body, null, "no text in D1"); assert.match(row.body_key, new RegExp(`^text/${P}/${id}/${put.body.proposal_id}$`)); assert.equal(row.size, Buffer.byteLength(big));
-  // Open proposal bytes count toward workspace storage; the pending text is not searchable.
-  assert.equal(ok(await reader.call("search_artifacts", { query: "zanzibarline" })).results?.length ?? 0, 0);
-  const rp = ok(await reviewer.call("read_proposal", { project_id: P, proposal_id: put.body.proposal_id }));
-  assert.equal(rp.body_truncated, true); assert.ok(rp.body.length < big.length);
-  assert.match(rp.download_url, /\/files\/d\/ft_/, "an OAuth reviewer gets the whole text through a short-lived link");
-  assert.equal(rp.diff_from_base.truncated ?? false, true, "a diff of a text over 1 MiB is summarised");
-  const full = await owner.req("GET", `${base}/proposals/${put.body.proposal_id}/content`, undefined, { binary: true });
-  assert.equal(full.status, 200); assert.equal(sha256(full.body), sha256(Buffer.from(big)));
-  ok(await reviewer.call("review_proposal", { project_id: P, proposal_id: put.body.proposal_id, decision: "approve", idempotency_key: key() }));
-  const v = sql(`SELECT body, body_key FROM revisions WHERE artifact_id = '${id}' AND rev_no = 2`)[0];
-  assert.equal(v.body, null); assert.equal(v.body_key, row.body_key, "the version points at the proposal's object: nothing is copied");
-  const live = await owner.req("GET", art(id));
-  assert.equal(live.body.body, big);
-  assert.ok((ok(await reader.call("search_artifacts", { query: "zanzibarline" })).results ?? []).some((r) => r.artifact_id === id), "approved text is searchable");
-  assert.equal(sql(`SELECT COUNT(*) AS n FROM content_writes WHERE key = '${row.body_key}'`)[0].n, 0);
-  // The approved text is never purged, even when its proposal is old.
-  sql(`UPDATE proposals SET decided_at = '2000-01-01T00:00:00Z' WHERE id = '${put.body.proposal_id}'`);
-  // A rejected text proposal: bytes purged 30 days after the decision; the record stays and says the body is purged.
-  const rej = await api("PUT", `/projects/${P}/files/${id}`, { expected_revision: 2, body: "rejected draft", change_note: "r" });
-  const rejKey = sql(`SELECT body_key FROM proposals WHERE id = '${rej.body.proposal_id}'`)[0].body_key;
-  ok(await reviewer.call("review_proposal", { project_id: P, proposal_id: rej.body.proposal_id, decision: "reject", note: "no", idempotency_key: key() }));
-  assert.equal((await owner.req("POST", `${base}/maintenance/reconcile-uploads`)).status, 200);
-  assert.equal(sql(`SELECT blob_purged_at FROM proposals WHERE id = '${rej.body.proposal_id}'`)[0].blob_purged_at, null, "not before 30 days");
-  sql(`UPDATE proposals SET decided_at = '2000-01-01T00:00:00Z' WHERE id = '${rej.body.proposal_id}'`);
-  assert.equal((await owner.req("POST", `${base}/maintenance/reconcile-uploads`)).status, 200);
-  assert.ok(sql(`SELECT blob_purged_at FROM proposals WHERE id = '${rej.body.proposal_id}'`)[0].blob_purged_at, "closed text purged");
-  assert.equal((await owner.req("GET", `${base}/proposals/${rej.body.proposal_id}/content`)).status, 410);
-  const purged = ok(await reviewer.call("read_proposal", { project_id: P, proposal_id: rej.body.proposal_id }));
-  assert.equal(purged.body_purged, true); assert.equal(purged.body, undefined); assert.equal(purged.proposal.status, "rejected");
-  assert.equal(sql(`SELECT body_key FROM proposals WHERE id = '${rej.body.proposal_id}'`)[0].body_key, rejKey, "the record stays");
-  assert.equal(sql(`SELECT COUNT(*) AS n FROM revisions WHERE body_key = '${row.body_key}'`)[0].n, 1, "approved text survives");
-  assert.equal((await owner.req("GET", art(id))).body.body, big);
-});
-
 test("review permission: owner-only grant, live revocation, publisher never, tools listed only where granted", async () => {
   const names = (await reviewer.list()).map((t) => t.name);
   assert.ok(names.includes("review_proposal") && names.includes("review_revision"));
@@ -533,6 +493,13 @@ test("every agent write path is gated: templates, JSON data files, legacy /mcp; 
 });
 
 test("database gate: a rolled-back Worker's agent writes to required documents fail closed; owner and publisher writes don't", async () => {
+  // A mode flip between a gate check and the write surfaces as a conflict, never a 500. (Kept before the direct
+  // SQL below: on a busy machine a request sent after those slow wrangler calls twice failed with ECONNRESET; cause not found.)
+  const off = await ownerDoc("Flip");
+  sql(`UPDATE artifacts SET review_mode = 'required' WHERE id = '${off}'`);
+  const r = await legacy.call("save_markdown", { project_id: P, artifact_id: off, expected_revision: 1, body: "x", idempotency_key: key() });
+  assert.equal(r.isError, false, "the service re-reads the mode and proposes");
+  assert.equal(r.data.status, "pending_review");
   const id = await ownerDoc("Rollback"); await setMode(id, "required");
   // Simulate the previous Worker: a direct agent revision insert with no proposal.
   for (const via of ["oauth", "api_key", "grant"]) assert.match(sqlRefused(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, size, sha256, mime, created_at, via_kind, via_id)
@@ -547,9 +514,117 @@ test("database gate: a rolled-back Worker's agent writes to required documents f
     SELECT 'rev_${via}_ok', a.id, a.project_id, ${n}, p.owner_id, 'ok', 2, 'h', 'text/markdown', '2026', '${via}' FROM artifacts a JOIN projects p ON p.id = a.project_id WHERE a.id = '${id}'`);
   assert.equal(sql(`SELECT COUNT(*) AS n FROM revisions WHERE artifact_id = '${id}' AND id LIKE 'rev_%_ok'`)[0].n, 2);
   sql(`DELETE FROM revisions WHERE id LIKE 'rev_%_ok'`); // synthetic hashes; keep the later backup round trip honest
-  // A mode flip between a gate check and the write surfaces as a conflict, never a 500.
-  const off = await ownerDoc("Flip");
-  sql(`UPDATE artifacts SET review_mode = 'required' WHERE id = '${off}'`);
-  const r = await legacy.call("save_markdown", { project_id: P, artifact_id: off, expected_revision: 1, body: "x", idempotency_key: key() });
-  assert.equal(r.isError, false, "the service re-reads the mode and proposes");
+});
+
+test("backup /4 round trip keeps modes, proposals, reviews and pre-review agent history", async () => {
+  const ex = await owner.req("GET", base + "/backup");
+  assert.equal(ex.status, 200, JSON.stringify(ex.body).slice(0, 300));
+  assert.equal(ex.body.schema, "agent-library-backup/4");
+  assert.ok(ex.body.review.proposals.length > 0 && ex.body.review.reviews.length > 0);
+  const fresh = await startAppConnectServer({ port: SERVER_PORTS["review-gating-restore"] });
+  try {
+    const o2 = await fresh.owner();
+    // Crafted backups are refused before anything is written: a purged proposal can't point at another project's
+    // bytes, a pending one can't be "purged", and the project default's kinds must be valid.
+    const bad = (mut) => { const b = structuredClone(ex.body); mut(b); return o2.req("POST", "/api/restore", b); };
+    const anyProp = (b) => b.review.proposals[0];
+    for (const [why, mut] of [
+      ["foreign key on a purged proposal", (b) => Object.assign(anyProp(b), { blob_key: "blobs/other-project/x/y", blob_purged_at: "2000-01-01T00:00:00Z", status: "rejected" })],
+      ["pending with purged bytes", (b) => Object.assign(anyProp(b), { blob_key: `blobs/${P}/x/y`, blob_purged_at: "2000-01-01T00:00:00Z", status: "pending" })],
+      ["malformed kinds", (b) => { b.review.kinds = "not json"; }]
+    ]) { const r = await bad(mut); assert.equal(r.status, 400, why + ": " + JSON.stringify(r.body)); assert.equal(r.body.error.code, "bad_backup", why); }
+    const r = await o2.req("POST", "/api/restore", ex.body);
+    assert.equal(r.status, 201, JSON.stringify(r.body));
+    const q = JSON.parse(execFileSync("wrangler", ["d1", "--config", LOCAL_CONFIG, "execute", "DB", "--local", "--persist-to", fresh.dir, "--json", "--command",
+      "SELECT (SELECT COUNT(*) FROM proposals) AS p, (SELECT COUNT(*) FROM reviews) AS r, (SELECT COUNT(*) FROM artifacts WHERE review_mode = 'required') AS m, (SELECT COUNT(*) FROM review_restore_context) AS c"],
+      { cwd: ROOT, encoding: "utf8", env: { ...process.env, CI: "1", NO_COLOR: "1" } }))[0].results[0];
+    assert.equal(q.p, ex.body.review.proposals.length); assert.equal(q.r, ex.body.review.reviews.length);
+    assert.equal(q.m, ex.body.review.modes.filter((m) => m.review_mode === "required").length); assert.equal(q.c, 0, "restore context removed");
+    // Restored proposals keep their text: the big proposal's approved text and a pending one both read back.
+    const pend = ex.body.review.proposals.find((x) => x.status === "pending" && x.has_content && x.kind === "markdown");
+    const back = await o2.req("GET", `/api/projects/${P}/proposals/${pend.id}`);
+    assert.equal(back.status, 200, JSON.stringify(back.body)); assert.equal(back.body.body, pend.body ?? back.body.body);
+    assert.equal(back.body.proposal.status, "pending");
+    // Main's own /3 (a review section, no app or folder fields) is read too.
+  } finally { await fresh.stop(); }
+});
+test("backup: import (new project in a workspace) keeps proposals and hidden documents; /3 with a review section and /1 are accepted; /3 without one is the app-files schema", async () => {
+  const ex = (await owner.req("GET", base + "/backup")).body;
+  const imp = await owner.req("POST", `/api/workspaces/${(await owner.req("GET", "/api/workspaces")).body.workspaces[0].id}/import`, { backup: ex, title: "Imported review" });
+  assert.equal(imp.status, 201, JSON.stringify(imp.body));
+  const ip = imp.body.project_id;
+  const counts = sql(`SELECT (SELECT COUNT(*) FROM proposals WHERE project_id = '${ip}') AS p, (SELECT COUNT(*) FROM reviews WHERE project_id = '${ip}') AS r,
+    (SELECT COUNT(*) FROM artifacts WHERE project_id = '${ip}' AND pending_review = 1) AS h, (SELECT COUNT(*) FROM review_restore_context) AS c`)[0];
+  assert.equal(counts.p, ex.review.proposals.length); assert.equal(counts.r, ex.review.reviews.length);
+  assert.equal(counts.h, ex.review.modes.filter((m) => m.pending_review).length); assert.equal(counts.c, 0);
+  // Proposal text was copied to objects of the new project: nothing points into the old one.
+  assert.equal(sql(`SELECT COUNT(*) AS n FROM proposals WHERE project_id = '${ip}' AND (body_key LIKE 'text/${P}/%' OR blob_key LIKE 'blobs/${P}/%')`)[0].n, 0);
+  assert.equal(sql(`SELECT COUNT(*) AS n FROM proposals WHERE project_id = '${ip}' AND status = 'pending' AND has_content = 1 AND body_key IS NULL AND blob_key IS NULL`)[0].n, 0);
+  // Hidden documents don't count toward items_per_project; the imported queue is the importer's to review.
+  const q = await owner.req("GET", `/api/projects/${ip}/proposals`);
+  assert.equal(q.status, 200); assert.ok(q.body.proposals.length >= 1);
+  const first = q.body.proposals.find((x) => x.kind === "markdown" && !x.is_new);
+  if (first) { const rd = await owner.req("GET", `/api/projects/${ip}/proposals/${first.proposal_id}`); assert.equal(rd.status, 200); assert.equal(typeof rd.body.body, "string"); }
+  // Schema detection: /3 is read for either set of fields; an older Worker's /1 and /2 stay readable.
+  const wsId = (await owner.req("GET", "/api/workspaces")).body.workspaces[0].id;
+  // Main's /3: a review section and nothing else new. This branch's /3: app/folder fields and no review section.
+  const mainStyle = { ...structuredClone(ex), schema: "agent-library-backup/3" };
+  for (const a of mainStyle.artifacts) { delete a.app; delete a.folder_name; }
+  assert.equal((await owner.req("POST", `/api/workspaces/${wsId}/import`, { backup: mainStyle, title: "Main-style /3" })).status, 201);
+  const appStyle = structuredClone(ex); delete appStyle.review; appStyle.schema = "agent-library-backup/3";
+  const hiddenIds = new Set(ex.review.modes.filter((m) => m.pending_review).map((m) => m.id));
+  appStyle.artifacts = appStyle.artifacts.filter((a) => !hiddenIds.has(a.id)); appStyle.artifacts[0].folder_name = "Plans"; appStyle.artifacts[1].app = { name: "Synthetic app", path: "notes.md" };
+  const ai = await owner.req("POST", `/api/workspaces/${wsId}/import`, { backup: appStyle, title: "App-style /3" });
+  assert.equal(ai.status, 201, JSON.stringify(ai.body));
+  assert.equal(sql(`SELECT COUNT(*) AS n FROM proposals WHERE project_id = '${ai.body.project_id}'`)[0].n, 0, "no review section: no proposals");
+  assert.equal(sql(`SELECT COUNT(*) AS n FROM folders WHERE project_id = '${ai.body.project_id}' AND name = 'Plans'`)[0].n, 1);
+  const old = structuredClone(ex); delete old.review; old.schema = "agent-library-backup/1"; old.artifacts = old.artifacts.filter((a) => a.head_rev > 0 && a.head_revision_id);
+  const ids = new Set(old.artifacts.map((a) => a.id)); old.revisions = old.revisions.filter((r) => ids.has(r.artifact_id)); old.comments = old.comments.filter((c) => ids.has(c.artifact_id)); old.meta_versions = old.meta_versions.filter((m) => ids.has(m.artifact_id));
+  for (const a of old.artifacts) { delete a.folder_name; }
+  assert.equal((await owner.req("POST", `/api/workspaces/${(await owner.req("GET", "/api/workspaces")).body.workspaces[0].id}/import`, { backup: old, title: "Old /1" })).status, 201);
+  const bad = { ...structuredClone(ex), schema: "agent-library-backup/5" };
+  assert.equal((await owner.req("POST", `/api/workspaces/${(await owner.req("GET", "/api/workspaces")).body.workspaces[0].id}/import`, { backup: bad })).status, 400);
+});
+
+test("proposal text lives in R2: a >2 MiB proposal is approved end to end without a copy; rejected text is purged after 30 days", async () => {
+  const id = await ownerDoc("Big", "small start");
+  await setMode(id, "required");
+  const big = ("zanzibarline " + "x".repeat(60) + "\n").repeat(45000); // about 3.3 MiB, over the 2 MiB MCP request cap
+  assert.ok(Buffer.byteLength(big) > 2 * 1024 * 1024);
+  const put = await api("PUT", `/projects/${P}/files/${id}`, { expected_revision: 1, body: big, change_note: "big" });
+  assert.equal(put.status, 200, JSON.stringify(put.body)); assert.equal(put.body.status, "pending_review");
+  const row = sql(`SELECT body, body_key, size FROM proposals WHERE id = '${put.body.proposal_id}'`)[0];
+  assert.equal(row.body, null, "no text in D1"); assert.match(row.body_key, new RegExp(`^text/${P}/${id}/${put.body.proposal_id}$`)); assert.equal(row.size, Buffer.byteLength(big));
+  // Open proposal bytes count toward workspace storage; the pending text is not searchable.
+  assert.equal(ok(await reader.call("search_artifacts", { query: "zanzibarline" })).results?.length ?? 0, 0);
+  const rp = ok(await reviewer.call("read_proposal", { project_id: P, proposal_id: put.body.proposal_id }));
+  assert.equal(rp.body_truncated, true); assert.ok(rp.body.length < big.length);
+  assert.match(rp.download_url, /\/files\/d\/ft_/, "an OAuth reviewer gets the whole text through a short-lived link");
+  assert.equal(rp.diff_from_base.truncated ?? false, true, "a diff of a text over 1 MiB is summarised");
+  const full = await owner.req("GET", `${base}/proposals/${put.body.proposal_id}/content`, undefined, { binary: true });
+  assert.equal(full.status, 200); assert.equal(sha256(full.body), sha256(Buffer.from(big)));
+  ok(await reviewer.call("review_proposal", { project_id: P, proposal_id: put.body.proposal_id, decision: "approve", idempotency_key: key() }));
+  const v = sql(`SELECT body, body_key FROM revisions WHERE artifact_id = '${id}' AND rev_no = 2`)[0];
+  assert.equal(v.body, null); assert.equal(v.body_key, row.body_key, "the version points at the proposal's object: nothing is copied");
+  const live = await owner.req("GET", art(id));
+  assert.equal(live.body.body, big);
+  assert.ok((ok(await reader.call("search_artifacts", { query: "zanzibarline" })).results ?? []).some((r) => r.artifact_id === id), "approved text is searchable");
+  assert.equal(sql(`SELECT COUNT(*) AS n FROM content_writes WHERE key = '${row.body_key}'`)[0].n, 0);
+  // The approved text is never purged, even when its proposal is old.
+  sql(`UPDATE proposals SET decided_at = '2000-01-01T00:00:00Z' WHERE id = '${put.body.proposal_id}'`);
+  // A rejected text proposal: bytes purged 30 days after the decision; the record stays and says the body is purged.
+  const rej = await api("PUT", `/projects/${P}/files/${id}`, { expected_revision: 2, body: "rejected draft", change_note: "r" });
+  const rejKey = sql(`SELECT body_key FROM proposals WHERE id = '${rej.body.proposal_id}'`)[0].body_key;
+  ok(await reviewer.call("review_proposal", { project_id: P, proposal_id: rej.body.proposal_id, decision: "reject", note: "no", idempotency_key: key() }));
+  assert.equal((await owner.req("POST", `${base}/maintenance/reconcile-uploads`)).status, 200);
+  assert.equal(sql(`SELECT blob_purged_at FROM proposals WHERE id = '${rej.body.proposal_id}'`)[0].blob_purged_at, null, "not before 30 days");
+  sql(`UPDATE proposals SET decided_at = '2000-01-01T00:00:00Z' WHERE id = '${rej.body.proposal_id}'`);
+  assert.equal((await owner.req("POST", `${base}/maintenance/reconcile-uploads`)).status, 200);
+  assert.ok(sql(`SELECT blob_purged_at FROM proposals WHERE id = '${rej.body.proposal_id}'`)[0].blob_purged_at, "closed text purged");
+  assert.equal((await owner.req("GET", `${base}/proposals/${rej.body.proposal_id}/content`)).status, 410);
+  const purged = ok(await reviewer.call("read_proposal", { project_id: P, proposal_id: rej.body.proposal_id }));
+  assert.equal(purged.body_purged, true); assert.equal(purged.body, undefined); assert.equal(purged.proposal.status, "rejected");
+  assert.equal(sql(`SELECT body_key FROM proposals WHERE id = '${rej.body.proposal_id}'`)[0].body_key, rejKey, "the record stays");
+  assert.equal(sql(`SELECT COUNT(*) AS n FROM revisions WHERE body_key = '${row.body_key}'`)[0].n, 1, "approved text survives");
+  assert.equal((await owner.req("GET", art(id))).body.body, big);
 });

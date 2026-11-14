@@ -353,7 +353,7 @@ test("backup: a project with app files exports them with app:{name,path}; import
   const gone = (await put(c.tok, "old.md", "# old\n", { create: true })).json.file;
   assert.equal((await del(c.tok, "old.md", { match: etagOf("# old\n") })).status, 200);
   const backup = ok(await owner.req("GET", `/api/projects/${pid}/backup`));
-  assert.equal(backup.schema, "agent-library-backup/3");
+  assert.equal(backup.schema, "agent-library-backup/4");
   const byId = Object.fromEntries(backup.artifacts.map((a) => [a.id, a]));
   const appName = byId[kept.file_id].app.name;
   assert.match(appName, /^Files app-/);
