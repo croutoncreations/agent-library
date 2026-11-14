@@ -11,7 +11,7 @@ import { loadWorker } from "./load-worker.mjs";
 import { ROOT } from "./helpers.mjs";
 
 const lib = await loadWorker({
-  "limits.js": ["planEntitlements", "workspaceLimits", "withRequestMemo"], "adapters.js": ["withAdapters", "resolveAdapters"],
+  "limits.js": ["planEntitlements", "workspaceLimits", "withRequestMemo", "defaultLimits"], "adapters.js": ["withAdapters", "resolveAdapters"],
   "auth.js": ["agentRate"], "backup.js": ["checkImportRows", "IMPORT_MAX_ROWS"]
 });
 
@@ -115,4 +115,26 @@ test("cron: a failed retention run logs retention_failed instead of an unhandled
     // The third waitUntil is retention (index.js scheduled); it settles fulfilled because its failure is handled.
     assert.equal(settled[2].status, "fulfilled");
   } finally { console.error = orig; }
+});
+
+test("PROJECT_ARTIFACT_LIMIT: default 1000, whole numbers 1..10000, anything else uses 1000 and warns once; a plan's items_per_project wins", async () => {
+  const warned = [], orig = console.warn; console.warn = (m) => warned.push(JSON.parse(m));
+  try {
+    const cap = (v) => lib.defaultLimits(v === undefined ? {} : { PROJECT_ARTIFACT_LIMIT: v }).items_per_project;
+    for (const v of [undefined, "", "1000"]) assert.equal(cap(v), 1000, String(v));
+    for (const [v, n] of [["1", 1], ["2", 2], ["1500", 1500], ["10000", 10000]]) assert.equal(cap(v), n, v);
+    assert.equal(warned.length, 0, "valid values and an unset var log nothing");
+    for (const v of ["0", "10001", "12abc", "-5", "1.5", "1e3", " 7", "007", "99999"]) assert.equal(cap(v), 1000, v);
+    assert.equal(warned.length, 1, "one config warning per Worker instance, however many invalid reads");
+    assert.deepEqual(warned[0], { event: "config_invalid", name: "PROJECT_ARTIFACT_LIMIT", value: "0", using: 1000, allowed: "integer 1-10000" });
+    // The old name does nothing.
+    assert.equal(lib.defaultLimits({ PROJECT_ITEMS_MAX: "5" }).items_per_project, 1000);
+    // A hosted plan sets items_per_project through the entitlements adapter; it replaces the Worker var and is not bound by the ceiling.
+    const { DB } = mkDB();
+    const env = lib.withAdapters({ DB, PROJECT_ARTIFACT_LIMIT: "50", PLAN_LIMITS: JSON.stringify({ free: { items_per_project: 500 }, pro: { items_per_project: 25000 } }) },
+      lib.resolveAdapters({ entitlements: lib.planEntitlements }));
+    assert.equal((await lib.workspaceLimits(env, "wsp_hum_o")).items_per_project, 500, "plan (free) beats the var");
+    const bare = lib.withAdapters({ DB, PROJECT_ARTIFACT_LIMIT: "50" }, lib.resolveAdapters());
+    assert.equal((await lib.workspaceLimits(bare, "wsp_hum_o")).items_per_project, 50, "no plan value: the var applies");
+  } finally { console.warn = orig; }
 });

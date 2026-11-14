@@ -27,6 +27,7 @@ export const SERVER_PORTS = range({
   "hosted-supabase": 21055,
   addresses: 21056, "addresses-browser": 21057, "plan-limits": 21058, "project-deletion": 21059, "content-host": 21060, "large-uploads": 21061, "list-limits": 21062, "single-pass-uploads": 21063, "text-r2": 21064, "list-artifacts-filter": 21065, "text-limit": 21066, "render-limit": 21067, "text-uploads": 21068, "text-uploads-oauth": 21069, "text-uploads-v1": 21070, "search-excerpt-bounds": 21071, "list-filter-long": 21072, "text-uploads-mcp": 21073, "text-uploads-mcp-off": 21074, "app-files": 21076, "app-files-hooks-off": 21078,
   "offline-shell": 21080, "offline-network": 21081, "offline-hosted": 21082,
+  "artifact-cap": 21090, "artifact-cap-guards": 21091, "upgrade-old": 21092, "upgrade-new": 21093, "upgrade-rollback": 21094,
 });
 
 /** Plain node:http listeners that tests start next to a server. */
