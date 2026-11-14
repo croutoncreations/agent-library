@@ -135,11 +135,11 @@ test("cron: the database-size step runs alongside the other steps, and its failu
     const DB = { prepare: (q) => q === "SELECT 1" ? w.DB.prepare(q) : ({ bind: () => ({ run: fail, all: fail, first: fail }), run: fail, all: fail, first: fail }), batch: fail };
     await worker.scheduled({}, { DB, DB_SIZE_WARN_BYTES: String(5 * GB) }, { waitUntil: (p) => waits.push(p) });
     const settled = await Promise.allSettled(waits);
-    assert.equal(waits.length, 6, "cleanup, reconcile, retention, project purge, workspace purge, db size");
+    assert.equal(waits.length, 7, "cleanup, reconcile, retention, project purge, workspace purge, search rebuild, db size");
     assert.ok(logs.some((l) => /"event":"db_size"/.test(l) && /"size_bytes":7516192768/.test(l)), logs.join("\n"));
     assert.ok(logs.some((l) => /"event":"db_size_warning"/.test(l)), logs.join("\n"));
     assert.ok(errors.some((e) => /"event":"retention_failed"/.test(e)), "retention ran and reported its own failure");
-    assert.equal(settled[5].status, "fulfilled");
+    assert.equal(settled.at(-1).status, "fulfilled");
 
     // And the reverse: the size step fails, every other step still runs to its own outcome.
     waits.length = 0; logs.length = 0; errors.length = 0;
@@ -148,6 +148,6 @@ test("cron: the database-size step runs alongside the other steps, and its failu
     const settled2 = await Promise.allSettled(waits);
     assert.ok(errors.some((e) => /"event":"db_size_failed"/.test(e)));
     assert.ok(errors.some((e) => /"event":"retention_failed"/.test(e)));
-    assert.equal(settled2[5].status, "fulfilled");
+    assert.equal(settled2.at(-1).status, "fulfilled");
   } finally { Object.assign(console, orig); }
 });
