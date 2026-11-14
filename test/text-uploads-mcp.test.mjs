@@ -221,10 +221,12 @@ test("retries: begin replay returns the same upload and keeps metadata; double f
 test("refusals: read-only, revoked, expired link, another connection's upload, kind mismatches, upload_file with text", async () => {
   const bytes = Buffer.from("# refused\n");
   const decl = { project_id: P, title: "Refused", mime: "text/markdown", size: bytes.length, sha256: sha256(bytes), change_note: "x" };
-  // Read-only: OAuth token without write scope is refused before the tool; a read-only legacy grant gets 403.
+  // Read-only: the OAuth token always carries the write scope (edit access can be granted later without reconnecting), so
+  // a read-only connection is refused by the per-project gate ("forbidden"); a read-only legacy grant gets 403.
   const ro = await h.connectMcpAgent({ [P]: "read" }, { clientName: "Synthetic reader" });
   assert.ok(!(await ro.list()).some((t) => t.name === "upload_begin"));
-  assert.equal((await ro.call("upload_begin", { ...decl, idempotency_key: key("ub") })).status, 403);
+  const roBegin = await ro.call("upload_begin", { ...decl, idempotency_key: key("ub") });
+  assert.equal(roBegin.isError, true); assert.equal(roBegin.data.error.code, "forbidden");
   const roLegacy = await sdkClient(h.appUi, roGrantToken, "synthetic-ro");
   try {
     const r = await roLegacy.call("upload_begin", { ...decl, idempotency_key: key("ub") });

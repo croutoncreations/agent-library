@@ -279,8 +279,11 @@ test("read-only connection: can list, read and download; every upload tool is re
     upload_finish: { project_id: P, upload_id: "upl_doesnotexist", idempotency_key: key("uf") },
   };
   for (const [name, args] of Object.entries(calls)) {
+    // The token always carries the write scope (edit access can be granted later without reconnecting); the per-project
+    // can_write is the gate, so a read-only connection gets no upload tools in tools/list and "forbidden" if it calls one.
     const r = await ro.call(name, args);
-    assert.equal(r.status, 403, `${name}: a read-only token lacks the write scope`);
+    assert.equal(r.isError, true, `${name}: refused for a read-only connection`);
+    assert.equal(r.data?.error?.code ?? r.data?.code, "forbidden", `${name}: read-only for this project`);
   }
   // Mixed connection (Edit on one project, Read on another): the write tools exist but refuse the read-only project.
   const mixed = await h.connectMcpAgent({ [P]: "write", [Q]: "read" }, { clientName: "Mixed" });
@@ -458,7 +461,8 @@ test("permission changes after minting: write downgrade stops the PUT; removing 
   assert.equal((await fetch(b.data.put_url, { method: "PUT", body: bytes })).status, 403);
   assert.equal((await fetch(rd.data.download_url)).status, 200, "still readable");
   await sql(`DELETE FROM oauth_connection_projects WHERE connection_id = '${cid}'`);
-  assert.equal((await fetch(rd.data.download_url)).status, 401, "no projects left: connection is no longer live");
+  assert.equal((await fetch(rd.data.download_url)).status, 403, "no projects left: the link no longer reaches the project (the connection itself stays live)");
+  assert.equal((await agent.call("list_projects", {})).isError, false, "the connection is not revoked");
 });
 
 test("revoke: list, read, download link minted before revoke, PUT and finish all fail on the next request", async () => {

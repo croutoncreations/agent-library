@@ -203,7 +203,14 @@ async function liveConnection(env, id) {
      WHERE cp.connection_id = ? AND ${memberRoleSql("p.id", "viewer")} ORDER BY p.created_at LIMIT ${MAX_CONN_PROJECTS}`
   ).bind(...Array(3).fill(row.created_by ?? row.owner_principal_id), id, row.created_by ?? row.owner_principal_id).all();
   // No live projects is not revoked: the owner may not have shared any yet, or removed them all (Connections). Every
-  // project-scoped call then fails its own live check; only revoked or expired connections are refused here.
+  // project-scoped call then fails its own live check. What still ends a connection with no projects is what always did:
+  // its creator is no longer a member of its workspace (removed, or the workspace is being deleted). Suspended workspaces
+  // stay readable. (With projects, the project query above already proves the creator's membership.)
+  if (!ps.results.length) {
+    const creator = row.created_by ?? row.owner_principal_id;
+    const member = await env.DB.prepare(`SELECT ${workspaceRoleSql("?", "viewer", "?", true)} AS ok`).bind(creator, row.workspace_id ?? `wsp_${row.owner_principal_id}`).first("ok");
+    if (!member) return null;
+  }
   return { ...row, display_name: row.label ?? row.client_name, projects: ps.results };
 }
 /**
@@ -298,7 +305,7 @@ function clientFacts(d) {
     d.clientDomain ? cxChip("ok", "check", `Verified \u00B7 ${esc(d.clientDomain)}`) : cxChip("warn", "alert", "Name not verified"),
     cxChip("", "back", `Returns to ${esc(d.redirectHost)}`)
   ];
-  return `<div class="chips">${chips.join("")}</div>${d.redirectUri ? `<p class="fine">Returns to <code class="url">${esc(d.redirectUri)}</code></p>` : ""}${d.redirectIsLoopback ? `<div class="callout warn">${cxIcon("alert")}<div><strong>This sends access to an app on this computer.</strong> Continue only if you just started connecting from it.</div></div>` : ""}`;
+  return `<div class="chips">${chips.join("")}</div>${d.redirectUri ? `<p class="note">Returns to <code class="url">${esc(d.redirectUri)}</code></p>` : ""}${d.redirectIsLoopback ? `<div class="callout warn">${cxIcon("alert")}<div><strong>This sends access to an app on this computer.</strong> Continue only if you just started connecting from it.</div></div>` : ""}`;
 }
 // The owner's most recent live connection for this exact client_id. Never matched by name: client names are
 // self-asserted, so a look-alike registration must not inherit another app's access or be offered its replacement.
@@ -342,11 +349,11 @@ function cxGrantPage(d, email, projects, prev, consent, values = null, error = "
   // The owner's name for the connection (the app's own name is only a suggestion), and where it lives when no project is picked.
   const nameValue = pick("label", (prev?.label ?? d.clientName).slice(0, CONNECTION_NAME_MAX));
   const nameField = `<section class="sec"><h2>Name</h2><label class="field"><span>Name in Agent Library</span><input type="text" name="label" required maxlength="${CONNECTION_NAME_MAX}" pattern=".*\\S.*" value="${esc(nameValue)}" autocomplete="off"></label>
-<p class="fine">The app reports itself as \u201C${esc(d.clientName)}\u201D. That name comes from the app, not from Agent Library.</p></section>`;
+<p class="note">The app reports itself as \u201C${esc(d.clientName)}\u201D. That name comes from the app, not from Agent Library.</p></section>`;
   const homes = projects.memberWorkspaces ?? [];
   const homeDefault = (homes.find((w) => w.personal) ?? homes[0])?.id ?? "";
   const homePick = homes.length > 1 ? `<label class="field"><span>Workspace for this connection</span><select name="connect_workspace">${homes.map((w) => `<option value="${esc(w.id)}"${pick("connect_workspace", homeDefault) === w.id ? " selected" : ""}>${esc(w.name ?? "Personal")}</option>`).join("")}</select></label>
-<p class="fine">Used when you pick no projects now. If you pick projects, the connection belongs to their workspace.</p>${homes.truncated ? '<p class="fine">Showing the first 50 workspaces.</p>' : ""}` : "";
+<p class="note">Used when you pick no projects now. If you pick projects, the connection belongs to their workspace.</p>${homes.truncated ? '<p class="fine">Showing the first 50 workspaces.</p>' : ""}` : "";
   const welcome = prev && !values ? `<div class="callout info">${cxIcon("redo")}<div><strong>Welcome back.</strong> Your earlier connection${prev.label ? ` \u201C${esc(prev.label)}\u201D` : ""} (${esc(cxDate(prev.created_at))}) ${prev.projects.length ? "has its name and access already picked" : "has its name already filled in"}. Adjust anything below.</div></div>` : "";
   const replaceOn = values ? values.get("replace") === prev?.id : true;
   const replace = prev ? `<label class="check"><input type="checkbox" name="replace" value="${esc(prev.id)}"${replaceOn ? " checked" : ""}><span><strong>Replace the earlier connection</strong><small>Its old sign-in stops working as soon as you click Connect, so you don't end up with duplicates.</small></span></label>` : "";
@@ -355,7 +362,7 @@ function cxGrantPage(d, email, projects, prev, consent, values = null, error = "
 ${clientFacts(d)}${welcome}${cxErr(error)}
 <form method="post" action="/authorize" class="grant"><input type="hidden" name="handle" value="${esc(consent.handle)}"><input type="hidden" name="step" value="grant">${CX_ENTER}
 ${nameField}
-<section class="sec"><h2>Projects</h2><p class="fine">Optional. You can connect now and share projects later in Connections.</p>${groups.length > 1 ? `<p class="fine one-ws">Pick projects from one workspace. To share another workspace, connect again.</p>` : ""}${rows}
+<section class="sec"><h2>Projects</h2><p class="note">Optional. You can connect now and share projects later in Connections.</p>${groups.length > 1 ? `<p class="fine one-ws">Pick projects from one workspace. To share another workspace, connect again.</p>` : ""}${rows}
 <h3 class="sub">${cxIcon("plus")}${rows ? "Or create a project" : "Create a project to share"}</h3>${wsPick}${fresh}${homePick}</section>
 ${replace}
 <p class="fine"><strong>Read</strong>: view documents and files (images, PDFs, videos) and their history, and download files. <strong>Edit</strong>: also create and change documents, and upload new files and new versions of files. Comments, trash and settings are never shared.</p>
@@ -1035,7 +1042,8 @@ h2{margin:0 0 8px;font-size:12.5px;font-weight:600;letter-spacing:.06em;text-tra
 .sub{display:flex;align-items:center;gap:6px;margin:14px 0 0;font-size:14px;font-weight:600;color:var(--muted)}
 p{margin:0 0 12px;overflow-wrap:anywhere}
 .lede{margin:6px 0 16px;color:var(--muted);text-align:center;font-size:14.5px}
-.fine{font-size:13px;color:var(--faint)}
+.fine,.note{font-size:13px;color:var(--faint)}
+.note{margin:6px 0 0}
 strong{font-weight:650}
 small{display:block;color:var(--muted);font-size:13px;font-weight:400}
 code{font:12px ui-monospace,Menlo,monospace;background:var(--sunk);padding:1px 5px;border-radius:var(--r1)}
