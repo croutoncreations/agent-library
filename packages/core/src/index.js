@@ -160,8 +160,15 @@ async function route3(req, env, url, requestId, seen = {}) {
     });
   if (m === "POST" && path === "/auth/dev-login") return devLogin(req, env, url);
   if (m === "POST" && path === "/auth/access-login") return accessLogin(req, env, url);
-  // How this installation signs people in (public; the browser app picks its sign-in screen from it).
-  if (m === "GET" && path === "/auth/methods") return json({ redirect: browserSignInEnabled(env), choices: signinChoices(env), turnstile_site_key: emailTurnstile(env), access: adapters(env).identity.enabled(env), local: !!env.LOCAL_DEV_LOGIN && ["localhost", "127.0.0.1"].includes(url.hostname) }, 200, { "cache-control": "no-store" });
+  // Optional policy links on the sign-in page (PRIVACY_URL, TERMS_URL): an https URL or a same-origin path; anything
+// else is ignored.
+const legalUrl = (v) => typeof v === "string" && v.length <= 300 && (/^https:\/\/[^\s"'<>]+$/.test(v) || /^\/[A-Za-z0-9._~\/-]*$/.test(v) && !v.startsWith("//")) ? v : null;
+function legalLinks(env) {
+  const privacy = legalUrl(env.PRIVACY_URL), terms = legalUrl(env.TERMS_URL);
+  return privacy || terms ? { privacy, terms } : null;
+}
+// How this installation signs people in (public; the browser app picks its sign-in screen from it).
+  if (m === "GET" && path === "/auth/methods") return json({ redirect: browserSignInEnabled(env), choices: signinChoices(env), turnstile_site_key: emailTurnstile(env), legal: legalLinks(env), access: adapters(env).identity.enabled(env), local: !!env.LOCAL_DEV_LOGIN && ["localhost", "127.0.0.1"].includes(url.hostname) }, 200, { "cache-control": "no-store" });
   if ((m === "GET" || m === "POST") && path === "/auth/signin") return signinStart(req, env, url);
   if (m === "GET" && path === "/auth/callback") return signinCallback(req, env, url);
   if (m === "GET" && path === "/auth/check-email" && browserSignInEnabled(env)) return checkEmailPage();

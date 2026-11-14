@@ -569,6 +569,14 @@ async function logout() {
 }
 
 // ---------- login ----------
+// The installation's policy links (PRIVACY_URL / TERMS_URL), if it sets them.
+function legalFoot() {
+  var l = AUTH && AUTH.legal; if (!l) return null;
+  var links = [];
+  if (l.privacy) links.push(h("a", { href: l.privacy, text: "Privacy Policy" }));
+  if (l.terms) { if (links.length) links.push(" \u00b7 "); links.push(h("a", { href: l.terms, text: "Terms of Service" })); }
+  return h("p", { class: "signin-legal small muted" }, links);
+}
 function viewLogin(note) {
   if (redirectSignIn()) {
     var nextHash = location.hash && location.hash !== "#/" ? location.hash : "";
@@ -599,7 +607,8 @@ function viewLogin(note) {
       h("div", { class: "card signin" },
         h("div", { class: "signin-head" }, brandLogo(52), title, h("p", { class: "signin-sub", text: "One home for everything your agents make." })),
         h("div", { class: "signin-body" }, parts),
-        h("p", { class: "signin-foot", text: "New here? Signing in creates your account if sign-up is open to you." }))));
+        h("p", { class: "signin-foot", text: "New here? Signing in creates your account if sign-up is open to you." }),
+        legalFoot())));
     // Focus the heading (no ring on an option, which would look pre-selected); Tab reaches the options in order.
     title.focus({ preventScroll: true });
     void first;

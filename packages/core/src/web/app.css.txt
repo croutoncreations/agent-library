@@ -518,6 +518,7 @@ main > .tabs,main > nav.tabs{margin:16px 0 12px}
 .signin-sub{margin:0;color:var(--muted);font-size:14.5px}
 .signin-body{display:flex;flex-direction:column;gap:10px}
 .signin-foot{margin:0;padding-top:16px;border-top:1px solid var(--line);color:var(--faint);font-size:12.5px;text-align:center}
+.signin-legal{margin:10px 0 0;text-align:center;font-size:12.5px}.signin-legal a{color:inherit}
 .card.signin .signin-choice{justify-content:center;gap:10px;min-height:44px;font-weight:600}
 .card.signin .signin-choice .pmark{width:18px;height:18px;flex:none;stroke:none}.card.signin .signin-choice .pmark path{stroke:none}
 .signin-choice .pmark path[fill=currentColor]{fill:var(--fg)}

@@ -94,7 +94,8 @@ before(async () => {
   srv = await startServer("offline-hosted", WORKER, { readyBase: `http://127.0.0.1:${PROXY}`, vars: {
     APP_HOST: HOST, MCP_HOST, CONTENT_HOST,
     OIDC_ISSUER: IDP, OIDC_CLIENT_ID: CLIENT, OIDC_CLIENT_SECRET: SECRET, OIDC_AUTHORIZATION_URL: `${IDP}/authorize`, OIDC_TOKEN_URL: `${IDP}/token`, OIDC_JWKS_URL: `${IDP}/jwks`,
-    SIGNUP_ALLOWLIST: "@example.test", RATE_READS_PER_MIN: "100000", RATE_WRITES_PER_MIN: "100000", RATE_AUTHFAIL_PER_MIN: "100000", RATE_SIGNIN_PER_MIN: "1000" } });
+    SIGNUP_ALLOWLIST: "@example.test", RATE_READS_PER_MIN: "100000", RATE_WRITES_PER_MIN: "100000", RATE_AUTHFAIL_PER_MIN: "100000", RATE_SIGNIN_PER_MIN: "1000",
+    PRIVACY_URL: "/privacy", TERMS_URL: "javascript:alert(1)" } });
   if (!haveChrome) return;
   browser = await require(PUPPETEER).launch({ executablePath: CHROME, headless: true, protocolTimeout: 20000,
     // Treat the plain-HTTP test host as secure so the service worker runs, as it does on https in production.
@@ -203,6 +204,9 @@ test("session ended while online (a 401): the sign-in screen, not saved copies; 
   assert.equal(res.fromServiceWorker(), true, "the shell came from the cache");
   await page.waitForFunction(() => /Sign in to Agent Library/.test(document.body.innerText), { timeout: 10000 });
   assert.doesNotMatch(await text(), /Saved on this device|Packing list/, "a signed-out device does not open saved copies");
+  // The installation's policy links sit under the sign-in card; a value that isn't https or a path is dropped.
+  assert.deepEqual(await page.evaluate(() => [...document.querySelectorAll(".signin-legal a")].map((x) => [x.textContent, x.getAttribute("href")])),
+    [["Privacy Policy", "/privacy"]]);
   assert.equal(await page.$(".offline-banner"), null);
   assert.equal(net.navHits, before, "the launch reached the network only for the sign-in check, not as a page load");
   await Promise.all([page.waitForNavigation(), tap("Continue to sign in")]);
