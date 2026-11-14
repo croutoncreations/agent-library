@@ -678,7 +678,7 @@ async function viewWorkspaces() {
       r.workspaces.forEach(function (w) {
         list.append(h("li", { class: "link" }, h("span", { class: "ficon-sm", "aria-hidden": "true" }, icon(w.personal ? "user" : "users")),
           h("div", { class: "grow" }, rowLink("#/workspaces/" + enc(w.id), wsLabel(w)),
-            h("small", { class: "muted", text: ROLE_LABEL[w.role] + (w.personal ? " · only you" : " · " + w.member_count + (w.member_count === 1 ? " member" : " members")) })),
+            h("small", { class: "muted", text: ROLE_LABEL[w.role] + (w.personal ? " · only you" : " · " + w.member_count + (w.member_count === 1 ? " member" + ((w.role === "owner" || w.role === "admin") && w.status === "active" ? " · invite people" : "") : " members")) })),
           w.status !== "active" ? statusBadge(w.status) : null,
           h("span", { class: "chev", "aria-hidden": "true" }, icon("chevron"))));
       });
