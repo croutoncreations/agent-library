@@ -11,6 +11,7 @@ import { key, grant, mcpClient, agentHttp, ROOT, LOCAL_CONFIG, sha256, barrier }
 import { makePng } from "./make-fixtures.mjs";
 
 const P = "rvw", Q = "rvw-other";
+const ARTIFACT_LIMIT = 120; // Exercise the operator override during new-proposal approval.
 const base = `/api/projects/${P}`;
 const art = (id) => `${base}/artifacts/${id}`;
 let h, owner, writer, writer2, reviewer, reader, legacy, legacyGrant, apiKey, apiKeyId, reviewerConn;
@@ -43,7 +44,7 @@ const connId = async (clientName) => (await owner.req("GET", "/api/access")).bod
 const allowReview = (path_kind, path_id, project_id = P, can_review = true) => owner.req("PUT", "/api/review-grants", { path_kind, path_id, project_id, can_review });
 
 before(async () => {
-  h = await startAppConnectServer({ port: SERVER_PORTS["review-gating"], vars: { PROJECT_BINARY_BYTES: String(1024 * 1024) } });
+  h = await startAppConnectServer({ port: SERVER_PORTS["review-gating"], vars: { PROJECT_ARTIFACT_LIMIT: String(ARTIFACT_LIMIT), PROJECT_BINARY_BYTES: String(1024 * 1024) } });
   owner = await h.owner();
   for (const [id, title] of [[P, "Review"], [Q, "Other"]]) assert.equal((await owner.req("POST", "/api/projects", { id, title })).status, 201);
   writer = await h.connectMcpAgent({ [P]: "write" }, { clientName: "Writer" });
@@ -275,7 +276,7 @@ test("approving a new document re-checks the project document limit; reject stil
     const c = ok(await writer.call("create_markdown", { project_id: P, title: "Over the limit", body: "x", idempotency_key: key() }));
     assert.equal(c.status, "pending_review");
     const n = sql(`SELECT COUNT(*) AS n FROM artifacts WHERE project_id = '${P}' AND publisher_id IS NULL AND pending_review = 0`)[0].n;
-    sql(`WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < ${100 - n})
+    sql(`WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < ${ARTIFACT_LIMIT - n})
       INSERT INTO artifacts (id, project_id, kind, title, created_at, updated_at) SELECT 'fill_' || i, '${P}', 'markdown', 'Filler', '2000-01-01T00:00:00Z', '2000-01-01T00:00:00Z' FROM s`);
     try {
       const e = err(await reviewer.call("review_proposal", { project_id: P, proposal_id: c.proposal_id, decision: "approve", idempotency_key: key() }));

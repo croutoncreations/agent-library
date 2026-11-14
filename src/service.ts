@@ -1,6 +1,6 @@
 // Shared business logic for HTTP API and MCP. Every operation: authenticate (caller) ->
 // authorize project -> validate -> guarded atomic mutation -> audit -> serialize.
-import { authorizeProject, authzSql, contentWriteSql, protectSql, requireHuman, type Ctx } from "./auth";
+import { limitsFor, authorizeProject, authzSql, contentWriteSql, protectSql, requireHuman, type Ctx } from "./auth";
 import { HttpError, int, nowIso, nowMs, randomId, sha256Hex, str } from "./util";
 import { checkFile, isCalendarDate, MEASUREMENTS, MIME } from "./formats";
 
@@ -20,7 +20,7 @@ export const LIMITS = {
   markdownBytes: 1024 * 1024,
   binaryBytes: 5 * 1024 * 1024, // owner envelope: <= 5 MiB synthetic fixtures
   projectBinaryBytes: 100 * 1024 * 1024,
-  artifactsPerProject: 100,
+  artifactsPerProject: 1000,
   pageSize: 50,
   uploadTtlMs: 15 * 60 * 1000,
   commentChars: 10_000,
@@ -270,7 +270,7 @@ export async function createMarkdown(ctx: Ctx, projectId: string, input: any, ke
   if (prior) return prior;
   // App exports have their own per-publisher quota and don't use up the project's artifact quota.
   const count = await db(ctx).prepare("SELECT COUNT(*) AS n FROM artifacts WHERE project_id = ? AND publisher_id IS NULL").bind(projectId).first<number>("n");
-  if ((count ?? 0) >= LIMITS.artifactsPerProject) throw new HttpError(413, "quota_exceeded", "Artifact limit reached");
+  if ((count ?? 0) >= limitsFor(ctx.env).artifactsPerProject) throw new HttpError(413, "quota_exceeded", "Artifact limit reached");
 
   const artId = randomId("art");
   const revId = randomId("rev");

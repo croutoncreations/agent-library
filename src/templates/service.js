@@ -76,7 +76,7 @@ async function tplCopy(ctx, projectId, input, key, definition = false) {
     AND trashed_at IS NULL AND publisher_id IS NULL ${definition ? "" : "AND is_template = 1"})
     AND (? IS NULL OR EXISTS (SELECT 1 FROM folders WHERE id = ? AND project_id = ?))
     AND (SELECT COUNT(*) FROM artifacts WHERE project_id = ? AND publisher_id IS NULL) < ?`;
-  const gp = [...az.params, sourceId, projectId, folderId, folderId, projectId, projectId, LIMITS.artifactsPerProject];
+  const gp = [...az.params, sourceId, projectId, folderId, folderId, projectId, projectId, limitsFor(ctx.env).artifactsPerProject];
   const result = { status: 201, body: { artifact_id: id, kind: "markdown", revision: 1, revision_id: rid, sha256: hash,
     ...tplLinks(ctx, projectId, id), source_artifact_id: sourceId, source_revision: revision,
     ...definition ? { is_template: true } : { source_template_id: sourceId, source_template_revision: revision, date } } };
@@ -100,7 +100,7 @@ async function tplCopy(ctx, projectId, input, key, definition = false) {
     await tplSource(ctx, projectId, sourceId, revision, !definition);
     await folderCheck(ctx, projectId, folderId);
     const n = await db(ctx).prepare("SELECT COUNT(*) AS n FROM artifacts WHERE project_id = ? AND publisher_id IS NULL").bind(projectId).first("n");
-    if (n >= LIMITS.artifactsPerProject) throw new HttpError(413, "quota_exceeded", "Artifact limit reached");
+    if (n >= limitsFor(ctx.env).artifactsPerProject) throw new HttpError(413, "quota_exceeded", "Artifact limit reached");
     throw new HttpError(403, "forbidden", "Grant no longer valid");
   }
   return result;

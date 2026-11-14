@@ -10,6 +10,7 @@ import { key, grant, mcpClient, startServer, agentHttp, ROOT, LOCAL_CONFIG, barr
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 const P = 'templates', Q = 'foreign';
+const ARTIFACT_LIMIT = 120; // Exercise the operator override in the template quota guards.
 const base = `/api/projects/${P}`;
 const sourceBody = '# {{title}}\nProject: {{project}}\nDate: {{date}}\n\n## Findings\n{{unknown}}\n<script>alert(1)</script>\n';
 let h, owner, rw, ro, sdk, legacy, legacyGrant, apiKey, readKey, source, template, copy;
@@ -24,7 +25,7 @@ async function api(method, path, body, token = apiKey, idem = key('api')) {
 }
 const use = extra => ({ template_id: template, template_revision: 1, title: 'Report', date: '2026-10-27', ...extra });
 before(async () => {
-  h = await startAppConnectServer({ port: SERVER_PORTS.templates }); owner = await h.owner();
+  h = await startAppConnectServer({ port: SERVER_PORTS.templates, vars: { PROJECT_ARTIFACT_LIMIT: String(ARTIFACT_LIMIT) } }); owner = await h.owner();
   for (const [id, title] of [[P, 'Research 日本 {{date}}'], [Q, 'Foreign project']]) assert.equal((await owner.req('POST', '/api/projects', { id, title })).status, 201);
   source = (await owner.req('POST', base + '/artifacts', { title: 'Research report', body: sourceBody })).body.artifact_id;
   rw = await h.connectMcpAgent({ [P]: 'write' }); ro = await h.connectMcpAgent({ [P]: 'read' });
@@ -193,7 +194,7 @@ test('transaction failure rolls back artifacts/revision/audit/idempotency; quota
   await sql('DROP TRIGGER fail_template_test');
   assert.equal((await api('POST', `/projects/${P}/files/from-template`, args, apiKey, idem)).status, 201);
   const [{ n }] = await sql(`SELECT COUNT(*) AS n FROM artifacts WHERE project_id='${P}'`);
-  await sql(`WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n < ${100 - n}) INSERT INTO artifacts (id, project_id, kind, title, created_at, updated_at) SELECT 'quota_'||n, '${P}', 'markdown', 'Quota fixture', '2026-01-01', '2026-01-01' FROM seq`);
+  await sql(`WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n < ${ARTIFACT_LIMIT - n}) INSERT INTO artifacts (id, project_id, kind, title, created_at, updated_at) SELECT 'quota_'||n, '${P}', 'markdown', 'Quota fixture', '2026-01-01', '2026-01-01' FROM seq`);
   const quotaKey = key(); assert.equal((await api('POST', `/projects/${P}/files/from-template`, use(), apiKey, quotaKey)).status, 413);
   assert.equal((await sql(`SELECT COUNT(*) AS n FROM idempotency WHERE key='${quotaKey}'`))[0].n, 0);
   await sql("DELETE FROM artifacts WHERE id LIKE 'quota_%'");

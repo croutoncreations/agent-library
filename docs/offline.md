@@ -18,6 +18,7 @@ Status: implemented. Build step `build-offline-shell.mjs` (last in `npm run buil
 
 ## What is never cached
 
+- Very large projects: **Keep project offline** lists a project 40 pages at a time and so syncs only its first 2,000 items. Documents beyond that are not kept, even if the project's cap (`PROJECT_ARTIFACT_LIMIT`, default 1,000, at most 10,000) allows more.
 - Library data: API responses, content, previews and files. Every data request still goes to the network through Cloudflare Access. Offline reading uses only the copies the owner saved in IndexedDB (read-only, removed on sign-out; see Settings → Offline).
 - Anything other than an exact shell file or app route. A PDF opened in a new tab, for example, is left to the browser.
 - A shell response that is not a plain same-origin `200`. Access redirects and sign-in pages are rejected: `/` must be the app's own page (it loads `/app.js`), and no other shell file may be HTML.

@@ -24,6 +24,7 @@ export const SERVER_PORTS = range({
   templates: 21043, "templates-restore": 21044, "templates-legacy-restore": 21047,
   diagnostics: 21048, "file-types": 21049, "marketing-capture": 21045, "marketing-clips": 21046,
   "review-gating": 21050, "review-gating-restore": 21051, "review-ui": 21052, "offline-shell": 21053, "offline-network": 21054,
+  "artifact-cap": 21055, "artifact-cap-guards": 21056,
 });
 
 /** Plain node:http listeners that tests start next to a server. */

@@ -66,6 +66,11 @@ OWNER_EMAIL = "you@example.com"
 # Access for SaaS OIDC application used for agent consent on MCP_HOST.
 ACCESS_OIDC_ISSUER = "https://your-team.cloudflareaccess.com/cdn-cgi/access/sso/oidc/replace-with-client-id"
 ACCESS_OIDC_CLIENT_ID = "replace-with-client-id"
+# Optional: per-project document cap, the same for every project. A whole number from 1 to 10000
+# (default 1000); anything else is ignored with a logged config warning. 10000 is the supported ceiling
+# because list paging, offline sync (which stops at 2000 items) and project backup are not designed
+# for more.
+# PROJECT_ARTIFACT_LIMIT = "1000"
 # App Connect: lets apps you register keep their own files in your library (docs/app-connect.md).
 APP_CONNECT_ENABLED = "1"
 # Optional: extra exact https OAuth callbacks to trust besides the built-in ChatGPT, Claude and

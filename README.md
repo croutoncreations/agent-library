@@ -57,7 +57,7 @@ Then [connect your agents](docs/agent-setup.md).
 Agent Library is a personal library: one owner, many agents.
 
 - There are no other human users, public links or real-time co-editing. Agents edit one revision at a time, and conflicting saves are rejected rather than merged.
-- Limits: 1 MiB per Markdown or HTML document; 5 MiB per binary file (PNG, JPEG, WebP, GIF, PDF, MP4, WebM) and 100 MiB of binaries per project (adjustable with `PROJECT_BINARY_BYTES`). A project stops accepting new documents once it holds 100 items, counting uploads and trashed items.
+- Limits: 1 MiB per Markdown or HTML document; 5 MiB per binary file (PNG, JPEG, WebP, GIF, PDF, MP4, WebM) and 100 MiB of binaries per project (adjustable with `PROJECT_BINARY_BYTES`). A project stops accepting new documents once it holds 1,000 items, counting uploads and trashed items. `PROJECT_ARTIFACT_LIMIT` sets this cap for the whole installation (a positive whole number from 1 to 10,000; anything else is ignored with a config warning and the default applies). It stops at 10,000 because list paging, offline sync and backup are not designed beyond that. Very large projects have caveats: **Keep project offline** syncs only the first 2,000 items, and a project backup is built in memory, so it can exceed Worker limits. See [Operations](docs/operations.md).
 - Backups are per project and exclude App Connect projects. See [Operations](docs/operations.md).
 - Cloudflare's free tiers cover a typical personal library, but usage beyond them is billed to your account.
 

@@ -58,7 +58,8 @@ The deployable Worker is a committed, byte-pinned bundle. `npm run build:design`
 - `src/oauth-renewal/*`;
 - `src/file-tools/*` (files for OAuth connections, `build-file-tools-fixes.mjs`);
 - `src/review/*` (optional review per document, `build-review.mjs`);
-- `src/offline/*` (installed app shell and offline launch, [offline.md](offline.md), `build-offline-shell.mjs`, the last step).
+- `src/offline/*` (installed app shell and offline launch, [offline.md](offline.md), `build-offline-shell.mjs`);
+- `src/auth.ts` (the per-project document cap, `PROJECT_ARTIFACT_LIMIT`, `build-artifact-limits.mjs`, the last step).
 
 Each step must leave every other byte unchanged and records hashes in a `*-preservation.json` manifest. CI's `npm run check:bundle` rebuilds in a temporary copy and fails on any difference. Because of this, every change to what ships is a reviewable source diff, and the shipped bytes are reproducible.
 
@@ -73,7 +74,7 @@ Nothing installation-specific is compiled in. Each installation sets these Worke
 - `APP_CONNECT_ENABLED`;
 - optionally, `OAUTH_EXTRA_REDIRECT_URIS`.
 
-Rate limits and upload TTLs have defaults and optional vars. See [wrangler.example.toml](../wrangler.example.toml).
+Rate limits and upload TTLs have defaults and optional vars. `PROJECT_ARTIFACT_LIMIT` sets the per-project document cap for every project (default 1,000; whole numbers from 1 to 10,000, otherwise the default applies and the Worker logs a `config_invalid` warning). Ordinary creation, template copies and creation, and approval of new-document proposals all read it through `limitsFor`; App Connect files keep their own per-publisher quota. The ceiling is a supported boundary, not a storage limit: list paging, offline sync (which stops at 2,000 items) and project backup are not designed for more. It is integrated by the last build step, `build-artifact-limits.mjs`. See [wrangler.example.toml](../wrangler.example.toml).
 
 ## Ranked search
 
