@@ -88,7 +88,7 @@ test("installed-app icons are the Fold mark: manifest, favicon and touch icon se
     assert.equal(await bytes("/icons/" + old), hash(brand(now)), old);
   // A new shell cache name makes installed apps drop cached copies of the old shell and icons.
   const sw = await (await get("/sw.js")).text();
-  assert.match(sw, /var SHELL = "al-shell-v2"/);
+  assert.match(sw, /var SHELL = "al-shell-v3"/);
   assert.match(sw, /"\/icons\/app-icon-192\.png","\/icons\/app-apple-180\.png"/);
   assert.equal((await fetch(ORIGIN + "/icons/nope.png")).status, 404);
 });
