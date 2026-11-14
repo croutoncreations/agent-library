@@ -141,7 +141,7 @@ Worker rollback restores code and config only, not D1, R2 or KV. Rolling back to
 
 ### Search rollout readiness
 
-Migration 0014 seeds search as unavailable on an existing installation. Automatic deployment can proceed, but Home and both MCP catalogs hide search until the bounded backfill has verified completeness; direct HTTP searches return `503 search_initializing`. Deploy the new Worker first, then run the operator-authorized backfill from `--after 0` until `processed=0` and `ready=1`. A zero-row batch alone never makes an incomplete index ready. Fresh empty installations are immediately ready. Old-Worker generation writes made during rollback are detected by the completeness probe and require backfill before search resumes. See [ranked search rollout](ranked-search.md#required-infrastructure--rollout).
+Migration 0014 seeds search as unavailable on an existing installation. Automatic deployment can proceed, but Home and both MCP catalogs hide search until the bounded backfill has verified completeness; direct HTTP searches return `503 search_initializing`. Deploy the new Worker first, then run the operator-authorized backfill from `--after 0` until `processed=0` and `ready=1`. A zero-row batch alone never makes an incomplete index ready. Fresh empty installations are immediately ready. Writes made by an old Worker during a rollback that the index misses are detected by the completeness probe and require backfill before search resumes. See [ranked search rollout](ranked-search.md#required-infrastructure--rollout).
 
 ## Branch protection
 

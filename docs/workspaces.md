@@ -121,7 +121,7 @@ Decision D21 B. Workspace owners and admins delete a project from Project settin
   per-project role cap doesn't change that), in an active workspace. Restoring needs room in the projects limit, and in
   the agents limit for its legacy grant tokens.
 - **Then:** the 15-minute cron (`purgeDueProjects`) removes its R2 files and its content rows (documents, versions,
-  comments, details history, folders, uploads, change feed, idempotency, publisher generations and snapshots, per-project
+  comments, details history, folders, uploads, change feed, idempotency, per-project
   roles), in bounded batches, skipping a project while an upload is inside its finish lease. Kept, all closed: the
   `projects` row as a tombstone (title "Deleted project", no address), grants, API keys, OAuth connections and their
   project scopes, publishers, and audits. At purge, its grants and publishers are revoked, and so are API keys and OAuth

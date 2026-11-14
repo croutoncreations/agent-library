@@ -74,7 +74,6 @@ The text limit is a storage bound, not a memory guarantee. Server CSV validation
 | New projects created on a consent page | 5 | consent | fixed | — |
 | OAuth connection lifetime | never expires (until revoked); access tokens last 15 minutes and refresh | connection | fixed | — |
 | Project grant token lifetime | 1–720 hours (default 24) | token | fixed | `400 invalid_input` |
-| Publishing app snapshots | 32 files, 256 MiB per app | app | fixed | `413 quota_exceeded` |
 
 ## Search & lists
 
@@ -213,7 +212,7 @@ free tier's starting numbers, D22 the current keys.)
 
 | Key | Counts | Scope | Without a value |
 |---|---|---|---|
-| `storage_bytes` | Every stored version of every document and file, plus uploads and app generations in flight | workspace | unlimited |
+| `storage_bytes` | Every stored version of every document and file, plus uploads in flight | workspace | unlimited |
 | `projects` | Live projects | workspace | unlimited |
 | `members` | Accepted members | workspace | unlimited |
 | `pending_invites` | Invitations not yet accepted, revoked or expired | workspace | unlimited |
@@ -236,7 +235,7 @@ free tier's starting numbers, D22 the current keys.)
   member. Accepting checks `members` again. Someone who is already a member takes no new slot.
 - Replacing an OAuth connection in the same workspace doesn't need a free slot (the old one is revoked in the same
   step). Replacing an API key does, because the old key keeps working until you revoke it. Revoking frees a slot.
-- Expired upload reservations and app generations stop counting when they expire. Comments and title/tag history are
+- Expired upload reservations stop counting when they expire. Comments and title/tag history are
   small and not counted.
 - `GET /api/workspaces/:id/usage` (any member) returns `storage_bytes`, `projects`, `members`, `pending_invites` and
   `agents`, each `{ used, limit }`, plus `file_bytes` and `max_key_lifetime_days` as `{ limit }` (`limit: null` =
