@@ -7,7 +7,7 @@ import { createApiKey, listApiKeys, replaceApiKey, revokeApiKey, setApiKeyScope 
 import { handleV1, isV1Path } from "./api/v1.js";
 import { authenticate, enforceRate, requireCsrf, requireHuman, sessionCookie } from "./auth.js";
 import { exportBackup, importBackup, restoreBackup } from "./backup.js";
-import { pruneExpiredRows, reconcileUploads } from "./cleanup.js";
+import { pruneExpiredRows, reconcileUploads, recordDbSize } from "./cleanup.js";
 import { rebuildSearchIndex } from "./search/indexing.js";
 import { EDITOR_JS, EDITOR_JS_SHA256 } from "./editor-bundle.js";
 import { RENDER_CSP, htmlRefs, renderHtmlDocument } from "./html.js";
@@ -389,6 +389,8 @@ var coreWorker = {
     // Search index bootstrap and repair: re-indexes what the completeness probe reports missing (migration 0031 empties the index).
     ctx.waitUntil(rebuildSearchIndex(env).then((r) => { if (r.processed) console.log("search_rebuild", JSON.stringify(r)); },
       (e) => console.error(JSON.stringify({ event: "search_rebuild_failed", message: String(e?.message ?? e).slice(0, 200) }))));
+    // Database size: one log line per run, optional warning at DB_SIZE_WARN_BYTES (cleanup.js recordDbSize never throws).
+    ctx.waitUntil(recordDbSize(env));
   },
   async fetch(req, env, ctx) {
     const url = new URL(req.url);

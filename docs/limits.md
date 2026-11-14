@@ -74,7 +74,6 @@ The text limit is a storage bound, not a memory guarantee. Server CSV validation
 | New projects created on a consent page | 5 | consent | fixed | — |
 | OAuth connection lifetime | never expires (until revoked); access tokens last 15 minutes and refresh | connection | fixed | — |
 | Project grant token lifetime | 1–720 hours (default 24) | token | fixed | `400 invalid_input` |
-| Publishing app snapshots | 32 files, 256 MiB per app | app | fixed | `413 quota_exceeded` |
 
 ## Search & lists
 
@@ -196,10 +195,13 @@ The cron job runs every 15 minutes. Each step is bounded per run and later runs 
 | Deleted projects | purged after 30 days | project | fixed | large projects take several runs |
 | Deleted workspaces | content deleted from 30 days after deletion | workspace | fixed | its projects go through the project purge, 5 per run; at most 5 workspaces marked and 10 checked per run |
 | Abandoned uploads | removed after their reservation plus a 10-minute grace | upload | `UPLOAD_CLEANUP_GRACE_SECONDS` | — |
+| Database size | measured every run, logged as `db_size` | installation | `DB_SIZE_WARN_BYTES` (unset = no warning) | `db_size_warning` is logged while the size is at or above it (operations.md#database-size) |
 | A new document or file whose upload never finished | its hidden placeholder is removed a day after the upload expired, up to 100 per run | project | fixed | until then it counts toward `items_per_project` |
 
 A full batch logs a warning (`retention_cleanup_batch_full`, `project_changes_cleanup_batch_full`); a failed
 retention run logs `retention_failed` and the next run tries again.
+
+The database-size step makes 2 D1 queries per run, 3 on the first run of a UTC day (it keeps one sample a day for 400 days).
 
 The deleted-workspace step makes 4 D1 queries per run when there is nothing to do, 14 while 10 deleted workspaces wait for their projects, and at most 29. Workers Free allows 50 D1 queries per Worker invocation, shared by all the cron's steps, so on Free a busy run can stop early and later runs continue; on Workers Free a large deleted workspace takes many more runs.
 
@@ -210,7 +212,7 @@ free tier's starting numbers, D22 the current keys.)
 
 | Key | Counts | Scope | Without a value |
 |---|---|---|---|
-| `storage_bytes` | Every stored version of every document and file, plus uploads and app generations in flight | workspace | unlimited |
+| `storage_bytes` | Every stored version of every document and file, plus uploads in flight | workspace | unlimited |
 | `projects` | Live projects | workspace | unlimited |
 | `members` | Accepted members | workspace | unlimited |
 | `pending_invites` | Invitations not yet accepted, revoked or expired | workspace | unlimited |
@@ -233,7 +235,7 @@ free tier's starting numbers, D22 the current keys.)
   member. Accepting checks `members` again. Someone who is already a member takes no new slot.
 - Replacing an OAuth connection in the same workspace doesn't need a free slot (the old one is revoked in the same
   step). Replacing an API key does, because the old key keeps working until you revoke it. Revoking frees a slot.
-- Expired upload reservations and app generations stop counting when they expire. Comments and title/tag history are
+- Expired upload reservations stop counting when they expire. Comments and title/tag history are
   small and not counted.
 - `GET /api/workspaces/:id/usage` (any member) returns `storage_bytes`, `projects`, `members`, `pending_invites` and
   `agents`, each `{ used, limit }`, plus `file_bytes` and `max_key_lifetime_days` as `{ limit }` (`limit: null` =

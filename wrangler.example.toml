@@ -101,6 +101,8 @@ APP_CONNECT_ENABLED = "1"
 # RATE_SIGNIN_EMAIL_PER_ADDRESS_PER_MIN = "2"   # sign-in emails per address
 # AUDIT_RETENTION_DAYS = "365"         # audit log retention; "0" = keep forever
 # UPLOAD_TTL_SECONDS = "900"           # upload reservation lifetime (at most 86400)
+# DB_SIZE_WARN_BYTES = "3221225472"    # log db_size_warning once the D1 database reaches this many bytes (3 GiB; the D1 cap is 10 GB).
+#                                      # Workers Free (500 MB cap): "419430400" (400 MiB). Unset = no warning. docs/operations.md#database-size
 #
 # Worker secret (never in this file):
 #   ACCESS_OIDC_CLIENT_SECRET  (wrangler secret put ACCESS_OIDC_CLIENT_SECRET --env hosted)
