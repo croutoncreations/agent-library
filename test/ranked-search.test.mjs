@@ -8,11 +8,12 @@ import { createRequire } from 'node:module';
 import { grant, mcpClient, sha256 } from './helpers.mjs';
 import { SERVER_PORTS } from './ports.mjs';
 import { startAppConnectServer } from './fixtures/app-connect-harness.mjs';
-import { backfillSql } from '../scripts/search/backfill.mjs';
 const PORT=SERVER_PORTS['ranked-search'], APP=`http://localhost:${PORT}`, API=`http://127.0.0.1:${PORT}`;
 let server, owner;
 const search=async a=>owner.req('GET','/api/search?'+new URLSearchParams(a));
 const create=async(p,title,body)=>{const r=await owner.req('POST',`/api/projects/${p}/artifacts`,{title,body});assert.equal(r.status,201,JSON.stringify(r.body));return r.body.artifact_id;};
+// The cron (rebuildSearchIndex) re-indexes whatever the completeness probe reports missing, a bounded batch a run.
+const rebuild=async()=>{for(let i=0;i<80;i++){assert.equal((await fetch(server.issuer+'/cdn-cgi/handler/scheduled')).status,200);if((await owner.req('GET','/api/search/status')).body.ready&&(await sql('SELECT count(*) AS n FROM artifact_search_missing;'))[0].results[0].n===0)return;await new Promise(r=>setTimeout(r,100));}assert.fail('search index did not rebuild');};
 const sql=async q=>JSON.parse((await promisify(execFile)('wrangler',['d1','execute','DB','--config','wrangler.local.toml','--local','--persist-to',server.dir,'--command',q,'--json'],{encoding:'utf8',env:{...process.env,WRANGLER_SEND_METRICS:'false'}})).stdout);
 before(async()=>{
  server=await startAppConnectServer({port:PORT});
@@ -57,18 +58,18 @@ test('create/save/rename/trash/untrash/restore and bounded idempotent existing-d
  assert.equal((await search({query:'newsearchword'})).body.results.length,1);
  r=await owner.req('POST',`/api/projects/search-notes/artifacts/${id}/restore`,{from_revision:1,expected_revision:2});assert.equal(r.status,200,JSON.stringify(r.body));
  assert.equal((await search({query:'oldsearchword'})).body.results[0].revision,3);
- // The SQL-only backfill is for legacy inline data. Convert these synthetic fixtures explicitly; the lifecycle
- // above ran against R2 versions, and new writes below must still exercise the R2 bridge after backfill.
- for(const pid of ['search-planning','search-notes','search-private']){
+ // A rebuild reads every current text version: legacy inline rows (search-private) and R2 objects (the rest).
+ for(const pid of ['search-private']){
   const backup=(await owner.req('GET',`/api/projects/${pid}/backup`)).body;
   for(const rev of backup.revisions) if(rev.blob_key===null) await sql(`UPDATE revisions SET body='${rev.body.replace(/'/g,"''")}',body_key=NULL WHERE id='${rev.id}'`);
  }
- await sql('DELETE FROM artifact_search;');assert.equal((await search({query:'oldsearchword'})).status,503);
- for(let pass=0;pass<2;pass++){let after=0;while(true){const x=(await sql(backfillSql(after,2))).at(-1).results[0];if(!x.processed)break;after=x.next_after_rowid;}}
+ // The state after migration 0031 on an existing installation: not ready, nothing indexed.
+ await sql('UPDATE artifact_search_state SET ready=0; UPDATE artifact_search_keys SET revision_id=NULL,sha256=NULL,indexed_title=NULL; DELETE FROM artifact_search;');assert.equal((await search({query:'oldsearchword'})).status,503);
+ await rebuild();
  assert.equal((await search({query:'oldsearchword'})).body.results.length,1);
+ assert.equal((await search({query:'Annual subscriptions',project_ids:'search-private'})).body.results.length,1,'a legacy inline row is rebuilt too');
  const afterBackfill=await create('search-notes','After backfill','freshbridgeword');
  assert.equal((await search({query:'freshbridgeword'})).body.results[0].artifact_id,afterBackfill);
- const counts=(await sql('SELECT count(*) AS n,count(DISTINCT artifact_id) AS u FROM artifact_search;'))[0].results[0];assert.equal(counts.n,counts.u);
 });
 test('plaintext full-text search finds text from every write path: save, template copy, text upload and backup import',async()=>{
  const id=await create('search-notes','Plaintext note','alpha quokkafirst beta');
@@ -169,6 +170,8 @@ test('reproducible synthetic multi-project performance sample',async()=>{
  const q=`WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<50) INSERT INTO artifacts(id,project_id,kind,title,head_rev,head_revision_id,created_at,updated_at) SELECT 'bench-${i}-'||x,'${p}','markdown','Benchmark '||x,1,'brevision-${i}-'||x,'2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z' FROM n; INSERT INTO revisions(id,artifact_id,project_id,rev_no,author_id,body,size,sha256,mime,created_at) SELECT head_revision_id,id,project_id,1,'${ownerId}','${body}',${Buffer.byteLength(body)},'${sha256(body)}','text/markdown',created_at FROM artifacts WHERE project_id='${p}';`;
  await sql(q);
  }
+ // Raw SQL fixtures bypass the Worker's index writes: the cron's rebuild indexes them.
+ await rebuild();
  const start=performance.now(),r=await search({query:'benchmarkneedle',limit:20}),ms=performance.now()-start;
  assert.equal(r.status,200,JSON.stringify(r.body));assert.equal(r.body.results.length,20);assert.equal(r.body.has_more,true);
  const metrics={synthetic_projects:6,synthetic_documents:300,body_bytes:Buffer.byteLength(body),query_ms:Math.round(ms*100)/100,response_bytes:Buffer.byteLength(JSON.stringify(r.body)),search_sql_queries:2,query_count_basis:'Unfiltered first-page service path executes a readiness SELECT and a candidate SELECT; authentication and KV are separate.'};
@@ -207,7 +210,7 @@ test('App Connect app file, unpublished heads, binary title-only results and liv
 });
 test('stale index revisions are excluded until repaired; HTML and CSV remain source text',async()=>{
  const id=await create('search-notes','Freshness check','freshnessneedle');
- await sql(`UPDATE artifact_search SET revision_id='stale_revision' WHERE artifact_id='${id}';`);
+ await sql(`UPDATE artifact_search_keys SET revision_id='stale_revision' WHERE artifact_id='${id}';`);
  assert.equal((await search({query:'freshnessneedle'})).status,503);
  assert.equal((await owner.req('PATCH',`/api/projects/search-notes/artifacts/${id}`,{expected_meta_version:1,title:'Freshness check'})).status,200);
  assert.equal((await search({query:'freshnessneedle'})).body.results.length,1);
@@ -223,21 +226,20 @@ test('rollout hides tools and Home entry and returns 503 until a complete bounde
  const {createRequire}=await import('node:module'),require=createRequire(import.meta.url),puppeteer=require(process.env.HOME+'/.npm-packages/lib/node_modules/puppeteer');
  const browser=await puppeteer.launch({executablePath:process.env.CHROME_PATH??'/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',headless:true});
  try {
-  await sql('UPDATE artifact_search_state SET ready=0; DELETE FROM artifact_search WHERE artifact_id IN (SELECT id FROM artifacts ORDER BY rowid DESC LIMIT 2);');
+  await sql('UPDATE artifact_search_state SET ready=0; UPDATE artifact_search_keys SET revision_id=NULL WHERE artifact_id IN (SELECT id FROM artifacts ORDER BY rowid DESC LIMIT 2);');
   assert.equal((await owner.req('GET','/api/search/status')).body.ready,false);
   assert.equal((await search({query:'annual'})).status,503);
   assert.ok(!(await c.list()).some(x=>x.name==='search_artifacts'));
   assert.ok(!(await m.client.listTools()).tools.some(x=>x.name==='search_artifacts'));
   assert.equal((await fetch(API+'/v1/search?query=annual',{headers:{authorization:'Bearer '+k.secret}})).status,503);
-  const partial=(await sql(backfillSql(0,1))).at(-1).results[0];assert.equal(partial.ready,0);
-  // Skipping ahead cannot mark an incomplete index ready, even on a zero-row batch.
-  assert.equal((await sql(backfillSql(999999999,1))).at(-1).results[0].ready,0);
+  // Not ready stays not ready until the cron's rebuild has indexed what is missing.
+  assert.equal((await owner.req('GET','/api/search/status')).body.ready,false);
   const page=await browser.newPage();await page.setViewport({width:1440,height:1000});
   await page.setCookie({name:owner.cookie.split('=')[0],value:owner.cookie.split('=')[1],url:APP,httpOnly:true});
   await page.goto(APP+'/#/search');await page.waitForFunction(()=>document.body.textContent.includes('Search is being prepared'));
   await page.screenshot({path:'tmp/proof-of-work/ranked-search/initializing.png',fullPage:true});assert.equal(await page.$('input[name=query]'),null);
   await page.goto(APP+'/#/');await page.waitForSelector('a[href="#/search"]');assert.equal(await page.$eval('a[href="#/search"]',e=>e.hidden),true);
-  let after=0;while(true){const x=(await sql(backfillSql(after,50))).at(-1).results[0];if(!x.processed)break;after=x.next_after_rowid;}
+  await rebuild();
   assert.equal((await owner.req('GET','/api/search/status')).body.ready,true);
   assert.ok((await c.list()).some(x=>x.name==='search_artifacts'));
   assert.ok((await m.client.listTools()).tools.some(x=>x.name==='search_artifacts'));
@@ -253,26 +255,34 @@ test('stable search keys survive artifacts rowid reassignment and later updates'
  assert.equal((await search({query:'stablekeysecondneedle'})).body.results[0].revision,2);
 });
 
-test('known gap: SQL-only backfill retains R2 title matching but loses body matching until a save',async()=>{
- const id=await create('search-notes','Gapfixturetitle','gapfixturebody');
- assert.equal((await search({query:'gapfixturebody'})).body.results[0].artifact_id,id);
- const row=(await sql(`SELECT rowid AS n FROM artifacts WHERE id='${id}'`))[0].results[0].n;
- await sql(backfillSql(row-1,1));
- assert.equal((await search({query:'Gapfixturetitle'})).body.results[0].artifact_id,id);
- assert.equal((await search({query:'gapfixturebody'})).body.results.length,0);
- assert.equal((await owner.req('GET','/api/search/status')).body.ready,true);
- assert.equal((await owner.req('PUT',`/api/projects/search-notes/artifacts/${id}`,{expected_revision:1,body:'gapfixturebody'})).status,200);
- assert.equal((await search({query:'gapfixturebody'})).body.results[0].artifact_id,id);
+test('the index stores no document text: a contentless table whose words beyond the excerpt prefix are still found',async()=>{
+ const filler='Plain filler sentence number. '.repeat(900),late='contentlessunique'+Date.now();
+ const id=await create('search-notes','Contentless fixture',filler+late+' closing words.');
+ assert.ok(filler.length>16384*1.5);
+ const r=await search({query:late});assert.equal(r.status,200,JSON.stringify(r.body));
+ const hit=r.body.results.find(x=>x.artifact_id===id);assert.ok(hit,'a word after the first 16 KB is searchable');
+ assert.match(hit.snippet,/^Plain filler sentence number\./,'the excerpt is the start of the R2 text; the match lies beyond its prefix');
+ const names=(await sql("SELECT name FROM sqlite_master WHERE name LIKE 'artifact\\_search%' ESCAPE '\\' ORDER BY name;"))[0].results.map(x=>x.name);
+ assert.ok(!names.includes('artifact_search_content'),names.join());
+ assert.match((await sql("SELECT sql FROM sqlite_master WHERE name='artifact_search';"))[0].results[0].sql,/content=''/);
+ const stored=(await sql('SELECT count(*) AS rows, sum(title IS NOT NULL OR body IS NOT NULL) AS text FROM artifact_search;'))[0].results[0];
+ assert.ok(stored.rows>0);assert.equal(stored.text,0,'FTS5 returns no stored title or body');
+ assert.equal((await sql('SELECT count(*) AS n FROM artifact_search_missing;'))[0].results[0].n,0);
 });
-
-test('standalone backfill resolves the pinned local Wrangler without global Wrangler in PATH',async()=>{
- mkdirSync('tmp',{recursive:true});
- await create('search-notes','Standalone backfill fixture','Synthetic standalone CLI verification.');
- const r=await promisify(execFile)(process.execPath,['scripts/search/backfill.mjs','--config','wrangler.local.toml','--local','--persist-to',server.dir,'--after','0','--limit','1'],{env:{...process.env,PATH:dirname(process.execPath),WRANGLER_SEND_METRICS:'false'}});
- const results=JSON.parse(r.stdout);assert.equal(results.at(-1).results[0].processed,1);assert.equal(results.at(-1).results[0].ready,1);
- const config='tmp/backfill-env-fixture.toml';
- writeFileSync(config,'name="backfill-env-fixture"\ncompatibility_date="2025-09-01"\n[[env.fixture.d1_databases]]\nbinding="DB"\ndatabase_name="agent-library-db"\ndatabase_id="00000000-0000-0000-0000-000000000000"\n');
- const selected=await promisify(execFile)(process.execPath,['scripts/search/backfill.mjs','--config',config,'--env','fixture','--local','--persist-to',server.dir,'--after','0','--limit','1'],{env:{...process.env,PATH:dirname(process.execPath),WRANGLER_SEND_METRICS:'false'}});
- assert.equal(JSON.parse(selected.stdout).at(-1).results[0].processed,1);
-
+test('index follows replace, rename, trash and delete of the current head; excerpts come from R2',async()=>{
+ const id=await create('search-notes','Follow fixture','followonefirst words');
+ const find=async w=>(await search({query:w})).body.results.filter(x=>x.artifact_id===id);
+ assert.equal((await find('followonefirst')).length,1);
+ assert.match((await find('followonefirst'))[0].snippet,/followonefirst words/);
+ assert.equal((await sql(`SELECT count(*) AS n FROM revisions WHERE artifact_id='${id}' AND body_key IS NOT NULL AND body IS NULL;`))[0].results[0].n,1,'the text is an R2 object');
+ assert.equal((await owner.req('PUT',`/api/projects/search-notes/artifacts/${id}`,{expected_revision:1,body:'followtwosecond words'})).status,200);
+ assert.equal((await find('followonefirst')).length,0);assert.match((await find('followtwosecond'))[0].snippet,/followtwosecond words/);
+ assert.equal((await owner.req('PATCH',`/api/projects/search-notes/artifacts/${id}`,{expected_meta_version:1,title:'Renamed followtitle'})).status,200);
+ assert.equal((await find('followtitle')).length,1);assert.equal((await find('Follow fixture')).length,0);assert.equal((await find('followtwosecond')).length,1);
+ assert.equal((await owner.req('PATCH',`/api/projects/search-notes/artifacts/${id}`,{expected_meta_version:2,trashed:true})).status,200);
+ assert.equal((await find('followtwosecond')).length,0);assert.equal((await find('followtitle')).length,0);
+ assert.equal((await sql(`SELECT count(*) AS n FROM artifact_search_keys WHERE artifact_id='${id}';`))[0].results[0].n,0,'a trashed document leaves the index');
+ assert.equal((await owner.req('PATCH',`/api/projects/search-notes/artifacts/${id}`,{expected_meta_version:3,trashed:false})).status,200);
+ assert.equal((await find('followtwosecond')).length,1,'untrash re-indexes the head text read back from R2');
+ assert.equal((await sql('SELECT count(*) AS n FROM artifact_search_missing;'))[0].results[0].n,0);
 });
