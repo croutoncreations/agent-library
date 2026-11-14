@@ -44,7 +44,7 @@ const connId = async (clientName) => (await owner.req("GET", "/api/access")).bod
 const allowReview = (path_kind, path_id, project_id = P, can_review = true) => owner.req("PUT", "/api/review-grants", { path_kind, path_id, project_id, can_review });
 
 before(async () => {
-  h = await startAppConnectServer({ port: SERVER_PORTS["review-gating"], vars: { PROJECT_ITEMS_MAX: String(ARTIFACT_LIMIT), PROJECT_BINARY_BYTES: String(1024 * 1024) } });
+  h = await startAppConnectServer({ port: SERVER_PORTS["review-gating"], vars: { PROJECT_ARTIFACT_LIMIT: String(ARTIFACT_LIMIT), PROJECT_BINARY_BYTES: String(1024 * 1024) } });
   owner = await h.owner();
   for (const [id, title] of [[P, "Review"], [Q, "Other"]]) assert.equal((await owner.req("POST", "/api/projects", { id, title })).status, 201);
   writer = await h.connectMcpAgent({ [P]: "write" }, { clientName: "Writer" });
