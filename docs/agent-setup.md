@@ -69,8 +69,11 @@ read-only and available to read-only OAuth MCP connections and legacy grant
 clients. The result identifies that request's authenticated connection, current
 projects and effective `can_write` for each. Compare `connection.id` with
 **Connections → Reader apps → Connection ID** (or **Agent tokens**). Names may
-be identical; IDs distinguish connections. Registered app names are
-self-reported labels, not evidence of which model or process is calling. If the
+be identical; IDs distinguish connections. The name you gave the connection
+(its app-reported name until you rename it) is shown; app-reported names are
+self-reported labels, not evidence of which model or process is calling. A
+connection may have no projects yet (`projects: []`): share some under
+**Connections → Reader apps → Edit projects**; the agent doesn't reconnect. If the
 new tool is missing after an upgrade, refresh tool discovery in the client;
 existing tools continue to work.
 

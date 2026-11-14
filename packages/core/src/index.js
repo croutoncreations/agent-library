@@ -18,7 +18,7 @@ import { RESERVED_HANDLES, addressLinksResponse, resolveProjectRef } from "./pat
 import { imageRefs, renderMarkdown } from "./markdown.js";
 import { getRenderSource } from "./render-source.js";
 import { handleMcp } from "./mcp.js";
-import { listAccess, listConnections, revokeConnection, revokeConnectionById } from "./oauth/connections.js";
+import { listAccess, listConnections, renameConnection, revokeConnection, revokeConnectionById, setConnectionProjects } from "./oauth/connections.js";
 import { handleFileTransfer } from "./oauth/mcp.js";
 import { handleOAuthHost, originFor } from "./oauth/server.js";
 import { servePwa, serveShellVersion, shellVersion } from "./pwa.js";
@@ -227,6 +227,8 @@ function legalLinks(env) {
   if (seg[0] === "restore" && m === "POST") return json(await restoreBackup(ctx, await body(req)), 201);
   if (seg[0] === "access" && seg.length === 1 && m === "GET") return json(await listAccess(ctx));
   if (seg[0] === "connections" && seg.length === 3 && seg[2] === "revoke" && m === "POST") return json(await revokeConnectionById(ctx, str(seg[1], "connection", 80)));
+  if (seg[0] === "connections" && seg.length === 3 && seg[2] === "projects" && m === "PUT") return json(await setConnectionProjects(ctx, str(seg[1], "connection", 80), await body(req)));
+  if (seg[0] === "connections" && seg.length === 2 && m === "PATCH") return json(await renameConnection(ctx, str(seg[1], "connection", 80), await body(req)));
   if (seg[0] === "api-keys") {
     if (seg.length === 1 && m === "GET") return json(await listApiKeys(ctx));
     if (seg.length === 1 && m === "POST") return json(await createApiKey(ctx, await body(req)), 201);

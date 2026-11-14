@@ -108,8 +108,9 @@ test("delete: closed to everyone at once (same 404 as unknown), frees the limit 
     const s = await f(P.id, P.doc);
     // 404 like an unknown project; an API key whose only project is gone is inactive as a whole (401
     // credential_inactive, the same as when its creator loses access; a legacy grant token likewise); the OAuth
-    // connection likewise (401 at the MCP transport: it has no live project left); the publisher's token is refused (401).
-    const want = { bob: [404], key: [401], grant: [401], grantMcp: [401], oauth: ["401:-32001"], publisher: [401, 403] }[name];
+    // connection stays connected with no live project (the MCP transport answers, the project is "not found in this
+    // connection"); the publisher's token is refused (401).
+    const want = { bob: [404], key: [401], grant: [401], grantMcp: [401], oauth: ["404:not_found"], publisher: [401, 403] }[name];
     assert.ok(want.includes(s), `${name} after delete: ${s}`);
   }
   assert.equal((await bob.req("GET", `/api/projects/${P.id}/artifacts/${P.doc}`)).body.error.message, unknown.body.error.message, "indistinguishable from unknown");
@@ -188,10 +189,11 @@ test("delete permanently: rows and R2 files are removed, a tombstone stays, cred
   for (const t of ["artifacts", "revisions", "comments", "meta_versions", "uploads", "project_changes", "folders", "idempotency", "transfer_links", "view_links",
     "project_members", "project_change_state", "change_scope_epochs"])
     assert.equal(await n(`SELECT COUNT(*) AS n FROM ${t} WHERE project_id = '${P.id}'`), 0, `${t} purged`);
-  // Credentials whose only project this was are revoked (they'd otherwise hold an agents slot forever).
+  // Credentials whose only project this was are revoked (they'd otherwise hold an agents slot forever), except OAuth
+  // connections: zero projects is a normal state for them, so the connection stays and can be given other projects.
   assert.equal(await n(`SELECT COUNT(*) AS n FROM publishers WHERE id = '${cred.pub.publisher_id}' AND revoked_at IS NOT NULL`), 1);
   assert.equal(await n(`SELECT COUNT(*) AS n FROM api_credential_projects acp JOIN api_credentials k ON k.id = acp.credential_id WHERE acp.project_id = '${P.id}' AND k.revoked_at IS NULL`), 0);
-  assert.equal(await n(`SELECT COUNT(*) AS n FROM oauth_connection_projects cp JOIN oauth_connections c ON c.id = cp.connection_id WHERE cp.project_id = '${P.id}' AND c.revoked_at IS NULL`), 0);
+  assert.equal(await n(`SELECT COUNT(*) AS n FROM oauth_connection_projects cp JOIN oauth_connections c ON c.id = cp.connection_id WHERE cp.project_id = '${P.id}' AND c.revoked_at IS NOT NULL`), 0, "purge does not revoke an OAuth connection");
   assert.equal(await n(`SELECT COUNT(*) AS n FROM grants WHERE project_id = '${P.id}' AND revoked_at IS NULL`), 0);
   const row = (await sql(`SELECT title, slug, purged_at FROM projects WHERE id = '${P.id}'`))[0];
   assert.equal(row.title, "Deleted project"); assert.equal(row.slug, null); assert.ok(row.purged_at > 0);
@@ -199,10 +201,12 @@ test("delete permanently: rows and R2 files are removed, a tombstone stays, cred
   // Not restorable, not listed; credentials still closed.
   assert.equal((await owner.req("POST", `/api/projects/${P.id}/restore`)).status, 404);
   assert.ok(!ok(await bob.req("GET", `/api/workspaces/${WS}/deleted-projects`)).projects.some((x) => x.id === P.id), "no longer under Recently deleted");
-  // The API key is revoked now (401); the OAuth agent's connection is revoked, so its token stops working.
+  // The API key is revoked now (401). The OAuth agent's connection is not: its token still works, with no project left.
   assert.equal(await reach.key(P.id, P.doc), 401);
   assert.equal((await fetch(`${h.issuer}/mcp`, { method: "POST", headers: { authorization: `Bearer ${cred.oauth.access_token}`, "content-type": "application/json", accept: "application/json" },
-    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }) })).status, 401);
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }) })).status, 200);
+  assert.deepEqual((await cred.oauth.call("list_projects", {})).data.projects, [], "the purged project is not listed");
+  assert.equal(await reach.oauth(P.id, P.doc), "404:not_found");
   assert.equal(await n(`SELECT COUNT(*) AS n FROM audits WHERE action = 'project.purge' AND project_id = '${P.id}'`), 1);
   // R2: the objects are gone from the local bucket. Read miniflare's object index directly (read-only): a second
   // wrangler process on the live persist dir would disturb the running server.

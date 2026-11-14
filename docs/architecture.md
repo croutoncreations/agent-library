@@ -28,7 +28,7 @@ A `*/15` cron cleans up expired uploads and their staging objects (bounded and i
 
 - **Owner:** the one human. Only the owner manages projects, grants, API keys, connected apps and App Connect registrations.
 - **Agents**, which connect in one of three ways:
-  - **OAuth MCP connection.** For example ChatGPT, Claude or Cursor adding `https://MCP_HOST/mcp`. The owner picks projects and read/write access on the consent page. The connection lasts until it is revoked (access tokens are 15 minutes; refresh slides).
+  - **OAuth MCP connection.** For example ChatGPT, Claude or Cursor adding `https://MCP_HOST/mcp`. The owner names the connection and may pick projects and read/write access on the consent page, or pick none and share projects later. The connection lasts until it is disconnected (access tokens are 15 minutes; refresh slides). See [Agent access](#agent-access).
   - **API key** (`alk_…`). Expiring, per-project read or read/write, for scripts and REST clients.
   - **Legacy grant token.** A project-scoped bearer token for `/mcp`.
 - **Publishers (App Connect):** apps the owner registers. A publisher can create files and read or update only the files it created, inside one owner-chosen project and folder: file by file by path (App Files, `/v1/app/files`). Every App Files request re-checks the publisher's authorization and is fenced in the same D1 statement that writes; request bodies are at most 1 MiB and are refused from `Content-Length` before they are read. See [app-connect.md](app-connect.md).
@@ -39,6 +39,16 @@ OAuth redirect URIs are exact-match only:
 - the built-in hosted callbacks for ChatGPT, Claude and Cursor;
 - loopback URIs for local clients;
 - anything listed in the `OAUTH_EXTRA_REDIRECT_URIS` var, for example your own MCP gateway.
+
+### Agent access
+
+An OAuth-connected agent is managed in the app after it connects; it never has to reconnect. **Connections → Reader apps** (`#/settings/apps`) shows each connection's name, redirect host and projects, with three separate actions:
+
+- **Edit projects** adds or removes projects and sets each to Read or Read & edit (`PUT /api/connections/{id}/projects`, `{ projects: [{ project_id, access: "read" | "read_write" }] }`). The list may be empty: a connection with no projects is connected, not revoked (the agent's `list_projects` returns `[]` with a note that the owner hasn't shared anything yet, and project tools answer not-found). Like an API key's scope edit it is human-only, allowed for the connection's creator or an admin of its workspace, limited to projects of the connection's workspace that the editor (and the creator, whose role the agent acts with) can reach, edit access needs a member role, at most 50 projects, and it is one D1 batch whose statements repeat the guards. Each add, change and removal is audited (`oauth.scope`, per project). It takes effect on the agent's next request, because authorization reads `oauth_connection_projects` on every request. `oauth_connections.can_write` follows the projects (on if any project has edit access).
+- **Rename** (`PATCH /api/connections/{id}`, `{ label }`) sets the owner's name (`oauth_connections.label`, 1–80 characters, trimmed, no control characters; audited `oauth.rename`). The name shown everywhere is `COALESCE(label, client_name)`: connection lists, `connection_info`, the version provenance of new writes (`via_label`, `oauth:<name>`) and the review queue. History is not rewritten. `client_name` is what the app reported about itself and is shown as "App reports itself as …" next to the redirect host and full redirect URL.
+- **Disconnect** (`POST /api/connections/{id}/revoke`) ends the connection entirely.
+
+On the consent page the name field is required and prefilled with the app's own name, the full redirect URL is shown, and no project is required. With no project picked, a workspace picker (only for people in more than one active workspace; Personal by default) says where the connection lives; with projects picked, it belongs to their workspace. A connection always belongs to exactly one workspace (the connected-agents limit and admin rights are per workspace). The token is always issued with `agentlib:read`, `agentlib:write` and `offline_access`; the connection's `can_write` and each project's `can_write` are the gate, so a read-only connection can be granted edit access later. Purging a deleted project no longer revokes a connection that is left with no projects. `oauth_connections.project_id` is legacy (the first project, or NULL; migration `0034`).
 
 ## Artifacts and versions
 

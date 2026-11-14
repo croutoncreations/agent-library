@@ -113,7 +113,7 @@ async function handleOAuthMcp(req, env, ctx) {
       const allowed = new Set(Object.keys(tool.inputSchema.properties));
       for (const k of Object.keys(args)) if (!allowed.has(k)) return reply(rpcErr(msg.id, -32602, `Unknown argument ${k}`));
       if (tool.name === "connection_info") {
-        const result = connectionInfo("oauth", conn.id, conn.client_name, conn.projects.map((p) => ({ ...p, can_write: projectWrite(p) })), conn.expires_at, conn.last_used_at, { files: conn.file_access === 1 });
+        const result = connectionInfo("oauth", conn.id, conn.display_name, conn.projects.map((p) => ({ ...p, can_write: projectWrite(p) })), conn.expires_at, conn.last_used_at, { files: conn.file_access === 1, owner_named: conn.label != null });
         return reply(rpc(msg.id, { content: [{ type: "text", text: JSON.stringify(result) }], structuredContent: result, isError: false }));
       }
       // A project may be named by its address (<handle>/<slug>) as well as its id.
@@ -122,7 +122,7 @@ async function handleOAuthMcp(req, env, ctx) {
       const connIds = conn.projects.map((p) => p.id);
       if (tool.name === "list_projects") {
         const paths = await projectPaths(env, conn.projects.map((p) => p.id));
-        const result = await addressLinks(env, withWebUrls("list_projects", args, void 0, { projects: conn.projects.map((p) => ({ id: p.id, title: p.title, ...paths.has(p.id) ? { path: paths.get(p.id) } : {}, can_write: projectWrite(p) })) }, appOrigin(env.APP_HOST)), connIds);
+        const result = await addressLinks(env, withWebUrls("list_projects", args, void 0, { projects: conn.projects.map((p) => ({ id: p.id, title: p.title, ...paths.has(p.id) ? { path: paths.get(p.id) } : {}, can_write: projectWrite(p) })), ...conn.projects.length ? {} : { note: NO_PROJECTS_NOTE } }, appOrigin(env.APP_HOST)), connIds);
         return reply(rpc(msg.id, { content: [{ type: "text", text: JSON.stringify(result) }], structuredContent: result, isError: false }));
       }
       if (tool.name === "search_artifacts") {
@@ -139,7 +139,7 @@ async function handleOAuthMcp(req, env, ctx) {
       if (args.project_id !== void 0) proj = conn.projects.find((p) => p.id === args.project_id);
       if (!proj) {
         const choices = conn.projects.map((p) => ({ id: p.id, title: p.title }));
-        const err2 = args.project_id === void 0 ? { status: 400, code: "project_required", message: `This connection has ${choices.length} projects; pass project_id (one of: ${choices.map((c) => c.id).join(", ")}). If your tool schema has no project_id argument, refresh this app's tools in the client.`, projects: choices } : { status: 404, code: "not_found", message: "Project not found in this connection", projects: choices };
+        const err2 = !choices.length ? { status: 404, code: "not_found", message: NO_PROJECTS_NOTE, projects: choices } : args.project_id === void 0 ? { status: 400, code: "project_required", message: `This connection has ${choices.length} projects; pass project_id (one of: ${choices.map((c) => c.id).join(", ")}). If your tool schema has no project_id argument, refresh this app's tools in the client.`, projects: choices } : { status: 404, code: "not_found", message: "Project not found in this connection", projects: choices };
         return reply(rpc(msg.id, toolError(err2)));
       }
       const canWrite = projectWrite(proj);
@@ -149,12 +149,12 @@ async function handleOAuthMcp(req, env, ctx) {
       const sctx = {
         env,
         requestId: randomId("req", 9),
-        principal: { id: conn.owner_principal_id, kind: "agent", label: `oauth:${conn.client_name}` },
+        principal: { id: conn.owner_principal_id, kind: "agent", label: `oauth:${conn.display_name}` },
         grant: { id: conn.id, project_id: proj.id, can_write: canWrite ? 1 : 0 },
         oauthConnection: true,
         ftConn: conn,
         ftOrigin: new URL(req.url).origin,
-        via: { kind: "oauth", id: conn.id, label: conn.client_name },
+        via: { kind: "oauth", id: conn.id, label: conn.display_name },
         clientInfo: mcpClientInfo(msg.params, conn.client_info),
         rpcIdBytes: rtIdBytes(msg.id)
       };
@@ -173,6 +173,7 @@ async function handleOAuthMcp(req, env, ctx) {
       return reply(rpcErr(msg.id, -32601, "Method not found"));
   }
 }
+var NO_PROJECTS_NOTE = "The owner hasn't shared any projects with this connection yet. They can share projects in Agent Library \u2192 Connections; no need to reconnect.";
 var MCP_TEXT_MAX, SUPPORTED, S, A, P, K, NOTE, RT_CURSOR, RT_MAXB, unwrap, RO, RW, TOOLS, AC_LIST_PROPS, READ_RECORDS, rpc, rpcErr, HDR, toolError;
 MCP_TEXT_MAX = 64 * 1024;
 SUPPORTED = ["2025-11-25", "2025-06-18", "2025-03-26"];
@@ -370,7 +371,7 @@ function ftRateLimited(msg, tool, write, e, lim, limit) {
 }
 var FT_LINK = /^\/files\/([du])\/(ft_[A-Za-z0-9_-]{40,60})$/;
 function ftUploadPrincipal(conn) {
-  return { id: "oap_" + conn.id.slice(4), kind: "agent", label: `oauth:${conn.client_name}`.slice(0, 200) };
+  return { id: "oap_" + conn.id.slice(4), kind: "agent", label: `oauth:${conn.display_name}`.slice(0, 200) };
 }
 async function ftUploadCtx(c, create) {
   const principal = ftUploadPrincipal(c.ftConn);
@@ -681,10 +682,10 @@ async function handleFileTransfer(req, env, url) {
     const ctx = {
       env,
       requestId,
-      principal: { id: conn.owner_principal_id, kind: "agent", label: `oauth:${conn.client_name}` },
+      principal: { id: conn.owner_principal_id, kind: "agent", label: `oauth:${conn.display_name}` },
       grant: { id: conn.id, project_id: proj.id, can_write: canWrite ? 1 : 0 },
       oauthConnection: true,
-      via: { kind: "oauth", id: conn.id, label: conn.client_name }
+      via: { kind: "oauth", id: conn.id, label: conn.display_name }
     };
     if (kind === "download") {
       await rateLimit(env, `dl:oauth:${conn.id}`, 300);

@@ -65,10 +65,10 @@ async function runBatch(ctx, stmts, i) {
   }
 }
 // Inputs come only from existing authenticated, live scope evaluators. Never serialize a credential row.
-function connectionInfo(type, id, label, projects, expires, activity, extra = {}) {
+function connectionInfo(type, id, label, projects, expires, activity, { owner_named, ...extra } = {}) {
   const iso = (v) => v == null ? null : new Date(v).toISOString();
   return {
-    connection: { type, id, display_label: String(label).slice(0, 200), label_source: type === "oauth" || type === "publisher" ? "registered app name (self-reported; not proof of caller identity)" : "owner-assigned label" },
+    connection: { type, id, display_label: String(label).slice(0, 200), label_source: owner_named || (type !== "oauth" && type !== "publisher") ? "owner-assigned label" : "registered app name (self-reported; not proof of caller identity)" },
     checked_at: nowIso(), expires_at: iso(expires), last_activity_at: iso(activity),
     successful_operations: "not measured",
     projects: projects.map((p) => ({ id: p.id, title: p.title, can_read: true, can_write: !!p.can_write })),

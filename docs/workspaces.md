@@ -207,7 +207,11 @@ headings when there is more than one. A connection covers projects from one work
 the server refuses a mix). A new project created on the consent page goes in the workspace of the picked projects,
 or the one chosen in "New projects go in" (offered for every active workspace where the signer is an admin, even one
 without projects; checked again inside the insert). Projects where the signer is a viewer offer Read only. Lists
-show at most 500 projects on the consent page and 1000 in the app.
+show at most 500 projects on the consent page and 1000 in the app. Picking no project is allowed: the connection
+then lives in the workspace chosen under "Workspace for this connection" (shown to people in more than one active
+workspace; Personal by default; the signer must be at least a member, and the connected-agents limit applies). Later,
+**Edit projects** in Connections can only use projects of the connection's workspace
+([architecture.md](architecture.md#agent-access)).
 
 ## Isolation tests
 

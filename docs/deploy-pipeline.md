@@ -141,6 +141,8 @@ Worker rollback restores code and config only, not D1, R2 or KV. Rolling back to
 
 ### Search rollout readiness
 
+Migration 0034 (`oauth_connections.project_id` nullable) rebuilds one table and is destructive-marked too: run it in the same kind of manual window (record the Time Travel bookmark, `wrangler d1 migrations apply`, then deploy straight away); it keeps every row and index, and the previous Worker keeps working on the new schema except that it treats a connection with no projects as revoked. `0035` is additive and applies automatically afterwards.
+
 Migration 0031 (contentless index) drops the old search index and sets search unavailable on an existing installation; it is destructive-marked, so run it in a manual window (above) and then deploy the new Worker. Home and both MCP catalogs hide search, and direct HTTP searches return `503 search_initializing`, until the Worker's cron has re-indexed every document from R2 or legacy inline text (15 documents per 15-minute run) and verified completeness. Nothing is run by hand. Fresh empty installations are immediately ready. Rolling the Worker back past 0031 is not supported (the previous Worker expects the dropped table and triggers). See [ranked search rollout](ranked-search.md#required-infrastructure--rollout).
 
 ## Branch protection

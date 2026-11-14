@@ -308,11 +308,15 @@ test("read-only connection cannot write; Project A connection cannot reach Proje
   const a = await authorize(clientId, { project: PA, access: "read" });
   const t = await token({ grant_type: "authorization_code", code: a.code, redirect_uri: CB, client_id: clientId, code_verifier: a.verifier, resource: RESOURCE });
   roToken = t.body.access_token;
-  assert.ok(!t.body.scope.split(" ").includes("agentlib:write"), "ceiling enforced at consent");
+  // The token always carries write (a read-only connection can be given edit access later without reconnecting); the
+  // per-project can_write is the gate, so a read-only connection sees no write tools and is refused as forbidden.
+  assert.ok(t.body.scope.split(" ").includes("agentlib:write"), "token scope is read, write and offline for every consent");
   const tl = await mcp(roToken, "tools/list");
   assert.ok(!tl.body.result.tools.some((x) => x.name === "create_markdown"));
   const w = await call(roToken, "create_markdown", { title: "nope", idempotency_key: key("x") });
-  assert.equal(w.status, 403); assert.match(w.www, /insufficient_scope/);
+  assert.equal(w.status, 200); assert.equal(w.body.result.isError, true);
+  assert.equal(w.body.result.structuredContent.error.code, "forbidden");
+  assert.match(w.body.result.structuredContent.error.message, /read-only/);
   const list = await call(rwToken, "list_artifacts", {});
   assert.ok(!list.body.result.structuredContent.artifacts.some((x) => x.title === "Secret B"));
   const bDocs = await owner.req("GET", `/api/projects/${PB}/artifacts`);
@@ -476,7 +480,8 @@ test("consent validation: nothing chosen, new name without access, unknown value
   assert.doesNotMatch(html, /<script/i);
   const handle = hidden(html, "handle");
   const projectsBefore = (await owner.req("GET", "/api/projects")).body.projects.length;
-  for (const bad of [{}, { new_title: "No access chosen" }, { [`access:${PA}`]: "admin" }, { new_title: "x".repeat(201), new_access: "read" },
+  // (Choosing nothing is valid now: the connection is made with no projects. A blank name is not.)
+  for (const bad of [{ label: "   " }, { new_title: "No access chosen" }, { [`access:${PA}`]: "admin" }, { new_title: "x".repeat(201), new_access: "read" },
     { new_title: "Dup", new_access: "read", new_title_3: "dup", new_access_3: "write" }, { new_title_2: "Second only", new_access_2: "bogus" }]) {
     r = await b.go(`${MCP}/authorize`, form({ handle, step: "grant", decision: "approve", ...bad }));
     assert.equal(r.status, 400, JSON.stringify(bad).slice(0, 60));
@@ -663,7 +668,8 @@ test("Grok Bot desktop: full authorization on the loopback callback; tokens work
   assert.equal(ok.body.resource, RESOURCE);
   const lp = await call(ok.body.access_token, "list_projects", {});
   assert.deepEqual(lp.body.result.structuredContent.projects.map((p) => p.id), [PA]);
-  assert.equal((await call(ok.body.access_token, "create_markdown", { title: "x", idempotency_key: key("g") })).status, 403, "read-only consent: no write");
+  const denied = await call(ok.body.access_token, "create_markdown", { title: "x", idempotency_key: key("g") });
+  assert.equal(denied.body.result.structuredContent.error.code, "forbidden", "read-only consent: no write (the per-project flag is the gate)");
 });
 
 test("authorize: missing PKCE, plain PKCE and redirect substitution are refused for Cursor/Grok clients", async () => {

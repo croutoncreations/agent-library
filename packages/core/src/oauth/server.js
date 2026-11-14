@@ -184,6 +184,11 @@ async function consentProjects(env, principalId) {
     WHERE m.principal_id = ? AND w.status = 'active' AND m.role IN ('owner','admin') ORDER BY w.personal DESC, w.created_at LIMIT 51`).bind(principalId).all()).results;
   list.adminWorkspaces = admin.slice(0, 50).map((w) => ({ id: w.id, name: w.personal ? null : w.name }));
   list.adminWorkspaces.truncated = admin.length > 50;
+  // Active workspaces where the signer is at least a member: where a connection with no projects yet may live.
+  const member = (await env.DB.prepare(`SELECT w.id, w.name, w.personal FROM workspace_members m JOIN workspaces w ON w.id = m.workspace_id
+    WHERE m.principal_id = ? AND w.status = 'active' AND m.role IN ('owner','admin','member') ORDER BY w.personal DESC, w.created_at LIMIT 51`).bind(principalId).all()).results;
+  list.memberWorkspaces = member.slice(0, 50).map((w) => ({ id: w.id, name: w.personal ? null : w.name, personal: !!w.personal }));
+  list.memberWorkspaces.truncated = member.length > 50;
   list.truncated = visible.length > CONSENT_PROJECTS_MAX || visible.truncated;
   return list;
 }
@@ -197,8 +202,21 @@ async function liveConnection(env, id) {
      FROM oauth_connection_projects cp JOIN projects p ON p.id = cp.project_id
      WHERE cp.connection_id = ? AND ${memberRoleSql("p.id", "viewer")} ORDER BY p.created_at LIMIT ${MAX_CONN_PROJECTS}`
   ).bind(...Array(3).fill(row.created_by ?? row.owner_principal_id), id, row.created_by ?? row.owner_principal_id).all();
-  if (!ps.results.length) return null;
-  return { ...row, projects: ps.results };
+  // No live projects is not revoked: the owner may not have shared any yet, or removed them all (Connections). Every
+  // project-scoped call then fails its own live check; only revoked or expired connections are refused here.
+  return { ...row, display_name: row.label ?? row.client_name, projects: ps.results };
+}
+/**
+ * The owner's name for a connection: trimmed, 1-80 characters, no control characters. Throws a 400 HttpError.
+ * (The app's own client_name is self-asserted and only ever shown next to this name.)
+ */
+function cleanConnectionName(raw) {
+  if (typeof raw !== "string") throw new HttpError(400, "invalid_input", "A name is required");
+  const name = raw.trim();
+  if (!name) throw new HttpError(400, "invalid_input", "A name is required");
+  if (name.length > CONNECTION_NAME_MAX) throw new HttpError(400, "invalid_input", `The name can be at most ${CONNECTION_NAME_MAX} characters`);
+  if (/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(name)) throw new HttpError(400, "invalid_input", "The name can't contain control characters");
+  return name;
 }
 // ---- connect page building blocks ----
 function cxIcon(name) {
@@ -252,7 +270,7 @@ function cxDupes(list) {
 // Enter connects (not cancels) while the visible buttons keep their on-screen order for Tab.
 var CX_ENTER = '<button name="decision" value="approve" class="enter" tabindex="-1" aria-hidden="true">Connect</button>';
 function cxBar(lead) {
-  return `<div class="bar">${lead}<button name="decision" value="deny">Cancel</button><button name="decision" value="approve" class="primary">Connect</button></div>`;
+  return `<div class="bar">${lead}<button name="decision" value="deny" formnovalidate>Cancel</button><button name="decision" value="approve" class="primary">Connect</button></div>`;
 }
 function cxStart(handle, choices = [], siteKey = null) {
   const head = `<form method="post" action="/authorize"><input type="hidden" name="handle" value="${esc(handle)}"><input type="hidden" name="step" value="signin"><input type="hidden" name="decision" value="approve">`;
@@ -280,7 +298,7 @@ function clientFacts(d) {
     d.clientDomain ? cxChip("ok", "check", `Verified \u00B7 ${esc(d.clientDomain)}`) : cxChip("warn", "alert", "Name not verified"),
     cxChip("", "back", `Returns to ${esc(d.redirectHost)}`)
   ];
-  return `<div class="chips">${chips.join("")}</div>${d.redirectIsLoopback ? `<div class="callout warn">${cxIcon("alert")}<div><strong>This sends access to an app on this computer.</strong> Continue only if you just started connecting from it.</div></div>` : ""}`;
+  return `<div class="chips">${chips.join("")}</div>${d.redirectUri ? `<p class="fine">Returns to <code class="url">${esc(d.redirectUri)}</code></p>` : ""}${d.redirectIsLoopback ? `<div class="callout warn">${cxIcon("alert")}<div><strong>This sends access to an app on this computer.</strong> Continue only if you just started connecting from it.</div></div>` : ""}`;
 }
 // The owner's most recent live connection for this exact client_id. Never matched by name: client names are
 // self-asserted, so a look-alike registration must not inherit another app's access or be offered its replacement.
@@ -321,18 +339,27 @@ function cxGrantPage(d, email, projects, prev, consent, values = null, error = "
     const sfx = k === 0 ? "" : `_${k + 1}`;
     return `<div class="newp"><input type="text" name="new_title${sfx}" maxlength="200" pattern=".*\\S.*" value="${esc(pick(`new_title${sfx}`, ""))}" placeholder="${rows ? "New project (optional)" : "Project name"}" aria-label="New project ${k + 1} name">${cxSeg(`new_access${sfx}`, `Access to new project ${k + 1}`, pick(`new_access${sfx}`, "read"), false)}</div>`;
   }).join("");
-  const welcome = prev && !values ? `<div class="callout info">${cxIcon("redo")}<div><strong>Welcome back.</strong> Access from your earlier connection (${esc(cxDate(prev.created_at))}) is already picked. Adjust anything below.</div></div>` : "";
+  // The owner's name for the connection (the app's own name is only a suggestion), and where it lives when no project is picked.
+  const nameValue = pick("label", (prev?.label ?? d.clientName).slice(0, CONNECTION_NAME_MAX));
+  const nameField = `<section class="sec"><h2>Name</h2><label class="field"><span>Name in Agent Library</span><input type="text" name="label" required maxlength="${CONNECTION_NAME_MAX}" pattern=".*\\S.*" value="${esc(nameValue)}" autocomplete="off"></label>
+<p class="fine">The app reports itself as \u201C${esc(d.clientName)}\u201D. That name comes from the app, not from Agent Library.</p></section>`;
+  const homes = projects.memberWorkspaces ?? [];
+  const homeDefault = (homes.find((w) => w.personal) ?? homes[0])?.id ?? "";
+  const homePick = homes.length > 1 ? `<label class="field"><span>Workspace for this connection</span><select name="connect_workspace">${homes.map((w) => `<option value="${esc(w.id)}"${pick("connect_workspace", homeDefault) === w.id ? " selected" : ""}>${esc(w.name ?? "Personal")}</option>`).join("")}</select></label>
+<p class="fine">Used when you pick no projects now. If you pick projects, the connection belongs to their workspace.</p>${homes.truncated ? '<p class="fine">Showing the first 50 workspaces.</p>' : ""}` : "";
+  const welcome = prev && !values ? `<div class="callout info">${cxIcon("redo")}<div><strong>Welcome back.</strong> Your earlier connection${prev.label ? ` \u201C${esc(prev.label)}\u201D` : ""} (${esc(cxDate(prev.created_at))}) ${prev.projects.length ? "has its name and access already picked" : "has its name already filled in"}. Adjust anything below.</div></div>` : "";
   const replaceOn = values ? values.get("replace") === prev?.id : true;
   const replace = prev ? `<label class="check"><input type="checkbox" name="replace" value="${esc(prev.id)}"${replaceOn ? " checked" : ""}><span><strong>Replace the earlier connection</strong><small>Its old sign-in stops working as soon as you click Connect, so you don't end up with duplicates.</small></span></label>` : "";
   return page("Choose what to share", cxShell(`${cxPair(d.clientName)}
 <h1>Choose what ${esc(d.clientName)} can use</h1><p class="lede">Signed in as ${esc(email)}</p>
 ${clientFacts(d)}${welcome}${cxErr(error)}
 <form method="post" action="/authorize" class="grant"><input type="hidden" name="handle" value="${esc(consent.handle)}"><input type="hidden" name="step" value="grant">${CX_ENTER}
-<section class="sec"><h2>Projects</h2>${groups.length > 1 ? `<p class="fine one-ws">Pick projects from one workspace. To share another workspace, connect again.</p>` : ""}${rows}
-<h3 class="sub">${cxIcon("plus")}${rows ? "Or create a project" : "Create a project to share"}</h3>${wsPick}${fresh}</section>
+${nameField}
+<section class="sec"><h2>Projects</h2><p class="fine">Optional. You can connect now and share projects later in Connections.</p>${groups.length > 1 ? `<p class="fine one-ws">Pick projects from one workspace. To share another workspace, connect again.</p>` : ""}${rows}
+<h3 class="sub">${cxIcon("plus")}${rows ? "Or create a project" : "Create a project to share"}</h3>${wsPick}${fresh}${homePick}</section>
 ${replace}
 <p class="fine"><strong>Read</strong>: view documents and files (images, PDFs, videos) and their history, and download files. <strong>Edit</strong>: also create and change documents, and upload new files and new versions of files. Comments, trash and settings are never shared.</p>
-${cxBar('<span class="count"><span class="some"><b class="n"></b> selected</span><span class="none">Pick at least one project</span></span>')}</form>`), consent.headers, status);
+${cxBar('<span class="count"><span class="some"><b class="n"></b> selected</span><span class="none">No projects yet \u2014 you can share projects later in Connections</span></span>')}</form>`), consent.headers, status);
 }
 async function appClientFor(env, clientId) {
   if (!acOn(env)) return null;
@@ -425,6 +452,10 @@ async function authorizePost(req, env, as, origin) {
     // A fixable mistake re-renders the page with the owner's choices kept: the consent handle is still unused, and
     // the browser's Back button can't help (the sign-in callback that rendered the page is single-use).
     const retry = (msg) => sess.view ? cxGrantPage(sess.view.d, sess.view.email, owned.results, sess.view.prev, { handle, headers: new Headers() }, form, msg, 400) : errorPage(msg);
+    let label;
+    // The page always sends the name field (required, prefilled). A form without the field at all (a page rendered before
+    // this field existed and submitted after an upgrade) takes the app's own name; a blank or invalid name is refused.
+    try { label = cleanConnectionName(form.has("label") ? form.get("label") : String(sess.view?.d?.clientName ?? "").trim().slice(0, CONNECTION_NAME_MAX)); } catch (e) { return retry(e.message); }
     const chosen = [];
     for (const p of owned.results) {
       const a = String(form.get(`access:${p.id}`) ?? "none");
@@ -438,7 +469,12 @@ async function authorizePost(req, env, as, origin) {
     const pickedWs = String(form.get("new_workspace") ?? "");
     if (wsIds.length && pickedWs && pickedWs !== wsIds[0] && [...Array(NEW_PROJECT_SLOTS).keys()].some((i) => String(form.get(`new_title${i ? `_${i + 1}` : ""}`) ?? "").trim()))
       return retry("New projects must go in the same workspace as the projects you picked.");
-    const connWs = wsIds[0] ?? (pickedWs || personalWorkspaceId(sess.principal_id));
+    // No project picked: the connection lives in the workspace chosen for it (default Personal), which must be one the
+    // signer belongs to as at least a member. Picking only new projects uses the new-project workspace as before.
+    const homeWs = String(form.get("connect_workspace") ?? "");
+    const newTitled = [...Array(NEW_PROJECT_SLOTS).keys()].some((i) => String(form.get(`new_title${i ? `_${i + 1}` : ""}`) ?? "").trim());
+    if (!wsIds.length && !newTitled && homeWs && !owned.results.memberWorkspaces.some((w) => w.id === homeWs)) return retry("Pick a workspace you belong to for this connection.");
+    const connWs = wsIds[0] ?? (newTitled ? (pickedWs || personalWorkspaceId(sess.principal_id)) : (homeWs || pickedWs || personalWorkspaceId(sess.principal_id)));
     const seenTitles = /* @__PURE__ */ new Set();
     for (let i = 1; i <= NEW_PROJECT_SLOTS; i++) {
       const sfx = i === 1 ? "" : `_${i}`;
@@ -451,7 +487,11 @@ async function authorizePost(req, env, as, origin) {
       seenTitles.add(newTitle.toLowerCase());
       chosen.push({ id: randomId("prj"), write: newAccess === "write", isNew: newTitle, workspace_id: connWs });
     }
-    if (!chosen.length) return retry("Pick at least one project, or create one.");
+    // No projects is fine: the connection is made now and the owner shares projects later in Connections. The workspace
+    // still has to be one the signer belongs to (a member may connect an agent; the agents limit applies below).
+    const homeGuard = chosen.length ? { sql: "1", params: [] } : { sql: workspaceRoleSql("?", "member"), params: [sess.principal_id, connWs] };
+    if (!chosen.length && !await env.DB.prepare(`SELECT ${homeGuard.sql} AS ok`).bind(...homeGuard.params).first("ok"))
+      return retry("You can't connect an app to that workspace. Choose a workspace you belong to.");
     if (chosen.some((c) => c.isNew)) {
       // Admin of an ACTIVE workspace (checked again inside the INSERT below).
       const ok = await env.DB.prepare(`SELECT ${workspaceRoleSql("?", "admin")} AS ok`).bind(sess.principal_id, connWs).first("ok");
@@ -460,7 +500,9 @@ async function authorizePost(req, env, as, origin) {
     const wsOwner = await env.DB.prepare("SELECT created_by FROM workspaces WHERE id = ?").bind(connWs).first("created_by");
     if (chosen.length > MAX_CONN_PROJECTS) return retry(`Pick at most ${MAX_CONN_PROJECTS} projects.`);
     const anyWrite = chosen.some((c) => c.write);
-    const scope = anyWrite ? [SCOPES.read, SCOPES.write, SCOPES.offline] : [SCOPES.read, SCOPES.offline];
+    // Always read, write and offline: the connection's can_write and each project's can_write are the real gate, so
+    // a read-only connection can be granted edit access later (Connections) without reconnecting.
+    const scope = [SCOPES.read, SCOPES.write, SCOPES.offline];
     // Replacing is offered only for the connection the consent page showed (stored server-side with the handle).
     // The predecessor must still be live: if another tab already replaced it, connecting here would leave two.
     const replaceId = String(form.get("replace") ?? "");
@@ -500,7 +542,7 @@ async function authorizePost(req, env, as, origin) {
       SELECT ?, ?, ?, 'oauth.revoke', ?, 'ok:replaced', ?, (SELECT COALESCE(workspace_id, 'wsp_' || owner_id) FROM projects WHERE id = ?) WHERE changes() = 1`).bind(at, sess.principal_id, pid, replaced.id, rid, pid);
     let res;
     try { res = await env.DB.batch([
-      ...claim ? [claim, ...(replaced.projects.length ? replaced.projects : [replaced.project_id]).map(auditReplaced)] : [],
+      ...claim ? [claim, ...(replaced.projects.length ? replaced.projects : [replaced.project_id ?? null]).map(auditReplaced)] : [],
       ...chosen.filter((c) => c.isNew).flatMap((c) => [
         // Gated in-statement: if the signer lost admin or the workspace closed since the check, no row is written and
         // the connection rows below fail their project foreign key, so the whole batch rolls back.
@@ -511,15 +553,21 @@ async function authorizePost(req, env, as, origin) {
       // opened before files were offered keeps documents only (migration 0013; build-file-tools-fixes.mjs).
       // A connection row refused by the limit makes oauth_connection_projects' foreign key fail below, which rolls the
       // whole batch back (reported like the admin race).
-      env.DB.prepare(`INSERT INTO oauth_connections (id, owner_principal_id, project_id, client_id, client_name, redirect_uri, resource, can_read, can_write, file_access, created_at, expires_at, workspace_id, created_by)
-        SELECT ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ? WHERE ${agentGuard.sql}`).bind(connectionId, sess.principal_id, chosen[0].id, ar.clientId, (client?.clientName ?? ar.clientId).slice(0, 200), ar.redirectUri, `${origin}/mcp`, anyWrite ? 1 : 0, sess.offered === "files" ? 1 : 0, at, CONNECTION_EXPIRES_AT, connWs, sess.principal_id, ...agentGuard.params),
+      env.DB.prepare(`INSERT INTO oauth_connections (id, owner_principal_id, project_id, client_id, client_name, redirect_uri, resource, can_read, can_write, file_access, created_at, expires_at, workspace_id, created_by, label)
+        SELECT ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ? WHERE ${agentGuard.sql} AND ${homeGuard.sql}`).bind(connectionId, sess.principal_id, chosen[0]?.id ?? null, ar.clientId, (client?.clientName ?? ar.clientId).slice(0, 200), ar.redirectUri, `${origin}/mcp`, anyWrite ? 1 : 0, sess.offered === "files" ? 1 : 0, at, CONNECTION_EXPIRES_AT, connWs, sess.principal_id, label, ...agentGuard.params, ...homeGuard.params),
       ...chosen.flatMap((c) => [
         env.DB.prepare("INSERT INTO oauth_connection_projects (connection_id, project_id, can_write) VALUES (?, ?, ?)").bind(connectionId, c.id, c.write ? 1 : 0),
         audit2(c.id, "oauth.connect", connectionId, c.write ? "ok:read+write" : "ok:read")
-      ])
+      ]),
+      // No project rows exist to trip a foreign key, so a connection row refused by its guards (limit, lost membership)
+      // fails this statement instead (json() of a malformed value raises), which rolls the whole batch back.
+      ...chosen.length ? [] : [
+        env.DB.prepare("SELECT json('!') WHERE NOT EXISTS (SELECT 1 FROM oauth_connections WHERE id = ?)").bind(connectionId),
+        audit2(null, "oauth.connect", connectionId, "ok:no-projects")
+      ]
     ]); } catch (e) {
       // The in-statement admin check lost a race (demoted, or the workspace closed): nothing was written.
-      if (/FOREIGN KEY/i.test(String(e?.message ?? e))) return errorPage("Your access to that workspace, or its plan limits, changed. Start connecting again from the app.", 403);
+      if (/FOREIGN KEY|malformed JSON/i.test(String(e?.message ?? e))) return errorPage("Your access to that workspace, or its plan limits, changed. Start connecting again from the app.", 403);
       throw e;
     }
     // Lost a race with another tab replacing the same connection: withdraw this one before any code is issued, so
@@ -527,7 +575,7 @@ async function authorizePost(req, env, as, origin) {
     if (claim && !res[0].meta.changes) {
       await env.DB.batch([
         env.DB.prepare("UPDATE oauth_connections SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL").bind(nowMs(), connectionId),
-        audit2(chosen[0].id, "oauth.revoke", connectionId, "ok:lost-replace-race")
+        audit2(chosen[0]?.id ?? null, "oauth.revoke", connectionId, "ok:lost-replace-race")
       ]);
       return errorPage("That earlier connection was just replaced in another tab. Use that connection, or start again from the app.");
     }
@@ -643,15 +691,15 @@ async function callback(req, env, as, origin) {
   const consent = await oauth.beginConsent(resumed.request);
   const prev = await cxPreviousConnection(env, principalId, resumed.request);
   // view: what the page needs to re-render itself after a fixable mistake (owner-only data, same 10-minute TTL).
-  const view = { email: ident.email, d: { clientName: details.clientName, clientDomain: details.clientDomain, redirectHost: details.redirectHost, redirectIsLoopback: details.redirectIsLoopback },
-    prev: prev ? { id: prev.id, created_at: prev.created_at, projects: prev.projects.map((p) => ({ id: p.id, can_write: p.can_write })) } : null };
+  const view = { email: ident.email, d: { clientName: details.clientName, clientDomain: details.clientDomain, redirectHost: details.redirectHost, redirectUri: details.redirectUri, redirectIsLoopback: details.redirectIsLoopback },
+    prev: prev ? { id: prev.id, created_at: prev.created_at, label: prev.label ?? null, projects: prev.projects.map((p) => ({ id: p.id, can_write: p.can_write })) } : null };
   await env.OAUTH_KV.put(`consentctx:${await sha(consent.handle)}`, JSON.stringify({ principal_id: principalId, view, offered: "files", ...prev ? { replace_candidate: prev.id } : {} }), { expirationTtl: 600 });
   for (const [k, v] of resumed.headers) if (k.toLowerCase() === "set-cookie") consent.headers.append("set-cookie", v);
   return cxGrantPage(details, ident.email, projects.results, prev, consent);
 }
 async function readerAudience(env, ownerId, projectId) {
   const conns = await env.DB.prepare(
-    `SELECT oc.client_name AS name, cp.can_write FROM oauth_connections oc JOIN oauth_connection_projects cp ON cp.connection_id = oc.id
+    `SELECT COALESCE(oc.label, oc.client_name) AS name, cp.can_write FROM oauth_connections oc JOIN oauth_connection_projects cp ON cp.connection_id = oc.id
      WHERE cp.project_id = ? AND ? IS NOT NULL AND oc.revoked_at IS NULL AND oc.expires_at > ? ORDER BY oc.created_at`
   ).bind(projectId, ownerId, nowMs()).all();
   const keys = await env.DB.prepare(
@@ -926,7 +974,7 @@ function upstreamFor(env) {
   if (!u) throw new HttpError(503, "oidc_not_configured", "Upstream sign-in is not configured");
   return u;
 }
-var acOn, LIM, lim, SCOPES, CATALOGUE, AC_CATALOGUE, CONNECTION_EXPIRES_AT, cache, HOSTED_CALLBACKS, LISTED_ONLY, isLoopbackRedirect, MAX_CONN_PROJECTS, NEW_PROJECT_SLOTS, esc, page, errorPage, oauthJson, AS_PATHS, RS_META;
+var acOn, LIM, lim, SCOPES, CATALOGUE, AC_CATALOGUE, CONNECTION_EXPIRES_AT, cache, HOSTED_CALLBACKS, LISTED_ONLY, isLoopbackRedirect, MAX_CONN_PROJECTS, CONNECTION_NAME_MAX, NEW_PROJECT_SLOTS, esc, page, errorPage, oauthJson, AS_PATHS, RS_META;
 acOn = (env) => env.APP_CONNECT_ENABLED === "1";
 LIM = { authorize: 30, token: 60, register: 10 };
 lim = (env, k) => LIM[k] * (env.OAUTH_RATE_MULTIPLIER && /^\d{1,6}$/.test(env.OAUTH_RATE_MULTIPLIER) ? Number(env.OAUTH_RATE_MULTIPLIER) : 1);
@@ -943,6 +991,7 @@ HOSTED_CALLBACKS = /* @__PURE__ */ new Set([
 LISTED_ONLY = /* @__PURE__ */ new Set(["cursor://anysphere.cursor-mcp/oauth/callback"]);
 isLoopbackRedirect = (u) => /^http:\/\/(127\.0\.0\.1|localhost)(:\d{1,5})?\/[A-Za-z0-9/_.-]*$/.test(u);
 MAX_CONN_PROJECTS = 50;
+CONNECTION_NAME_MAX = 80;
 NEW_PROJECT_SLOTS = 5;
 esc = (v) => String(v).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 page = (title, body2, headers, status = 200, formTargets = [], opts = {}) => {
@@ -1060,7 +1109,7 @@ input[type=text]:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 
 .enter{position:absolute;left:-9999px;width:1px;height:1px;overflow:hidden}
 .grant:has(.proj input:is([value=read],[value=write]):checked,.newp input[type=text]:not(:placeholder-shown):valid) .count .some{display:inline}
 .grant:has(.proj input:is([value=read],[value=write]):checked,.newp input[type=text]:not(:placeholder-shown):valid) .count .none{display:none}
-.grant:not(:has(.proj input:is([value=read],[value=write]):checked,.newp input[type=text]:not(:placeholder-shown):valid)) button.primary{opacity:.55}
+code.url{overflow-wrap:anywhere;word-break:break-all}
 .n{color:var(--fg);font-weight:650}
 .bar{position:sticky;bottom:0;z-index:1;display:flex;align-items:center;justify-content:flex-end;gap:8px;margin:20px -28px 0;padding:14px 28px;border-top:1px solid var(--line);background:color-mix(in srgb,var(--sunk) 50%,var(--card));border-radius:0 0 var(--r3) var(--r3)}
 button{font:inherit;display:inline-flex;align-items:center;justify-content:center;gap:6px;min-height:40px;padding:6px 16px;border-radius:var(--r2);border:1px solid var(--line2);background:var(--card);color:var(--fg);font-size:14.5px;font-weight:500;cursor:pointer;white-space:nowrap;transition:filter .15s,background .15s,transform .05s}
@@ -1097,4 +1146,4 @@ function statusPage(title, msg, { status = 200, icon = "alert", actions = [], he
     .map((a) => `<a class="btnlink${a.primary ? " primary" : ""}" href="${esc(a.href)}">${esc(a.label)}</a>`).join("");
   return page(title, cxShell(`<div class="state${icon === "alert" ? " off" : icon === "check" ? " on" : " neutral"}"><span class="big" aria-hidden="true">${cxIcon(icon)}</span><h1>${esc(title)}</h1><p class="lede">${esc(msg)}</p></div>${links ? `<div class="bar">${links}</div>` : ""}`, false), headers, status);
 }
-export { SCOPES, _servers, handleOAuthHost, liveConnection, livePublisher, originFor, servers, statusPage };
+export { MAX_CONN_PROJECTS, SCOPES, _servers, cleanConnectionName, handleOAuthHost, liveConnection, livePublisher, originFor, servers, statusPage };

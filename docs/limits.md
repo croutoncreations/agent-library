@@ -70,7 +70,7 @@ The text limit is a storage bound, not a memory guarantee. Server CSV validation
 | Connected agents (OAuth connections, API keys, publishing apps, project grant tokens) | unlimited | workspace | plan `agents` | `402 limit_reached` (consent pages say so first) |
 | API key lifetime | choice of 1, 7, 30, 90 (default), 365 days or never | key | plan `max_key_lifetime_days` (absent = any, including never) | `400 invalid_input` for other values; `402 limit_reached` `{ limit: "max_key_lifetime_days" }` over the plan |
 | Projects per API key | 1–50 | key | fixed | `400 invalid_input` |
-| Projects per OAuth connection | 50 (one workspace) | connection | fixed | consent page: "Pick at most 50 projects." |
+| Projects per OAuth connection | 0–50 (one workspace) | connection | fixed | consent page: "Pick at most 50 projects."; Edit projects: `400 invalid_input` |
 | New projects created on a consent page | 5 | consent | fixed | — |
 | OAuth connection lifetime | never expires (until revoked); access tokens last 15 minutes and refresh | connection | fixed | — |
 | Project grant token lifetime | 1–720 hours (default 24) | token | fixed | `400 invalid_input` |

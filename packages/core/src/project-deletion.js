@@ -164,7 +164,8 @@ const STEPS = [
 ];
 // Kept (credentials and history; all closed by the gate): grants, oauth_connections, oauth_connection_projects,
 // api_credentials, api_credential_projects, publishers and audits. At purge, publishers and grants for this project are
-// revoked, and so are API keys and OAuth connections left with no live project.
+// revoked, and so are API keys left with no live project. An OAuth connection left with none stays (zero projects is a
+// normal state: the owner shares others with it, or disconnects it).
 
 /**
  * Cron: remove the content of projects whose purge_at has passed. Bounded per run (rowBudget rows, blobBudget R2
@@ -247,16 +248,17 @@ export async function purgeDueProjects(env, { projectId, rowBudget = 5000, blobB
         blobBudget -= keys.length; out.files += keys.length;
       }
     }
-    // Search index entries went above, before their artifacts. Publishers stop for good; API keys and OAuth connections
-    // whose every project is purged are revoked (they can't reach anything and would hold an agents slot forever). A
-    // project still in Recently deleted counts as live here, so restoring it brings its credentials back.
+    // Search index entries went above, before their artifacts. Publishers stop for good; API keys whose every project is
+    // purged are revoked (they can't reach anything and would hold an agents slot forever). A project still in Recently
+    // deleted counts as live here, so restoring it brings its credentials back. An OAuth connection left with no
+    // project is NOT revoked: having no projects is a normal state (Connections shows "No projects shared yet"), and the
+    // owner may share others with it or disconnect it.
     const noLive = (table, col) => `NOT EXISTS (SELECT 1 FROM ${table} x JOIN projects pj ON pj.id = x.project_id WHERE x.${col} = c.id AND x.project_id <> ?2 AND pj.purged_at IS NULL)`;
     // One transaction, tombstone first: the rest runs only if this call tombstoned it (still deleted and due).
     const [tomb] = await env.DB.batch([
       env.DB.prepare(`UPDATE projects SET purged_at = ?3, title = 'Deleted project', slug = NULL, deleted_slug = NULL WHERE id = ?1 AND purged_at IS NULL AND deleted_at IS NOT NULL AND purge_at <= ?3`).bind(id, null, now),
       env.DB.prepare("UPDATE publishers SET revoked_at = COALESCE(revoked_at, ?1) WHERE project_id = ?2 AND EXISTS (SELECT 1 FROM projects WHERE id = ?2 AND purged_at = ?1)").bind(now, id),
       env.DB.prepare(`UPDATE api_credentials AS c SET revoked_at = ?1 WHERE c.revoked_at IS NULL AND EXISTS (SELECT 1 FROM projects WHERE id = ?2 AND purged_at = ?1) AND EXISTS (SELECT 1 FROM api_credential_projects WHERE credential_id = c.id AND project_id = ?2) AND ${noLive("api_credential_projects", "credential_id")}`).bind(now, id),
-      env.DB.prepare(`UPDATE oauth_connections AS c SET revoked_at = ?1 WHERE c.revoked_at IS NULL AND EXISTS (SELECT 1 FROM projects WHERE id = ?2 AND purged_at = ?1) AND EXISTS (SELECT 1 FROM oauth_connection_projects WHERE connection_id = c.id AND project_id = ?2) AND ${noLive("oauth_connection_projects", "connection_id")}`).bind(now, id),
       env.DB.prepare("UPDATE grants SET revoked_at = COALESCE(revoked_at, ?1) WHERE project_id = ?2 AND EXISTS (SELECT 1 FROM projects WHERE id = ?2 AND purged_at = ?1)").bind(now, id),
       env.DB.prepare(`INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id, workspace_id)
         SELECT ?, 'system', ?, 'project.purge', ?, 'ok', 'cron', workspace_id FROM projects WHERE id = ? AND purged_at = ?`).bind(nowIso(), id, id, id, now)

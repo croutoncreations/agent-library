@@ -416,6 +416,9 @@ main > .tabs,main > nav.tabs{margin:16px 0 12px}
 .conn-access{display:flex;flex-wrap:wrap;gap:6px;list-style:none;margin:0;padding:0}
 .conn-access li{display:inline-flex;align-items:center;gap:6px;font-size:13.5px;padding:4px 10px;border-radius:999px;background:var(--sunk);border:1px solid var(--line);overflow-wrap:anywhere;max-width:100%}
 .conn-access li b{font-weight:600}
+.conn-details summary{cursor:pointer;font-size:13.5px;color:var(--muted)}
+.conn-details p{margin:6px 0 0}
+code.wrap{overflow-wrap:anywhere;word-break:break-all}
 .conn-foot{display:flex;flex-wrap:wrap;gap:4px 16px;font-size:13px;color:var(--muted)}
 .callout{display:flex;gap:10px;align-items:flex-start;padding:12px 14px;border-radius:var(--r2);background:var(--accent-soft);border:1px solid var(--accent-line);font-size:14px;margin:0 0 16px}
 .callout svg{flex:none;width:18px;height:18px;margin-top:2px;stroke:var(--accent);fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}

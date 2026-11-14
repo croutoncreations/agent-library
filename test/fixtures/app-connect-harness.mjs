@@ -164,9 +164,11 @@ export async function startAppConnectServer({ port, oidcPort = port + OIDC_OFFSE
      * Connect an ordinary MCP agent (like ChatGPT/Claude) through DCR + owner consent, for reader/protection tests.
      * grants: { [projectId]: "read" | "write" }. Returns { access_token, call(name, args) } (token in memory only).
      */
-    async connectMcpAgent(grants, { clientName = "synthetic agent", onConsent, redirect = "http://127.0.0.1:5998/cb", extra = {} } = {}) {
+    async connectMcpAgent(grants, { clientName = "synthetic agent", onConsent, onGrant, client, redirect = "http://127.0.0.1:5998/cb", extra = {} } = {}) {
       // redirect is never contacted: the code is read from the consent interstitial.
-      const reg = await fetch(`${issuer}/oauth/register`, { method: "POST", headers: { "content-type": "application/json" },
+      // client: a previous result, to connect again as the same OAuth client (the consent page then offers to replace it).
+      // onGrant(status, html): sees the page the consent form's submit answered with (a re-rendered error page, or the interstitial).
+      const reg = client ? { client_id: client.client_id } : await fetch(`${issuer}/oauth/register`, { method: "POST", headers: { "content-type": "application/json" },
         body: JSON.stringify({ client_name: clientName, redirect_uris: [redirect], token_endpoint_auth_method: "none" }) }).then((r) => r.json());
       const b = browser();
       const verifier = b64u(randomBytes(48)), state = "st" + randomBytes(6).toString("hex");
@@ -178,7 +180,9 @@ export async function startAppConnectServer({ port, oidcPort = port + OIDC_OFFSE
       const consentHtml = await r.text();
       await onConsent?.(consentHtml);
       r = await b.go(`${issuer}/authorize`, form({ handle: hidden(consentHtml, "handle"), step: "grant", ...per, ...extra, decision: "approve" }));
-      const code = interstitialTarget(await r.text()).searchParams.get("code");
+      const grantHtml = await r.text();
+      await onGrant?.(r.status, grantHtml);
+      const code = interstitialTarget(grantHtml).searchParams.get("code");
       const t = await h.token({ grant_type: "authorization_code", code, redirect_uri: redirect, client_id: reg.client_id, code_verifier: verifier, resource: `${issuer}/mcp` });
       const at = t.body.access_token;
       let id = 0;
@@ -192,7 +196,7 @@ export async function startAppConnectServer({ port, oidcPort = port + OIDC_OFFSE
       };
       const list = async () => (await fetch(`${issuer}/mcp`, { method: "POST", headers: { authorization: `Bearer ${at}`, "content-type": "application/json", accept: "application/json" },
         body: JSON.stringify({ jsonrpc: "2.0", id: ++id, method: "tools/list" }) }).then((x) => x.json())).result.tools;
-      return { access_token: at, refresh_token: t.body.refresh_token, client_id: reg.client_id, call, list };
+      return { access_token: at, refresh_token: t.body.refresh_token, scope: t.body.scope, client_id: reg.client_id, redirect, call, list };
     },
     async token(params, headers = {}) {
       const r = await fetch(`${issuer}/oauth/token`, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded", ...headers }, body: new URLSearchParams(params).toString() });
