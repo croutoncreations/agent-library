@@ -47,7 +47,7 @@ The text limit is a storage bound, not a memory guarantee. Server CSV validation
 | Limit | Default | Scope | Configure | When you hit it |
 |---|---|---|---|---|
 | Projects | unlimited | workspace | plan `projects` | `402 limit_reached` |
-| Documents and files | 10,000 (including trashed items and uploads in progress; not App Connect files) | project | `PROJECT_ITEMS_MAX`; plan `items_per_project` | `402 limit_reached` `{ limit: "items_per_project" }` |
+| Documents and files | 1,000 (including trashed items and uploads in progress; not App Connect files) | project | `PROJECT_ARTIFACT_LIMIT` (a whole number from 1 to 10,000; anything else uses 1,000 and logs a `config_invalid` warning); plan `items_per_project` (not bound by the 10,000 ceiling) | `402 limit_reached` `{ limit: "items_per_project" }` |
 | File bytes per project | 100 MiB | project | `PROJECT_BINARY_BYTES` (`"0"` = no per-project cap; workspace `storage_bytes` still applies) | `413 quota_exceeded` `{ used_bytes, limit_bytes }` |
 | Folders | 1,000 | project | fixed | `409 too_many_folders` |
 | Folder name | 1–80 characters, no `/` | folder | fixed | `400 invalid_input` |
@@ -138,7 +138,7 @@ the error instead of a reset connection.
 | Backup export | 16 MiB of files (distinct file versions), and 32 MiB of text (sum of text revision sizes) | project | fixed; checked before reading any object | `413 backup_too_large`; download documents/files individually or export a smaller project |
 | Export of a project with App Connect files | allowed: app files are exported as ordinary files marked `app: { name, path }` | project | fixed | none |
 | Backup import request | 2 MiB | request | fixed | `413 backup_too_large` |
-| Imported documents and files | `items_per_project` (10,000 by default), and at most 2,000 per import (one D1 batch) | import | `PROJECT_ITEMS_MAX`; plan `items_per_project` | `400 bad_backup` |
+| Imported documents and files | `items_per_project` (1,000 by default), and at most 2,000 per import (one D1 batch) | import | `PROJECT_ARTIFACT_LIMIT`; plan `items_per_project` | `400 bad_backup` |
 | Imported versions, comments, details versions | 2,000 each | import | fixed | `400 bad_backup` |
 | Imported file bytes | `PROJECT_BINARY_BYTES` (`"0"` = no cap) | import | `PROJECT_BINARY_BYTES` | `400 bad_backup` |
 | Workspace limits on import | `projects`, `storage_bytes` | workspace | plan | `402 limit_reached` |
@@ -218,7 +218,7 @@ free tier's starting numbers, D22 the current keys.)
 | `pending_invites` | Invitations not yet accepted, revoked or expired | workspace | unlimited |
 | `agents` | Live OAuth connections, API keys, publishing apps and project grant tokens (a disabled app's connections count until revoked) | workspace | unlimited |
 | `owned_workspaces` | Shared workspaces a person created (not deleted) | person | unlimited |
-| `items_per_project` | Documents and files in one project, including trashed ones and upload placeholders | project | `PROJECT_ITEMS_MAX`, default 10,000 |
+| `items_per_project` | Documents and files in one project, including trashed ones and upload placeholders | project | `PROJECT_ARTIFACT_LIMIT`, default 1,000 (1 to 10,000) |
 | `file_bytes` | Size of one file version | file | `FILE_MAX_BYTES`, default 25 MiB; never above 90 MiB |
 | `rate_multiplier` | Multiplies agent read and write rate limits (integer ≥ 1) | workspace | 1 |
 | `max_key_lifetime_days` | Longest API key lifetime | workspace | any, including never |

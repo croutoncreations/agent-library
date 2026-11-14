@@ -31,29 +31,32 @@ let built = null;
 /**
  * worker: optional path of another built Worker to run instead of dist/worker/index.js (the hosted repository runs its
  * own bundle through this harness). It runs with the same local config, bindings and migrations.
+ * root: another checkout of this project (the upgrade test runs older releases): its own wrangler.local.toml, Worker and
+ * migrations are used, and nothing is built. migrate: false starts on state whose migrations the caller applied.
  */
-export async function startServer(name, port, { fresh = true, persistDir, vars = FUNCTIONAL_VARS, readyHeaders = {}, readyBase, worker, readyStatus = 401 } = {}) {
+export async function startServer(name, port, { fresh = true, persistDir, vars = FUNCTIONAL_VARS, readyHeaders = {}, readyBase, worker, readyStatus = 401, root = ROOT, migrate = true } = {}) {
   if (!Object.values(SERVER_PORTS).includes(port)) throw new Error(`port ${port} is not in test/ports.mjs SERVER_PORTS`);
   for (const p of [port, port + INSPECTOR_OFFSET]) if (!(await portFree(p))) throw new Error(`port ${p} for server ${name} is already in use (a previous server did not exit?)`);
-  if (!worker) { built ??= buildWorker(); await built; }
+  const localConfig = join(root, "wrangler.local.toml");
+  if (!worker && root === ROOT) { built ??= buildWorker(); await built; }
   const dir = persistDir ?? join(ROOT, "tmp", `test-state-${name}`);
   if (fresh) rmSync(dir, { recursive: true, force: true });
   mkdirSync(dir, { recursive: true });
   const env = { ...process.env, CI: "1", WRANGLER_SEND_METRICS: "false", NO_COLOR: "1" };
   const logPath = join(ROOT, "tmp", `test-state-${name}.log`);
   const fd = openSync(logPath, "a");
-  execFileSync("wrangler", ["d1", "--config", LOCAL_CONFIG, "migrations", "apply", "DB", "--local", "--persist-to", dir], { cwd: ROOT, env, stdio: ["ignore", fd, fd] });
+  if (migrate) execFileSync("wrangler", ["d1", "--config", localConfig, "migrations", "apply", "DB", "--local", "--persist-to", dir], { cwd: root, env, stdio: ["ignore", fd, fd] });
   const passphrase = "test-" + randomBytes(18).toString("hex");
-  let config = LOCAL_CONFIG;
+  let config = localConfig;
   if (worker) {
     // Same local config with main pointing at the other bundle; written next to it so the relative path is plain.
     config = join(dirname(worker), `wrangler.${name}.toml`);
-    writeFileSync(config, readFileSync(LOCAL_CONFIG, "utf8").replace(/^main = .*$/m, `main = ${JSON.stringify(basename(worker))}`));
+    writeFileSync(config, readFileSync(localConfig, "utf8").replace(/^main = .*$/m, `main = ${JSON.stringify(basename(worker))}`));
   }
   const child = spawn("wrangler", ["dev", "--config", config, "--local", "--port", String(port), "--ip", "127.0.0.1", "--persist-to", dir,
     "--var", `LOCAL_DEV_LOGIN:${passphrase}`, ...Object.entries(vars).flatMap(([k, v]) => ["--var", `${k}:${v}`]),
     "--show-interactive-dev-session=false", "--inspector-port", String(port + INSPECTOR_OFFSET)],
-    { cwd: ROOT, env, stdio: ["ignore", fd, fd], detached: true });
+    { cwd: root, env, stdio: ["ignore", fd, fd], detached: true });
   closeSync(fd);
   const base = `http://127.0.0.1:${port}`;
   const deadline = Date.now() + 60_000;

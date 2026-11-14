@@ -24,9 +24,29 @@ const LABEL = {
  */
 export const FILE_BYTES_CEILING = 90 * 1024 * 1024;
 const envInt = (v, d) => typeof v === "string" && /^\d{1,12}$/.test(v) ? Number(v) : d;
+export const ITEMS_PER_PROJECT_DEFAULT = 1000, ITEMS_PER_PROJECT_CEILING = 10000;
+let itemsConfigWarned = false;
+/**
+ * PROJECT_ARTIFACT_LIMIT: documents and files per project, a whole number from 1 to 10000 (default 1000). The ceiling is a
+ * supported boundary, not a storage one: list paging, offline sync (stops at 2,000 items) and project backup are not
+ * designed for more. Anything else uses the default and logs one config_invalid warning per Worker instance. An
+ * entitlements adapter's items_per_project (a hosted plan) replaces this value and is not bound by the ceiling.
+ */
+function itemsPerProject(env) {
+  const raw = env.PROJECT_ARTIFACT_LIMIT;
+  if (raw === undefined || raw === null || raw === "") return ITEMS_PER_PROJECT_DEFAULT;
+  const text = String(raw);
+  const n = /^[1-9]\d{0,4}$/.test(text) ? Number(text) : 0;
+  if (n >= 1 && n <= ITEMS_PER_PROJECT_CEILING) return n;
+  if (!itemsConfigWarned) {
+    itemsConfigWarned = true;
+    console.warn(JSON.stringify({ event: "config_invalid", name: "PROJECT_ARTIFACT_LIMIT", value: text.slice(0, 40), using: ITEMS_PER_PROJECT_DEFAULT, allowed: "integer 1-10000" }));
+  }
+  return ITEMS_PER_PROJECT_DEFAULT;
+}
 /** Core defaults when the entitlements adapter gives no value (self-host): Worker vars, else these numbers. */
 export const defaultLimits = (env) => ({
-  items_per_project: envInt(env.PROJECT_ITEMS_MAX, 10000),
+  items_per_project: itemsPerProject(env),
   file_bytes: Math.min(envInt(env.FILE_MAX_BYTES, 25 * 1024 * 1024), FILE_BYTES_CEILING),
   rate_multiplier: 1
 });
