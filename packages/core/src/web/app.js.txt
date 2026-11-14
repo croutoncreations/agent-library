@@ -2549,7 +2549,8 @@ async function viewApps() {
       var unseen = c.projects.filter(function (cp) { return !mine.some(function (p) { return p.id === cp.id; }); });
       var sp = scopePicker(mine, c.projects.map(function (p) { return { project_id: p.id, access: p.access === "read+write" ? "read_write" : "read" }; }), "Off");
       editHost.hidden = false;
-      editHost.replaceChildren(h("p", { class: "small", text: "Choose which projects " + c.display_name + " can use. Changes apply on its next request; it doesn't need to reconnect." }),
+      // replaceChildren() would print a null argument as the text "null"; pass only real nodes.
+      editHost.replaceChildren.apply(editHost, [h("p", { class: "small", text: "Choose which projects " + c.display_name + " can use. Changes apply on its next request; it doesn't need to reconnect." }),
         mine.length ? sp.el : h("p", { class: "small muted", text: "You don't have any projects in this connection's workspace yet." }),
         unseen.length ? h("p", { class: "small muted", text: unseen.length + " project(s) you can't open here are removed when you save." }) : null,
         h("div", { class: "row" }, h("span", { class: "spacer" }),
@@ -2562,7 +2563,7 @@ async function viewApps() {
             try { await api("PUT", "/api/connections/" + enc(c.id) + "/projects", { projects: next }); toast("Projects updated"); load(); }
             catch (err) { showErr(msg, err); ev.target.disabled = false; }
           } }, "Save projects"),
-          h("button", { type: "button", class: "secondary", onclick: function () { editHost.hidden = true; editHost.replaceChildren(); } }, "Cancel")));
+          h("button", { type: "button", class: "secondary", onclick: function () { editHost.hidden = true; editHost.replaceChildren(); } }, "Cancel"))].filter(Boolean));
     } }, "Edit projects");
     var rename = h("button", { type: "button", class: "secondary", onclick: function () {
       var name = h("input", { type: "text", maxLength: 80, required: true, value: c.display_name, "aria-label": "Name in Agent Library", class: "full-w" });

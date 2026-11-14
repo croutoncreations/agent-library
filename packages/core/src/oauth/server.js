@@ -351,7 +351,9 @@ function cxGrantPage(d, email, projects, prev, consent, values = null, error = "
   const nameField = `<section class="sec"><h2>Name</h2><label class="field"><span>Name in Agent Library</span><input type="text" name="label" required maxlength="${CONNECTION_NAME_MAX}" pattern=".*\\S.*" value="${esc(nameValue)}" autocomplete="off"></label>
 <p class="note">The app reports itself as \u201C${esc(d.clientName)}\u201D. That name comes from the app, not from Agent Library.</p></section>`;
   const homes = projects.memberWorkspaces ?? [];
-  const homeDefault = (homes.find((w) => w.personal) ?? homes[0])?.id ?? "";
+  // Default to Personal unless it is empty and another workspace has projects (an empty home is rarely what was meant).
+  const hasProjects = (w) => projects.some((p) => p.workspace_id === w.id);
+  const homeDefault = (homes.find((w) => w.personal && hasProjects(w)) ?? homes.find(hasProjects) ?? homes.find((w) => w.personal) ?? homes[0])?.id ?? "";
   const homePick = homes.length > 1 ? `<label class="field"><span>Workspace for this connection</span><select name="connect_workspace">${homes.map((w) => `<option value="${esc(w.id)}"${pick("connect_workspace", homeDefault) === w.id ? " selected" : ""}>${esc(w.name ?? "Personal")}</option>`).join("")}</select></label>
 <p class="note">Used when you pick no projects now. If you pick projects, the connection belongs to their workspace.</p>${homes.truncated ? '<p class="fine">Showing the first 50 workspaces.</p>' : ""}` : "";
   const welcome = prev && !values ? `<div class="callout info">${cxIcon("redo")}<div><strong>Welcome back.</strong> Your earlier connection${prev.label ? ` \u201C${esc(prev.label)}\u201D` : ""} (${esc(cxDate(prev.created_at))}) ${prev.projects.length ? "has its name and access already picked" : "has its name already filled in"}. Adjust anything below.</div></div>` : "";
@@ -362,8 +364,8 @@ function cxGrantPage(d, email, projects, prev, consent, values = null, error = "
 ${clientFacts(d)}${welcome}${cxErr(error)}
 <form method="post" action="/authorize" class="grant"><input type="hidden" name="handle" value="${esc(consent.handle)}"><input type="hidden" name="step" value="grant">${CX_ENTER}
 ${nameField}
-<section class="sec"><h2>Projects</h2><p class="note">Optional. You can connect now and share projects later in Connections.</p>${groups.length > 1 ? `<p class="fine one-ws">Pick projects from one workspace. To share another workspace, connect again.</p>` : ""}${rows}
-<h3 class="sub">${cxIcon("plus")}${rows ? "Or create a project" : "Create a project to share"}</h3>${wsPick}${fresh}${homePick}</section>
+<section class="sec"><h2>Projects</h2><p class="note">Optional. You can connect now and share projects later in Connections.</p>${groups.length > 1 ? `<p class="fine one-ws">Pick projects from one workspace. To share another workspace, connect again.</p>` : ""}${homePick}${rows}
+<h3 class="sub">${cxIcon("plus")}${rows ? "Or create a project" : "Create a project to share"}</h3>${wsPick}${fresh}</section>
 ${replace}
 <p class="fine"><strong>Read</strong>: view documents and files (images, PDFs, videos) and their history, and download files. <strong>Edit</strong>: also create and change documents, and upload new files and new versions of files. Comments, trash and settings are never shared.</p>
 ${cxBar('<span class="count"><span class="some"><b class="n"></b> selected</span><span class="none">No projects yet \u2014 you can share projects later in Connections</span></span>')}</form>`), consent.headers, status);

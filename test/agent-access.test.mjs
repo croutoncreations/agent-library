@@ -156,7 +156,8 @@ test("consent workspace picker: shown to people in more than one workspace; zero
   let page = "";
   await h.connectMcpAgent({}, { clientName: "Team home", onConsent: (html) => { page = html; }, extra: { label: "Team home", connect_workspace: WS } });
   assert.match(page, /Workspace for this connection/);
-  assert.match(page, new RegExp(`<option value="wsp_${ownerId}" selected>Personal</option>`), "Personal is the default");
+  assert.match(page, new RegExp(`<option value="wsp_${ownerId}" selected>Personal</option>`), "Personal (which has projects) is the default");
+  assert.ok(page.indexOf("Workspace for this connection") < page.indexOf("Or create a project"), "the picker sits above the create section, not at the bottom");
   assert.equal((await connection("Team home")).workspace_id, WS);
   // Picking projects decides the workspace; the picker is ignored.
   await h.connectMcpAgent({ [A]: "read" }, { clientName: "Picked wins", extra: { label: "Picked wins", connect_workspace: WS } });
@@ -349,6 +350,7 @@ test("Connections page: name, host, project chips, Edit projects, Rename and Dis
     // Edit projects: only projects of the connection's workspace; Read & edit on Alpha, Read on Beta.
     await click("Edit projects");
     await page.waitForSelector(`${card} .scope-row`);
+    assert.doesNotMatch(await text(), /\bnull\b/, "the editor prints no stray null");
     const rows = await page.$$eval(`${card} .scope-row .scope-name`, (els) => els.map((e) => e.textContent));
     assert.ok(rows.includes("Alpha") && rows.includes("Beta") && !rows.includes("Bob project"), rows.join());
     const offLabels = await page.$$eval(`${card} .scope-row select`, (els) => els[0].options[0].textContent);
