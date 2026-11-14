@@ -335,4 +335,4 @@ async function cleanupChanges(env) {
   return result;
 }
 
-export { chQuery, cleanupChanges, listChanges };
+export { chKinds, chQuery, cleanupChanges, listChanges };

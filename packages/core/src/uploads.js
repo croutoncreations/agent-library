@@ -5,6 +5,7 @@ import { CONTENT_TYPE, MEASUREMENTS, checkFile, spreadsheetSafeCsv } from "./for
 import { __name } from "./runtime.js";
 import { FILE_BYTES_CEILING, explainLimit, fileTooLarge, guardSql, projectLimitGuard } from "./limits.js";
 import { BINARY_TYPES, IMAGE_TYPES, VIDEO_TYPES, appConnectEnabled, assertWritable, audit, idemLookup, loadArtifact, mdBody, provenance, publishRevision, requireAppConnect, servedContentType, textCreateMetadata } from "./service.js";
+import { RV_PLACEHOLDER, rvGateUpload, rvGatedActor, rvNewCap, rvNewGated, rvResolveRev } from "./review/service.js";
 import { TEXT_MAX_BYTES } from "./text-limits.js";
 import { HttpError, int, nowIso, nowMs, randomId, sha256Hex, str } from "./util.js";
 
@@ -22,7 +23,9 @@ var quotaUsedSql = (now) => `(SELECT COALESCE(SUM(size),0) FROM revisions WHERE 
        AND (state IN ('receiving','sealed') OR (state IN ('pending','received') AND expires_at > ${Math.trunc(now)})))
   + (SELECT COALESCE(SUM(expected_size),0) FROM uploads WHERE project_id = ?1 AND ${BINARY_UPLOAD_SQL}
        AND (state IN ('failed','conflict') OR (state IN ('pending','received') AND expires_at <= ${Math.trunc(now)}))
-       AND (staging_purged_at IS NULL OR (final_key IS NOT NULL AND final_purged_at IS NULL)))`;
+       AND (staging_purged_at IS NULL OR (final_key IS NOT NULL AND final_purged_at IS NULL)))
+  + (SELECT COALESCE(SUM(size),0) FROM (SELECT DISTINCT blob_key, size FROM proposals pq WHERE project_id = ?1 AND blob_key IS NOT NULL AND blob_purged_at IS NULL AND status IN ('pending','approving')
+       AND NOT EXISTS (SELECT 1 FROM revisions rq WHERE rq.blob_key = pq.blob_key)))`;
 // From the first deployed text-upload version, text staging_purged_at is set only after final_purged_at (raw input purged).
 async function purgeStaging(env, u) {
   try {
@@ -38,7 +41,7 @@ async function dropUnpublished(env, uploadId, finalKey) {
   const publishedText = await env.DB.prepare("SELECT 1 AS x FROM uploads WHERE id = ? AND state = 'published' AND mime IN ('text/markdown','text/html','application/json','text/csv') AND final_writes = 0 AND final_purged_at IS NULL").bind(uploadId).first("x");
   // Published text uses body_key, never this raw input key. Failed/conflicting uploads retain the binary reference guard.
   if (!publishedText) {
-    const idle = await env.DB.prepare("SELECT 1 AS x FROM uploads u WHERE id = ? AND state IN ('failed','conflict') AND final_writes = 0 AND final_purged_at IS NULL AND NOT EXISTS (SELECT 1 FROM revisions r WHERE r.blob_key = u.final_key)").bind(uploadId).first("x");
+    const idle = await env.DB.prepare("SELECT 1 AS x FROM uploads u WHERE id = ? AND state IN ('failed','conflict') AND final_writes = 0 AND final_purged_at IS NULL AND NOT EXISTS (SELECT 1 FROM revisions r WHERE r.blob_key = u.final_key) AND NOT EXISTS (SELECT 1 FROM proposals pr WHERE pr.blob_key = u.final_key)").bind(uploadId).first("x");
     if (!idle) return;
   }
   await deleteBlob(env, finalKey);
@@ -78,7 +81,9 @@ async function uploadBegin(ctx, projectId, input, key, { allowText = false, allo
   if (kind && size > TEXT_MAX_BYTES) throw new HttpError(413, "too_large", kind === "markdown" ? "Markdown exceeds 10 MiB" : kind === "html" ? "HTML exceeds 10 MiB" : `${kind} file exceeds 10 MiB`);
   // Workspace limits (limits.js): file size, storage (the reservation counts as used until it publishes or is
   // released) and, for a new file, its placeholder document counts toward the project's items.
-  const adds = input.artifact_id ? { storage_bytes: size } : { storage_bytes: size, items_per_project: 1 };
+  // A new document an agent creates where review is required is hidden until approved and takes no item slot yet.
+  const gatedNew = !input.artifact_id && await rvNewGated(ctx, projectId, kind ?? "binary");
+  const adds = input.artifact_id || gatedNew ? { storage_bytes: size } : { storage_bytes: size, items_per_project: 1 };
   const lg = await projectLimitGuard(ctx.env, projectId, adds);
   if (!kind && size > lg.limits.file_bytes) throw fileTooLarge(lg.limits.file_bytes);
   const sha2 = str(input.sha256, "sha256", 64);
@@ -89,7 +94,7 @@ async function uploadBegin(ctx, projectId, input, key, { allowText = false, allo
     if (input.artifact_id) {
       if (input.title !== void 0 || input.folder !== void 0 || input.folder_id !== void 0) throw new HttpError(400, "invalid_input", "Pass title and optional create metadata for a new document, or artifact_id and expected_revision for a new version");
       targetId = str(input.artifact_id, "artifact_id", 64);
-      int(input.expected_revision, "expected_revision", 1);
+      int(input.expected_revision, "expected_revision", 0); // 0: an agent's own new document while it waits for review (checked against the document below)
     } else {
       if (input.expected_revision !== void 0) throw new HttpError(400, "invalid_input", "Pass title and optional create metadata for a new document, or artifact_id and expected_revision for a new version");
       metadata = await textCreateMetadata(ctx, projectId, input, kind);
@@ -102,7 +107,7 @@ async function uploadBegin(ctx, projectId, input, key, { allowText = false, allo
   const prior = await idemLookup(ctx, i);
   if (prior) return prior;
   if (targetId) {
-    target = await loadArtifact(ctx, projectId, targetId);
+    target = await loadArtifact(ctx, projectId, targetId, { pendingOk: rvGatedActor(ctx) });
     assertWritable(ctx, target, "content");
     if (target.kind !== kind) throw new HttpError(400, "invalid_input", "mime must match the existing document kind");
     if (input.schema !== void 0 && (input.schema == null ? null : String(input.schema)) !== target.schema_id) throw new HttpError(400, "invalid_input", "schema must match the existing document schema");
@@ -111,23 +116,30 @@ async function uploadBegin(ctx, projectId, input, key, { allowText = false, allo
   const limits = limitsFor(ctx.env);
   let artifactId;
   let baseRev;
+  let reviewMeta = null;
   const stmts = [];
   const azBase = authzSql(ctx, projectId);
   const cw = kind && target ? contentWriteSql(ctx, target.id) : { sql: "1", params: [] };
   const az = { sql: `${azBase.sql} AND ${cw.sql}`, params: [...azBase.params, ...cw.params] };
   if (input.artifact_id) {
     artifactId = str(input.artifact_id, "artifact_id", 64);
-    const a = target ?? await loadArtifact(ctx, projectId, artifactId);
+    const a = target ?? await loadArtifact(ctx, projectId, artifactId, { pendingOk: rvGatedActor(ctx) });
     assertWritable(ctx, a, "content");
     if (!kind && a.kind !== "binary") throw new HttpError(400, "invalid_input", "Not a binary artifact");
-    baseRev = int(input.expected_revision, "expected_revision", 1);
+    // 0: an agent's own new file while it waits for review.
+    baseRev = int(input.expected_revision, "expected_revision", a.pending_review === 1 ? 0 : 1);
   } else {
     const title = metadata?.title ?? str(input.title, "title", 200, { min: 1 });
     artifactId = randomId("art");
     baseRev = 0;
-    stmts.push(db2(ctx).prepare(`INSERT INTO artifacts (id, project_id, kind, title, folder, folder_id, schema_id, head_rev, created_at, updated_at)
-      SELECT ?, ?, ?, ?, ?, ?, ?, 0, ?, ? WHERE ${az.sql} AND ${lg.sql}
-      AND (? IS NULL OR EXISTS (SELECT 1 FROM folders WHERE id = ? AND project_id = ?))`).bind(artifactId, projectId, kind ?? "binary", title, metadata?.folder ?? str(input.folder, "folder", 200, { optional: true }), metadata?.folderId ?? null, metadata?.schema ?? null, nowIso(), nowIso(), ...az.params, ...lg.params, metadata?.folderId ?? null, metadata?.folderId ?? null, projectId));
+    const folder = metadata?.folder ?? str(input.folder, "folder", 200, { optional: true });
+    if (gatedNew) {
+      await rvNewCap(ctx, projectId);
+      reviewMeta = JSON.stringify({ title, folder, folder_id: metadata?.folderId ?? null });
+    }
+    stmts.push(db2(ctx).prepare(`INSERT INTO artifacts (id, project_id, kind, title, folder, folder_id, schema_id, head_rev, created_at, updated_at, review_mode, pending_review)
+      SELECT ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ? WHERE ${az.sql} AND ${lg.sql}
+      AND (? IS NULL OR EXISTS (SELECT 1 FROM folders WHERE id = ? AND project_id = ?))`).bind(artifactId, projectId, kind ?? "binary", gatedNew ? RV_PLACEHOLDER : title, gatedNew ? "" : folder, gatedNew ? null : metadata?.folderId ?? null, metadata?.schema ?? null, nowIso(), nowIso(), gatedNew ? "required" : "off", gatedNew ? 1 : 0, ...az.params, ...lg.params, metadata?.folderId ?? null, metadata?.folderId ?? null, projectId));
   }
   const uploadId = randomId("upl", 18);
   const expires = nowMs() + limits.uploadTtlMs;
@@ -158,6 +170,8 @@ async function uploadBegin(ctx, projectId, input, key, { allowText = false, allo
       SELECT ?, ?, ?, ?, ?, 201, ?, ? WHERE ${gate}`).bind(ctx.principal.id, projectId, i.op, i.key, i.digest, JSON.stringify(body2), nowIso(), uploadId),
     audit(ctx, projectId, "upload.begin", artifactId, baseRev, "ok", gate, [uploadId])
   );
+  // Title and folder of a gated new document, held until upload_finish turns the upload into its first proposal.
+  if (reviewMeta) stmts.push(db2(ctx).prepare("UPDATE uploads SET review_meta = ? WHERE id = ?").bind(reviewMeta, uploadId));
   const res = await db2(ctx).batch(stmts).catch(async (e) => {
     const p = await idemLookup(ctx, i);
     if (p) return p;
@@ -198,7 +212,7 @@ async function uploadPut(req, env, requestId, uploadId, linkCtx, { projectId, ra
   const textKind = Object.hasOwn(TEXT_UPLOAD_KINDS, u.mime) ? TEXT_UPLOAD_KINDS[u.mime] : null;
   if (textKind) {
     if (textKind === "json" || textKind === "csv") requireAppConnect(ctx);
-    assertWritable(ctx, await loadArtifact(ctx, u.project_id, u.artifact_id, { allowUnpublished: u.base_rev === 0 }), "content");
+    assertWritable(ctx, await loadArtifact(ctx, u.project_id, u.artifact_id, { allowUnpublished: u.base_rev === 0, pendingOk: rvGatedActor(ctx) }), "content");
   }
   const azBase = authzSql(ctx, u.project_id);
   const cw = textKind ? contentWriteSql(ctx, u.artifact_id) : { sql: "1", params: [] };
@@ -439,7 +453,7 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
     const sha2 = check.sha256;
     if (kind) {
       if (kind === "json" || kind === "csv") requireAppConnect(ctx);
-      const a = await loadArtifact(ctx, projectId, u.artifact_id, { allowUnpublished: u.base_rev === 0 });
+      const a = await loadArtifact(ctx, projectId, u.artifact_id, { allowUnpublished: u.base_rev === 0, pendingOk: rvGatedActor(ctx) });
       assertWritable(ctx, a, "content");
       if (a.kind !== kind) throw new HttpError(400, "invalid_input", "mime must match the existing document kind");
       if (textFinishSlot && textFinishSlot.until > nowMs()) throw new HttpError(503, "text_finish_busy", "Another text upload is being finalized on this server; retry the finish request shortly with the same idempotency key", { retry_after_seconds: 1 });
@@ -470,6 +484,16 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
     const ok2 = { artifact_id: u.artifact_id, revision: u.base_rev + 1, revision_id: revId, sha256: sha2, size };
     const gate = "EXISTS (SELECT 1 FROM revisions WHERE id = ?)";
     try {
+      // Where review is required for this agent the verified bytes become a proposal instead of a version.
+      const gated = await rvGateUpload(ctx, projectId, u, i, { ...kind ? { body: text } : { blobKey: finalKey }, size, sha256: sha2, mime: u.mime }, { sql: fenced, params: [uploadId, token] }, token);
+      if (gated) {
+        releaseTextFinishSlot();
+        if (!gated.body?.idempotent_replay) {
+          if (kind) await dropUnpublished(ctx.env, uploadId, finalKey).catch(() => {});
+          await purgeStaging(ctx.env, u);
+        }
+        return gated;
+      }
       const res = await publishRevision(
         ctx,
         projectId,
@@ -513,7 +537,7 @@ async function uploadFinish(ctx, projectId, uploadId, key) {
 async function serveContent(ctx, req, projectId, artifactId, revParam) {
   await authorizeProject(ctx, projectId, false);
   const a = await loadArtifact(ctx, projectId, artifactId);
-  const revNo = revParam ? int(Number(revParam), "rev", 1) : a.head_rev;
+  const revNo = revParam === "reviewed" ? await rvResolveRev(ctx, a, "reviewed") : revParam ? int(Number(revParam), "rev", 1) : a.head_rev;
   const r = await db2(ctx).prepare("SELECT * FROM revisions WHERE artifact_id = ? AND project_id = ? AND rev_no = ?").bind(artifactId, projectId, revNo).first();
   if (!r) throw new HttpError(404, "not_found", "Revision not found");
   const sp = new URL(req.url).searchParams;

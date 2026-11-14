@@ -81,6 +81,9 @@ const NOW_MS = "CAST(strftime('%s','now') AS INTEGER) * 1000";
 /** Bytes stored: every revision (text and files) plus reservations in flight (uploads). */
 export const usageSql = {
   storage_bytes: (ws) => `((SELECT COALESCE(SUM(size), 0) FROM revisions WHERE project_id IN (${PROJECTS_OF(ws)}))
+    + (SELECT COALESCE(SUM(size), 0) FROM proposals pq WHERE pq.project_id IN (${PROJECTS_OF(ws)}) AND pq.status IN ('pending','approving') AND pq.blob_purged_at IS NULL
+         AND COALESCE(pq.body_key, pq.blob_key) IS NOT NULL
+         AND NOT EXISTS (SELECT 1 FROM revisions rq WHERE rq.body_key = COALESCE(pq.body_key, pq.blob_key) OR rq.blob_key = COALESCE(pq.body_key, pq.blob_key)))
     + (SELECT COALESCE(SUM(expected_size), 0) FROM uploads WHERE project_id IN (${PROJECTS_OF(ws)})
          AND (state IN ('receiving','sealed') OR (state IN ('pending','received') AND expires_at > ${NOW_MS}))))`,
   projects: (ws) => `(SELECT COUNT(*) FROM (${LIVE_PROJECTS_OF(ws)}))`,
@@ -94,7 +97,8 @@ export const usageSql = {
     + (SELECT COUNT(*) FROM grants g WHERE g.project_id IN (${LIVE_PROJECTS_OF(ws)}) AND g.revoked_at IS NULL AND g.expires_at > ${NOW_MS}))`,
   owned_workspaces: (who) => `(SELECT COUNT(*) FROM workspaces w WHERE w.created_by = ${who} AND w.personal = 0 AND w.status <> 'deleting')`,
   // Per project (the expression is a project id): documents and files, including trashed ones and upload placeholders.
-  items_per_project: (pj) => `(SELECT COUNT(*) FROM artifacts WHERE project_id = ${pj} AND publisher_id IS NULL)`
+  // Hidden new documents (waiting for their first review, pending_review = 1) do not count until approved.
+  items_per_project: (pj) => `(SELECT COUNT(*) FROM artifacts WHERE project_id = ${pj} AND publisher_id IS NULL AND pending_review = 0)`
 };
 // The id each usage expression is evaluated over: the project for items_per_project, else the workspace.
 const scopeOf = (k, workspaceId, projectId) => k === "items_per_project" ? projectId : workspaceId;

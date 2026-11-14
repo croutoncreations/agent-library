@@ -29,6 +29,7 @@ import { acceptInvite, createInvite, createWorkspace, deleteWorkspace, listMembe
 import { __name } from "./runtime.js";
 import { IMAGE_TYPES, VIDEO_TYPES, addComment, appConnectEnabled, chQuery, cleanupChanges, createFile, createFolder, createFromTemplate, createGrant, createMarkdown, createProject, updateProject, diffRevisions, getArtifact, history, listArtifacts, listAudit, listChanges, listComments, listFolders, listGrants, listProjects, listTemplates, metaHistory, previewTemplate, readRecords, readTextChunk, requireAppConnect, restoreMetadata, restoreRevision, rsQuery, rsReady, rtQuery, saveAsTemplate, saveFile, saveMarkdown, searchArtifacts, updateGrant, updateMetadata } from "./service.js";
 import { APP_CSS, APP_HTML, APP_JS } from "./ui.js";
+import { applyReviewSettings, getReviewSettings, listProposals, listReviewGrants, readProposal, reviewProposal, reviewQueue, reviewRevision, serveProposalContent, setReviewGrant, setReviewMode, setReviewSettings, withdrawProposal } from "./review/service.js";
 import { serveContent, uploadBegin, uploadFinish, uploadPut } from "./uploads.js";
 import { HttpError, errorBody, errorLogFields, idemKey, json, nowIso, nowMs, randomId, readTextCapped, sha256Hex, str } from "./util.js";
 
@@ -235,6 +236,9 @@ async function route3(req, env, url, requestId, seen = {}) {
     if (seg.length === 2 && m === "PUT") return json(await updateAppClient(ctx, str(seg[1], "app", 64), await body(req)));
     throw new HttpError(404, "not_found", "Not found");
   }
+  if (seg[0] === "review-queue" && seg.length === 1 && m === "GET") return json(await reviewQueue(ctx));
+  if (seg[0] === "review-grants" && seg.length === 1 && m === "GET") return json(await listReviewGrants(ctx));
+  if (seg[0] === "review-grants" && seg.length === 1 && m === "PUT") return json(await setReviewGrant(ctx, await body(req)));
   if (seg[0] === "publishers" && seg.length === 3 && seg[2] === "revoke" && m === "POST") return json(await revokePublisher(ctx, str(seg[1], "publisher", 64)));
   if (seg[0] !== "projects") return extraRoute(req, env, url, requestId, ctx);
   if (seg.length === 1) {
@@ -266,6 +270,14 @@ async function route3(req, env, url, requestId, seen = {}) {
     await listGrants(ctx, pid);
     return json(await reconcileUploads(env, { projectId: pid, limit: 100 }));
   }
+  if (rest[0] === "proposals" && rest.length === 1 && m === "GET") return json(await listProposals(ctx, pid, { artifact_id: url.searchParams.get("artifact_id"), status: url.searchParams.get("status"), cursor: url.searchParams.get("cursor") }));
+  if (rest[0] === "proposals" && rest.length === 2 && m === "GET") return json(await readProposal(ctx, pid, rest[1], { contentPath: `/api/projects/${pid}/proposals/${rest[1]}/content` }));
+  if (rest[0] === "proposals" && rest.length === 3 && rest[2] === "content" && (m === "GET" || m === "HEAD")) return serveProposalContent(ctx, req, pid, rest[1]);
+  if (rest[0] === "proposals" && rest.length === 3 && rest[2] === "withdraw" && m === "POST") return out(await withdrawProposal(ctx, pid, rest[1], key()));
+  if (rest[0] === "proposals" && rest.length === 3 && rest[2] === "review" && m === "POST") return out(await reviewProposal(ctx, pid, rest[1], await body(req), key()));
+  if (rest[0] === "review-settings" && rest.length === 1 && m === "GET") return json(await getReviewSettings(ctx, pid));
+  if (rest[0] === "review-settings" && rest.length === 1 && m === "PUT") return json(await setReviewSettings(ctx, pid, await body(req)));
+  if (rest[0] === "review-settings" && rest[1] === "apply" && rest.length === 2 && m === "POST") return json(await applyReviewSettings(ctx, pid, await body(req)));
   if (rest[0] === "templates" && rest.length === 1) {
     if (m === "GET") return json(await listTemplates(ctx, pid, { cursor: url.searchParams.get("cursor"), limit: url.searchParams.get("limit") }));
     if (m === "POST") return out(await saveAsTemplate(ctx, pid, await body(req), key()));
@@ -293,7 +305,7 @@ async function route3(req, env, url, requestId, seen = {}) {
     const sub = rest[2];
     const revQ = url.searchParams.get("rev");
     if (!sub && m === "GET") {
-      const r = await getArtifact(ctx, pid, aid, revQ ? Number(revQ) : void 0);
+      const r = await getArtifact(ctx, pid, aid, revQ === "reviewed" ? "reviewed" : revQ ? Number(revQ) : void 0);
       return json(r, 200, { etag: `"${r.revision.sha256}"` });
     }
     if (!sub && m === "PUT") return out(appConnectEnabled(env) ? await saveFile(ctx, pid, aid, await body(req, TEXT_WRITE_BODY_BYTES), key()) : await saveMarkdown(ctx, pid, aid, await body(req, TEXT_WRITE_BODY_BYTES), key()));
@@ -339,6 +351,8 @@ async function route3(req, env, url, requestId, seen = {}) {
     if (sub === "meta-history" && m === "GET") return json(await metaHistory(ctx, pid, aid, false, url.searchParams.get("cursor") ?? void 0));
     if (sub === "meta-restore" && m === "POST") return out(await restoreMetadata(ctx, pid, aid, await body(req), key()));
     if (sub === "restore" && m === "POST") return out(await restoreRevision(ctx, pid, aid, await body(req), key()));
+    if (sub === "review-mode" && rest.length === 3 && m === "PUT") return json(await setReviewMode(ctx, pid, aid, await body(req)));
+    if (sub === "revisions" && rest.length === 5 && rest[4] === "review" && m === "POST") return out(await reviewRevision(ctx, pid, aid, Number(rest[3]), await body(req), key()));
     if (sub === "comments" && m === "GET") return json(await listComments(ctx, pid, aid, url.searchParams.get("cursor") ?? void 0));
     if (sub === "comments" && m === "POST") return out(await addComment(ctx, pid, aid, await body(req), key()));
   }

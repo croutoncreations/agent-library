@@ -6,7 +6,9 @@ import { appOrigin, artifactWebUrl, previewWebUrl } from "../links.js";
 import { renderMarkdown } from "../markdown.js";
 import { rtReadAuthzSql } from "../reads/service.js";
 import { audit, db, folderCheck, idemInsert, idemLookup, mdBody, runBatch } from "../service.js";
-import { HttpError, idemKey, int, nowIso, randomId, sha256Hex, str } from "../util.js";import { explainLimit, projectLimitGuard } from "../limits.js";
+import { HttpError, idemKey, int, nowIso, randomId, sha256Hex, str } from "../util.js";
+import { explainLimit, projectLimitGuard } from "../limits.js";
+import { rvCreateNew, rvNewGated } from "../review/service.js";
 
 
 // Project-scoped Markdown starting content. Template identity and copy provenance are immutable;
@@ -79,6 +81,10 @@ async function tplCopy(ctx, projectId, input, key, definition = false) {
   const project = await db(ctx).prepare("SELECT title FROM projects WHERE id = ?").bind(projectId).first();
   if (!definition) tplDate(date, src.body.includes("{{date}}"));
   const body = mdBody(definition ? src.body : tplReplace(src.body, title, project.title, date));
+  // A gated agent's copy is a hidden document with a proposal until a reviewer approves it.
+  if (!definition && await rvNewGated(ctx, projectId, "markdown"))
+    return rvCreateNew(ctx, projectId, "markdown", { title, folder, folderId, body, mime: "text/markdown", sha256: await sha256Hex(body), size: new TextEncoder().encode(body).length }, i, { change_note: note },
+      { cols: ["source_artifact_id", "source_revision", "source_role", "template_date"], vals: [sourceId, revision, "template", date] }, { source_template_id: sourceId, source_template_revision: revision, date });
   const id = randomId("art"), rid = randomId("rev"), now = nowIso(), hash = await sha256Hex(body);
   const az = authzSql(ctx, projectId);
   // All writes share this fence inside a single serialized D1 transaction. The idempotency insert is first,
@@ -164,4 +170,4 @@ function tplTools(oauth = false) {
   ];
 }
 
-export { createFromTemplate, listTemplates, previewTemplate, saveAsTemplate, tplAssertMaintenance, tplDate, tplProvenance, tplTools };
+export { createFromTemplate, listTemplates, previewTemplate, saveAsTemplate, tplAssertMaintenance, tplDate, tplDenyPublisher, tplProvenance, tplTools };

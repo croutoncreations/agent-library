@@ -1,6 +1,7 @@
 import { deleteBlob, TEXT_WRITE_STALE_MS } from "./content-store.js";
 import { limitsFor } from "./auth.js";
 import { nowMs } from "./util.js";
+import { rvPurge } from "./review/service.js";
 
 var EXPIRED = JSON.stringify({ status: 410, code: "upload_expired", message: "Upload expired" });
 var CRASHED = JSON.stringify({ status: 500, code: "finish_abandoned", message: "Upload finish did not complete" });
@@ -52,7 +53,7 @@ async function reconcileUploads(env, opts = {}) {
     await purgeStagingRow(u);
   }
   const fi = await DB.prepare(`SELECT id, final_key FROM uploads u WHERE final_key IS NOT NULL AND final_purged_at IS NULL AND state IN ('failed','conflict') AND (final_writes = 0 OR expires_at <= ?)
-      AND NOT EXISTS (SELECT 1 FROM revisions r WHERE r.blob_key = u.final_key)${pf.replace("project_id", "u.project_id")} LIMIT ?`).bind(stale, ...pp, limit).all();
+      AND NOT EXISTS (SELECT 1 FROM revisions r WHERE r.blob_key = u.final_key) AND NOT EXISTS (SELECT 1 FROM proposals pr WHERE pr.blob_key = u.final_key)${pf.replace("project_id", "u.project_id")} LIMIT ?`).bind(stale, ...pp, limit).all();
   for (const u of fi.results) {
     await deleteBlob(env, u.final_key);
     const r = await DB.prepare("UPDATE uploads SET final_purged_at = ?, final_writes = 0 WHERE id = ? AND final_purged_at IS NULL").bind(now, u.id).run();
@@ -64,7 +65,7 @@ async function reconcileUploads(env, opts = {}) {
   // Second delete of ended uploads' final keys, 1 to 3 hours after the first: R2 can't abort a put whose body fully
   // arrived, so an abandoned put that commits after the first purge is removed here (deletes of absent keys are free).
   const late = await DB.prepare(`SELECT final_key FROM uploads u WHERE final_key IS NOT NULL AND state IN ('failed','conflict')
-      AND final_purged_at BETWEEN ? AND ? AND NOT EXISTS (SELECT 1 FROM revisions r WHERE r.blob_key = u.final_key)${pf.replace("project_id", "u.project_id")} LIMIT ?`)
+      AND final_purged_at BETWEEN ? AND ? AND NOT EXISTS (SELECT 1 FROM revisions r WHERE r.blob_key = u.final_key) AND NOT EXISTS (SELECT 1 FROM proposals pr WHERE pr.blob_key = u.final_key)${pf.replace("project_id", "u.project_id")} LIMIT ?`)
     .bind(now - 3 * 36e5, now - 36e5, ...pp, limit).all().catch(() => ({ results: [] }));
   for (const u of late.results) await deleteBlob(env, u.final_key).catch(() => {
   });
@@ -74,6 +75,8 @@ async function reconcileUploads(env, opts = {}) {
     return 0;
   });
   await sweepContentWrites(env, { projectId: opts.projectId, limit });
+  // Bytes of proposals closed more than 30 days ago (review gating).
+  await rvPurge(env, now, limit, opts.projectId ?? null).catch(() => console.error(JSON.stringify({ event: "proposal_purge_failed" })));
   // rate_counters.win is a minute number. Only past windows are deleted: longer counters (hosted daily email caps) use
   // the minute their period ends, so keep this "older than" and never delete future windows.
   await DB.prepare("DELETE FROM rate_counters WHERE win < ?").bind(Math.floor(now / 6e4) - 2).run();
@@ -156,7 +159,7 @@ async function sweepContentWrites(env, { projectId, limit = 50 } = {}) {
   const rows = await env.DB.prepare(`SELECT key FROM content_writes WHERE created_at < ?${projectId ? " AND project_id = ?" : ""} ORDER BY created_at LIMIT ?`)
     .bind(cutoff, ...projectId ? [projectId] : [], limit).all();
   for (const { key } of rows.results) {
-    const referenced = await env.DB.prepare("SELECT 1 FROM revisions WHERE body_key = ? UNION ALL SELECT 1 FROM comments WHERE body_key = ? LIMIT 1").bind(key, key).first();
+    const referenced = await env.DB.prepare("SELECT 1 FROM revisions WHERE body_key = ? UNION ALL SELECT 1 FROM comments WHERE body_key = ? UNION ALL SELECT 1 FROM proposals WHERE body_key = ? LIMIT 1").bind(key, key, key).first();
     if (!referenced) await deleteBlob(env, key);
     await env.DB.prepare("DELETE FROM content_writes WHERE key = ? AND created_at < ?").bind(key, cutoff).run();
   }

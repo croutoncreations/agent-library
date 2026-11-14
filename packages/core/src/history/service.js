@@ -240,4 +240,4 @@ async function restoreMetadata(ctx, projectId, artifactId, input, key) {
   }, key, { restoredFrom: from });
 }
 
-export { diffRevisions, historyPage, lineDiff, metaBaselineInsert, metaHistory, metaVersionInsert, provenance, restoreMetadata };
+export { diffRevisions, historyPage, lineDiff, metaBaselineInsert, metaHistory, metaVersionInsert, provenance, restoreMetadata, whoLabel };

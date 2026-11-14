@@ -6,6 +6,7 @@ import { appOrigin, artifactWebUrl, previewWebUrl, projectWebUrl } from "../link
 import { addressLinksResponse, projectPaths, resolveProjectRef } from "../paths.js";
 import { __name } from "../runtime.js";
 import { RT_KINDS_ALL, RT_KINDS_DOCS, appConnectEnabled, chQuery, connectionInfo, createFile, createFolder, createFromTemplate, createMarkdown, diffRevisions, getArtifact, history, listArtifacts, listChanges, listFolders, listTemplates, metaHistory, readRecords, readTextChunk, requireAppConnect, restoreMetadata, restoreRevision, rsQuery, rtQuery, saveFile, saveMarkdown, searchArtifacts } from "../service.js";
+import { listProposals, readProposal, reviewProposal, reviewRevision, serveProposalContent, withdrawProposal } from "../review/service.js";
 import { serveContent, uploadBegin, uploadFinish, uploadPut } from "../uploads.js";
 import { HttpError, errorBody, idemKey, int, json, randomId } from "../util.js";
 
@@ -16,6 +17,11 @@ var R2 = {
   search: /^\/v1\/search$/,
   projects: /^\/v1\/projects$/,
   changes: new RegExp(`^/v1/projects/${SEG}/changes$`),
+  proposals: new RegExp(`^/v1/projects/${SEG}/proposals$`),
+  proposal: new RegExp(`^/v1/projects/${SEG}/proposals/${SEG}$`),
+  proposalContent: new RegExp(`^/v1/projects/${SEG}/proposals/${SEG}/content$`),
+  proposalAction: new RegExp(`^/v1/projects/${SEG}/proposals/${SEG}/(withdraw|review)$`),
+  revisionReview: new RegExp(`^/v1/projects/${SEG}/files/${SEG}/revisions/([0-9]{1,9})/review$`),
   templates: new RegExp(`^/v1/projects/${SEG}/templates$`),
   templateCreate: new RegExp(`^/v1/projects/${SEG}/files/from-template$`),
   files: new RegExp(`^/v1/projects/${SEG}/files$`),
@@ -89,7 +95,7 @@ var P1_FIELDS = ["id", "project_id", "kind", "title", "folder", "tags", "revisio
 function fileView2(origin, a, env) {
   const base = appConnectEnabled(env) ? a : Object.fromEntries(P1_FIELDS.map((k) => [k, a[k]]));
   const linkable = appConnectEnabled(env) ? ["markdown", "html", "json", "csv"].includes(a.kind) : a.kind === "markdown" || a.kind === "html";
-  return { ...base, ...a.is_template ? { is_template: true, template_description: a.template_description } : {}, ...a.source ? { source: a.source } : {}, ...origin ? { web_url: artifactWebUrl(origin, a.project_id, a.id), ...linkable ? { preview_url: previewWebUrl(origin, a.project_id, a.id) } : {} } : {} };
+  return { ...base, ...a.review ? { review: a.review } : {}, ...a.is_template ? { is_template: true, template_description: a.template_description } : {}, ...a.source ? { source: a.source } : {}, ...origin ? { web_url: artifactWebUrl(origin, a.project_id, a.id), ...linkable ? { preview_url: previewWebUrl(origin, a.project_id, a.id) } : {} } : {} };
 }
 __name(fileView2, "fileView");
 function withLinks(origin, pid, r) {
@@ -142,6 +148,35 @@ async function route2(req, env, url, requestId, seen = {}) {
     if (m !== "GET") throw new HttpError(405, "method_not_allowed", "Method not allowed");
     return json(await listChanges(projectCtx(env,k,requestId,g[1]),g[1],chQuery(url.searchParams)));
   }
+  if (g = R2.proposals.exec(path)) {
+    if (m !== "GET") throw new HttpError(405, "method_not_allowed", "Method not allowed");
+    const pid = g[1];
+    return json(await listProposals(projectCtx(env, k, requestId, pid), pid, { artifact_id: url.searchParams.get("artifact_id"), status: url.searchParams.get("status"), cursor: url.searchParams.get("cursor") }));
+  }
+  if (g = R2.proposal.exec(path)) {
+    if (m !== "GET") throw new HttpError(405, "method_not_allowed", "Method not allowed");
+    const [, pid, prp] = g;
+    return json(await readProposal(projectCtx(env, k, requestId, pid), pid, prp, { contentPath: `/v1/projects/${pid}/proposals/${prp}/content` }));
+  }
+  if (g = R2.proposalContent.exec(path)) {
+    if (m !== "GET" && m !== "HEAD") throw new HttpError(405, "method_not_allowed", "Method not allowed");
+    const [, pid, prp] = g;
+    return serveProposalContent(projectCtx(env, k, requestId, pid), new Request(`${url.origin}${url.pathname}`, { method: m, headers: req.headers }), pid, prp);
+  }
+  if (g = R2.proposalAction.exec(path)) {
+    if (m !== "POST") throw new HttpError(405, "method_not_allowed", "Method not allowed");
+    const [, pid, prp, action] = g;
+    const key = idemKey(req.headers.get("idempotency-key"));
+    if (action === "withdraw") writeAllowed(k, pid);
+    const r = action === "withdraw" ? await withdrawProposal(projectCtx(env, k, requestId, pid), pid, prp, key) : await reviewProposal(projectCtx(env, k, requestId, pid), pid, prp, await readJson(req), key);
+    return json(r.body, r.status);
+  }
+  if (g = R2.revisionReview.exec(path)) {
+    if (m !== "POST") throw new HttpError(405, "method_not_allowed", "Method not allowed");
+    const [, pid, fid, n] = g;
+    const r = await reviewRevision(projectCtx(env, k, requestId, pid), pid, fid, Number(n), await readJson(req), idemKey(req.headers.get("idempotency-key")));
+    return json(r.body, r.status);
+  }
   if (g = R2.templates.exec(path)) {
     if (m !== "GET") throw new HttpError(405, "method_not_allowed", "Method not allowed");
     const pid = g[1];
@@ -186,7 +221,7 @@ async function route2(req, env, url, requestId, seen = {}) {
     const [, pid, fid] = g;
     if (m === "GET") {
       const revQ = url.searchParams.get("revision");
-      const r = await getArtifact(projectCtx(env, k, requestId, pid), pid, fid, revQ !== null ? int(Number(revQ), "revision", 1) : void 0);
+      const r = await getArtifact(projectCtx(env, k, requestId, pid), pid, fid, revQ === "reviewed" ? "reviewed" : revQ !== null ? int(Number(revQ), "revision", 1) : void 0);
       const { content_url: _drop, artifact, ...rest } = r;
       return json({
         ...rest,

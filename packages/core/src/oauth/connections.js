@@ -109,6 +109,7 @@ async function revokeConnection(ctx, projectId, connectionId) {
   const r = await ctx.env.DB.prepare(`UPDATE oauth_connections AS c SET revoked_at = ? WHERE id = ? AND ${MANAGE} AND revoked_at IS NULL
       AND EXISTS (SELECT 1 FROM oauth_connection_projects cp WHERE cp.connection_id = c.id AND cp.project_id = ?)`).bind(nowMs(), connectionId, ctx.principal.id, ctx.principal.id, projectId).run();
   if (!r.meta.changes) throw new HttpError(404, "not_found", "Active connection not found");
+  await ctx.env.DB.prepare("DELETE FROM review_grants WHERE path_kind = 'oauth' AND path_id = ?").bind(connectionId).run();
   await ctx.env.DB.prepare("INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id) VALUES (?, ?, ?, 'oauth.revoke', ?, 'ok', ?)").bind(nowIso(), ctx.principal.id, projectId, connectionId, ctx.requestId).run();
   const env = ctx.env;
   let kv = "skipped";

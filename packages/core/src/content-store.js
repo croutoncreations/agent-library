@@ -187,7 +187,7 @@ export async function dropUnreferencedBlobs(env, keys) {
   let unreferenced;
   try {
     unreferenced = (await env.DB.prepare(`SELECT j.value AS key FROM json_each(?) j
-      WHERE NOT EXISTS (SELECT 1 FROM revisions WHERE blob_key = j.value)`).bind(JSON.stringify(keys)).all()).results.map((r) => r.key);
+      WHERE NOT EXISTS (SELECT 1 FROM revisions WHERE blob_key = j.value) AND NOT EXISTS (SELECT 1 FROM proposals WHERE blob_key = j.value)`).bind(JSON.stringify(keys)).all()).results.map((r) => r.key);
   } catch {
     console.error(JSON.stringify({ event: "backup_cleanup_skipped", count: keys.length, reason: "reference_query_failed" }));
     return;
@@ -302,7 +302,7 @@ export async function stageTextWrites(env, writes) {
 
 /** Include in the same transaction that references the immutable key. */
 export function textWriteComplete(env, key) {
-  return env.DB.prepare("DELETE FROM content_writes WHERE key = ? AND (EXISTS (SELECT 1 FROM revisions WHERE body_key = ?) OR EXISTS (SELECT 1 FROM comments WHERE body_key = ?))").bind(key, key, key);
+  return env.DB.prepare("DELETE FROM content_writes WHERE key = ? AND (EXISTS (SELECT 1 FROM revisions WHERE body_key = ?) OR EXISTS (SELECT 1 FROM comments WHERE body_key = ?) OR EXISTS (SELECT 1 FROM proposals WHERE body_key = ?))").bind(key, key, key, key);
 }
 
 // The sweep age must stay well above the publish deadline: an intent eligible for deletion can never publish.
@@ -316,7 +316,7 @@ export function isTextWriteFenceError(error) {
 
 /**
  * Atomic publication fence (the text-write deadline) and best-effort disposal of staged text objects known not to
- * have published: the cleanup deletes only keys that no revision or comment refers to. A slice that publishes text or
+ * have published: the cleanup deletes only keys that no revision, comment or proposal refers to. A slice that publishes text or
  * objects some other way must extend that check.
  */
 export async function commitTextWrites(env, keys, commit) {
@@ -346,7 +346,8 @@ export async function commitTextWrites(env, keys, commit) {
       try {
         const unreferenced = await env.DB.prepare(`SELECT j.value AS key FROM json_each(?) j
           WHERE NOT EXISTS (SELECT 1 FROM revisions WHERE body_key = j.value)
-            AND NOT EXISTS (SELECT 1 FROM comments WHERE body_key = j.value)`).bind(JSON.stringify(keys)).all();
+            AND NOT EXISTS (SELECT 1 FROM comments WHERE body_key = j.value)
+            AND NOT EXISTS (SELECT 1 FROM proposals WHERE body_key = j.value)`).bind(JSON.stringify(keys)).all();
         const orphanKeys = unreferenced.results.map(r => r.key);
         if (orphanKeys.length) {
           await deleteBlobs(env, orphanKeys);

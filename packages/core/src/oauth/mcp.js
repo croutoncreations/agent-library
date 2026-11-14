@@ -8,6 +8,8 @@ import { SCOPES, liveConnection } from "./server.js";
 import { __name } from "../runtime.js";
 import { FILE_BYTES_CEILING } from "../limits.js";
 import { BINARY_TYPES, IMAGE_TYPES, RS_SCHEMA, RT_ID_TOO_LONG, RT_KINDS_ALL, RT_KINDS_DOCS, appConnectEnabled, connectionInfo, createMarkdown, db, diffRevisions, getArtifact, history, listArtifacts, listChanges, loadArtifact, provenance, readRecords, readTextChunk, restoreMetadata, restoreRevision, rsToolReady, rtChunkLimit, rtFit, rtIdBytes, saveMarkdown, searchArtifacts, tplTools } from "../service.js";
+import { RV_REVIEWED_ARG, rvReviewedArgs, rvTools } from "../review/tools.js";
+import { rvAnyReview, rvGatedActor, serveProposalContent } from "../review/service.js";
 import { TEXT_UPLOAD_KINDS, UPLOAD_BEGIN_DESCRIPTION, UPLOAD_FINISH_DESCRIPTION, serveContent, uploadBegin, uploadBeginFields, uploadFinish, uploadPut } from "../uploads.js";
 import { CHANGE_NOTE_SCHEMA, HttpError, errorBody, errorLogFields, idemKey, json, mcpClientInfo, nowIso, nowMs, randomId, readTextCapped, rememberClientInfo, sha256Hex, str } from "../util.js";
 
@@ -70,12 +72,14 @@ async function handleOAuthMcp(req, env, ctx) {
   if (rtLim?.idTooLong) return reply(RT_ID_TOO_LONG, 400);
   const pv = req.headers.get("mcp-protocol-version");
   if (pv && !SUPPORTED.includes(pv)) return reply(rpcErr(null, -32600, "Unsupported protocol version"), 400);
+  const rvListReview = msg.method === "tools/list" && await rvAnyReview(env, "oauth", conn.id);
   const searchReady = await rsToolReady(env,msg);
   const tool = msg.method === "tools/call" ? ftToolsFor(env, conn).filter(t => t.name !== "search_artifacts" || searchReady).find((t) => t.name === msg.params?.name) : void 0;
   if (tool?.write && !tokenScopes.has(SCOPES.write)) return insufficientScope(ctx.auth, [SCOPES.read, SCOPES.write]);
   try {
-    rateBudget = await agentRate(env, conn.workspace_id ?? `wsp_${conn.owner_principal_id}`, !!tool?.write);
-    await rateLimit(env, `${tool?.write ? "w" : "r"}:oauth:${conn.id}`, rateBudget);
+    // Reviews use the write bucket too.
+    rateBudget = await agentRate(env, conn.workspace_id ?? `wsp_${conn.owner_principal_id}`, !!(tool?.write || tool?.review));
+    await rateLimit(env, `${tool?.write || tool?.review ? "w" : "r"}:oauth:${conn.id}`, rateBudget);
   } catch (e) {
     if (!(e instanceof HttpError) || e.status !== 429) throw e;
     return ftRateLimited(msg, tool, !!tool?.write, e, rtLim, rateBudget);
@@ -94,7 +98,7 @@ async function handleOAuthMcp(req, env, ctx) {
     case "ping":
       return reply(rpc(msg.id, {}));
     case "tools/list":
-      return reply(rpc(msg.id, { tools: ftToolsFor(env, conn).filter((t) => (t.name !== "search_artifacts" || searchReady) && (anyWrite || !t.write)).map(({ name, title, description, inputSchema, annotations }) => ({
+      return reply(rpc(msg.id, { tools: ftToolsFor(env, conn).filter((t) => (t.name !== "search_artifacts" || searchReady) && (anyWrite || !t.write) && (!t.review || rvListReview)).map(({ name, title, description, inputSchema, annotations }) => ({
         name,
         title,
         description: WEB_URL_OUTPUT_SCHEMAS[name] ? description + WEB_URL_TOOL_NOTE : description,
@@ -185,6 +189,7 @@ RW = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openW
 TOOLS = [
   { name: "connection_info", title: "Check connection access", description: "Identify this authenticated connection and its current effective project access. No document reads or writes. Compare the safe ID in Connections.", inputSchema: S({}, []), annotations: RO, write: false },
   ...tplTools(true),
+  ...rvTools(true, () => ({ ttlMs: FT_DOWNLOAD_TTL_MS, inlineBytes: FT_INLINE_IMAGE_BYTES, base64: ftBase64, blocksKey: FT_BLOCKS })),
   { name: "list_changes", title: "List project changes", description: "Poll published changes in one explicit project. WITHOUT cursor establishes a current checkpoint and returns NO history (initialized=true). Store next_cursor; follow has_more, then poll again. At-least-once: deduplicate by event_id. Cursors expire after 30 days; checkpoint BEFORE reconciling current content. Publishers excluded. No bodies or push notifications.", inputSchema: S({ project_id: { type: "string", maxLength: 110, description: "Project ID or path (workspace/project)" }, cursor: { type: "string", maxLength: 2048 }, limit: { type: "integer", minimum: 1, maximum: 50 } }, ["project_id"]), annotations: RO, write: false, run: (c,p,a) => listChanges(c,p,a) },
   { name: "search_artifacts", title: "Search library", description: "Ranked lexical search across currently readable projects. All words must match stored title/text; punctuation separates words. Returns bounded plain-text excerpts and revision-pinned links. Live pagination expires after 15 minutes.", inputSchema: RS_SCHEMA, annotations: RO, write: false, run: (c, p, a) => searchArtifacts(c,a,"mcp") },
   {
@@ -219,10 +224,11 @@ TOOLS = [
     name: "read_artifact",
     title: "Read document",
     description: "Read a Markdown or HTML document (current or a given revision). Returns body (source text), kind, revision and sha256. For long documents pass max_bytes (4096-524288) to get one bounded chunk, then pass next_cursor until eof: every chunk comes from the same version (revision + sha256), so concurrent edits never mix in; a revision_changed error means start again. Chunks return text, offset, content_bytes, eof and next_cursor.",
-    inputSchema: S({ project_id: P, artifact_id: A, revision: { type: "integer", minimum: 1 }, cursor: RT_CURSOR, max_bytes: RT_MAXB }, ["artifact_id"]),
+    inputSchema: S({ project_id: P, artifact_id: A, revision: { type: "integer", minimum: 1 }, reviewed: RV_REVIEWED_ARG, cursor: RT_CURSOR, max_bytes: RT_MAXB }, ["artifact_id"]),
     annotations: RO,
     write: false,
     run: async (c, p, a) => {
+      a = await rvReviewedArgs(c, p, a);
       if (a.cursor != null || a.max_bytes != null) return readTextChunk(c, p, a.artifact_id, { revision: a.revision, cursor: a.cursor, maxBytes: a.max_bytes, encoding: "mcp", kinds: appConnectEnabled(c.env) ? RT_KINDS_ALL : RT_KINDS_DOCS });
       const r = await getArtifact(c, p, a.artifact_id, a.revision);
       if ((r.artifact.kind === "json" || r.artifact.kind === "csv") && appConnectEnabled(c.env)) {
@@ -289,11 +295,11 @@ TOOLS = [
     name: "save_markdown",
     title: "Edit document",
     description: "Save a new revision of a Markdown or HTML document (the format is kept). expected_revision must be the revision you read; on revision_conflict re-read and merge. Every save is kept as an immutable version the owner can compare and restore. Always set change_note to one line on why you made the change; the owner reads it in History. For large Markdown or HTML that will not fit a tool request, use upload_begin \u2192 HTTP PUT raw UTF-8 \u2192 upload_finish, if those tools are available and you can make HTTP requests.",
-    inputSchema: S({ project_id: P, artifact_id: A, expected_revision: { type: "integer", minimum: 1 }, body: { type: "string" }, change_note: NOTE, idempotency_key: K }, ["artifact_id", "expected_revision", "body", "idempotency_key"]),
+    inputSchema: S({ project_id: P, artifact_id: A, expected_revision: { type: "integer", minimum: 0, description: "The revision you read (0 to revise your own new document while it waits for review)" }, body: { type: "string" }, change_note: NOTE, idempotency_key: K }, ["artifact_id", "expected_revision", "body", "idempotency_key"]),
     annotations: RW,
     write: true,
     run: async (c, p, a) => {
-      const cur = await getArtifact(c, p, a.artifact_id);
+      const cur = { artifact: await loadArtifact(c, p, a.artifact_id, { pendingOk: rvGatedActor(c) }) };
       if (cur.artifact.kind !== "markdown" && cur.artifact.kind !== "html") throw new HttpError(415, "unsupported_kind", "Only Markdown and HTML documents can be edited");
       return unwrap(await saveMarkdown(c, p, a.artifact_id, { expected_revision: a.expected_revision, body: a.body, change_note: a.change_note }, idemKey(a.idempotency_key)));
     }
@@ -435,7 +441,7 @@ async function ftUploadBegin(c, p, a, opts = {}) {
   const uc = await ftUploadCtx(c, true);
   const key = idemKey(a.idempotency_key);
   if (!isNew) {
-    const cur = await loadArtifact(c, p, str(a.artifact_id, "artifact_id", 64));
+    const cur = await loadArtifact(c, p, str(a.artifact_id, "artifact_id", 64), { pendingOk: rvGatedActor(c) });
     // Text versions go to documents of the same kind (checked by uploadBegin); everything else to files only.
     if (!textKind && cur.kind !== "binary") throw new HttpError(415, "unsupported_kind", "Not a file; use save_markdown for documents");
     // Fail early on a stale revision, except when retrying a begin that already succeeded (it replays below).
@@ -538,7 +544,7 @@ function ftUploadBeginTool(appConnect) {
       folder: { type: "string", maxLength: 200, description: f.folder },
       ...f.appConnect,
       artifact_id: { ...A, description: f.artifact_id },
-      expected_revision: { type: "integer", minimum: 1, description: "Current revision of artifact_id" },
+      expected_revision: { type: "integer", minimum: 0, description: "Current revision of artifact_id (0 for your own new file while it waits for review)" },
       mime: { ...f.mime, enum: f.mimeTypes },
       size: f.size,
       sha256: { type: "string", pattern: "^[0-9a-f]{64}$", description: "SHA-256 of the bytes, lowercase hex" },
@@ -592,7 +598,7 @@ function ftToolsFor(env, conn) {
         title: { type: "string", minLength: 1, maxLength: 200, description: "Title of a new file" },
         folder: { type: "string", maxLength: 200 },
         artifact_id: { ...A, description: "File to add a new version to" },
-        expected_revision: { type: "integer", minimum: 1, description: "Current revision of artifact_id" },
+        expected_revision: { type: "integer", minimum: 0, description: "Current revision of artifact_id (0 for your own new file while it waits for review)" },
         mime: { type: "string", enum: Object.keys(BINARY_TYPES) },
         content_base64: { type: "string", maxLength: FT_INLINE_B64_MAX + 4, contentEncoding: "base64", description: "The file's bytes, standard base64" },
         change_note: NOTE,
@@ -636,6 +642,7 @@ function ftToolsFor(env, conn) {
         description: "Read a document (Markdown, HTML, JSON, CSV: returns its text, revision and sha256) or a file (image, PDF, video: same result as read_file), current or a given revision.",
         inputSchema: S({ ...t.inputSchema.properties, include_image: { type: "boolean", description: "For images: return them inline (default true)" } }, t.inputSchema.required),
         run: async (c, p, a) => {
+          a = await rvReviewedArgs(c, p, a);
           const { include_image: _x, ...rest } = a;
           try {
             return await t.run(c, p, rest);
@@ -681,6 +688,7 @@ async function handleFileTransfer(req, env, url) {
     };
     if (kind === "download") {
       await rateLimit(env, `dl:oauth:${conn.id}`, 300);
+      if (row.proposal_id) return await serveProposalContent({ ...ctx, ftConn: conn }, req, row.project_id, row.proposal_id);
       return await serveContent(ctx, req, row.project_id, row.artifact_id, String(row.rev_no));
     }
     if (!canWrite) throw new HttpError(403, "forbidden", "This connection is read-only for this project");

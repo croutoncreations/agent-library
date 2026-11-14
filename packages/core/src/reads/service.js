@@ -2,6 +2,7 @@ import { getTextRange } from "../content-store.js";
 import { authorizeProject, credentialGate } from "../auth.js";
 import { db } from "../service.js";
 import { HttpError, int, nowMs } from "../util.js";
+import { rvReviewedRev } from "../review/service.js";
 
 // ---------- revision-pinned chunked text reads (docs/chunked-reads.md) ----------
 // One shared implementation for every transport (OAuth MCP, legacy /mcp, /v1, browser API). A read returns at most
@@ -85,12 +86,13 @@ function rtEncodedSize(result, mcp, idBytes) {
 // Query-string options for the HTTP routes (?revision=&cursor=&max_bytes=).
 function rtQuery(sp) {
   const n = (k) => sp.get(k) === null ? void 0 : Number(sp.get(k));
-  return { revision: n("revision"), cursor: sp.get("cursor") ?? void 0, maxBytes: n("max_bytes") };
+  return { revision: sp.get("revision") === "reviewed" ? "reviewed" : n("revision"), cursor: sp.get("cursor") ?? void 0, maxBytes: n("max_bytes") };
 }
 async function readTextChunk(ctx, projectId, artifactId, opts = {}) {
   await authorizeProject(ctx, projectId, false);
   const mcp = opts.encoding === "mcp";
   const maxBytes = opts.maxBytes === void 0 || opts.maxBytes === null ? RT_DEFAULT_MAX : int(opts.maxBytes, "max_bytes", RT_MIN_MAX, RT_MAX_MAX);
+  if (opts.revision === "reviewed") opts = { ...opts, revision: await rvReviewedRev(ctx, projectId, artifactId) };
   let rev = opts.revision === void 0 || opts.revision === null ? null : int(opts.revision, "revision", 1);
   let pin = null;
   if (opts.cursor !== void 0 && opts.cursor !== null) {

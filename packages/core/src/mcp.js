@@ -4,6 +4,8 @@ import { addressLinks, resolveProjectRef } from "./paths.js";
 import { __name } from "./runtime.js";
 import { RS_SCHEMA, RT_ID_TOO_LONG, addComment, appConnectEnabled, auditDenied, createMarkdown, diffRevisions, getArtifact, history, legacyConnectionInfo, listArtifacts, listChanges, listComments, listProjects, provenance, readTextChunk, restoreMetadata, restoreRevision, rsToolReady, rtChunkLimit, rtFit, rtIdBytes, saveMarkdown, searchArtifacts, tplTools, updateMetadata } from "./service.js";
 import { TEXT_UPLOAD_KINDS, UPLOAD_BEGIN_DESCRIPTION, UPLOAD_FINISH_DESCRIPTION, uploadBegin, uploadBeginFields, uploadFinish } from "./uploads.js";
+import { RV_REVIEWED_ARG, rvReviewedArgs, rvTools } from "./review/tools.js";
+import { rvAnyReview } from "./review/service.js";
 import { CHANGE_NOTE_SCHEMA, HttpError, idemKey, mcpClientInfo, readTextCapped, rememberClientInfo } from "./util.js";
 
 var SUPPORTED2 = ["2025-11-25", "2025-06-18", "2025-03-26"];
@@ -15,6 +17,7 @@ var unwrap2 = /* @__PURE__ */ __name((r) => r && typeof r.status === "number" &&
 var TOOLS2 = [
   { name: "connection_info", description: "Identify this authenticated grant and current project access. Read-only; compare the safe ID in Connections.", inputSchema: S2({}, []), annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }, run: (c) => legacyConnectionInfo(c) },
   ...tplTools(false),
+  ...rvTools(false),
   { name: "list_changes", description: "Poll published changes in one explicit project. WITHOUT cursor establishes a current checkpoint and returns NO history (initialized=true). Store next_cursor; follow has_more, then poll again. At-least-once: deduplicate by event_id. Cursors expire after 30 days; checkpoint BEFORE reconciling current content. Publishers excluded. No bodies or push notifications.", inputSchema: S2({ project_id: { type: "string", maxLength: 110, description: "Project ID or path (workspace/project)" }, cursor: { type: "string", maxLength: 2048 }, limit: { type: "integer", minimum: 1, maximum: 50 } }, ["project_id"]), run: (c,a) => listChanges(c,a.project_id,a) },
   { name: "search_artifacts", description: "Ranked lexical search of currently readable projects, with excerpts and revision-pinned links. All words must match. Live pagination.", inputSchema: RS_SCHEMA, annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }, run: (c,a) => searchArtifacts(c,a,"mcp") },
   { name: "list_projects", description: "List projects this identity may access.", inputSchema: S2({}, []), run: (c) => listProjects(c) },
@@ -27,8 +30,8 @@ var TOOLS2 = [
   {
     name: "read_artifact",
     description: "Read an artifact's current (or given) revision. Markdown returns body; binaries return metadata and an authenticated content_url. For long documents pass max_bytes (4096-524288) to get one bounded chunk, then pass next_cursor until eof: every chunk comes from the same version (revision + sha256), so concurrent edits never mix in; a revision_changed error means start again.",
-    inputSchema: S2({ project_id: P2, artifact_id: A2, revision: { type: "integer" }, cursor: { type: "string", maxLength: 512 }, max_bytes: { type: "integer", minimum: 4096, maximum: 524288 } }, ["project_id", "artifact_id"]),
-    run: (c, a) => a.cursor != null || a.max_bytes != null ? readTextChunk(c, a.project_id, a.artifact_id, { revision: a.revision, cursor: a.cursor, maxBytes: a.max_bytes, encoding: "mcp" }) : getArtifact(c, a.project_id, a.artifact_id, a.revision)
+    inputSchema: S2({ project_id: P2, artifact_id: A2, revision: { type: "integer" }, reviewed: RV_REVIEWED_ARG, cursor: { type: "string", maxLength: 512 }, max_bytes: { type: "integer", minimum: 4096, maximum: 524288 } }, ["project_id", "artifact_id"]),
+    run: async (c, a0) => { const a = await rvReviewedArgs(c, a0.project_id, a0); return a.cursor != null || a.max_bytes != null ? readTextChunk(c, a.project_id, a.artifact_id, { revision: a.revision, cursor: a.cursor, maxBytes: a.max_bytes, encoding: "mcp" }) : getArtifact(c, a.project_id, a.artifact_id, a.revision); }
   },
   {
     name: "artifact_history",
@@ -165,7 +168,7 @@ async function handleMcp(req, env, requestId, origin) {
   if (msg.id === void 0) return new Response(null, { status: 202 });
   const rtLim = rtChunkLimit(msg);
   if (rtLim?.idTooLong) return new Response(JSON.stringify(RT_ID_TOO_LONG), { status: 400, headers: hdr });
-  const MUTATING = /* @__PURE__ */ new Set(["create_markdown", "save_markdown", "add_comment", "upload_begin", "upload_finish", "trash_artifact", "restore_revision", "restore_metadata", "create_from_template"]);
+  const MUTATING = /* @__PURE__ */ new Set(["create_markdown", "save_markdown", "add_comment", "upload_begin", "upload_finish", "trash_artifact", "restore_revision", "restore_metadata", "create_from_template", "withdraw_proposal", "review_proposal", "review_revision"]);
   try {
     await enforceRate(ctx, msg.method === "tools/call" && MUTATING.has(msg.params?.name));
   } catch (e) {
@@ -174,6 +177,8 @@ async function handleMcp(req, env, requestId, origin) {
   }
   const reply = (body2) => new Response(rtFit(body2, rtLim), { status: 200, headers: hdr });
   const searchReady = await rsToolReady(env,msg);
+  // Review tools are listed only to a connection that was allowed to review.
+  const rvListReview = msg.method === "tools/list" && !!ctx.grant?.id && await rvAnyReview(env, "grant", ctx.grant.id);
   switch (msg.method) {
     case "initialize": {
       const want = msg.params?.protocolVersion;
@@ -188,7 +193,7 @@ async function handleMcp(req, env, requestId, origin) {
     case "ping":
       return reply(rpc2(msg.id, {}));
     case "tools/list":
-      return reply(rpc2(msg.id, { tools: legacyTools(env).filter(t => (t.name !== "search_artifacts" || searchReady) && (!t.write || !!ctx.grant?.can_write)).map(({ name, description, inputSchema, annotations }) => ({
+      return reply(rpc2(msg.id, { tools: legacyTools(env).filter(t => (t.name !== "search_artifacts" || searchReady) && (!t.write || !!ctx.grant?.can_write) && (!t.review || rvListReview)).map(({ name, description, inputSchema, annotations }) => ({
         annotations,
         name,
         description: WEB_URL_OUTPUT_SCHEMAS[name] ? description + WEB_URL_TOOL_NOTE : description,

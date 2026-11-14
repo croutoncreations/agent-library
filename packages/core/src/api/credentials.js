@@ -2,6 +2,7 @@ import { requireHuman } from "../auth.js";
 import { ROLE_RANK, memberRoleSql, projectRole, workspaceRoleSql, readOnlyError } from "../tenancy.js";
 import { HttpError, NEVER_EXPIRES_AT, cutLists, nowIso, nowMs, randomId, sha256Hex, str } from "../util.js";
 import { explainLimit, limitGuard, workspaceLimits } from "../limits.js";
+import { rvCarryReview } from "../review/service.js";
 
 
 // "never": expires_at = NEVER_EXPIRES_AT (the same far-future value as OAuth connections). A plan's
@@ -122,7 +123,9 @@ async function replaceApiKey(ctx, id, input) {
   if (!cur.results.length) throw new HttpError(409, "empty_scope", "Key has no projects left");
   // The new key belongs to whoever replaces it, so its scope is re-validated against their own role.
   const scope = await validateScope(ctx.env, ctx.principal.id, cur.results.map((r) => ({ project_id: r.project_id, access: r.can_write ? "read_write" : "read" })));
-  return insertKey(ctx, old.label, lifetime(input?.lifetime_days), scope, id);
+  const made = await insertKey(ctx, old.label, lifetime(input?.lifetime_days), scope, id);
+  await rvCarryReview(ctx.env, id, made.id);
+  return made;
 }
 async function setApiKeyScope(ctx, id, input) {
   requireHuman(ctx);
@@ -148,6 +151,7 @@ async function setApiKeyScope(ctx, id, input) {
     );
   await env.DB.batch([
     env.DB.prepare("DELETE FROM api_credential_projects WHERE credential_id = ?").bind(id),
+    env.DB.prepare("DELETE FROM review_grants WHERE path_kind = 'api_key' AND path_id = ? AND project_id NOT IN (SELECT value FROM json_each(?))").bind(id, JSON.stringify(scope.map((s) => s.project_id))),
     ...scope.map((s) => env.DB.prepare("INSERT INTO api_credential_projects (credential_id, project_id, can_write) VALUES (?, ?, ?)").bind(id, s.project_id, s.can_write ? 1 : 0)),
     ...scope.map((s) => auditStmt(env, ctx, s.project_id, "apikey.scope", id, s.can_write ? "ok:read_write" : "ok:read"))
   ]);
@@ -164,6 +168,7 @@ async function revokeApiKey(ctx, id) {
       SELECT ?, ?, NULL, 'apikey.revoke', ?, 'ok', ? WHERE EXISTS (SELECT 1 FROM api_credentials WHERE id = ? AND revoked_at = ?)`).bind(nowIso(), ctx.principal.id, id, ctx.requestId, id, at)
   ]);
   if (!r.meta.changes) throw new HttpError(409, "already_revoked", "Key already revoked");
+  await env.DB.prepare("DELETE FROM review_grants WHERE path_kind = 'api_key' AND path_id = ?").bind(id).run();
   return { ok: true };
 }
 async function verifyApiKey(env, authz) {

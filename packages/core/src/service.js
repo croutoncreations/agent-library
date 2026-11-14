@@ -13,6 +13,8 @@ import { ROLE_RANK, memberRoleSql, personalWorkspaceId, projectRole, workspaceRo
 import { HttpError, b64url, cutLists, int, nowIso, nowMs, randomId, sha256Hex, str } from "./util.js";
 import { checkSlug, ensureHandle, ensureSlug, projectPaths, slugify } from "./paths.js";
 import { explainLimit, limitGuard, projectLimitGuard } from "./limits.js";
+import { RV_ART_COLS } from "./review/sql.js";
+import { rvArtifactReview, rvCreateNew, rvDecorateHistory, rvGateContent, rvGateMeta, rvGatedActor, rvNewGated, rvOwnPending, rvResolveRev } from "./review/service.js";
 
 function requireAppConnect(ctx) {
   if (!appConnectEnabled(ctx.env)) throw new HttpError(404, "not_found", "Not found");
@@ -53,6 +55,7 @@ async function runBatch(ctx, stmts, i) {
     return await db(ctx).batch(stmts);
   } catch (e) {
     if (isTextWriteFenceError(e)) throw e;
+    if (/review_required/.test(String(e?.message ?? e))) throw new HttpError(409, "review_mode_changed", "Review settings of this document changed; read it again and retry");
     if (/UNIQUE|PRIMARY KEY|constraint/i.test(String(e?.message ?? e))) {
       const prior = await idemLookup(ctx, i);
       if (prior) return prior;
@@ -208,12 +211,15 @@ async function updateGrant(ctx, projectId, grantId, input) {
     res = await db(ctx).prepare("UPDATE grants SET can_write = ? WHERE id = ? AND project_id = ? AND revoked_at IS NULL").bind(input.can_write ? 1 : 0, grantId, projectId).run();
   } else throw new HttpError(400, "invalid_input", "Specify revoke:true or can_write");
   if (!res.meta.changes) throw new HttpError(404, "not_found", "Active grant not found");
+  if (input.revoke) await db(ctx).prepare("DELETE FROM review_grants WHERE path_kind = 'grant' AND path_id = ?").bind(grantId).run();
   await audit(ctx, projectId, input.revoke ? "grant.revoke" : "grant.update", grantId, null, "ok").run();
   return { ok: true };
 }
 async function loadArtifact(ctx, projectId, artifactId, opts = {}) {
   const a = await db(ctx).prepare(`SELECT ${ART_COLS} FROM artifacts a WHERE a.id = ? AND a.project_id = ?`).bind(artifactId, projectId).first();
-  if (!a || a.head_rev === 0 && !opts.allowUnpublished) throw new HttpError(404, "not_found", "Artifact not found");
+  if (!a || a.head_rev === 0 && !opts.allowUnpublished && !(opts.pendingOk && a.pending_review === 1)) throw new HttpError(404, "not_found", "Artifact not found");
+  // A hidden new document (waiting for its first review) exists only for the agent that proposed it.
+  if (a.pending_review === 1 && !(opts.pendingOk && await rvOwnPending(ctx, a))) throw new HttpError(404, "not_found", "Artifact not found");
   if (a.trashed_at && !opts.allowTrashed) throw new HttpError(404, "not_found", "Artifact not found");
   return a;
 }
@@ -247,7 +253,7 @@ async function getArtifact(ctx, projectId, artifactId, revNo) {
   // People get their effective access with the document, so the UI never renders write controls it must take back.
   const access = ctx.principal.kind === "human" ? await projectRole(ctx.env, ctx.principal.id, projectId) : null;
   const a = await loadArtifact(ctx, projectId, artifactId);
-  const rev = await db(ctx).prepare("SELECT * FROM revisions WHERE artifact_id = ? AND project_id = ? AND rev_no = ?").bind(artifactId, projectId, revNo ?? a.head_rev).first();
+  const rev = await db(ctx).prepare("SELECT * FROM revisions WHERE artifact_id = ? AND project_id = ? AND rev_no = ?").bind(artifactId, projectId, await rvResolveRev(ctx, a, revNo)).first();
   if (!rev) throw new HttpError(404, "not_found", "Revision not found");
   return {
     artifact: { ...artifactView(a, appConnectEnabled(ctx.env)), ...await tplProvenance(ctx, projectId, a) },
@@ -259,7 +265,7 @@ async function getArtifact(ctx, projectId, artifactId, revNo) {
 async function history(ctx, projectId, artifactId, opts = {}) {
   await authorizeProject(ctx, projectId, false);
   await loadArtifact(ctx, projectId, artifactId, { allowTrashed: ctx.principal.kind === "human" });
-  return historyPage(ctx, projectId, artifactId, opts);
+  return rvDecorateHistory(ctx, projectId, artifactId, await historyPage(ctx, projectId, artifactId, opts));
 }
 function mdFits(text) {
   return text.length <= LIMITS.markdownBytes && new TextEncoder().encode(text).length <= LIMITS.markdownBytes;
@@ -331,6 +337,10 @@ async function createMarkdown(ctx, projectId, input, key, kind = "markdown", int
   const i = internal ? internal.idem : { op: "artifact.create", key, projectId, digest: await sha256Hex(JSON.stringify(digestParts)) };
   const prior = await idemLookup(ctx, i);
   if (prior) return prior;
+  if (!internal && await rvNewGated(ctx, projectId, kind)) {
+    const size = new TextEncoder().encode(body2).length;
+    return rvCreateNew(ctx, projectId, kind, { title, folder, folderId, schema, body: body2, mime, sha256: await sha256Hex(body2), size }, i, input);
+  }
   const artId = randomId("art");
   const revId = internal ? internal.revId : randomId("rev");
   const sha2 = await sha256Hex(body2);
@@ -365,6 +375,12 @@ async function createMarkdown(ctx, projectId, input, key, kind = "markdown", int
   return result;
 }
 async function publishRevision(ctx, projectId, artifactId, expected, i, rev, extra = [], action = "artifact.save") {
+  // Agents' edits of a required document become proposals (uploads are gated at finish, which passes a fence).
+  if (rvGatedActor(ctx) && !rev.fence) {
+    const ga = await db(ctx).prepare("SELECT * FROM artifacts WHERE id = ? AND project_id = ?").bind(artifactId, projectId).first();
+    const g = ga && await rvGateContent(ctx, projectId, ga, i, expected, rev);
+    if (g) return g;
+  }
   const revId = rev.revId ?? randomId("rev");
   const next = expected + 1;
   const azBase = authzSql(ctx, projectId);
@@ -437,7 +453,8 @@ async function publishRevision(ctx, projectId, artifactId, expected, i, rev, ext
 }
 async function saveMarkdown(ctx, projectId, artifactId, input, key) {
   await authorizeProject(ctx, projectId, true);
-  const expected = int(input.expected_revision, "expected_revision", 1);
+  // 0: an agent revising its own new document while it waits for review.
+  const expected = int(input.expected_revision, "expected_revision", 0);
   // An oversized body is refused after the document is loaded, so the message names its kind (HTML or Markdown); a
   // missing, wrong-kind or protected document answers that refusal instead. This function never hashes it (saveFile's
   // own early idempotency check may).
@@ -448,7 +465,7 @@ async function saveMarkdown(ctx, projectId, artifactId, input, key) {
     const prior = await idemLookup(ctx, i);
     if (prior) return prior;
   }
-  const a = await loadArtifact(ctx, projectId, artifactId);
+  const a = await loadArtifact(ctx, projectId, artifactId, { pendingOk: rvGatedActor(ctx) });
   if (a.kind !== "markdown" && a.kind !== "html") throw new HttpError(400, "invalid_input", "Not a Markdown or HTML document");
   assertWritable(ctx, a, "content");
   if (!fits) mdBody(body2, a.kind);
@@ -464,13 +481,13 @@ async function saveMarkdown(ctx, projectId, artifactId, input, key) {
 async function saveFile(ctx, projectId, artifactId, input, key) {
   if (!appConnectEnabled(ctx.env)) return saveMarkdown(ctx, projectId, artifactId, input, key);
   await authorizeProject(ctx, projectId, true);
-  const expected = int(input.expected_revision, "expected_revision", 1);
+  const expected = int(input.expected_revision, "expected_revision", 0);
   const text = input.body ?? input.content;
   if (typeof text === "string") {
     const prior = await idemLookup(ctx, { op: "artifact.save:" + artifactId, key, projectId, digest: await sha256Hex(JSON.stringify([expected, text])) });
     if (prior) return prior;
   }
-  const a = await loadArtifact(ctx, projectId, artifactId);
+  const a = await loadArtifact(ctx, projectId, artifactId, { pendingOk: rvGatedActor(ctx) });
   assertWritable(ctx, a, "content");
   if (a.kind === "markdown" || a.kind === "html") return saveMarkdown(ctx, projectId, artifactId, { expected_revision: input.expected_revision, body: text, change_note: input.change_note }, key);
   if (a.kind !== "json" && a.kind !== "csv") throw new HttpError(422, "unsupported_kind", "Binary files are replaced through uploads");
@@ -517,7 +534,7 @@ async function updateMetadata(ctx, projectId, artifactId, input, key, internal) 
   const i = { op: restoredFrom ? "artifact.meta_restore:" + artifactId : "artifact.meta:" + artifactId, key, projectId, digest: await sha256Hex(JSON.stringify(restoredFrom ? [expected, restoredFrom] : digestInput)) };
   const prior = await idemLookup(ctx, i);
   if (prior) return prior;
-  const a = await loadArtifact(ctx, projectId, artifactId, { allowTrashed: true });
+  const a = await loadArtifact(ctx, projectId, artifactId, { allowTrashed: true, pendingOk: rvGatedActor(ctx) });
   // Agents can't restore a trashed document's details (the trash takes it away from them). Checked after the
   // idempotency lookup, so a same-key retry of a restore that already succeeded still replays.
   if (restoredFrom && ctx.principal.kind !== "human" && a.trashed_at) throw new HttpError(404, "not_found", "Artifact not found");
@@ -534,6 +551,10 @@ async function updateMetadata(ctx, projectId, artifactId, input, key, internal) 
   let trashed = a.trashed_at;
   if (input.trashed === true) trashed = trashed ?? nowIso();
   if (input.trashed === false) trashed = null;
+  {
+    const g = await rvGateMeta(ctx, projectId, a, i, expected, input, { title, folder, tags }, restoredFrom);
+    if (g) return g;
+  }
   const az0 = authzSql(ctx, projectId), pr = protectSql(ctx, artifactId);
   const az = { sql: `${az0.sql} AND ${pr.sql}`, params: [...az0.params, ...pr.params] };
   const next = expected + 1;
@@ -784,8 +805,9 @@ artifactView = (a, appConnect = true) => ({
     schema: a.schema_id ?? null,
     publisher: a.publisher_id ? { id: a.publisher_id, display_name: a.pub_name ?? null, protected: true } : null,
     app_path: a.publisher_id ? a.export_name ?? null : null
-  } : {}
+  } : {},
+  ...rvArtifactReview(a)
 });
-ART_COLS = "a.*, (SELECT display_name FROM publishers WHERE id = a.publisher_id) AS pub_name";
+ART_COLS = "a.*, (SELECT display_name FROM publishers WHERE id = a.publisher_id) AS pub_name" + RV_ART_COLS;
 
 export { BINARY_TYPES, FOLDERS_PER_PROJECT, FOLDER_ROOM_SQL, IMAGE_TYPES, LIMITS, RS_SCHEMA, RT_ID_TOO_LONG, RT_KINDS_ALL, RT_KINDS_DOCS, VIDEO_TYPES, addComment, appConnectEnabled, assertWritable, audit, auditDenied, chQuery, cleanupChanges, connectionInfo, createFile, createFolder, createFromTemplate, createGrant, createMarkdown, createProject, updateProject, db, diffRevisions, folderCheck, folderName, getArtifact, history, idemInsert, idemLookup, legacyConnectionInfo, listArtifacts, listAudit, listChanges, listComments, listFolders, listGrants, listProjects, listTemplates, loadArtifact, textCreateMetadata, mdBody, metaHistory, previewTemplate, provenance, publishRevision, readRecords, readRecordsPage, readTextChunk, requireAppConnect, restoreMetadata, restoreRevision, rsQuery, rsReady, rsToolReady, rtChunkLimit, rtFit, rtIdBytes, rtQuery, rtReadAuthzSql, runBatch, saveAsTemplate, saveFile, saveMarkdown, searchArtifacts, servedContentType, tplDate, tplTools, tooManyFolders, updateGrant, updateMetadata };
