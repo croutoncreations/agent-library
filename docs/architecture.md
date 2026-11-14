@@ -151,7 +151,7 @@ Limits (sizes, counts, rate limits, upload TTLs, retention) have defaults and op
 
 ## Ranked search
 
-[Ranked search](ranked-search.md) adds a D1 FTS5 index over current published heads, live permission filtering, opaque query-bound pagination, a Home search view, `/api/search`, `/v1/search` and the `search_artifacts` MCP tool. Sources: `packages/core/src/search/`.
+[Ranked search](ranked-search.md) adds a contentless D1 FTS5 index (inverted index only: titles and text are not stored in D1; text lives in R2) over current published heads, written in the same batch as every change by one module (`search/indexing.js`) and rebuilt from R2 by the cron, live permission filtering, opaque query-bound pagination, a Home search view, `/api/search`, `/v1/search` and the `search_artifacts` MCP tool. Sources: `packages/core/src/search/`.
 
 ## Templates
 

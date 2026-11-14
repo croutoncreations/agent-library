@@ -278,6 +278,8 @@ test("new saves store only R2 keys, conflicts leave no orphan, search and backup
   other.sql.exec("DELETE FROM projects");
   await other.lib.restoreBackup(other.ctx, backup);
   assert.equal((await other.lib.getArtifact(other.ctx, "proj-s", id)).body, "quasarneedle café🙂");
+  assert.equal(hits(other.sql, 'quasarneedle'), 1, "restore indexes the restored head in the same batch");
+  assert.equal(other.sql.prepare("SELECT COUNT(*) AS n FROM artifact_search_missing").get().n, 0);
   assert.deepEqual((await other.lib.exportBackup(other.ctx, "proj-s")).revisions, backup.revisions);
 });
 

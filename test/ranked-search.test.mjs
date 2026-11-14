@@ -191,6 +191,15 @@ test('App Connect app file, unpublished heads, binary title-only results and liv
  const pub=await server.connectPublisher(app,{project_id:'search-notes',destination:'root'});
  const published=await fetch(`${server.api}/app/files/search-data.json`,{method:'PUT',body:JSON.stringify({note:'publicationneedle'}),headers:{authorization:`Bearer ${pub.access_token}`,'content-type':'application/json','if-none-match':'*','idempotency-key':'search-app-file-fixture'}});
  assert.equal(published.status,201,await published.text());assert.ok((await search({query:'publicationneedle',kind:'json'})).body.results.length>0);
+ // App Files replace and delete keep the index in step (the same batch as the write).
+ const appHeaders=(extra)=>({authorization:`Bearer ${pub.access_token}`,'content-type':'application/json',...extra});
+ const etag=published.headers.get('etag');assert.ok(etag);
+ const replaced=await fetch(`${server.api}/app/files/search-data.json`,{method:'PUT',body:JSON.stringify({note:'publicationreplaced'}),headers:appHeaders({'if-match':etag,'idempotency-key':'search-app-file-replace'})});
+ assert.equal(replaced.status,200,await replaced.text());
+ assert.equal((await search({query:'publicationneedle',kind:'json'})).body.results.length,0);assert.ok((await search({query:'publicationreplaced',kind:'json'})).body.results.length>0);
+ const removed=await fetch(`${server.api}/app/files/search-data.json`,{method:'DELETE',headers:appHeaders({'if-match':replaced.headers.get('etag'),'idempotency-key':'search-app-file-delete'})});
+ assert.equal(removed.status,200,await removed.text());
+ assert.equal((await search({query:'publicationreplaced',kind:'json'})).body.results.length,0);
  const id=await create('search-notes','unpublishedneedle','unpublishedneedle');
  await sql(`UPDATE artifacts SET head_rev=0,head_revision_id=NULL WHERE id='${id}';`);
  assert.equal((await search({query:'unpublishedneedle'})).body.results.length,0);
