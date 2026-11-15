@@ -625,10 +625,11 @@ test("OAuth host route allow-list: every non-OAuth path and method is 404/405, n
 });
 
 test("registration policy: any clean https or loopback callback registers; http, IPs, credentials and fragments are refused", async () => {
-  const r = await fetch(`${MCP}/oauth/register`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ client_name: "Some agent", redirect_uris: ["https://agent.example/cb"], token_endpoint_auth_method: "none" }) });
+  const r = await fetch(`${MCP}/oauth/register`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ client_name: "Some agent", redirect_uris: ["https://agent.example.com/cb"], token_endpoint_auth_method: "none" }) });
   assert.equal(r.status, 201, "an unknown hosted agent can connect (the consent page warns)");
   for (const bad of ["http://agent.example/cb", "https://10.0.0.5/cb", "https://[::1]/cb", "https://user:pw@agent.example/cb", "https://agent.example/cb#x",
-    "https://agent.example/a/../cb", "https://AGENT.example/cb", "https://agent.example", "https://localhost/cb", "ftp://agent.example/cb", "https://agent.example/" + "a".repeat(600)]) {
+    "https://agent.example/a/../cb", "https://AGENT.example/cb", "https://agent.example", "https://localhost/cb", "ftp://agent.example/cb", "https://agent.example/" + "a".repeat(600),
+    "https://app.localhost/cb", "https://printer.local/cb", "https://vault.internal/cb", "https://agent.example:0/cb", "https://agent.example/cb?error=1", "https://agent.example/cb?code=x"]) {
     const e = await fetch(`${MCP}/oauth/register`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ client_name: "x", redirect_uris: [bad], token_endpoint_auth_method: "none" }) });
     assert.equal(e.status, 400, bad);
   }
@@ -712,30 +713,69 @@ test("registration: unsafe schemes and hosts are refused; a name claiming a know
   const text = (html) => html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ");
   // Look-alikes register (any https callback may), but the consent page refuses to vouch: strong warning, sign-in hidden
   // behind "continue anyway", no Verified badge. The name is never identity.
-  for (const [name, cb] of [["Claude", "https://claude.ai.evil.example/api/mcp/auth_callback"], ["ChatGPT", "https://evil.example/cb"], ["Cl4ude", "https://evil.example/cb"],
-    ["\u0421laude Desktop", "https://evil.example/cb"], ["Cursor", "https://evilcursor.com/agents/mcp/oauth/callback"], ["Agent Library sync", "https://evil.example/cb"]]) {
+  for (const [name, cb] of [["Claude", "https://claude.ai.evil-agent.com/api/mcp/auth_callback"], ["ChatGPT", "https://evil-agent.com/cb"], ["Cl4ude", "https://evil-agent.com/cb"],
+    ["CIaude", "https://evil-agent.com/cb"], ["\u0421laude Desktop", "https://evil-agent.com/cb"], ["Cursor", "https://evilcursor.com/agents/mcp/oauth/callback"], ["Agent Library sync", "https://evil-agent.com/cb"],
+    ["Helper", "https://chatgpt.com.evil-agent.com/cb"], ["\u200b".repeat(150) + "Claude", "https://evil-agent.com/cb"]]) {
     const r = await reg({ client_name: name, redirect_uris: [cb], token_endpoint_auth_method: "none" });
     assert.equal(r.status, 201, name);
     const page = await (await fetch(authUrl((await r.json()).client_id, cb), { redirect: "manual" })).text();
     assert.match(page, /class="callout bad risk" role="alert"/, name);
     assert.match(text(page), /This may not be/, name);
-    // Every way to approve (the sign-in form with decision=approve) is inside the closed gate; outside it only Cancel.
-    const gate = page.match(/<details class="risk-gate"><summary>[^]*?I understand the risk, continue anyway<\/summary>([^]*?)<\/details>/);
-    assert.ok(gate && /value="approve"/.test(gate[1]), `${name}: sign-in only inside the gate`);
-    assert.doesNotMatch(page.replace(gate[0], ""), /value="approve"/, `${name}: no approve outside the gate`);
+    // No way to sign in on the warning page: only "continue anyway" (step=risk) and Cancel.
+    assert.doesNotMatch(page, /name="step" value="signin"/, `${name}: no sign-in form on the warning page`);
+    assert.match(page, /name="step" value="risk"[^]*I understand the risk, continue anyway/, name);
     assert.doesNotMatch(page, /Verified \u00B7|Known app/, name);
   }
   // The real ones keep the normal page.
   for (const [name, cb] of [["Claude", "https://claude.ai/api/mcp/auth_callback"], ["ChatGPT", "https://chatgpt.com/connector_platform_oauth_redirect"], ["Claude Code", "http://localhost:3118/callback"]]) {
     const r = await reg({ client_name: name, redirect_uris: [cb], token_endpoint_auth_method: "none" });
     const page = await (await fetch(authUrl((await r.json()).client_id, cb), { redirect: "manual" })).text();
-    assert.doesNotMatch(page, /<details class="risk-gate"|This may not be/, name);
+    assert.doesNotMatch(page, /name="step" value="risk"|This may not be/, name);
   }
   // Unknown but honest: a plain warning naming the host, sign-in in view.
-  const u = await reg({ client_name: "Weekend Agent", redirect_uris: ["https://agent.example/cb"], token_endpoint_auth_method: "none" });
-  const up = await (await fetch(authUrl((await u.json()).client_id, "https://agent.example/cb"), { redirect: "manual" })).text();
-  assert.match(text(up), /Agent Library can't verify this app\. It would send access to agent\.example/);
-  assert.doesNotMatch(up, /<details class="risk-gate"/);
+  const u = await reg({ client_name: "Weekend Agent", redirect_uris: ["https://agent.example.com/cb"], token_endpoint_auth_method: "none" });
+  const up = await (await fetch(authUrl((await u.json()).client_id, "https://agent.example.com/cb"), { redirect: "manual" })).text();
+  assert.match(text(up), /Agent Library can't verify this app\. It would send access to agent\.example\.com/);
+  assert.doesNotMatch(up, /name="step" value="risk"/);
+});
+
+test("impersonation gate is enforced by the server: sign-in is refused until 'continue anyway', which needs the page's own handle", async () => {
+  const cb = "https://evil-agent.com/cb";
+  const c = await (await reg({ client_name: "Claude", redirect_uris: [cb], token_endpoint_auth_method: "none" })).json();
+  const b = browser();
+  const page = await (await b.go(authUrl(c.client_id, cb))).text();
+  const handle = page.match(/name="handle" value="([^"]+)"/)[1];
+  const post = (fields) => b.go(`${MCP}/authorize`, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ handle, ...fields }).toString() });
+  // Skipping the warning (a direct sign-in POST) is refused and doesn't use up the consent.
+  const skip = await post({ step: "signin", decision: "approve" });
+  assert.equal(skip.status, 400);
+  assert.match(await skip.text(), /may not be what it says/);
+  // A risk POST for a page that wasn't gated (or an unknown handle) is refused.
+  assert.match(await (await b.go(`${MCP}/authorize`, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ handle: "x".repeat(40), step: "risk", decision: "approve" }).toString() })).text(), /expired/);
+  // Continue anyway: the warning stays, the sign-in options appear, and sign-in then proceeds normally.
+  const risk = await post({ step: "risk", decision: "approve" });
+  assert.equal(risk.status, 200);
+  const rp = await risk.text();
+  assert.match(rp, /This may not be/); assert.match(rp, /name="step" value="signin"/);
+  const go = await post({ step: "signin", decision: "approve" });
+  assert.equal(go.status, 302, "sign-in starts after the choice is recorded");
+  // Cancel from the warning page goes back to the app with access_denied, as "Cancelled".
+  const c2 = await (await reg({ client_name: "ChatGPT", redirect_uris: [cb], token_endpoint_auth_method: "none" })).json();
+  const b2 = browser();
+  const h2 = (await (await b2.go(authUrl(c2.client_id, cb))).text()).match(/name="handle" value="([^"]+)"/)[1];
+  const cancel = await b2.go(`${MCP}/authorize`, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ handle: h2, step: "risk", decision: "deny" }).toString() });
+  assert.match(await cancel.text(), /Cancelled/);
+});
+
+test("no zero-click redirect: an authorization error for an unknown https callback is shown here, not redirected", async () => {
+  const cb = "https://some-agent.com/cb";
+  const c = await (await reg({ client_name: "Some agent", redirect_uris: [cb], token_endpoint_auth_method: "none" })).json();
+  const r = await fetch(`${MCP}/authorize?${new URLSearchParams({ response_type: "code", client_id: c.client_id, redirect_uri: cb, scope: "agentlib:read", state: "s", resource: RESOURCE })}`, { redirect: "manual" });
+  assert.equal(r.headers.get("location"), null, "no PKCE: error page, no redirect to the callback");
+  // A known callback still gets the standard error redirect.
+  const k = await (await reg({ client_name: "Claude", redirect_uris: ["https://claude.ai/api/mcp/auth_callback"], token_endpoint_auth_method: "none" })).json();
+  const kr = await fetch(`${MCP}/authorize?${new URLSearchParams({ response_type: "code", client_id: k.client_id, redirect_uri: "https://claude.ai/api/mcp/auth_callback", scope: "agentlib:read", state: "s", resource: RESOURCE })}`, { redirect: "manual" });
+  assert.match(kr.headers.get("location") ?? "", /^https:\/\/claude\.ai\/api\/mcp\/auth_callback\?error=invalid_request/);
 });
 
 test("Claude: hosted callback and Claude Code loopback (localhost + 127.0.0.1, any port) register and reach consent", async () => {
