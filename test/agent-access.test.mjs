@@ -174,6 +174,30 @@ test("consent workspace picker: shown to people in more than one workspace; zero
   } finally { ok(await bob.req("PATCH", `/api/workspaces/${WS}/members/${ownerId}`, { role: "member" })); }
 });
 
+test("consent Set all: fills one workspace's projects, keeps the name, grants nothing until Connect", async () => {
+  const checked = (html, pid) => new RegExp(`name="access:${pid}" value="(\\w+)" checked`).exec(html)?.[1];
+  let page = "", seen = null;
+  // Read for the Personal workspace (Alpha, Beta): both set to Read, Bob's team cleared, the typed name kept.
+  await assert.rejects(h.connectMcpAgent({ [BOBP]: "write" }, { clientName: "Bulk", onConsent: (x) => { page = x; }, onGrant: (status, html) => { seen = { status, html }; },
+    extra: { label: "Bulk name", bulk: `read:wsp_${ownerId}` } }), /no interstitial redirect/);
+  assert.match(page, /aria-label="Set all in Personal"/);
+  assert.doesNotMatch(page, /aria-label="Set all in Bob/, "a single-project workspace has no Set all");
+  assert.equal(seen.status, 200);
+  assert.deepEqual([checked(seen.html, A), checked(seen.html, B), checked(seen.html, BOBP)], ["read", "read", "none"]);
+  assert.match(seen.html, /name="label"[^>]*value="Bulk name"/);
+  assert.doesNotMatch(seen.html, /role="alert"/);
+  assert.equal(await connection("Bulk name"), undefined, "nothing granted");
+  // Off clears only that workspace; Edit on a read-only project falls back to Read.
+  await assert.rejects(h.connectMcpAgent({ [A]: "read", [BOBP]: "read" }, { clientName: "Bulk2", onGrant: (status, html) => { seen = { status, html }; }, extra: { label: "Bulk2", bulk: `none:wsp_${ownerId}` } }), /no interstitial redirect/);
+  assert.deepEqual([checked(seen.html, A), checked(seen.html, BOBP)], ["none", "read"]);
+  ok(await bob.req("PATCH", `/api/workspaces/${WS}/members/${ownerId}`, { role: "viewer" }));
+  try {
+    await assert.rejects(h.connectMcpAgent({}, { clientName: "Bulk3", onGrant: (status, html) => { seen = { status, html }; }, extra: { label: "Bulk3", bulk: `write:${WS}` } }), /no interstitial redirect/);
+    assert.equal(checked(seen.html, BOBP), "read");
+  } finally { ok(await bob.req("PATCH", `/api/workspaces/${WS}/members/${ownerId}`, { role: "member" })); }
+  assert.equal(await connection("Bulk2"), undefined);
+});
+
 test("editing projects takes effect on the agent's next request: add, upgrade to edit, downgrade, remove all", async () => {
   const agent = await h.connectMcpAgent({}, { clientName: "Grower", extra: { label: "Grower" } });
   const c = await connection("Grower");
@@ -343,6 +367,7 @@ test("Connections page: name, host, project chips, Edit projects, Rename and Dis
     const text = () => page.$eval(card, (e) => e.innerText);
     const buttons = await page.$eval(card, (e) => [...e.querySelectorAll(".conn-head button")].map((b) => b.textContent));
     assert.deepEqual(buttons, ["Edit projects", "Rename", "Disconnect"]);
+    assert.equal(await page.$eval(card, (e) => e.querySelector(".conn-title .badge")?.textContent), "Active", "the status sits next to the name");
     assert.match(await text(), /returns to 127\.0\.0\.1:5998/);
     assert.match(await text(), /No projects shared yet/);
     assert.match(await page.$eval(card, (e) => e.querySelector("details.conn-details").innerHTML), /http:\/\/127\.0\.0\.1:5998\/cb/, "full redirect URL in the details");
@@ -355,6 +380,14 @@ test("Connections page: name, host, project chips, Edit projects, Rename and Dis
     assert.ok(rows.includes("Alpha") && rows.includes("Beta") && !rows.includes("Bob project"), rows.join());
     const offLabels = await page.$$eval(`${card} .scope-row select`, (els) => els[0].options[0].textContent);
     assert.equal(offLabels, "Off");
+    // Set all, then back to Off: every row follows; nothing is saved yet.
+    const values = () => page.$$eval(`${card} .scope-row select`, (els) => els.map((s) => s.value));
+    await page.evaluate((sel) => [...document.querySelector(sel).querySelectorAll(".scope-bulk button")].find((b) => b.textContent === "Read & edit").click(), card);
+    assert.ok((await values()).every((v) => v === "read_write"), (await values()).join());
+    assert.match(await text(), /(\d+) of \1 selected/);
+    await page.evaluate((sel) => [...document.querySelector(sel).querySelectorAll(".scope-bulk button")].find((b) => b.textContent === "Off").click(), card);
+    assert.ok((await values()).every((v) => v === ""));
+    assert.deepEqual((await connection("Browser agent")).projects, []);
     await page.evaluate((sel) => {
       for (const s of document.querySelector(sel).querySelectorAll(".scope-row select")) {
         const name = s.getAttribute("aria-label");

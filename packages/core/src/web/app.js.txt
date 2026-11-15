@@ -2523,7 +2523,7 @@ function connCard(o) {
   // o: { name, sub, status, access:[{title, access}], foot:[text], actions:[el], inactive }
   return h("article", { class: "conn" + (o.inactive ? " inactive" : ""), "aria-label": o.name },
     h("div", { class: "conn-head" }, h("span", { class: "ficon-sm", "aria-hidden": "true" }, icon(o.icon || "plug")),
-      h("div", { class: "grow" }, h("h3", { text: o.name }), o.sub ? h("p", { class: "conn-sub", text: o.sub }) : null), o.status,
+      h("div", { class: "grow" }, h("div", { class: "conn-title" }, h("h3", { text: o.name }), o.status), o.sub ? h("p", { class: "conn-sub", text: o.sub }) : null),
       o.actions && o.actions.length ? h("div", { class: "row" }, o.actions) : null),
     o.accessLabel ? h("div", { class: "small muted", text: o.accessLabel }) : null,
     o.access ? (o.access.length ? h("ul", { class: "conn-access", "aria-label": "Saved project access" }, o.access.map(function (p) { return h("li", null, h("b", { text: p.title }), h("span", { text: p.access })); }))
@@ -2800,8 +2800,16 @@ function scopePicker(projects, current, offLabel) {
     count.textContent = n ? n + " of " + rows.length + " selected" : "None selected";
   }
   rows.forEach(function (r) { r.mark(); });
+  // Set every row at once (then adjust the exceptions). Edit falls back to Read where your role is read-only.
+  function setAll(v) {
+    rows.forEach(function (r) { var s = r.querySelector("select"); s.value = v && !s.querySelector('option[value="' + v + '"]') ? "read" : v; r.mark(); });
+  }
+  var bulk = rows.length > 1 ? h("span", { class: "scope-bulk", role: "group", "aria-label": "Set all projects" }, h("span", { text: "Set all:" }),
+    [["", offLabel || "No access"], ["read", "Read"], ["read_write", "Read & edit"]].map(function (x) {
+      return h("button", { type: "button", class: "secondary", onclick: function () { setAll(x[0]); } }, x[1]);
+    })) : null;
   return { el: h("div", { class: "scope-wrap" },
-    h("div", { class: "scope-head" }, h("span", { text: "Projects and access" }), count),
+    h("div", { class: "scope-head" }, h("span", { text: "Projects and access" }), bulk, count),
     h("div", { class: "scope" }, rows)), value: function () {
     return rows.map(function (r) { var s = r.querySelector("select"); return s.value ? { project_id: s.dataset.pid, access: s.value } : null; }).filter(Boolean);
   } };

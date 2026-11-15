@@ -334,9 +334,13 @@ function cxGrantPage(d, email, projects, prev, consent, values = null, error = "
   for (const p of projects) { const g = groups.find((x) => x.id === (p.workspace_id ?? "")); if (g) g.items.push(p); else groups.push({ id: p.workspace_id ?? "", name: p.workspace_name, items: [p] }); }
   // One group per workspace, each with its own heading, whenever any shared workspace is involved.
   const named = groups.length > 1 || groups.some((g) => g.name);
+  // "Set all" for a workspace's projects. The page runs no script, so each button re-renders the form with the
+  // choices filled in (nothing is granted until Connect) and returns to the same group.
+  const bulk = (g, i) => g.items.length > 1 ? `<span class="bulk" role="group" aria-label="Set all in ${esc(g.name ?? "Personal")}">Set all:${[["none", "Off"], ["read", "Read"], ["write", "Edit"]].map(([v, t]) =>
+    `<button name="bulk" value="${v}:${esc(g.id)}" formaction="/authorize#wsh-${i}" formnovalidate>${t}</button>`).join("")}</span>` : "";
   const rows = projects.length ? (named
-    ? groups.map((g, i) => `<div class="wsg" role="group" aria-labelledby="wsh-${i}"><h3 class="wsh" id="wsh-${i}">${esc(g.name ?? "Personal")}</h3><ul class="list">${g.items.map(row).join("")}</ul></div>`).join("")
-    : `<ul class="list">${projects.map(row).join("")}</ul>`) + consentProjectsNote(projects) : "";
+    ? groups.map((g, i) => `<div class="wsg" role="group" aria-labelledby="wsh-${i}"><div class="wsrow"><h3 class="wsh" id="wsh-${i}">${esc(g.name ?? "Personal")}</h3>${bulk(g, i)}</div><ul class="list">${g.items.map(row).join("")}</ul></div>`).join("")
+    : `<div class="wsrow" id="wsh-0">${bulk(groups[0], 0)}</div><ul class="list">${projects.map(row).join("")}</ul>`) + consentProjectsNote(projects) : "";
   // New projects: by default they go in the workspace of the picked projects (else Personal); any other active
   // workspace where the signer is an admin can be chosen, including ones without projects yet.
   const admin = projects.adminWorkspaces ?? [];
@@ -422,7 +426,8 @@ async function authorizePost(req, env, as, origin) {
   const form = await req.formData();
   const handle = String(form.get("handle") ?? "");
   const step = String(form.get("step") ?? "");
-  if (form.get("decision") !== "approve") {
+  // A "Set all" button on the grant page re-renders the form (handled below); it is neither approve nor deny.
+  if (form.get("decision") !== "approve" && !(step === "grant" && form.has("bulk"))) {
     const denied = await oauth.denyConsent(req, handle);
     const loc = denied.headers.get("location");
     denied.headers.delete("location");
@@ -461,6 +466,18 @@ async function authorizePost(req, env, as, origin) {
     // A fixable mistake re-renders the page with the owner's choices kept: the consent handle is still unused, and
     // the browser's Back button can't help (the sign-in callback that rendered the page is single-use).
     const retry = (msg) => sess.view ? cxGrantPage(sess.view.d, sess.view.email, owned.results, sess.view.prev, { handle, headers: new Headers() }, form, msg, 400) : errorPage(msg);
+    // "Set all" in one workspace: show the form again with that choice applied. Choosing Read or Edit clears the other
+    // workspaces (one connection covers one workspace); Edit is Read where your role is read-only. Nothing is granted yet.
+    const bulk = /^(none|read|write):(.+)$/.exec(String(form.get("bulk") ?? ""));
+    if (bulk && sess.view) {
+      const values = new FormData();
+      for (const [k, v] of form) if (k !== "bulk" && k !== "decision") values.append(k, v);
+      for (const p of owned.results) {
+        if ((p.workspace_id ?? "") === bulk[2]) values.set(`access:${p.id}`, bulk[1] === "write" && !p.can_write ? "read" : bulk[1]);
+        else if (bulk[1] !== "none") values.set(`access:${p.id}`, "none");
+      }
+      return cxGrantPage(sess.view.d, sess.view.email, owned.results, sess.view.prev, { handle, headers: new Headers() }, values);
+    }
     let label;
     // The page always sends the name field (required, prefilled). A form without the field at all (a page rendered before
     // this field existed and submitted after an upgrade) takes the app's own name; a blank or invalid name is refused.
@@ -1065,7 +1082,10 @@ form{margin:0}
 .list{list-style:none;margin:0;padding:0;border:1px solid var(--line);border-radius:var(--r3);overflow:hidden}
 .proj{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:8px 8px 8px 14px;border-top:1px solid var(--line);transition:background .15s}
 .proj:first-child{border-top:0}
-.wsg+.wsg{margin-top:14px}.wsh{margin:0 0 6px;font-size:13px;font-weight:650;letter-spacing:.02em;text-transform:uppercase;color:var(--muted);overflow-wrap:anywhere}
+.wsg+.wsg{margin-top:14px}.wsh{margin:0;font-size:13px;font-weight:650;letter-spacing:.02em;text-transform:uppercase;color:var(--muted);overflow-wrap:anywhere}
+.wsrow{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin:0 0 6px;scroll-margin-top:16px}
+.bulk{display:inline-flex;align-items:center;gap:4px;margin-left:auto;font-size:12.5px;color:var(--muted)}
+.bulk button{min-height:28px;padding:2px 10px;font-size:12.5px}
 .ro-badge{display:inline-block;margin-left:6px;padding:1px 7px;border-radius:999px;font-size:11.5px;font-weight:600;color:var(--muted);background:var(--sunk);vertical-align:1px}
 .grant:has(.wsg .proj input:is([value=read],[value=write]):checked) .wsg:not(:has(.proj input:is([value=read],[value=write]):checked)) .seg{opacity:.6}
 .one-ws{transition:color .15s}.grant:has(.wsg .proj input:is([value=read],[value=write]):checked) .one-ws{color:var(--fg);font-weight:600}
