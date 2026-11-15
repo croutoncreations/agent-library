@@ -6,7 +6,7 @@ Agents connect to your installation's MCP host (`MCP_HOST`). No account with any
 
 In your client's MCP or connector settings, add a remote server at `https://YOUR_MCP_HOST/mcp`. The client opens a sign-in page: sign in, pick which projects it may use, and choose read-only or edit for each (start with read-only). Give each agent its own connection, and disconnect it under **Connections** when you're done.
 
-ChatGPT, Claude and Cursor work out of the box, as do local clients that use a `127.0.0.1`/`localhost` callback. Another hosted service, such as your own MCP gateway, needs its exact callback URL added to `OAUTH_EXTRA_REDIRECT_URIS` (or `extraRedirectUris` in `.self-host.json`). Wildcards are never accepted.
+Any agent can connect: ChatGPT, Claude and Cursor, local clients with a `127.0.0.1`/`localhost` callback, and any hosted agent or gateway with an `https` callback. The sign-in page says how far it can vouch for the app (verified, known, on this computer, or not verified) and shows where access is sent; an app whose name claims to be a well-known app but returns somewhere else gets a strong warning. Listing your own gateway's callbacks in `OAUTH_EXTRA_REDIRECT_URIS` (or `extraRedirectUris` in `.self-host.json`) marks them as a known app; it is not required to connect.
 
 Tell the agent:
 
@@ -122,5 +122,4 @@ request; revocation or expiry can prevent diagnostics entirely. Check those
 states in the owner UI. For 401/403, inspect authentication and project access;
 for offline/network errors, check connectivity; for 5xx, retry after the server
 recovers. None identifies an external client's state. Use the configured URLs
-in Connections and the existing exact callback policy; do not broaden callbacks
-or grants to troubleshoot a connection.
+in Connections; do not broaden grants to troubleshoot a connection.

@@ -624,9 +624,14 @@ test("OAuth host route allow-list: every non-OAuth path and method is 404/405, n
   }
 });
 
-test("registration policy: non-ChatGPT/non-loopback redirect URIs refused", async () => {
-  const r = await fetch(`${MCP}/oauth/register`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ client_name: "evil", redirect_uris: ["https://evil.example/cb"], token_endpoint_auth_method: "none" }) });
-  assert.equal(r.status, 400);
+test("registration policy: any clean https or loopback callback registers; http, IPs, credentials and fragments are refused", async () => {
+  const r = await fetch(`${MCP}/oauth/register`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ client_name: "Some agent", redirect_uris: ["https://agent.example/cb"], token_endpoint_auth_method: "none" }) });
+  assert.equal(r.status, 201, "an unknown hosted agent can connect (the consent page warns)");
+  for (const bad of ["http://agent.example/cb", "https://10.0.0.5/cb", "https://[::1]/cb", "https://user:pw@agent.example/cb", "https://agent.example/cb#x",
+    "https://agent.example/a/../cb", "https://AGENT.example/cb", "https://agent.example", "https://localhost/cb", "ftp://agent.example/cb", "https://agent.example/" + "a".repeat(600)]) {
+    const e = await fetch(`${MCP}/oauth/register`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ client_name: "x", redirect_uris: [bad], token_endpoint_auth_method: "none" }) });
+    assert.equal(e.status, 400, bad);
+  }
   const ok = await fetch(`${MCP}/oauth/register`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ client_name: "ChatGPT", redirect_uris: ["https://chatgpt.com/connector_platform_oauth_redirect"], token_endpoint_auth_method: "none" }) });
   assert.equal(ok.status, 201);
 });
@@ -693,12 +698,9 @@ test("authorize: missing PKCE, plain PKCE and redirect substitution are refused 
   }
 });
 
-test("registration: lookalike hosts, unapproved paths, schemes and client_name spoofing are refused", async () => {
+test("registration: unsafe schemes and hosts are refused; a name claiming a known app on another domain gets the strong warning, not a pass", async () => {
   const bad = [
-    ["https://www.cursor.com.evil.example/agents/mcp/oauth/callback"], ["https://evilcursor.com/agents/mcp/oauth/callback"],
-    ["https://www.cursor.com/agents/mcp/oauth/callback?x=1"], ["https://www.cursor.com/agents/mcp/oauth/callback/"], ["https://www.cursor.com/bot/mcp/oauth/callback"],
-    ["https://www.cursor.com:8443/agents/mcp/oauth/callback"], ["http://www.cursor.com/agents/mcp/oauth/callback"], ["https://cursor.com/agents/mcp/oauth/callback"],
-    ["https://claude.ai.evil.example/api/mcp/auth_callback"], ["https://claude.ai/api/mcp/auth_callback/x"], ["https://claude.com/api/mcp/auth_callback"],
+    ["http://www.cursor.com/agents/mcp/oauth/callback"],
     ["cursor://anysphere.cursor-mcp/oauth/callback"], // listed-only entry alone can never sign in
     ["cursor://evil/oauth/callback", "http://localhost:8787/callback"], ["javascript:alert(1)//", "http://localhost:8787/callback"],
     ["http://localhost.evil.example/callback"], ["http://10.0.0.5:8787/callback"], ["http://[::1]:8787/callback"],
@@ -707,7 +709,33 @@ test("registration: lookalike hosts, unapproved paths, schemes and client_name s
     const r = await reg({ client_name: "Claude", redirect_uris: uris, token_endpoint_auth_method: "none" });
     assert.equal(r.status, 400, JSON.stringify(uris));
   }
-  assert.equal((await reg({ client_name: "ChatGPT", redirect_uris: ["https://evil.example/cb"], token_endpoint_auth_method: "none" })).status, 400, "client_name is not identity");
+  const text = (html) => html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ");
+  // Look-alikes register (any https callback may), but the consent page refuses to vouch: strong warning, sign-in hidden
+  // behind "continue anyway", no Verified badge. The name is never identity.
+  for (const [name, cb] of [["Claude", "https://claude.ai.evil.example/api/mcp/auth_callback"], ["ChatGPT", "https://evil.example/cb"], ["Cl4ude", "https://evil.example/cb"],
+    ["\u0421laude Desktop", "https://evil.example/cb"], ["Cursor", "https://evilcursor.com/agents/mcp/oauth/callback"], ["Agent Library sync", "https://evil.example/cb"]]) {
+    const r = await reg({ client_name: name, redirect_uris: [cb], token_endpoint_auth_method: "none" });
+    assert.equal(r.status, 201, name);
+    const page = await (await fetch(authUrl((await r.json()).client_id, cb), { redirect: "manual" })).text();
+    assert.match(page, /class="callout bad risk" role="alert"/, name);
+    assert.match(text(page), /This may not be/, name);
+    // Every way to approve (the sign-in form with decision=approve) is inside the closed gate; outside it only Cancel.
+    const gate = page.match(/<details class="risk-gate"><summary>[^]*?I understand the risk, continue anyway<\/summary>([^]*?)<\/details>/);
+    assert.ok(gate && /value="approve"/.test(gate[1]), `${name}: sign-in only inside the gate`);
+    assert.doesNotMatch(page.replace(gate[0], ""), /value="approve"/, `${name}: no approve outside the gate`);
+    assert.doesNotMatch(page, /Verified \u00B7|Known app/, name);
+  }
+  // The real ones keep the normal page.
+  for (const [name, cb] of [["Claude", "https://claude.ai/api/mcp/auth_callback"], ["ChatGPT", "https://chatgpt.com/connector_platform_oauth_redirect"], ["Claude Code", "http://localhost:3118/callback"]]) {
+    const r = await reg({ client_name: name, redirect_uris: [cb], token_endpoint_auth_method: "none" });
+    const page = await (await fetch(authUrl((await r.json()).client_id, cb), { redirect: "manual" })).text();
+    assert.doesNotMatch(page, /<details class="risk-gate"|This may not be/, name);
+  }
+  // Unknown but honest: a plain warning naming the host, sign-in in view.
+  const u = await reg({ client_name: "Weekend Agent", redirect_uris: ["https://agent.example/cb"], token_endpoint_auth_method: "none" });
+  const up = await (await fetch(authUrl((await u.json()).client_id, "https://agent.example/cb"), { redirect: "manual" })).text();
+  assert.match(text(up), /Agent Library can't verify this app\. It would send access to agent\.example/);
+  assert.doesNotMatch(up, /<details class="risk-gate"/);
 });
 
 test("Claude: hosted callback and Claude Code loopback (localhost + 127.0.0.1, any port) register and reach consent", async () => {
@@ -751,9 +779,11 @@ test('configured extra callback: only the exact configured callback registers an
  }assert.notEqual(ids[0],ids[1]);
  for(const redirect of ['https://chatgpt.com/connector_platform_oauth_redirect','https://claude.ai/api/mcp/auth_callback','https://www.cursor.com/agents/mcp/oauth/callback'])assert.ok((await fetch(authUrl(ids[0],redirect),{redirect:'manual'})).status>=400);
 });
-test('configured extra callback: registration rejects paths, query, fragment, wildcard, sibling Workers and lookalike hosts',async()=>{
- for(const redirect of GATEWAY_BAD_CALLBACKS)assert.equal((await reg({client_name:'cc-gateway-chatgpt-library',redirect_uris:[redirect],token_endpoint_auth_method:'none'})).status,400,redirect);
- assert.equal((await reg({client_name:'cc-gateway-chatgpt-library',redirect_uris:[GATEWAY_CALLBACK,GATEWAY_BAD_CALLBACKS[0]],token_endpoint_auth_method:'none'})).status,400,'valid entry does not admit an invalid sibling');
+test('configured extra callback: registration still rejects fragments, http and non-canonical URLs',async()=>{
+ // Callbacks are no longer limited to the configured list (any clean https URL may register); still refused: fragments, http,
+ // and anything a URL parser would rewrite. The registered list is still matched exactly at authorization (above).
+ for(const redirect of [GATEWAY_CALLBACK+'#fragment',GATEWAY_CALLBACK.replace('https:','http:'),GATEWAY_CALLBACK.replace('/library','/%6cibrary').replace('%6c','%6C')+'/../x'])assert.equal((await reg({client_name:'cc-gateway-chatgpt-library',redirect_uris:[redirect],token_endpoint_auth_method:'none'})).status,400,redirect);
+ assert.equal((await reg({client_name:'cc-gateway-chatgpt-library',redirect_uris:[GATEWAY_CALLBACK,GATEWAY_CALLBACK.replace('https:','http:')],token_endpoint_auth_method:'none'})).status,400,'valid entry does not admit an invalid sibling');
 });
 
 test("reconnect: earlier access is preselected; replacing revokes the earlier connection (tokens and refresh), a forged replace id is refused", async () => {

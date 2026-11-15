@@ -78,7 +78,7 @@ Fill in `.self-host.json`:
 | `appHost`, `mcpHost` | step 2 |
 | `accessTeamDomain`, `accessAudience`, `ownerEmail` | step 3 |
 | `oidcClientId`, `oidcIssuer` | step 4 |
-| `extraRedirectUris` (optional) | exact https OAuth callbacks to trust besides ChatGPT, Claude and Cursor, e.g. your own MCP gateway |
+| `extraRedirectUris` (optional) | exact https OAuth callbacks of your own services (e.g. your MCP gateway), shown as a known app at sign-in; any https agent can connect without this |
 
 Then:
 

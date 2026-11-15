@@ -35,10 +35,22 @@ A `*/15` cron cleans up expired uploads and their staging objects (bounded and i
 
 Every request re-checks the current grant and project scope. Nothing caches authorization in a way that would delay revocation. API, MCP and App Connect call the same service layer. Every request is authenticated, checked against its grant and project, validated, applied as a revision-guarded mutation and audited.
 
-OAuth redirect URIs are exact-match only:
-- the built-in hosted callbacks for ChatGPT, Claude and Cursor;
-- loopback URIs for local clients;
-- anything listed in the `OAUTH_EXTRA_REDIRECT_URIS` var, for example your own MCP gateway.
+### Agent callbacks
+
+Agent Library is meant for every agent, including ones that don't exist yet, so any agent may register (dynamic client registration or a client ID metadata document) and connect. A redirect URI must be:
+- loopback (`http://127.0.0.1` or `http://localhost`, any port) for local clients; or
+- a canonical `https` URL on a DNS name: no IP literals, user/password, fragment, or anything a URL parser would rewrite (the parsed URL must equal the string), at most 512 characters.
+
+Plain `http` to anything else and custom schemes on their own are refused. At authorization the redirect URI must exactly match one the client registered (the client ID metadata document's list for CIMD clients).
+
+Because registration is open, the consent page decides how far it can vouch for the app (`cxTrust` in `oauth/server.js`) and says so before anyone signs in:
+- **Verified** (green): the client ID is a metadata document on the same host the callback returns to (e.g. claude.ai, an Agent Shed gateway).
+- **Known app** (green): a built-in callback (`HOSTED_CALLBACKS`: ChatGPT, Claude, Cursor) or one the operator listed in `OAUTH_EXTRA_REDIRECT_URIS`.
+- **On this computer**: a loopback callback (warning to continue only if you started it).
+- **Not verified** (amber): any other https callback; the warning names the host access goes to.
+- **Impersonation** (red): the app's self-reported name claims a watched brand (`WATCHED_APPS`: Claude/Anthropic, ChatGPT/OpenAI/Codex, Cursor, Grok/xAI, Google/Gemini, GitHub/Copilot, Microsoft, Perplexity, Mistral, Agent Library) but the callback is neither on that brand's domains nor a known callback. Names are folded (accents, Cyrillic/Greek look-alikes, digits for letters, camel case, spaced letters) before matching. The page says it may not be that app and where access would go; every sign-in option sits inside a closed "I understand the risk, continue anyway" section, with Cancel in view. Each such page is logged (`oauth_impersonation_warning`). Self-hosted agents (OpenClaw, Hermes, …) have no fixed domain and are not watched.
+
+Nothing is shared by default either way: no project is pre-selected, the full return address is shown, and every connection can be renamed, re-scoped or disconnected in Connections.
 
 ### Agent access
 

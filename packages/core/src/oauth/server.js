@@ -84,7 +84,7 @@ function servers(origin, appConnect = false) {
       const uris = Array.isArray(clientMetadata.redirect_uris) ? clientMetadata.redirect_uris : [];
       const ok2 = registrableRedirects(uris);
       logRegistration(ok2 ? "accepted" : "rejected", clientMetadata);
-      if (!ok2) return { description: "redirect_uris must be verified ChatGPT, Cursor/Grok Bot or Claude callbacks, or loopback for local clients" };
+      if (!ok2) return { description: "redirect_uris must be https URLs on a domain name, or loopback (http://127.0.0.1 or localhost) for local clients" };
       return;
     },
     onError: ({ code, internal }) => {
@@ -145,8 +145,67 @@ function configureExtraCallbacks(env) {
   extraCallbacksRaw = raw;
   EXTRA_CALLBACKS = new Set(raw.split(/[\s,]+/).filter((u) => /^https:\/\/[a-z0-9.-]+(:\d{1,5})?\/[A-Za-z0-9\/_.~-]*$/.test(u)));
 }
+// Callbacks Agent Library knows: the built-in hosted ones (ChatGPT, Claude, Cursor) and the operator's exact extras.
+function knownRedirect(u) {
+  return HOSTED_CALLBACKS.has(u) || EXTRA_CALLBACKS.has(u) || /^https:\/\/chatgpt\.com\/connector\/oauth\/[A-Za-z0-9_-]{1,128}$/.test(u);
+}
+// Any agent may connect (docs/architecture.md#agent-callbacks): a known callback, loopback for local clients, or any
+// plain https URL on a DNS name. The consent page says how far the app can be trusted (cxTrust) and puts a strong,
+// click-through warning in front of an app whose name claims a watched brand it doesn't come from. Still refused: http
+// to anything but loopback, IP literals, credentials in the URL, fragments, and anything a URL parser would rewrite.
+function openRedirect(u) {
+  if (typeof u !== "string" || u.length > 512 || !u.startsWith("https://")) return false;
+  let p;
+  try { p = new URL(u); } catch { return false; }
+  return p.href === u && !p.username && !p.password && !p.hash && !u.includes("#")
+    && /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$/.test(p.hostname) && !/\.[0-9]+$/.test(p.hostname);
+}
 function allowedRedirect(u) {
-  return HOSTED_CALLBACKS.has(u) || EXTRA_CALLBACKS.has(u) || /^https:\/\/chatgpt\.com\/connector\/oauth\/[A-Za-z0-9_-]{1,128}$/.test(u) || isLoopbackRedirect(u);
+  return knownRedirect(u) || isLoopbackRedirect(u) || openRedirect(u);
+}
+// Brands people would expect to be the real thing. An app whose (self-reported) name says one of these but whose
+// callback is not on the brand's own domains gets the strong warning. Self-hosted agents (OpenClaw, Hermes, …) have
+// no fixed domain, so they are not listed. "agentlibrary" catches an app posing as this service.
+const WATCHED_APPS = [
+  { brand: "Claude", words: ["claude", "anthropic"], domains: ["claude.ai", "claude.com", "anthropic.com"] },
+  { brand: "ChatGPT", words: ["chatgpt", "openai", "codex"], domains: ["chatgpt.com", "openai.com"] },
+  { brand: "Cursor", words: ["cursor"], domains: ["cursor.com", "cursor.sh"] },
+  { brand: "Grok", words: ["grok", "xai"], domains: ["grok.com", "x.ai", "x.com"] },
+  { brand: "Google", words: ["gemini", "google", "bard"], domains: ["google.com"] },
+  { brand: "GitHub", words: ["copilot", "github"], domains: ["github.com", "githubcopilot.com"] },
+  { brand: "Microsoft", words: ["microsoft"], domains: ["microsoft.com"] },
+  { brand: "Perplexity", words: ["perplexity"], domains: ["perplexity.ai"] },
+  { brand: "Mistral", words: ["mistral", "lechat"], domains: ["mistral.ai"] },
+  { brand: "Agent Library", words: ["agentlibrary"], domains: [] }
+];
+// Look-alike letters folded to ASCII (Cyrillic and Greek homoglyphs, digits used as letters), so "Cl4ude" or a
+// Cyrillic "\u0421laude" still match. The name is never trusted; this only decides when to warn. A word matches as a
+// whole word, at the start of a word ("ClaudeBot", "MyClaude" after splitting camel case), or spelled out with gaps
+// ("C l a u d e", "agent library"); not inside another word ("precursor").
+const CONFUSABLE = { "0": "o", "1": "l", "3": "e", "4": "a", "5": "s", "\u0430": "a", "\u0441": "c", "\u0435": "e", "\u043E": "o", "\u0440": "p", "\u0445": "x", "\u0443": "y", "\u0456": "i", "\u04CF": "l", "\u0391": "a", "\u0392": "b", "\u0395": "e", "\u039F": "o", "\u03BF": "o", "\u0399": "i", "\u039A": "k", "\u03A1": "p", "\u03A7": "x" };
+function watchedBrand(name) {
+  const folded = String(name ?? "").slice(0, 200).normalize("NFKD").replace(/[\u0300-\u036f]/g, "").replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase().replace(/./gu, (c) => CONFUSABLE[c] ?? c);
+  const tokens = folded.split(/[^a-z]+/).filter(Boolean), compact = tokens.join("");
+  return WATCHED_APPS.find((w) => w.words.some((x) => tokens.some((t) => t.startsWith(x)) || compact.startsWith(x) || tokens.some((_, i) => tokens.slice(i).join("").startsWith(x) && tokens[i].length < x.length))) ?? null;
+}
+const onDomain = (host, d) => host === d || host.endsWith("." + d);
+/**
+ * How far the consent page can vouch for an app (d: describeConsent details):
+ *   local         loopback callback (an app on this computer)
+ *   impersonation the name claims a watched brand, the callback is not on its domains and not a known callback
+ *   verified      the client id is a metadata document on the same host the callback returns to
+ *   known         a built-in or operator-listed callback
+ *   unverified    anything else (any other https callback)
+ */
+function cxTrust(d) {
+  const host = String(d.redirectHost ?? "").toLowerCase();
+  if (d.redirectIsLoopback) return { kind: "local", host };
+  const w = watchedBrand(d.clientName);
+  const known = knownRedirect(d.redirectUri);
+  if (w && !known && !w.domains.some((x) => onDomain(host, x))) return { kind: "impersonation", host, brand: w.brand, official: w.domains[0] ?? null };
+  if (d.clientDomain && d.clientDomain.toLowerCase() === host) return { kind: "verified", host };
+  if (known) return { kind: "known", host };
+  return { kind: "unverified", host };
 }
 function registrableRedirects(uris) {
   if (!uris.length || uris.length > 5 || !uris.every((u) => typeof u === "string")) return false;
@@ -284,7 +343,12 @@ const CX_PROVIDER_MARKS = {
   google: `<svg class="pmark" viewBox="0 0 48 48" aria-hidden="true"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg>`,
   github: `<svg class="pmark" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 .5C5.65.5.5 5.65.5 12a11.5 11.5 0 0 0 7.86 10.92c.58.1.79-.25.79-.56v-1.97c-3.2.7-3.87-1.37-3.87-1.37-.52-1.33-1.28-1.69-1.28-1.69-1.05-.71.08-.7.08-.7 1.16.08 1.77 1.19 1.77 1.19 1.03 1.77 2.7 1.26 3.36.96.1-.75.4-1.26.73-1.55-2.55-.29-5.24-1.28-5.24-5.69 0-1.26.45-2.29 1.19-3.1-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.17 1.18a11 11 0 0 1 5.77 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.23 2.76.11 3.05.74.81 1.19 1.84 1.19 3.1 0 4.42-2.69 5.39-5.26 5.68.41.36.78 1.06.78 2.14v3.17c0 .31.21.67.8.56A11.5 11.5 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5z"/></svg>`
 };
-function cxStart(handle, choices = [], siteKey = null) {
+// gated: the sign-in options sit behind an explicit "continue anyway" (impersonation warning); Cancel stays in view.
+function cxStart(handle, choices = [], siteKey = null, gated = false) {
+  if (gated) {
+    const cancel = `<form method="post" action="/authorize"><input type="hidden" name="handle" value="${esc(handle)}"><input type="hidden" name="step" value="signin"><div class="bar"><button name="decision" value="deny" class="primary">Cancel</button></div></form>`;
+    return `<details class="risk-gate"><summary>${cxIcon("next")}I understand the risk, continue anyway</summary>${cxStart(handle, choices, siteKey)}</details>${cancel}`;
+  }
   const head = `<form method="post" action="/authorize"><input type="hidden" name="handle" value="${esc(handle)}"><input type="hidden" name="step" value="signin"><input type="hidden" name="decision" value="approve">`;
   if (!choices.length) return `<form method="post" action="/authorize"><input type="hidden" name="handle" value="${esc(handle)}"><input type="hidden" name="step" value="signin">
 <div class="bar"><button name="decision" value="deny">Cancel</button><button name="decision" value="approve" class="primary">Continue${cxIcon("next")}</button></div></form>`;
@@ -306,11 +370,19 @@ function cxChoices(env) {
   return (upstreamFor(env).choices?.() ?? []).filter((x) => typeof x?.id === "string" && /^[a-z0-9_-]{1,32}$/.test(x.id) && typeof x.label === "string").map((x) => ({ id: x.id, label: x.label.slice(0, 60), email: !!x.email }));
 }
 function clientFacts(d) {
+  const t = cxTrust(d), host = esc(t.host);
   const chips = [
-    d.clientDomain ? cxChip("ok", "check", `Verified \u00B7 ${esc(d.clientDomain)}`) : cxChip("warn", "alert", "Name not verified"),
+    t.kind === "impersonation" ? cxChip("bad", "alert", `Not verified as ${esc(t.brand)}`)
+      : t.kind === "verified" ? cxChip("ok", "check", `Verified \u00B7 ${host}`)
+      : t.kind === "known" ? cxChip("ok", "check", `Known app \u00B7 ${host}`)
+      : cxChip("warn", "alert", "Name not verified"),
     cxChip("", "back", `Returns to ${esc(d.redirectHost)}`)
   ];
-  return `<div class="chips">${chips.join("")}</div>${d.redirectUri ? `<p class="note">Returns to <code class="url">${esc(d.redirectUri)}</code></p>` : ""}${d.redirectIsLoopback ? `<div class="callout warn">${cxIcon("alert")}<div><strong>This sends access to an app on this computer.</strong> Continue only if you just started connecting from it.</div></div>` : ""}`;
+  const callout = t.kind === "local" ? `<div class="callout warn">${cxIcon("alert")}<div><strong>This sends access to an app on this computer.</strong> Continue only if you just started connecting from it.</div></div>`
+    : t.kind === "impersonation" ? `<div class="callout bad risk" role="alert">${cxIcon("alert")}<div><strong>This may not be ${esc(t.brand)}.</strong> It calls itself \u201C${esc(d.clientName)}\u201D, but it would send access to <strong>${host}</strong>, which isn't ${esc(t.brand)}'s.${t.official ? ` The real ${esc(t.brand)} connects from ${esc(t.official)}.` : ""} Don't continue unless you set up this app yourself.</div></div>`
+    : t.kind === "unverified" ? `<div class="callout warn">${cxIcon("alert")}<div><strong>Agent Library can't verify this app.</strong> It would send access to <strong>${host}</strong>. Continue only if you just started connecting from ${host} and trust it.</div></div>`
+    : "";
+  return `<div class="chips">${chips.join("")}</div>${d.redirectUri ? `<p class="note">Returns to <code class="url">${esc(d.redirectUri)}</code></p>` : ""}${callout}`;
 }
 // The owner's most recent live connection for this exact client_id. Never matched by name: client names are
 // self-asserted, so a look-alike registration must not inherit another app's access or be offered its replacement.
@@ -419,10 +491,12 @@ ${cxStart(consent2.handle, cxChoices(env), cxTurnstile(env))}${cxTurnstileScript
   const details = await oauth.describeConsent(parsed);
   const consent = await oauth.beginConsent(parsed);
   const targets = upstreamFor(env).origins();
+  const gated = cxTrust(details).kind === "impersonation";
+  if (gated) console.log("oauth_impersonation_warning " + JSON.stringify({ client_name: String(details.clientName).slice(0, 100), redirect_host: details.redirectHost }));
   return page("Connect an app to Agent Library", cxShell(`${cxPair(details.clientName)}
 <h1>Connect ${esc(details.clientName)}</h1><p class="lede">It wants to use documents in your library. Sign in to pick which projects. Nothing is shared yet.</p>
 ${clientFacts(details)}
-${cxStart(consent.handle, cxChoices(env), cxTurnstile(env))}${cxTurnstileScript(env)}`), consent.headers, 200, targets, { turnstile: !!cxTurnstile(env) });
+${cxStart(consent.handle, cxChoices(env), cxTurnstile(env), gated)}${cxTurnstileScript(env)}`), consent.headers, 200, targets, { turnstile: !!cxTurnstile(env) });
 }
 async function authorizePost(req, env, as, origin) {
   const oauth = as.getOAuthApi(env);
@@ -1077,6 +1151,9 @@ code{font:12px ui-monospace,Menlo,monospace;background:var(--sunk);padding:1px 5
 .chip svg{width:13px;height:13px}
 .chip.ok{color:var(--ok);background:color-mix(in srgb,var(--ok) 12%,transparent)}
 .chip.warn{color:var(--warn);background:color-mix(in srgb,var(--warn) 13%,transparent)}
+.chip.bad{color:var(--bad);background:color-mix(in srgb,var(--bad) 13%,transparent)}
+.callout.risk{border-width:2px}
+.risk-gate{margin:14px 0 0}.risk-gate summary{display:inline-flex;align-items:center;gap:6px;min-height:40px;cursor:pointer;list-style:none;color:var(--muted);font-size:13.5px;text-decoration:underline}.risk-gate summary::-webkit-details-marker{display:none}.risk-gate[open] summary{margin-bottom:10px}.risk-gate[open] summary svg{transform:rotate(90deg)}
 .callout{display:flex;gap:10px;align-items:flex-start;margin:0 0 16px;padding:10px 12px;border-radius:var(--r2);font-size:13.5px;border:1px solid var(--line)}
 .callout svg{margin-top:2px}
 .callout.warn{background:var(--banner-bg);border-color:var(--banner-line)}.callout.warn svg{color:var(--warn)}
