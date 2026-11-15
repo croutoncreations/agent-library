@@ -172,15 +172,15 @@ function allowedRedirect(u) {
 // service. hosts: exact hosts (or a ".domain" suffix where every subdomain is the company's own; user-content hosts
 // such as script.google.com or gist.github.com are deliberately not covered). Short words match only as whole words.
 const WATCHED_APPS = [
-  { brand: "Claude", words: ["claude", "anthropic"], hosts: ["claude.ai", "claude.com", ".anthropic.com"] },
-  { brand: "ChatGPT", words: ["chatgpt", "openai", "codex"], hosts: ["chatgpt.com", "openai.com", "platform.openai.com"] },
-  { brand: "Cursor", words: ["cursor"], hosts: ["cursor.com", "www.cursor.com", "cursor.sh"] },
-  { brand: "Grok", words: ["grok", "xai"], hosts: ["grok.com", "x.ai", "x.com"] },
+  { brand: "Claude", words: ["claude", "anthropic"], hosts: [".claude.ai", ".claude.com", ".anthropic.com"] },
+  { brand: "ChatGPT", words: ["chatgpt", "openai", "codex"], hosts: [".chatgpt.com", ".openai.com"] },
+  { brand: "Cursor", words: ["cursor"], hosts: [".cursor.com", ".cursor.sh"] },
+  { brand: "Grok", words: ["grok", "xai"], hosts: [".grok.com", ".x.ai", "x.com"] },
   { brand: "Google", words: ["gemini", "google", "bard"], hosts: ["gemini.google.com", "accounts.google.com", "google.com"] },
   { brand: "GitHub", words: ["github", "copilot"], hosts: ["github.com", "githubcopilot.com"] },
   { brand: "Microsoft", words: ["microsoft", "copilot"], hosts: ["copilot.microsoft.com", "microsoft.com", "login.microsoftonline.com"] },
-  { brand: "Perplexity", words: ["perplexity"], hosts: ["perplexity.ai", "www.perplexity.ai"] },
-  { brand: "Mistral", words: ["mistral", "lechat"], hosts: ["mistral.ai", "chat.mistral.ai", "console.mistral.ai"] },
+  { brand: "Perplexity", words: ["perplexity"], hosts: [".perplexity.ai"] },
+  { brand: "Mistral", words: ["mistral", "lechat"], hosts: [".mistral.ai"] },
   { brand: "Agent Library", words: ["agentlibrary"], hosts: [] }
 ];
 const WHOLE_WORD = new Set(["bard", "codex", "grok", "xai", "cursor", "lechat"]);
@@ -193,34 +193,37 @@ const CONFUSABLE = { "0": "o", "3": "e", "4": "a", "5": "s", "7": "t", "8": "b",
   "\u0458": "j", "\u0408": "j", "\u043A": "k", "\u041A": "k", "\u04CF": "i", "\u043C": "m", "\u041C": "m", "\u043E": "o", "\u041E": "o", "\u0440": "p", "\u0420": "p", "\u0455": "s", "\u0405": "s",
   "\u0442": "t", "\u0422": "t", "\u0443": "y", "\u0423": "y", "\u0445": "x", "\u0425": "x", "\u0501": "d", "\u051B": "q", "\u051D": "w",
   "\u03B1": "a", "\u0391": "a", "\u03B2": "b", "\u0392": "b", "\u03B5": "e", "\u0395": "e", "\u0397": "h", "\u03B9": "i", "\u0399": "i", "\u03BA": "k", "\u039A": "k", "\u039C": "m", "\u039D": "n",
-  "\u03BF": "o", "\u039F": "o", "\u03C1": "p", "\u03A1": "p", "\u03C4": "t", "\u03A4": "t", "\u03C5": "y", "\u03A5": "y", "\u03C7": "x", "\u03A7": "x", "\u0396": "z",
+  "\u03BF": "o", "\u039F": "o", "\u03C1": "p", "\u03A1": "p", "\u03C4": "t", "\u03A4": "t", "\u03C5": "u", "\u03A5": "y", "\u03C7": "x", "\u03A7": "x", "\u0396": "z",
   "\u0251": "a", "\u0261": "g", "\u026A": "i", "\u0131": "i", "\u1D00": "a", "\u0280": "r" };
 const foldChars = (t) => t.replace(/./gu, (c) => CONFUSABLE[c] ?? c);
 /** The text a person sees, without invisible format characters (zero-width, bidi controls) and with spaces collapsed. */
 function visibleText(v) {
-  return String(v ?? "").replace(/[\p{Cf}\p{Cc}]/gu, "").replace(/\s+/gu, " ").trim();
+  return String(v ?? "").replace(/[\p{Cf}\p{Cc}\u3164\u115F\u1160\uFFA0\u2800]/gu, "").replace(/\s+/gu, " ").trim();
 }
-function brandTokens(text) {
-  const t = visibleText(text).slice(0, 200).normalize("NFKD").replace(/[\u0300-\u036f]/g, "").replace(/([a-z])([A-Z])/g, "$1 $2");
-  return foldChars(foldChars(t).toLowerCase()).split(/[^a-z]+/).filter(Boolean);
+// Words of a name or host, folded, in two readings: digits as look-alike letters ("Cl4ude") and digits as separators
+// ("Grok4", "ChatGPT5"). Combining marks (accents, variation selectors) are dropped after NFKD.
+function brandTokens(text, max = 260) {
+  const t = visibleText(text).slice(0, max).normalize("NFKD").replace(/\p{M}/gu, "").replace(/([a-z])([A-Z])/g, "$1 $2");
+  const asLetters = foldChars(foldChars(t).toLowerCase()).split(/[^a-z]+/).filter(Boolean);
+  const asBreaks = foldChars(foldChars(t.replace(/[0-9]+/g, " ")).toLowerCase()).split(/[^a-z]+/).filter(Boolean);
+  return [asLetters, asBreaks];
 }
 const foldWord = (w) => foldChars(w);
 /** Every watched brand the text claims (empty when none). */
 function watchedBrands(text) {
-  const tokens = brandTokens(text);
-  const hit = (word) => {
+  const readings = brandTokens(text);
+  const hitIn = (tokens, word) => {
     const x = foldWord(word);
-    if (WHOLE_WORD.has(word)) return tokens.includes(x);
-    // A whole word, a word that starts with it ("claudebot"), or spelled out over consecutive short words that end
-    // exactly at the brand ("c l a u d e", "open ai", "agent library"), never across into a longer word.
-    if (tokens.some((t) => t.startsWith(x))) return true;
+    // A whole word; for longer words also a word that starts with it ("claudebot"); or spelled out over consecutive
+    // words that end exactly at the brand ("c l a u d e", "open ai", "x ai", "le chat"), never into a longer word.
+    if (WHOLE_WORD.has(word) ? tokens.includes(x) : tokens.some((t) => t.startsWith(x))) return true;
     for (let i = 0; i < tokens.length; i++) {
       let acc = "";
       for (let j = i; j < tokens.length && acc.length < x.length; j++) { acc += tokens[j]; if (acc === x && j > i) return true; }
     }
     return false;
   };
-  return WATCHED_APPS.filter((w) => w.words.some(hit));
+  return WATCHED_APPS.filter((w) => w.words.some((word) => readings.some((tokens) => hitIn(tokens, word))));
 }
 const onHost = (host, h) => h.startsWith(".") ? host === h.slice(1) || host.endsWith(h) : host === h;
 /**

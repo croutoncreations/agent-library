@@ -715,7 +715,8 @@ test("registration: unsafe schemes and hosts are refused; a name claiming a know
   // behind "continue anyway", no Verified badge. The name is never identity.
   for (const [name, cb] of [["Claude", "https://claude.ai.evil-agent.com/api/mcp/auth_callback"], ["ChatGPT", "https://evil-agent.com/cb"], ["Cl4ude", "https://evil-agent.com/cb"],
     ["CIaude", "https://evil-agent.com/cb"], ["\u0421laude Desktop", "https://evil-agent.com/cb"], ["Cursor", "https://evilcursor.com/agents/mcp/oauth/callback"], ["Agent Library sync", "https://evil-agent.com/cb"],
-    ["Helper", "https://chatgpt.com.evil-agent.com/cb"], ["\u200b".repeat(150) + "Claude", "https://evil-agent.com/cb"]]) {
+    ["Helper", "https://chatgpt.com.evil-agent.com/cb"], ["\u200b".repeat(150) + "Claude", "https://evil-agent.com/cb"], ["Grok4", "https://evil-agent.com/cb"],
+    ["xAI Assistant", "https://evil-agent.com/cb"], ["Cur\u3164sor", "https://evil-agent.com/cb"], ["Helper", "https://x.ai.evil-agent.com/cb"]]) {
     const r = await reg({ client_name: name, redirect_uris: [cb], token_endpoint_auth_method: "none" });
     assert.equal(r.status, 201, name);
     const page = await (await fetch(authUrl((await r.json()).client_id, cb), { redirect: "manual" })).text();
