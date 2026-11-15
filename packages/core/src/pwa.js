@@ -71,10 +71,22 @@ function servePwaFile(path) {
     return new Response(MANIFEST2, { headers: { "content-type": "application/manifest+json; charset=utf-8", "cache-control": "no-cache" } });
   if (path === "/sw.js")
     return new Response(SERVICE_WORKER, { headers: { "content-type": "text/javascript; charset=utf-8", "cache-control": "no-cache", "service-worker-allowed": "/" } });
-  const m = /^\/icons\/([a-z0-9-]+\.png)$/.exec(path);
+  return serveIcon(path);
+}
+// The app icon by path, for both hosts. /favicon.ico answers with the PNG (browsers and favicon services accept a PNG
+// there), so connector lists that look up a host's favicon show the Agent Library mark.
+function serveIcon(path) {
+  const m = path === "/favicon.ico" ? [null, "app-icon-192.png"] : /^\/icons\/([a-z0-9-]+\.png)$/.exec(path);
   if (m && ICON_BYTES.has(m[1]))
     return new Response(ICON_BYTES.get(m[1]), { headers: { "content-type": "image/png", "cache-control": "public, max-age=86400" } });
   return null;
 }
+// MCP icons (Implementation.icons, spec 2025-11-25) for serverInfo and the server card: absolute URLs on the given origin.
+function mcpIcons(origin) {
+  return [
+    { src: origin + "/icons/app-icon-192.png", mimeType: "image/png", sizes: ["192x192"] },
+    { src: origin + "/icons/app-icon-512.png", mimeType: "image/png", sizes: ["512x512"] }
+  ];
+}
 
-export { servePwa, serveShellVersion, shellVersion };
+export { mcpIcons, serveIcon, servePwa, serveShellVersion, shellVersion };

@@ -1,4 +1,5 @@
 import { readBlobBytes } from "../content-store.js";
+import { mcpIcons } from "../pwa.js";
 import { insufficientScope } from "@cloudflare/workers-oauth-provider";
 import { agentRate, limitsFor, rateLimit } from "../auth.js";
 import { byteLength } from "../formats.js";
@@ -91,7 +92,7 @@ async function handleOAuthMcp(req, env, ctx) {
       return reply(rpc(msg.id, {
         protocolVersion: SUPPORTED.includes(want) ? want : SUPPORTED[0],
         capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: "agent-library", title: "Agent Library", version: "0.3.0" },
+        serverInfo: { name: "agent-library", title: "Agent Library", version: "0.3.0", icons: mcpIcons(new URL(req.url).origin) },
         instructions: conn.file_access === 1 ? FT_INSTRUCTIONS : "Agent Library: Markdown documents in owner-approved projects. Call list_projects first; pass project_id when more than one project is connected. Read before editing; saves need expected_revision and a fresh idempotency_key. Every change is kept as a version the owner reviews in History: whenever a tool has a change_note field, always set it to one line on why."
       }));
     }

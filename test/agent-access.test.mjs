@@ -70,6 +70,16 @@ test("consent with no projects: connect now, the token works, list_projects is e
   assert.equal(sql(`SELECT project_id, can_write FROM oauth_connections WHERE id = '${c.id}'`)[0].project_id, null, "legacy project_id column is NULL");
   const init = await mcp(agent.access_token, "initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "zero-sim", version: "1" } });
   assert.equal(init.status, 200); assert.equal(init.body.result.serverInfo.name, "agent-library");
+  // The Agent Library mark: serverInfo.icons (absolute, on the MCP host) and /favicon.ico on both hosts, all real PNGs.
+  const icons = init.body.result.serverInfo.icons;
+  assert.deepEqual(icons.map((i) => [i.src, i.mimeType, i.sizes]), [[`${h.issuer}/icons/app-icon-192.png`, "image/png", ["192x192"]], [`${h.issuer}/icons/app-icon-512.png`, "image/png", ["512x512"]]]);
+  for (const u of [icons[0].src, icons[1].src, `${h.issuer}/favicon.ico`, `${h.appUi}/favicon.ico`]) {
+    const r = await fetch(u);
+    const bytes = new Uint8Array(await r.arrayBuffer());
+    assert.equal(r.status, 200, u); assert.equal(r.headers.get("content-type"), "image/png", u);
+    assert.deepEqual([...bytes.slice(0, 4)], [0x89, 0x50, 0x4e, 0x47], u);
+  }
+  assert.equal((await fetch(`${h.issuer}/icons/nope.png`)).status, 404);
   const tools = (await agent.list()).map((t) => t.name);
   assert.ok(tools.includes("list_projects") && tools.includes("connection_info") && !tools.includes("save_markdown"), tools.join());
   const lp = await agent.call("list_projects", {});

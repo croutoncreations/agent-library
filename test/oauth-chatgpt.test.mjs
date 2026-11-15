@@ -608,7 +608,14 @@ test("OAuth host route allow-list: every non-OAuth path and method is 404/405, n
   const paths = ["/", "/index.html", "/app.js", "/app.css", "/api", "/api/me", "/api/logout", "/api/projects", `/api/projects/${PA}/artifacts`,
     `/api/projects/${PA}/grants`, `/api/projects/${PA}/connections`, `/api/projects/${PA}/audit`, `/api/projects/${PA}/backup`,
     `/api/projects/${PA}/maintenance/reconcile-uploads`, "/api/restore", "/api/transfers/upl_x", "/auth/dev-login", "/auth/access-login",
-    "/.well-known/oauth-protected-resource", "/mcp/../api/projects", "/MCP", "/oauth", "/oauth/other", "/callback/x", "/authorize/x", "/favicon.ico"];
+    "/.well-known/oauth-protected-resource", "/mcp/../api/projects", "/MCP", "/oauth", "/oauth/other", "/callback/x", "/authorize/x",
+    "/manifest.webmanifest", "/sw.js", "/icons/../app.js", "/icons/nope.png"];
+  // The one public exception: the app icon (GET /favicon.ico and /icons/<known>.png, a static PNG), for connector lists.
+  for (const p of ["/favicon.ico", "/icons/app-icon-192.png"]) {
+    const g = await fetch(MCP + p, { headers: { cookie: owner.cookie } });
+    assert.deepEqual([g.status, g.headers.get("content-type"), g.headers.get("set-cookie")], [200, "image/png", null], p);
+    assert.equal((await fetch(MCP + p, { method: "POST", body: "{}" })).status === 200, false, `POST ${p}`);
+  }
   for (const p of paths) for (const m of ["GET", "POST"]) {
     const r = await fetch(MCP + p, { method: m, headers: { cookie: owner.cookie, "x-csrf-token": owner.csrf, "content-type": "application/json" }, body: m === "POST" ? "{}" : undefined });
     const body = await r.text();

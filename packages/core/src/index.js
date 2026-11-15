@@ -21,7 +21,7 @@ import { handleMcp } from "./mcp.js";
 import { listAccess, listConnections, renameConnection, revokeConnection, revokeConnectionById, setConnectionProjects } from "./oauth/connections.js";
 import { handleFileTransfer } from "./oauth/mcp.js";
 import { handleOAuthHost, originFor } from "./oauth/server.js";
-import { servePwa, serveShellVersion, shellVersion } from "./pwa.js";
+import { serveIcon, servePwa, serveShellVersion, shellVersion } from "./pwa.js";
 import { contentOrigin, handleContentHost, isContentHost, projectMedia, viewLinkRedirect, wantsContentHost } from "./view-links.js";
 import { deleteProject, listDeletedProjects, purgeDueProjects, purgeProjectNow, restoreProject } from "./project-deletion.js";
 import { purgeDeletingWorkspaces } from "./workspace-purge.js";
@@ -147,6 +147,7 @@ async function route3(req, env, url, requestId, seen = {}) {
     const r = servePwa(path);
     if (r) return r;
   }
+  if (m === "GET" && path === "/favicon.ico") return serveIcon(path);
   if (m === "GET" && path === "/app.css") return shellResponse(APP_CSS, "text/css; charset=utf-8");
   if (m === "GET" && path === `/editor.${EDITOR_JS_SHA256.slice(0, 16)}.js`)
     return new Response(EDITOR_JS, { headers: { "content-type": "text/javascript; charset=utf-8", "cache-control": "public, max-age=31536000, immutable" } });
@@ -432,6 +433,9 @@ var coreWorker = {
     if (e2.MCP_HOST && host === e2.MCP_HOST.toLowerCase()) {
       const publisherRoute = env.APP_CONNECT_ENABLED === "1" && /^\/v1\/(publisher|app)(\/|$)/.test(url.pathname);
       if (url.pathname.startsWith("/files/")) return withSec(await handleFileTransfer(req, env, url));
+      // The app icon, so connector lists that show a favicon (or serverInfo.icons) find the Agent Library mark here too.
+      const icon = req.method === "GET" && (url.pathname === "/favicon.ico" || url.pathname.startsWith("/icons/")) ? serveIcon(url.pathname) : null;
+      if (icon) return withSec(icon);
       if (isV1Path(url.pathname) && !publisherRoute) return withSec(await handleV1(req, env));
       return withSec(await handleOAuthHost(req, e2, ctx, host));
     }
