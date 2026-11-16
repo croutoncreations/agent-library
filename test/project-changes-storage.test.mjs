@@ -16,6 +16,119 @@ function db() {
   );
   return d;
 }
+test("the documented v0.1.0 upgrade installs the changes feed and preserves existing content", () => {
+  const guide = readFileSync("docs/project-changes.md", "utf8");
+  const target = guide.match(/Apply migration `([^`]+\.sql)` before deploying/);
+  assert.ok(target, "the rollout guide must name the exact migration file");
+  assert.equal(target[1], "0015_project_changes.sql");
+
+  const names = readdirSync("migrations")
+    .filter((n) => n.endsWith(".sql"))
+    .sort();
+  const released = names.filter((n) => n <= "0013_oauth_file_access.sql");
+  const pending = names.filter(
+    (n) => n > "0013_oauth_file_access.sql" && n <= target[1],
+  );
+  const d = new DatabaseSync(":memory:");
+  d.exec("PRAGMA foreign_keys = ON");
+  for (const n of released)
+    d.exec(readFileSync("migrations/" + n, "utf8"));
+
+  d.prepare("INSERT INTO principals VALUES(?,?,?,?,?,?)").run(
+    "owner",
+    "human",
+    "synthetic",
+    "owner",
+    "Owner",
+    "2026-10-28",
+  );
+  d.prepare("INSERT INTO projects VALUES(?,?,?,?)").run(
+    "project-old",
+    "owner",
+    "Existing project",
+    "2026-10-28",
+  );
+  d.prepare(
+    `INSERT INTO artifacts
+      (id,project_id,kind,title,head_rev,head_revision_id,created_at,updated_at)
+      VALUES(?,?,?,?,?,?,?,?)`,
+  ).run(
+    "artifact-old",
+    "project-old",
+    "markdown",
+    "Existing document",
+    1,
+    "revision-old",
+    "2026-10-28",
+    "2026-10-28",
+  );
+  d.prepare(
+    `INSERT INTO revisions
+      (id,artifact_id,project_id,rev_no,author_id,body,size,sha256,mime,created_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?)`,
+  ).run(
+    "revision-old",
+    "artifact-old",
+    "project-old",
+    1,
+    "owner",
+    "preserved body",
+    14,
+    "synthetic-hash-1",
+    "text/markdown",
+    "2026-10-28",
+  );
+
+  for (const n of pending)
+    d.exec(readFileSync("migrations/" + n, "utf8"));
+  const key = d
+    .prepare("SELECT secret FROM change_feed_key WHERE id=1")
+    .get().secret;
+  assert.match(key, /^[a-f0-9]{64}$/);
+  assert.deepEqual(
+    { ...d.prepare(`SELECT a.title,r.body FROM artifacts a
+      JOIN revisions r ON r.id=a.head_revision_id`).get() },
+    { title: "Existing document", body: "preserved body" },
+  );
+  assert.equal(
+    d.prepare("SELECT count(*) AS n FROM project_changes").get().n,
+    0,
+    "the migration does not invent historical publication events",
+  );
+
+  d.exec(readFileSync("migrations/" + target[1], "utf8"));
+  assert.equal(
+    d.prepare("SELECT secret FROM change_feed_key WHERE id=1").get().secret,
+    key,
+    "retry keeps the database-local cursor key",
+  );
+  d.prepare(
+    `INSERT INTO revisions
+      (id,artifact_id,project_id,rev_no,author_id,body,size,sha256,mime,created_at,via_kind)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+  ).run(
+    "revision-after-rollback",
+    "artifact-old",
+    "project-old",
+    2,
+    "owner",
+    "previous Worker write",
+    21,
+    "synthetic-hash-2",
+    "text/markdown",
+    "2026-10-29",
+    "browser",
+  );
+  d.prepare(
+    "UPDATE artifacts SET head_rev=2,head_revision_id=? WHERE id=? AND head_rev=1",
+  ).run("revision-after-rollback", "artifact-old");
+  assert.deepEqual(
+    { ...d.prepare("SELECT type,revision FROM project_changes").get() },
+    { type: "artifact.content_updated", revision: 2 },
+  );
+  assert.deepEqual(d.prepare("PRAGMA foreign_key_check").all(), []);
+  d.close();
+});
 const create = (d, id = "a", date = "1900-01-01") =>
   d.exec(
     `INSERT INTO artifacts(id,project_id,kind,title,head_rev,head_revision_id,created_at,updated_at) VALUES('${id}','p','markdown','Synthetic',1,'r-${id}','${date}','${date}');INSERT INTO revisions(id,artifact_id,project_id,rev_no,author_id,body,size,sha256,mime,created_at) VALUES('r-${id}','${id}','p',1,'owner','synthetic',9,'hash','text/markdown','${date}');`,
