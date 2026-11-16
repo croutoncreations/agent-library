@@ -14,9 +14,9 @@ The hosted service's own operator needs to satisfy the relevant conditions. Its 
 
 1. Search the [official designated-agent directory](https://www.copyright.gov/dmca-directory/) for the LLC and existing product names. If the same LLC already has a current designation, update it rather than creating conflicting entries. Separate legal entities require separate designations.
 2. Use the Copyright Office's online system to register or amend the service provider. Supply the LLC's legal name and physical street address and appropriate alternate business, product, and website names, including Agent Library.
-3. Choose one agent: an individual, role, department, or outside service. Supply the agent's mailing address, telephone number, and email. A monitored `support@croutonhq.com` can be the email; an email address alone is insufficient. Agent contact details are public.
-4. Pay the current $6 designation or amendment fee and publish matching agent contact information on an accessible service page.
-5. Keep details current and renew before three years elapse. An amendment or resubmission restarts that period. [Copyright Office registration FAQ](https://www.copyright.gov/dmca-directory/faq.html).
+3. Choose one agent: an individual, role, department, or outside service. Supply the agent's mailing address, telephone number, and email. A monitored `support@croutonhq.com` can be the email; an email address alone is insufficient. Agent contact details are public. [Required registration information](https://www.copyright.gov/title37/201/37cfr201-38.html).
+4. Pay the current $6 designation or amendment fee and publish matching agent contact information on an accessible service page. [Current fee schedule](https://www.copyright.gov/about/fees.html).
+5. Keep details current and renew before three years elapse. An amendment or resubmission restarts that period. [Renewal regulation](https://www.copyright.gov/title37/201/37cfr201-38.html).
 
 No additional outside agent is required merely because the company is small. The choice depends on whether the team can reliably monitor the inbox, assess notices, and meet the process requirements. An outside service can help operationally but does not replace the operator's responsibilities.
 
