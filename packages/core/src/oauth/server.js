@@ -567,11 +567,14 @@ async function authorizePost(req, env, as, origin) {
   const step = String(form.get("step") ?? "");
   // A "Set all" button on the grant page re-renders the form (handled below); it is neither approve nor deny.
   if (form.get("decision") !== "approve" && !(step === "grant" && form.has("bulk"))) {
-    const flagged = (await env.OAUTH_KV.get(`cxrisk:${await sha(handle)}`, "json"))?.state;
+    const flaggedState = (await env.OAUTH_KV.get(`cxrisk:${await sha(handle)}`, "json"))?.state;
+    // The grant page's consent has no cxrisk record; its saved view says whether the app was flagged.
+    const grantView = step === "grant" ? (await env.OAUTH_KV.get(`consentctx:${await sha(handle)}`, "json"))?.view?.d : null;
+    const flagged = flaggedState === "gated" || flaggedState === "accepted" || (grantView ? cxTrust(grantView).kind === "impersonation" : false);
     const denied = await oauth.denyConsent(req, handle);
     const loc = denied.headers.get("location");
     denied.headers.delete("location");
-    return toClient(loc, denied.headers, new URL(loc).host, true, flagged === "gated" || flagged === "accepted");
+    return toClient(loc, denied.headers, new URL(loc).host, true, flagged);
   }
   if (step === "risk") {
     // "I understand the risk, continue anyway" on an impersonation warning: record it, then show the sign-in options
@@ -590,7 +593,8 @@ ${cxStart(handle, cxChoices(env), cxTurnstile(env))}${cxTurnstileScript(env)}`),
   if (step === "signin") {
     // An impersonation warning must be passed (step=risk) before signing in; no record (expired, lost) refuses too.
     const risk = await env.OAUTH_KV.get(`cxrisk:${await sha(handle)}`, "json");
-    if (risk?.state !== "clear" && risk?.state !== "accepted") return errorPage("Read the warning first: this app may not be what it says. Start connecting again from the app.", 400);
+    if (risk?.state === "gated") return errorPage("Read the warning first: this app may not be what it says. Start connecting again from the app.", 400);
+    if (risk?.state !== "clear" && risk?.state !== "accepted") return errorPage("This consent page expired. Start connecting again from the app.", 400);
     // Validate the sign-in choice before the consent handle is used, so a typo can be fixed with Back.
     const choices = cxChoices(env);
     const picked = choices.find((c) => c.id === String(form.get("choice") ?? "")) ?? (choices.length ? null : undefined);
