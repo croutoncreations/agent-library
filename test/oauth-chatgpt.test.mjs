@@ -765,7 +765,11 @@ test("impersonation gate is enforced by the server: sign-in is refused until 'co
   const b2 = browser();
   const h2 = (await (await b2.go(authUrl(c2.client_id, cb))).text()).match(/name="handle" value="([^"]+)"/)[1];
   const cancel = await b2.go(`${MCP}/authorize`, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ handle: h2, step: "risk", decision: "deny" }).toString() });
-  assert.match(await cancel.text(), /Cancelled/);
+  const ct = await cancel.text();
+  assert.match(ct, /Cancelled/);
+  assert.doesNotMatch(ct, /http-equiv="refresh"/, "a flagged app's Cancel doesn't send the browser on automatically");
+  // A handle with no record (lost or expired) can't sign in either.
+  assert.equal((await b2.go(`${MCP}/authorize`, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ handle: "y".repeat(43), step: "signin", decision: "approve" }).toString() })).status, 400);
 });
 
 test("no zero-click redirect: an authorization error for an unknown https callback is shown here, not redirected", async () => {

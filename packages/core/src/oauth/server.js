@@ -127,10 +127,14 @@ async function livePublisher(env, p) {
   return row;
 }
 // denied: whether this is the Cancel answer (never read from the URL: a callback may carry its own query).
-function toClient(location, headers, clientHost, denied = false) {
+// noAuto: don't send the browser on automatically (Cancel on a flagged app): show the result and a link only.
+function toClient(location, headers, clientHost, denied = false, noAuto = false) {
   const u = new URL(location);
   if (!/^https?:$/.test(u.protocol)) return errorPage("This app's callback address is not allowed to connect.");
   const href = esc(location);
+  if (noAuto) return page("Cancelled", cxShell(`<div class="state neutral"><span class="big" aria-hidden="true">${cxIcon("x")}</span>
+<h1>Cancelled</h1><p class="lede">Nothing was shared. You can close this tab.</p>
+<p class="fine">This app may not be what it says, so you weren't sent back to <strong>${esc(clientHost)}</strong> automatically.</p></div>`, false), headers, 200);
   return page(denied ? "Cancelled" : "Connected", `<meta http-equiv="refresh" content="0;url=${href}">
 ${cxShell(`<div class="state ${denied ? "neutral" : "on"}"><span class="big" aria-hidden="true">${cxIcon(denied ? "x" : "check")}</span>
 <h1>${denied ? "Cancelled" : "Connected"}</h1><p class="lede">${denied ? "Nothing was shared. " : ""}Taking you back to <strong>${esc(clientHost)}</strong>\u2026</p>
@@ -530,6 +534,8 @@ async function authorizeGet(req, env, as, origin) {
     const hint = cxPublishHint(new URL(req.url).searchParams);
     if (hint) await env.OAUTH_KV.put(`pubhint:${await sha(parsed.clientId + " " + parsed.codeChallenge)}`, JSON.stringify(hint), { expirationTtl: 900 });
     const consent2 = await oauth.beginConsent(parsed);
+    // Owner-registered publisher: never gated (its name and callbacks were set by the owner).
+    await env.OAUTH_KV.put(`cxrisk:${await sha(consent2.handle)}`, JSON.stringify({ state: "clear" }), { expirationTtl: 900 });
     const targets2 = upstreamFor(env).origins();
     const app = pubCheck.app;
     return page("Connect an app to Agent Library", cxShell(`${cxPair(app.display_name)}
@@ -542,12 +548,11 @@ ${cxStart(consent2.handle, cxChoices(env), cxTurnstile(env))}${cxTurnstileScript
   const consent = await oauth.beginConsent(parsed);
   const targets = upstreamFor(env).origins();
   const gated = cxTrust(details).kind === "impersonation";
-  if (gated) {
-    // The sign-in step is refused for this consent until the person chooses "continue anyway" (step=risk).
-    const view = { clientName: details.clientName, clientDomain: details.clientDomain ?? null, redirectHost: details.redirectHost, redirectUri: details.redirectUri, redirectIsLoopback: false };
-    await env.OAUTH_KV.put(`cxrisk:${await sha(consent.handle)}`, JSON.stringify({ state: "gated", view }), { expirationTtl: 900 });
-    console.log("oauth_impersonation_warning " + JSON.stringify({ shown: true, client_name: String(details.clientName).slice(0, 100), redirect_host: details.redirectHost }));
-  }
+  // Every reader consent gets a record: "gated" (sign-in refused until "continue anyway", step=risk) or "clear". A
+  // missing record refuses sign-in, so a lost write fails closed.
+  const view = { clientName: details.clientName, clientDomain: details.clientDomain ?? null, redirectHost: details.redirectHost, redirectUri: details.redirectUri, redirectIsLoopback: details.redirectIsLoopback };
+  await env.OAUTH_KV.put(`cxrisk:${await sha(consent.handle)}`, JSON.stringify({ state: gated ? "gated" : "clear", view }), { expirationTtl: 900 });
+  if (gated) console.log("oauth_impersonation_warning " + JSON.stringify({ shown: true, client_name: String(details.clientName).slice(0, 100), redirect_host: details.redirectHost }));
   return page("Connect an app to Agent Library", cxShell(`${cxPair(details.clientName)}
 <h1>Connect ${esc(details.clientName)}</h1><p class="lede">It wants to use documents in your library. Sign in to pick which projects. Nothing is shared yet.</p>
 ${clientFacts(details)}
@@ -562,10 +567,11 @@ async function authorizePost(req, env, as, origin) {
   const step = String(form.get("step") ?? "");
   // A "Set all" button on the grant page re-renders the form (handled below); it is neither approve nor deny.
   if (form.get("decision") !== "approve" && !(step === "grant" && form.has("bulk"))) {
+    const flagged = (await env.OAUTH_KV.get(`cxrisk:${await sha(handle)}`, "json"))?.state;
     const denied = await oauth.denyConsent(req, handle);
     const loc = denied.headers.get("location");
     denied.headers.delete("location");
-    return toClient(loc, denied.headers, new URL(loc).host, true);
+    return toClient(loc, denied.headers, new URL(loc).host, true, flagged === "gated" || flagged === "accepted");
   }
   if (step === "risk") {
     // "I understand the risk, continue anyway" on an impersonation warning: record it, then show the sign-in options
@@ -582,8 +588,9 @@ ${d ? clientFacts(d) : ""}
 ${cxStart(handle, cxChoices(env), cxTurnstile(env))}${cxTurnstileScript(env)}`), new Headers({ "cache-control": "no-store" }), 200, upstreamFor(env).origins(), { turnstile: !!cxTurnstile(env) });
   }
   if (step === "signin") {
-    // An impersonation warning must be passed (step=risk) before signing in.
-    if ((await env.OAUTH_KV.get(`cxrisk:${await sha(handle)}`, "json"))?.state === "gated") return errorPage("Read the warning first: this app may not be what it says. Start connecting again from the app.", 400);
+    // An impersonation warning must be passed (step=risk) before signing in; no record (expired, lost) refuses too.
+    const risk = await env.OAUTH_KV.get(`cxrisk:${await sha(handle)}`, "json");
+    if (risk?.state !== "clear" && risk?.state !== "accepted") return errorPage("Read the warning first: this app may not be what it says. Start connecting again from the app.", 400);
     // Validate the sign-in choice before the consent handle is used, so a typo can be fixed with Back.
     const choices = cxChoices(env);
     const picked = choices.find((c) => c.id === String(form.get("choice") ?? "")) ?? (choices.length ? null : undefined);
@@ -599,7 +606,7 @@ ${cxStart(handle, cxChoices(env), cxTurnstile(env))}${cxTurnstileScript(env)}`),
     }
     catch (e) { const f = startFailure(e); return errorPage(`${f.title}. ${f.msg}`, f.status); }
     const approved = await oauth.approveConsent(req, handle, { scope: [SCOPES.read] });
-    const secrets = { verifier: randomToken(64), nonce: randomToken(32) };
+    const secrets = { verifier: randomToken(64), nonce: randomToken(32), risk_accepted: risk.state === "accepted" };
     const { state, headers } = await oauth.beginUpstream(approved.request, { data: secrets, headers: approved.headers });
     let target;
     try { target = await upstreamFor(env).start({ redirectUri: `${origin}/callback`, state, nonce: secrets.nonce, verifier: secrets.verifier, choice: picked?.id ?? null, email, mayCreateAccount: (e) => mayCreateAccount(env, e) }); }
@@ -730,7 +737,7 @@ ${cxStart(handle, cxChoices(env), cxTurnstile(env))}${cxTurnstileScript(env)}`),
       // A connection row refused by the limit makes oauth_connection_projects' foreign key fail below, which rolls the
       // whole batch back (reported like the admin race).
       env.DB.prepare(`INSERT INTO oauth_connections (id, owner_principal_id, project_id, client_id, client_name, redirect_uri, resource, can_read, can_write, file_access, created_at, expires_at, workspace_id, created_by, label)
-        SELECT ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ? WHERE ${agentGuard.sql} AND ${homeGuard.sql}`).bind(connectionId, sess.principal_id, chosen[0]?.id ?? null, ar.clientId, (client?.clientName ?? ar.clientId).slice(0, 200), ar.redirectUri, `${origin}/mcp`, anyWrite ? 1 : 0, sess.offered === "files" ? 1 : 0, at, CONNECTION_EXPIRES_AT, connWs, sess.principal_id, label, ...agentGuard.params, ...homeGuard.params),
+        SELECT ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ? WHERE ${agentGuard.sql} AND ${homeGuard.sql}`).bind(connectionId, sess.principal_id, chosen[0]?.id ?? null, ar.clientId, (visibleText(sess.view?.d?.clientName ?? client?.clientName ?? "") || ar.clientId).slice(0, 200), ar.redirectUri, `${origin}/mcp`, anyWrite ? 1 : 0, sess.offered === "files" ? 1 : 0, at, CONNECTION_EXPIRES_AT, connWs, sess.principal_id, label, ...agentGuard.params, ...homeGuard.params),
       ...chosen.flatMap((c) => [
         env.DB.prepare("INSERT INTO oauth_connection_projects (connection_id, project_id, can_write) VALUES (?, ?, ?)").bind(connectionId, c.id, c.write ? 1 : 0),
         audit2(c.id, "oauth.connect", connectionId, c.write ? "ok:read+write" : "ok:read")
@@ -864,6 +871,12 @@ async function callback(req, env, as, origin) {
     return publishConsentPage(env, oauth, resumed, pubApp, principalId, ident.email, writableConsentProjects(projects.results));
   }
   const details = await cxDescribe(oauth, resumed.request);
+  // Trust is decided again with what the app reports now (a metadata document can change its name between pages):
+  // an impersonation the person didn't choose to continue past stops here.
+  if (cxTrust(details).kind === "impersonation" && !resumed.data.risk_accepted) {
+    console.log("oauth_impersonation_warning " + JSON.stringify({ changed: true, client_name: String(details.clientName).slice(0, 100), redirect_host: details.redirectHost }));
+    return errorPage("This app changed how it describes itself during sign-in, and it may not be what it says. Nothing was shared. Start connecting again from the app.", 400);
+  }
   const consent = await oauth.beginConsent(resumed.request);
   const prev = await cxPreviousConnection(env, principalId, resumed.request);
   // view: what the page needs to re-render itself after a fixable mistake (owner-only data, same 10-minute TTL).
