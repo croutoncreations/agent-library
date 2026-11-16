@@ -1176,7 +1176,8 @@ async function viewSearch() {
   query.id = "global-search-query"; project.id = "global-search-project";
   project.addEventListener("change", function () { if (query.value.trim()) load(false); });
   function highlight(text, words) {
-    var fragment = document.createDocumentFragment(), terms = words.toLowerCase().match(/[\p{L}\p{N}\p{M}]+/gu) || [];
+    var fragment = document.createDocumentFragment(), terms = (Array.isArray(words) ? words.join(" ") : words).toLowerCase().match(/[\p{L}\p{N}\p{M}]+/gu) || [];
+    terms.sort(function (a, b) { return b.length - a.length; });
     if (!terms.length) { fragment.append(document.createTextNode(text)); return fragment; }
     var re = new RegExp("(" + terms.join("|") + ")", "giu"), last = 0, match;
     while ((match = re.exec(text))) { fragment.append(document.createTextNode(text.slice(last, match.index)), h("mark", { text: match[0] })); last = match.index + match[0].length; }
@@ -1193,22 +1194,24 @@ async function viewSearch() {
     try {
       var result = await api("GET", "/api/search?" + params);
       if (!alive || my !== seq) return;
+      var marks = result.highlight && result.highlight.length ? result.highlight : requested.query;
+      if (!append) requested.some = result.match === "some";
       result.results.forEach(function (r) {
         list.append(h("li", { class: "card search-hit" }, fileThumb({ id: r.artifact_id, kind: r.kind, mime: r.mime, revision: r.revision }, r.project_id),
-          h("a", { class: "search-title", href: r.preview_url || r.web_url || "/p/" + enc(r.project_id) + "/a/" + enc(r.artifact_id) + "/preview?v=" + r.revision }, highlight(r.title, requested.query)),
+          h("a", { class: "search-title", href: r.preview_url || r.web_url || "/p/" + enc(r.project_id) + "/a/" + enc(r.artifact_id) + "/preview?v=" + r.revision }, highlight(r.title, marks)),
           h("p", { class: "meta", text: r.project_title + " · " + kindLabel(r) + " · Version " + r.revision + " · " + fmtDate(r.updated_at) }),
-          h("p", { class: "search-snippet" }, highlight(r.snippet, requested.query)),
+          h("p", { class: "search-snippet" }, highlight(r.snippet, marks)),
           !r.indexed_body ? h("p", { class: "muted small", text: "Title match only · No indexed body" }) : null));
       });
       cursor = result.next_cursor; more.hidden = !result.has_more;
-      status.textContent = list.children.length ? list.children.length + " results shown" + (result.has_more ? " · More available" : "") : "No matches. Try fewer words or choose another project.";
+      status.textContent = list.children.length ? (requested.some ? "Nothing has all of those words. Showing documents with some of them: " : "") + list.children.length + " results shown" + (result.has_more ? " · More available" : "") : "No matches. Try other words or choose another project.";
     } catch (e) {
       if (!alive || my !== seq) return;
       status.textContent = "Search couldn't load. " + (e.message || "Try again.");
       if (append) more.hidden = false;
     } finally { if (alive && my === seq) { submit.disabled = false; list.removeAttribute("aria-busy"); } }
   }
-  shell([{ t: "Home", href: "#/" }, { t: "Search" }], pageHead("Search library", { sub: "Find documents across your projects. Searches stored words in titles and text; all words must match. This does not interpret questions." }), form, status, list, more);
+  shell([{ t: "Home", href: "#/" }, { t: "Search" }], pageHead("Search library", { sub: "Find documents across your projects by the words in their titles and text. Word forms count (plan, plans, planning); title matches come first. This does not interpret questions." }), form, status, list, more);
   status.textContent = "Enter words to search all your projects.";
   try {
     var projects = await api("GET", "/api/projects");

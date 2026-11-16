@@ -28,6 +28,38 @@ function rsScope(ctx) {
   const sql = gate.sql.replace(/\?/g, () => { const v = gate.params[n++]; if (v === marker) return "p.id"; params.push(v); return "?"; });
   return { sql, params };
 }
+// Light English word forms, applied to the query only (the index is unchanged): "planning", "plans" and "planned" all
+// search plan*; "migration" and "migrated" search migrat*. ASCII words only; stems shorter than 4 letters are not used,
+// so short words never widen into broad prefixes.
+function rsStem(t) {
+  if (!/^[a-z]+$/.test(t)) return null;
+  const rules = [/(ments?)$/, /(ions?)$/, /(ings?)$/, /(ies)$/, /(ied)$/, /(ed)$/, /(?:[sxz]|ch|sh)(es)$/, /[^su](s)$/, /[^aeiou](y)$/, /(e)$/];
+  for (const re of rules) {
+    const m = t.match(re); if (!m) continue;
+    let stem = t.slice(0, t.length - m[1].length);
+    if (/e$/.test(stem) && m[1] !== "e" && stem.length > 4) stem = stem.slice(0, -1); // updates -> updat (update, updated, updating)
+    if (/([bdfgmnprt])\1$/.test(stem) && stem.length > 4) stem = stem.slice(0, -1); // planned -> plan(n)
+    return stem.length >= 4 && stem !== t ? stem : null;
+  }
+  return null;
+}
+// What a query word matches: the word itself, any word starting with it ("deploy" finds "deployment", a half-typed last
+// word finds the whole word) or with its stem. All are lowercase letters, numbers and marks.
+// A word of 4+ characters matches as a word start; the last word from 3 (it may be half-typed). Shorter words match whole.
+function rsForms(t, last) {
+  // Length as the index sees the word: combining marks are dropped there, so "a" plus marks is still one letter.
+  const stem = rsStem(t), n = [...t.normalize("NFKD").replace(/\p{M}/gu, "")].length;
+  const prefixes = stem ? [stem] : n >= 4 || (last && n >= 3) ? [t] : [];
+  return { exact: t, prefixes };
+}
+const rsPhrase = (t) => '"' + t + '"';
+function rsGroup(f) { return "(" + [rsPhrase(f.exact), ...f.prefixes.map((p) => rsPhrase(p) + "*")].join(" OR ") + ")"; }
+// The FTS expressions are built only from words that are runs of letters, numbers and marks (rsNormalize), so they are
+// inlined as SQL string literals: up to 16 words need about 50 expressions, beyond D1's 100 bound parameters.
+function rsLit(expr) {
+  if (!/^[\p{L}\p{N}\p{M} "*():{}A-Za-z]+$/u.test(expr)) rsInvalid("Unsupported characters in query");
+  return "'" + expr.replace(/'/g, "''") + "'";
+}
 function rsInvalid(message) { throw new HttpError(400, "invalid_input", message); }
 function rsNormalize(a) {
   if (!a || typeof a !== "object" || Array.isArray(a)) rsInvalid("Search arguments must be an object");
@@ -64,8 +96,8 @@ async function rsToolReady(env,msg) {
 function rsBase64(bytes) { return btoa(String.fromCharCode(...bytes)).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,""); }
 function rsUnbase64(s) { return Uint8Array.from(atob(s.replace(/-/g,"+").replace(/_/g,"/")), c=>c.charCodeAt(0)); }
 async function rsSigningKey(secret) { return crypto.subtle.importKey("raw", new TextEncoder().encode(secret), {name:"HMAC",hash:"SHA-256"}, false, ["sign","verify"]); }
-async function rsCursorEncode(secret,binding,after) {
-  const payload=rsBase64(new TextEncoder().encode(JSON.stringify({b:binding,a:after,e:nowMs()+900000})));
+async function rsCursorEncode(secret,binding,after,mode) {
+  const payload=rsBase64(new TextEncoder().encode(JSON.stringify({b:binding,a:after,m:mode,e:nowMs()+900000})));
   const signature=await crypto.subtle.sign("HMAC",await rsSigningKey(secret),new TextEncoder().encode(payload));
   return "sc2."+payload+"."+rsBase64(new Uint8Array(signature));
 }
@@ -76,8 +108,8 @@ async function rsCursorDecode(secret,binding,cursor) {
     const [,payload,sig]=cursor.split(".");
     if(!await crypto.subtle.verify("HMAC",await rsSigningKey(secret),rsUnbase64(sig),new TextEncoder().encode(payload))) throw bad();
     const v=JSON.parse(new TextDecoder("utf-8",{fatal:true}).decode(rsUnbase64(payload)));
-    if(v.b!==binding || !Number.isSafeInteger(v.e) || v.e<=nowMs() || !Array.isArray(v.a) || v.a.length!==3 || !Number.isInteger(v.a[0]) || typeof v.a[1]!=="string" || v.a[1].length>40 || typeof v.a[2]!=="string" || v.a[2].length>64) throw bad();
-    return v.a;
+    if(v.b!==binding || (v.m!=="all" && v.m!=="some") || !Number.isSafeInteger(v.e) || v.e<=nowMs() || !Array.isArray(v.a) || v.a.length!==3 || !Number.isInteger(v.a[0]) || typeof v.a[1]!=="string" || v.a[1].length>40 || typeof v.a[2]!=="string" || v.a[2].length>64) throw bad();
+    return { after: v.a, mode: v.m };
   }catch { throw bad(); }
 }
 // Excerpts come from at most this many leading characters of the indexed text. FTS5 snippet() costs the square of
@@ -89,7 +121,7 @@ const RS_EXCERPT_TOKENS = 40;
  * text, +100 elsewhere; 1000 per distinct word in the window, 1 per repeat), computed in linear time over a bounded
  * prefix. Matches beyond the prefix are not seen; then the excerpt is the start of the text, as for a title-only hit.
  */
-function rsExcerpt(source, terms) {
+function rsExcerpt(source, terms, prefixes = []) {
   // SQL substr() counts characters; a UTF-16 length within the prefix already means at most that many characters.
   const chars = source.length <= RS_EXCERPT_PREFIX_CHARS ? null : Array.from(source);
   const complete = !chars || chars.length <= RS_EXCERPT_PREFIX_CHARS;
@@ -106,8 +138,15 @@ function rsExcerpt(source, terms) {
     if (entry) entry[1]++; else want.set(word, [want.size, 1]);
   }
   const folded = new Map(), fold = (w) => { let f = folded.get(w); if (f === undefined) folded.set(w, f = u61FoldToken(w)); return f; };
+  // Word forms (prefixes) count for the query word they came from: [folded prefix, that word's entry].
+  const pre = [];
+  if (want.size) for (const [term, list] of prefixes) {
+    const parts = term.match(U61_TOKEN) ?? [], e = parts.length === 1 ? want.get(u61FoldToken(parts[0])) : null;
+    if (e) for (const p of list) { const q = p.match(U61_TOKEN) ?? []; if (q.length === 1) pre.push([u61FoldToken(q[0]), e]); }
+  }
+  const entry = (w) => { const f = fold(w), e = want.get(f); if (e || !pre.length) return e; for (const [p, pe] of pre) if (f.startsWith(p)) return pe; return undefined; };
   const inst = []; // [position, group, weight], in position order like FTS5 instances
-  if (want.size) tokens.forEach((t, p) => { const e = want.get(fold(t.word)); if (e) inst.push([p, e[0], e[1]]); });
+  if (want.size) tokens.forEach((t, p) => { const e = entry(t.word); if (e) inst.push([p, e[0], e[1]]); });
   const sentences = [0];
   if (inst.length) for (let p = 1; p < n; p++) { const gap = text.slice(tokens[p - 1].end, tokens[p].start); if (/[.:][ \t\r\n]+$/.test(gap)) sentences.push(p); }
   // Sliding window over instances for non-decreasing window starts.
@@ -151,32 +190,46 @@ async function searchArtifacts(ctx, args, transport = "api") {
     if (allowed.results.length !== a.project_ids.length) throw new HttpError(404, "not_found", "Project not found");
   }
   const binding = await sha256Hex(JSON.stringify([ctx.principal.id, ctx.grant?.id ?? null, !!ctx.oauthConnection, !!ctx.apiCredential, kinds, a]));
-  const after = args.cursor === undefined ? null : await rsCursorDecode(searchState.cursor_key,binding,args.cursor);
-  if (a.project_ids?.length === 0) return { results: [], has_more: false, next_cursor: null };
-  const match = a.terms.map(t => '"' + t + '"').join(" AND ");
-  const titleScore = a.terms.map(() => "CASE WHEN instr(lower(a.title),?)>0 THEN 1 ELSE 0 END").join(" + ");
+  const resume = args.cursor === undefined ? null : await rsCursorDecode(searchState.cursor_key,binding,args.cursor);
+  if (a.project_ids?.length === 0) return { results: [], has_more: false, next_cursor: null, match: "all" };
+  const forms = a.terms.map((t, i) => rsForms(t, i === a.terms.length - 1)), groups = forms.map(rsGroup);
   const where = [scope.sql, "a.trashed_at IS NULL", "a.head_rev>0", "k.revision_id=r.id", "k.sha256=r.sha256", "k.indexed_title=a.title",
     "a.kind IN (SELECT value FROM json_each(?))"];
   const values = [...scope.params, JSON.stringify(a.kind ? [a.kind] : kinds)];
   if (a.project_ids !== null) { where.push("p.id IN (SELECT value FROM json_each(?))"); values.push(JSON.stringify(a.project_ids)); }
   for (const [k, op] of [["updated_after", ">"], ["updated_before", "<"]]) if (a[k]) { where.push(`a.updated_at ${op} ?`); values.push(a[k]); }
-  // No corpus-wide rank statistic: hidden documents cannot affect the order of authorized hits.
-  const sql = `WITH hits AS (
-    SELECT a.id, a.project_id, p.title AS project_title, a.title, a.kind, a.updated_at, r.rev_no, r.sha256, r.mime,
-      (CASE WHEN lower(a.title)=lower(?) THEN 1000 ELSE 0 END + (${titleScore})) AS score,
-      CASE WHEN (${titleScore})>0 THEN 'title' ELSE 'body' END AS matched_field,
-      r.id AS revision_id
+  // Scores use only each document's own title and text (whether a word or the phrase occurs), never statistics over the
+  // whole index such as BM25: documents a reader cannot see must not move the order of the ones they can.
+  // A non-correlated IN (SELECT rowid … MATCH …) is evaluated once per query.
+  const has = (expr) => `s.rowid IN (SELECT rowid FROM artifact_search WHERE artifact_search MATCH ${rsLit(expr)})`;
+  const inTitle = groups.map((g) => `(CASE WHEN ${has("title : " + g)} THEN 1 ELSE 0 END)`).join(" + ");
+  const phrase = a.terms.length > 1 ? `(CASE WHEN ${has(rsPhrase(a.terms.join(" ")))} THEN 30 ELSE 0 END)` : "0";
+  const run = async (mode, after) => {
+    // all: every word (in any of its forms) occurs. some: at least one does, ranked by how many.
+    const match = groups.join(mode === "all" ? " AND " : " OR ");
+    const matched = mode === "all" ? String(a.terms.length) : groups.map((g) => `(CASE WHEN ${has(g)} THEN 1 ELSE 0 END)`).join(" + ");
+    const sql = `WITH hits AS (
+    SELECT a.id, a.project_id, p.title AS project_title, a.title, a.kind, a.updated_at, r.rev_no, r.sha256, r.mime, r.id AS revision_id,
+      (${inTitle}) AS title_words, (${matched}) AS matched_words, ${phrase} AS phrase_bonus
     FROM artifact_search s JOIN artifact_search_keys k ON k.search_id=s.rowid JOIN artifacts a ON a.id=k.artifact_id JOIN projects p ON p.id=a.project_id
       JOIN revisions r ON r.id=a.head_revision_id AND r.artifact_id=a.id AND r.project_id=a.project_id AND r.rev_no=a.head_rev
-    WHERE artifact_search MATCH ? AND ${where.join(" AND ")}
-  ), page AS (SELECT * FROM hits ${after ? "WHERE score < ? OR (score = ? AND (updated_at < ? OR (updated_at = ? AND id > ?)))" : ""}
+    WHERE artifact_search MATCH ${rsLit(match)} AND ${where.join(" AND ")}
+  ), scored AS (SELECT *, CASE WHEN title_words>0 THEN 'title' ELSE 'body' END AS matched_field,
+      (CASE WHEN lower(title)=lower(?) THEN 1000 ELSE 0 END + matched_words*200 + CASE WHEN title_words=${a.terms.length} THEN 100 ELSE 0 END
+        + title_words*10 + phrase_bonus) AS score FROM hits
+  ), page AS (SELECT * FROM scored ${after ? "WHERE score < ? OR (score = ? AND (updated_at < ? OR (updated_at = ? AND id > ?)))" : ""}
     ORDER BY score DESC, updated_at DESC, id ASC LIMIT ?)
   -- The index holds no text. Only the returned page reads (below) a bounded prefix of its current text for the excerpt:
   -- legacy inline bodies here, R2 text by a ranged read.
   SELECT page.*, rv.body_key, CASE WHEN rv.body_key IS NULL AND page.kind<>'binary' THEN substr(rv.body,1,${RS_EXCERPT_PREFIX_CHARS + 1}) END AS inline_prefix
     FROM page JOIN revisions rv ON rv.id=page.revision_id ORDER BY score DESC, updated_at DESC, id ASC`;
-  const tail = after ? [after[0], after[0], after[1], after[1], after[2]] : [];
-  const rows = (await db(ctx).prepare(sql).bind(a.query, ...a.terms, ...a.terms, match, ...values, ...tail, a.limit + 1).all()).results;
+    const tail = after ? [after[0], after[0], after[1], after[1], after[2]] : [];
+    return (await db(ctx).prepare(sql).bind(...values, a.query, ...tail, a.limit + 1).all()).results;
+  };
+  let mode = resume?.mode ?? "all";
+  let rows = await run(mode, resume?.after ?? null);
+  // No document has every word: show the ones with most of them instead (said so in the response).
+  if (!resume && !rows.length && a.terms.length > 1) { mode = "some"; rows = await run(mode, null); }
   const origin = appOrigin(ctx.env.APP_HOST);
   const page = rows.slice(0, a.limit);
   // Excerpt sources: at most one ranged R2 read per R2-backed result, a few at a time. A missing object shows the title.
@@ -188,7 +241,7 @@ async function searchArtifacts(ctx, args, transport = "api") {
   });
   const results = page.map((r, n) => ({
     project_id: r.project_id, project_title: r.project_title, artifact_id: r.id, title: r.title, kind: r.kind,
-    matched_field: r.matched_field, snippet: (r.kind === "binary" ? r.title : rsExcerpt(sources[n], a.terms) || r.title).slice(0,500), indexed_body: r.kind !== "binary",
+    matched_field: r.matched_field, snippet: (r.kind === "binary" ? r.title : rsExcerpt(sources[n], a.terms, a.terms.map((t, i) => [t, forms[i].prefixes])) || r.title).slice(0,500), indexed_body: r.kind !== "binary",
     revision: r.rev_no, sha256: r.sha256, updated_at: r.updated_at, ...(ctx.principal?.kind === "human" && !ctx.oauthConnection && !ctx.apiCredential ? { mime: r.mime } : {}),
     web_url: origin ? artifactWebUrl(origin,r.project_id,r.id) + "?v=" + r.rev_no : null,
     preview_url: origin ? previewWebUrl(origin,r.project_id,r.id) + "?v=" + r.rev_no : null
@@ -196,13 +249,14 @@ async function searchArtifacts(ctx, args, transport = "api") {
   // Browser links use project paths (results are already limited to readable projects); before the size budget below.
   await addressLinks(ctx.env, { results }, new Set(results.map((r) => r.project_id)));
   const token = "x".repeat(512); // Conservative reservation for the signed cursor in both encoded copies.
-  const out = { results, has_more: rows.length > a.limit, next_cursor: null };
+  // match "some": no document had every word; these have some of them. highlight: words and word starts to mark.
+  const out = { results, has_more: rows.length > a.limit, next_cursor: null, match: mode, highlight: [...new Set(forms.flatMap((f) => [f.exact, ...f.prefixes]))] };
   // Budget the complete duplicated JSON MCP envelope (including JSON escaping and the echoed ID), not just snippets.
   const wire = () => new TextEncoder().encode(JSON.stringify({ jsonrpc: "2.0", id: "", result: { content: [{ type: "text", text: JSON.stringify({ ...out, next_cursor: token }) }], structuredContent: { ...out, next_cursor: token }, isError: false } })).length + (ctx.rpcIdBytes ?? 1024);
   while (results.length && wire() > 65536) { results.pop(); out.has_more = true; }
   if (out.has_more && results.length) {
     const last = rows[results.length-1];
-    out.next_cursor = await rsCursorEncode(searchState.cursor_key,binding,[last.score,last.updated_at,last.id]);
+    out.next_cursor = await rsCursorEncode(searchState.cursor_key,binding,[last.score,last.updated_at,last.id],mode);
   }
   return out;
 }

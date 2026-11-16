@@ -93,6 +93,42 @@ test('plaintext full-text search finds text from every write path: save, templat
  r=await owner.req('POST',`/api/workspaces/${ws}/import`,backup);assert.equal(r.status,201,JSON.stringify(r.body));
  assert.deepEqual(await titles('echidnafourth'),['Plaintext imported']);
 });
+test('ranking: word forms and word starts match, titles and phrases rank first, fewer words fall back, hidden documents never reorder',async()=>{
+ // Unique synthetic words so other tests' documents never interfere. Older first: recency must not decide the order.
+ const titleHit=await create('search-planning','Zorblax migration plan','Steps for the move.');
+ const phraseHit=await create('search-notes','Weekly notes','We discussed the zorblax migration plan in detail.');
+ const scattered=await create('search-notes','Misc','A plan for later. Unrelated zorblax mention. The migration happened.');
+ const newest=await create('search-notes','Zorblax digest','Mentions migrations once, and a plan.');
+ const ids=async(q,extra={})=>(await search({query:q,...extra})).body;
+ let r=await ids('zorblax migration plan');assert.equal(r.match,'all');
+ const order=r.results.map(x=>x.artifact_id);
+ assert.equal(order[0],titleHit,'every word in the title ranks first');
+ assert.ok(order.indexOf(phraseHit)<order.indexOf(scattered),'the exact phrase ranks above scattered words');
+ assert.ok(order.includes(newest),'word forms: migrations matches migration');
+ // Word forms and word starts.
+ assert.ok((await ids('zorblax migrating')).results.some(x=>x.artifact_id===titleHit),'migrating finds migration');
+ assert.ok((await ids('zorblax plans')).results.some(x=>x.artifact_id===titleHit),'plans finds plan');
+ assert.ok((await ids('zorblax migr')).results.some(x=>x.artifact_id===titleHit),'a half-typed last word finds the whole word');
+ assert.ok((await ids('zorbl')).results.length>=4,'word start');
+ assert.ok(r.highlight.includes('zorblax')&&r.highlight.includes('migrat'),'highlight words include word forms');
+ assert.match(r.results.find(x=>x.artifact_id===newest).snippet,/migrations/);
+ // Nothing has every word: documents with most of them, said so.
+ r=await ids('zorblax migration quuxnothing');assert.equal(r.match,'some');assert.equal(r.results[0].artifact_id,titleHit);
+ assert.equal((await ids('quuxnothing flurbnothing')).results.length,0);
+ // Combining marks don't count toward the minimum word-start length: "a" + marks stays a whole-word match, not a*.
+ const marked=await ids('zorblax a\u0305\u0305\u0305');
+ assert.deepEqual(marked.results.map(x=>x.artifact_id).sort(),[scattered,newest].sort(),'only documents with the whole word "a", not every word starting with a (titleHit, phraseHit)');
+ // Paging through a fallback keeps the fallback.
+ const p1=await ids('zorblax quuxnothing',{limit:2});assert.equal(p1.match,'some');assert.ok(p1.has_more);
+ const p2=await ids('zorblax quuxnothing',{limit:2,cursor:p1.next_cursor});assert.equal(p2.status??200,200);assert.equal(p2.match,'some');
+ assert.equal(new Set([...p1.results,...p2.results].map(x=>x.artifact_id)).size,4);
+ // A reader who can't see search-planning: the order of what they can see doesn't depend on it.
+ const key=(await owner.req('POST','/api/api-keys',{label:'rank reader',lifetime_days:1,projects:[{project_id:'search-notes',access:'read'}]})).body;
+ const get=async q=>(await (await fetch(API+'/v1/search?'+new URLSearchParams({query:q}),{headers:{authorization:'Bearer '+key.secret}})).json()).results.map(x=>x.artifact_id);
+ const before=await get('zorblax migration plan');assert.ok(!before.includes(titleHit));
+ for(let i=0;i<5;i++) await create('search-planning','Zorblax migration plan '+i,'zorblax zorblax migration plan '.repeat(20));
+ assert.deepEqual(await get('zorblax migration plan'),before,'hidden documents never change the order of visible ones');
+});
 test('literal operators, Unicode, punctuation, HTML-like text and invalid inputs',async()=>{
  await create('search-notes','Café 中文','<img src=x onerror=alert(1)> café 中文');
  assert.equal((await search({query:'CAFÉ 中文'})).body.results.length,1);
@@ -287,7 +323,7 @@ test('index follows replace, rename, trash and delete of the current head; excer
  assert.equal((await owner.req('PUT',`/api/projects/search-notes/artifacts/${id}`,{expected_revision:1,body:'followtwosecond words'})).status,200);
  assert.equal((await find('followonefirst')).length,0);assert.match((await find('followtwosecond'))[0].snippet,/followtwosecond words/);
  assert.equal((await owner.req('PATCH',`/api/projects/search-notes/artifacts/${id}`,{expected_meta_version:1,title:'Renamed followtitle'})).status,200);
- assert.equal((await find('followtitle')).length,1);assert.equal((await find('Follow fixture')).length,0);assert.equal((await find('followtwosecond')).length,1);
+ assert.equal((await find('followtitle')).length,1);assert.equal((await find('fixture')).length,0,'the old title is no longer indexed');assert.equal((await find('followtwosecond')).length,1);
  assert.equal((await owner.req('PATCH',`/api/projects/search-notes/artifacts/${id}`,{expected_meta_version:2,trashed:true})).status,200);
  assert.equal((await find('followtwosecond')).length,0);assert.equal((await find('followtitle')).length,0);
  assert.equal((await sql(`SELECT count(*) AS n FROM artifact_search_keys WHERE artifact_id='${id}';`))[0].results[0].n,0,'a trashed document leaves the index');

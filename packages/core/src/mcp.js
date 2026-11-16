@@ -19,7 +19,7 @@ var TOOLS2 = [
   ...tplTools(false),
   ...rvTools(false),
   { name: "list_changes", description: "Poll published changes in one explicit project. WITHOUT cursor establishes a current checkpoint and returns NO history (initialized=true). Store next_cursor; follow has_more, then poll again. At-least-once: deduplicate by event_id. Cursors expire after 30 days; checkpoint BEFORE reconciling current content. Publishers excluded. No bodies or push notifications.", inputSchema: S2({ project_id: { type: "string", maxLength: 110, description: "Project ID or path (workspace/project)" }, cursor: { type: "string", maxLength: 2048 }, limit: { type: "integer", minimum: 1, maximum: 50 } }, ["project_id"]), run: (c,a) => listChanges(c,a.project_id,a) },
-  { name: "search_artifacts", description: "Ranked lexical search of currently readable projects, with excerpts and revision-pinned links. All words must match. Live pagination.", inputSchema: RS_SCHEMA, annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }, run: (c,a) => searchArtifacts(c,a,"mcp") },
+  { name: "search_artifacts", description: "Ranked keyword search of currently readable projects, with excerpts and revision-pinned links. Word forms and word starts match; documents with every word first, else some of them (match: \"some\"). Live pagination.", inputSchema: RS_SCHEMA, annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }, run: (c,a) => searchArtifacts(c,a,"mcp") },
   { name: "list_projects", description: "List projects this identity may access.", inputSchema: S2({}, []), run: (c) => listProjects(c) },
   {
     name: "list_artifacts",

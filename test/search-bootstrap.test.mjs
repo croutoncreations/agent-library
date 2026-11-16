@@ -68,9 +68,10 @@ test('signed cursors reject payload edits, expiry, other bindings and signing-ke
  const ctx=createContext({crypto:webcrypto,TextEncoder,TextDecoder,Uint8Array,btoa,atob,HttpError,nowMs:()=>clock});
  runInContext(moduleScript('packages/core/src/search/service.js'),ctx);
  const key='synthetic-signing-key',binding='fixture-binding',after=[1001,'2026-10-28T00:00:00.000Z','art_fixture'];
- const cursor=await ctx.rsCursorEncode(key,binding,after);assert.ok(cursor.length<=512);
- assert.deepEqual(Array.from(await ctx.rsCursorDecode(key,binding,cursor)),after);
+ const cursor=await ctx.rsCursorEncode(key,binding,after,'all');assert.ok(cursor.length<=512);
+ const dec=await ctx.rsCursorDecode(key,binding,cursor);assert.deepEqual(Array.from(dec.after),after);assert.equal(dec.mode,'all');
  const bad=fn=>assert.rejects(fn,e=>e.status===400&&e.code==='invalid_cursor');
+ await bad(()=>ctx.rsCursorEncode(key,binding,after,'other').then(c=>ctx.rsCursorDecode(key,binding,c)));
  await bad(()=>ctx.rsCursorDecode(key,'other-binding',cursor));
  await bad(()=>ctx.rsCursorDecode('other-key',binding,cursor));
  const parts=cursor.split('.');const payload=JSON.parse(Buffer.from(parts[1],'base64url'));payload.a[0]=0;
