@@ -131,7 +131,7 @@ test("browser: copy link/title/contents; save + details below the document; no '
   assert.match(crumbs, /UI Polish/);
 });
 
-test("browser: inline image in preview opens a full-size overlay with download; Escape closes", { skip: !haveChrome && "Chrome not installed" }, async () => {
+test("browser: inline image in preview opens a keyboard-modal full-size overlay with download; Escape closes", { skip: !haveChrome && "Chrome not installed" }, async () => {
   await page.goto(`${ORIGIN}/#/p/${PID}/a/${docId}`);
   await page.waitForSelector(".preview img[data-artifact]");
   const loaded = await page.waitForFunction(() => { const i = document.querySelector(".preview img[data-artifact]"); return i.complete && i.naturalWidth === 64; }, { timeout: 5000 }).then(() => true, () => false);
@@ -140,6 +140,11 @@ test("browser: inline image in preview opens a full-size overlay with download; 
   await page.waitForSelector(".lightbox img");
   const dl = await page.evaluate(() => [...document.querySelectorAll(".lightbox a")].map((a) => [a.getAttribute("aria-label"), a.getAttribute("href")]));
   assert.ok(dl.some(([t, href]) => t === "Download" && /\/content\?download=1$/.test(href)), JSON.stringify(dl));
+  assert.equal(await page.evaluate(() => document.activeElement.getAttribute("aria-label")), "Close");
+  await page.keyboard.press("Tab");
+  assert.equal(await page.evaluate(() => document.activeElement.getAttribute("aria-label")), "Open original", "Tab wraps within the modal instead of reaching the obscured page");
+  await page.keyboard.down("Shift"); await page.keyboard.press("Tab"); await page.keyboard.up("Shift");
+  assert.equal(await page.evaluate(() => document.activeElement.getAttribute("aria-label")), "Close", "Shift+Tab also wraps within the modal");
   await page.screenshot({ path: "tmp/test-evidence/ui-lightbox.png" });
   await page.keyboard.press("Escape");
   assert.equal(await page.$(".lightbox"), null);

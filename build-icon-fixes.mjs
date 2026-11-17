@@ -11,9 +11,9 @@
 import {readFileSync,writeFileSync} from 'node:fs';
 import {createHash} from 'node:crypto';
 const sha=b=>createHash('sha256').update(b).digest('hex');
-const UI_FIXES='8dac70fea68ab81a6bf2705a9f0a698972070e4a3a313d3d46d83c59c309443a';
+const UI_FIXES='006ae495705c4b1e9e51481571c58647c5e3b4116caf23b2b7256a4cb5b18cc7';
 const input=readFileSync('src/index.js','utf8');
-if(sha(input)!==UI_FIXES)throw Error('Input is not the UI-fixes bundle 260ec845; run build-ui-fixes.mjs first');
+if(sha(input)!==UI_FIXES)throw Error('Input is not the UI-fixes bundle 006ae495; run build-ui-fixes.mjs first');
 const once=(s,needle,what,from=0)=>{const i=s.indexOf(needle,from);if(i<0||s.indexOf(needle,i+1)>=0)throw Error('Expected exactly one '+what);return i;};
 
 // New icon file name -> committed PNG. Old names are served the matching new image.

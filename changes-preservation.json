@@ -1,6 +1,6 @@
 {
-  "base_search_sha256": "049aa23146a73b6aacf6c415588cb31d48f8e7a5fdbcd294c804bf66570c4f53",
-  "integrated_sha256": "98026a1d3d662b49ef52b1796174de931a22dc2c0aeda557f7c115943d876b64",
+  "base_search_sha256": "e199c11be408ac03a6d048ec5b7987f8d763aea7a4821ecea5c42ff1b34134c1",
+  "integrated_sha256": "afd0696289da420e62be1a0cf3648f34cf1e48bf7b1e09ae7a978f1cbd0f3ced",
   "sources_sha256": {
     "service.js": "29dabf986ac32241002ecf083c1595dbfc2f7b3136ff7a31a469f33257f3c42a",
     "generation-batch.js": "9ce97b4355bbac3c6ae2b1dc4f9fa1c7a2d8538638ac83595e1cc10e2ab45d7b"

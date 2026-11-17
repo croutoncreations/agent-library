@@ -1,11 +1,11 @@
 {
-  "base_service_sha256": "47338896cb1e67153a41803d1d7a77ccd3762b8ccebe3c4e7c53bc378bc82926",
-  "integrated_sha256": "8dac70fea68ab81a6bf2705a9f0a698972070e4a3a313d3d46d83c59c309443a",
+  "base_service_sha256": "1a757998c4884caa12249db6cf2cde2d3b0819b1a21a894738fd2dbfe067aa58",
+  "integrated_sha256": "006ae495705c4b1e9e51481571c58647c5e3b4116caf23b2b7256a4cb5b18cc7",
   "preserved_prefix_sha256": "a0f73f1246010d190e932ddc1a01b5110652d89513b8a09fe07457c99b4a2245",
   "preserved_suffix_sha256": "d7e86424de51ba101723f8630c97ea24a2fa8feddd0d759c877eed5930b9c800",
   "home_ui_modules_sha256": {
-    "service": "87b7de30671906b21394081f744cf20df91329732f9082eb3945342e642240e9",
-    "candidate": "5c5395080e90533773fe4434a28eaabe2ca34ee9faa29d6323ab0edb4318f89a"
+    "service": "adb3e93fe56dc9ab238b10328ccc78b923059d69396adbd65327a59e2b34d6dc",
+    "candidate": "6462622d158349e4419ca26a6e98f7f5050e1e26dca707fc1aece01cd4354cee"
   },
   "patched_modules": [
     "src/home.ts",

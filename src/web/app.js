@@ -1521,7 +1521,16 @@ function openLightbox(src, title) {
       iconLink("download", "Download", downloadUrl(src), { download: title || "image.png" }),
       close = iconButton("x", "Close", function () { done(); })),
     img);
-  function onKey(e) { if (e.key === "Escape") done(); }
+  function onKey(e) {
+    if (e.key === "Escape") { done(); return; }
+    if (e.key !== "Tab") return;
+    var stops = Array.prototype.slice.call(box.querySelectorAll('a[href],button:not([disabled]),[tabindex]:not([tabindex="-1"])'));
+    if (!stops.length) return;
+    var first = stops[0], last = stops[stops.length - 1], active = document.activeElement;
+    if (e.shiftKey ? active === first || !box.contains(active) : active === last || !box.contains(active)) {
+      e.preventDefault(); (e.shiftKey ? last : first).focus();
+    }
+  }
   function done() { document.removeEventListener("keydown", onKey); box.remove(); if (opener && opener.focus) opener.focus(); }
   box.addEventListener("click", function (e) { if (e.target === box) done(); });
   document.addEventListener("keydown", onKey);
