@@ -1,7 +1,7 @@
 {
-  "base_session_fixes_sha256": "3c2b89d716f8c2ca6158de2292c01cc391a77ae1a29468be96da65c10c329665",
-  "integrated_sha256": "f686130247ce6db1f1dfbc6dec7849fcfc78f1036c08d4dcb8af660af7f7ed4a",
-  "preserved_outside_regions_sha256": "76f104b0b1a4ece5fc3e29c866143d100e9d2b870fe5882586ee6dd7108ea46f",
+  "base_session_fixes_sha256": "fddfd36de5098ae54d3e84b2f227d08ac41be3fa1fc8976e32df046d60dcfa1a",
+  "integrated_sha256": "a5ccef6b99393e744819d18e3f777e764bbbf5282fcf525ef5edd808baf12775",
+  "preserved_outside_regions_sha256": "454796c3f66855e7549bb19c8592cc76dc53a2c5a0169c123d054fae83207855",
   "regions": [
     {
       "name": "service: publishRevision accepts a fence predicate on the revision insert",
