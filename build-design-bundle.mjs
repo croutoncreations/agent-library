@@ -10,11 +10,11 @@
 import {readFileSync,writeFileSync} from 'node:fs';
 import {createHash} from 'node:crypto';
 const sha=b=>createHash('sha256').update(b).digest('hex');
-const RELEASE='7ca4365663bd3518a3613510b3d511a1357c5b2b53be9692d1ab82fcbbd50ef1';
+const RELEASE='42991d7d9c85960aa7d0914abe846a201af21767a57dcfd2db1d2104efd02bfd';
 const MARKDOWN_RELEASE='1896bc44836ba5c3ee0a7c92a95dee9346c42f3d15c795a0cc54409d6efda4e0';
 const consentStyle=process.argv.includes('--consent-style');
 const release=readFileSync(process.env.DESIGN_RELEASE_INPUT||'src/index.js','utf8');
-if(sha(release)!==RELEASE)throw Error('Input is not the publisher-integrated baseline 7ca43656; run build-current-bundle.mjs first');
+if(sha(release)!==RELEASE)throw Error('Input is not the publisher-integrated baseline 42991d7d; run build-current-bundle.mjs first');
 const once=(s,needle,what,from=0)=>{const i=s.indexOf(needle,from);if(i<0||s.indexOf(needle,i+1)>=0)throw Error('Expected exactly one '+what);return i;};
 // A module spans from its "// <name>\n" marker to the next module's marker.
 const mod=(name,next)=>{const a=once(release,`// ${name}\n`,name+' start');const b=release.indexOf(`\n// ${next}\n`,a)+1;if(b<=a)throw Error(name+' end not found');return [a,b];};

@@ -30,6 +30,28 @@ function gen(gid, rev, parent, { payloads = 1, extra = [], mutateRoot, rootAsPar
     part_count: all.length, total_bytes: all.reduce((n, f) => n + bytes(f.content), 0), coverage: rootDoc.coverage, exported_at: "2026-10-02T00:00:00Z" }, files: all };
 }
 
+test("keyed generation DELETE replays after the staging row is removed", async () => {
+  const h = await startAppConnectServer({ port: SERVER_PORTS.generations });
+  try {
+    const owner = await h.owner();
+    assert.equal((await owner.req("POST", "/api/projects", { id: "gen-delete-replay", title: "Delete replay" })).status, 201);
+    const app = await h.registerApp({ display_name: "Delete replay", redirect_uris: ["https://publisher.example.test/delete-replay/callback"], origins: [] });
+    const p = await h.connectPublisher(app, { project_id: "gen-delete-replay", destination: "root", resume: "new" });
+    const staged = gen("g_delete_replay", 1, null);
+    assert.equal((await h.pub(p.access_token, "POST", "/publisher/generations", { body: staged.begin, idem: "begin-delete-replay" })).status, 201);
+
+    const first = await h.pub(p.access_token, "DELETE", "/publisher/generations/g_delete_replay", { idem: "delete-replay-key" });
+    assert.equal(first.status, 200, first.text);
+    assert.deepEqual(first.json, { generation_id: "g_delete_replay", state: "abandoned", deleted_staging: true });
+
+    const retry = await h.pub(p.access_token, "DELETE", "/publisher/generations/g_delete_replay", { idem: "delete-replay-key" });
+    assert.equal(retry.status, 200, retry.text);
+    assert.deepEqual(retry.json, { ...first.json, idempotent_replay: true });
+  } finally {
+    await h.stop();
+  }
+});
+
 test("generation regressions: TTL scope, committed retention, auth/epoch, closure, quota, replay", { timeout: 600_000 }, async () => {
   const h = await startAppConnectServer({ port: SERVER_PORTS.generations });
   try {

@@ -1,11 +1,11 @@
 {
-  "base_release_sha256": "7ca4365663bd3518a3613510b3d511a1357c5b2b53be9692d1ab82fcbbd50ef1",
-  "integrated_sha256": "d87a630af7c7338588a4fda6dab3164ae72c0a1eefd3972caeafb5b2bc8a9dc1",
-  "preserved_prefix_sha256": "13b0228c45d6d0a41ac9458455e7647d21dcd905cddd559f409b728b97aeea66",
+  "base_release_sha256": "42991d7d9c85960aa7d0914abe846a201af21767a57dcfd2db1d2104efd02bfd",
+  "integrated_sha256": "148e483a6fb524c9127b45a4ecee9ad7afddcea0855901b6488c2fae2f97b93e",
+  "preserved_prefix_sha256": "09c43285b5e52f96b8a199c0b0bcbc7644a9725b66fa0d1c8d63a1820ff9102f",
   "preserved_suffix_sha256": "18bc518f668261da3a1a2e0935289c952658e785899a3caff8cfcb64c5150b66",
   "preserved_between_server_and_markdown_sha256": "8fb6c5695a608747d7d53f1fdf0c5b78b5eab7f2accea5be53175cd6da7943f6",
   "preserved_between_markdown_and_ui_sha256": "73494eb65899495923d84a9659aab4575cc6c9bf5c083872bae21aa06fc07974",
-  "publisher_module_sha256": "e74c8a762f18011cc90acab0f83bd12a47c214ac1275069b2843291df1d64cd7",
+  "publisher_module_sha256": "d5104716feed063014eb86871f5b930cf07972769c5a697ef3336b8dd14a69f9",
   "oauth_server_module_sha256": {
     "release": "931ea49b51b299eb40b34c9e27771fe21a71e68f5bbb4a6ac8ed2d95b80eb53a",
     "candidate": "91a78326ca0baa4270689cfd3c07c84ec1a12be1affa76573fe574e95f76498c"
