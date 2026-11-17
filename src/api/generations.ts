@@ -8,6 +8,7 @@
 import type { Env, Ctx } from "../auth";
 import { authzSql } from "../auth";
 import { checkFile, byteLength } from "../formats";
+import { idemLookup } from "../service";
 import { HttpError, json, nowIso, randomId, sha256Hex, idemKey } from "../util";
 export const GENERATION_CONTRACT = {
     version: "agentlib.generations/1", max_part_bytes: 32768, max_parts: 2048, max_generation_bytes: 33554432,
@@ -443,8 +444,64 @@ async function view(env: Env, p: Pub, id: string) {
         .bind(p.id, id, C.max_parts).all();
     return json({ ...beginView(g), uploaded_parts: rows.results.length, parts: rows.results });
 }
-async function abandon(env: Env, p: Pub, id: string, req: Request) {
+async function abandon(env: Env, p: Pub, id: string, req: Request, requestId: string) {
     const h = hooks(env, req);
+    const rawKey = req.headers.get("idempotency-key");
+    // Headerless DELETE predates the documented mutation contract. Keep it working for existing exporters,
+    // while keyed callers get a durable replay even though cleanup removes the generation row itself.
+    if (rawKey !== null) {
+        const key = idemKey(rawKey);
+        const ctx = context(env, p, requestId);
+        const i = { op: "generation.abandon", key, projectId: p.project_id, digest: await sha256Hex(JSON.stringify([id])) };
+        const prior = await idemLookup(ctx, i);
+        if (prior)
+            return json(prior.body, prior.status);
+        const g = await generation(env, p, id);
+        if (g.state === "committed")
+            conflict("Committed generations cannot be deleted", { snapshot_id: g.snapshot_id });
+        const response = { generation_id: id, state: "abandoned", deleted_staging: true };
+        const az = authzSql(ctx, p.project_id);
+        const live = `EXISTS (SELECT 1 FROM publishers pb JOIN app_clients ac ON ac.id=pb.app_client_id
+          WHERE pb.id=? AND pb.token_epoch=? AND pb.revoked_at IS NULL AND ac.disabled_at IS NULL
+            AND pb.project_id=? AND pb.folder_id IS ?
+            AND (pb.folder_id IS NULL OR EXISTS(SELECT 1 FROM folders f WHERE f.id=pb.folder_id AND f.project_id=pb.project_id)))`;
+        const abandoned = "EXISTS (SELECT 1 FROM publisher_generations WHERE publisher_id=? AND id=? AND state='abandoned')";
+        const stored = "EXISTS (SELECT 1 FROM idempotency WHERE principal_id=? AND project_id=? AND op=? AND key=? AND digest=?)";
+        let out: D1Result[];
+        try {
+            out = await env.DB.batch([
+                env.DB.prepare(`UPDATE publisher_generations SET state='abandoned', abandoned_at=?
+                  WHERE publisher_id=? AND id=? AND state='staged' AND ${live} AND ${az.sql}`)
+                    .bind(nowIso(), p.id, id, p.id, p.token_epoch, p.project_id, p.folder_id ?? null, ...az.params),
+                env.DB.prepare(`INSERT INTO idempotency (principal_id,project_id,op,key,digest,status,response,created_at)
+                  SELECT ?,?,?,?,?,200,?,? WHERE ${abandoned}`)
+                    .bind(p.principal_id, p.project_id, i.op, key, i.digest, JSON.stringify(response), nowIso(), p.id, id),
+                env.DB.prepare(`DELETE FROM publisher_generation_parts WHERE publisher_id=? AND generation_id=? AND artifact_id IS NULL AND ${stored}`)
+                    .bind(p.id, id, p.principal_id, p.project_id, i.op, key, i.digest),
+                env.DB.prepare(`DELETE FROM publisher_generations WHERE publisher_id=? AND id=? AND state='abandoned' AND snapshot_id IS NULL AND ${stored}`)
+                    .bind(p.id, id, p.principal_id, p.project_id, i.op, key, i.digest),
+            ]);
+        }
+        catch (e) {
+            if (isUnique(e)) {
+                const replay = await idemLookup(ctx, i);
+                if (replay)
+                    return json(replay.body, replay.status);
+            }
+            throw e;
+        }
+        if (!(out[0].meta.changes ?? 0)) {
+            const replay = await idemLookup(ctx, i);
+            if (replay)
+                return json(replay.body, replay.status);
+            await assertStillAuthorized(env, p);
+            const after = await generation(env, p, id);
+            if (after.state === "committed")
+                conflict("Committed generations cannot be deleted", { snapshot_id: after.snapshot_id });
+            conflict("Generation changed while it was being deleted", { state: after.state });
+        }
+        return json(response);
+    }
     const g = await generation(env, p, id);
     if (g.state === "committed")
         conflict("Committed generations cannot be deleted", { snapshot_id: g.snapshot_id });
@@ -483,6 +540,6 @@ export async function routeGeneration(req: Request, env: Env, p: Pub, requestId:
     if (req.method === "GET" || req.method === "HEAD")
         return view(env, p, id);
     if (req.method === "DELETE")
-        return abandon(env, p, id, req);
+        return abandon(env, p, id, req, requestId);
     throw new HttpError(405, "method_not_allowed", "Method not allowed");
 }

@@ -1,7 +1,7 @@
 {
-  "base_portability_fixes_sha256": "fbcdd72f0d74648dcd112c7d3e5bcb7ac3e6a2532eef7c1525a506fb31cbadc8",
-  "integrated_sha256": "176185e834c630417f40fb5545bc675083b5bdbb992d7419a7bd67eeb23c1d51",
-  "preserved_prefix_sha256": "19b50260e0a355db6335b5fb3358991cc0fe18baccba220c8a5635858f31a95f",
+  "base_portability_fixes_sha256": "7378c3c82c09965fdde4180cb3c493c3d7a7da1b3cf762df966aa2cf169b8955",
+  "integrated_sha256": "18fbc962dc2928c064470cd6b561f4da38edcc81a980e8cbfb0f689e839c85cb",
+  "preserved_prefix_sha256": "e77aa447b361d0e9580f88fe315dee772a7a2c12ddb090a70481a6ce2edd0345",
   "preserved_suffix_before_label_sha256": "b9087569a9490e3aebf60de14cf8e5dd1c89ab7d8d5c6d9c8f06822c1beb9496",
   "preserved_suffix_after_label_sha256": "5fcf603c2294f4a5b3f3b72036da952371f1d6587cb097b340d3db9dc3175b49",
   "ui_expiry_label_sha256": "5edfbd9261a14a03da256d0c5632db6aff04bd8f8676730b060595a37ccfde7f",

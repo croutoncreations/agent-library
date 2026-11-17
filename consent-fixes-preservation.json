@@ -1,7 +1,7 @@
 {
-  "base_history_fixes_sha256": "dbc48441eb4d2553d84dcd23ef247e89b63c28c39c81ca9f3e9fd7856f63c63c",
-  "integrated_sha256": "35586965e6bcc2718190d476ccf4a97900c7306b3c154a61c2c88f64e2c271a3",
-  "preserved_prefix_sha256": "eed00b8e2211d132c82cb55702d056b9e924a36ca5572b40d437f60167d967d2",
+  "base_history_fixes_sha256": "baf86c8d0038b4ee53ef4829a488c520b1f3822a39f1256af8d21d244bfe12a4",
+  "integrated_sha256": "eb3a8cacbca53b08a0d455964997a5af2c513fec1db65f821972a7e39473fdd0",
+  "preserved_prefix_sha256": "8b2c5eac20f6e0efd4a593552321331962a237e47d9b094789b6d52b8f517968",
   "preserved_suffix_sha256": "042f4be5bf4b8b69af9d3370d6a393ba3c15793b8a18763ced6ddff307b65f6e",
   "oauth_server_module_sha256": {
     "history_fixes": "91a78326ca0baa4270689cfd3c07c84ec1a12be1affa76573fe574e95f76498c",
