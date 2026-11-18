@@ -88,7 +88,7 @@ jobs:
           if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
-          npm install -g --no-audit --no-fund --prefix "$HOME/.npm-packages" puppeteer@24.16.2
+          npm install -g --allow-scripts=puppeteer --no-audit --no-fund --prefix "$HOME/.npm-packages" puppeteer@24.16.2
           command -v google-chrome
           echo "CHROME_PATH=$(command -v google-chrome)" >> "$GITHUB_ENV"
           # Tests spawn the pinned local `wrangler` (npm scripts add this; plain `node --test` does not).
