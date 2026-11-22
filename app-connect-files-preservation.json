@@ -1,0 +1,56 @@
+{
+  "base_folders_sha256": "962e9e837cffc86c6d2d57f3741da47e0bca65cceabf11dc80cb6a9e98f4eeec",
+  "integrated_sha256": "cbfa83df2fa58a81f29f7a8c8899a0ed4d8f8b8a3b35a52849b75120435750fa",
+  "preserved_outside_patches_sha256": "61caf9392c7b9d4ad396004b876febbbc993c65be2cb7626fd5b328b8f77465c",
+  "module_sha256": "d99c78a42b2a3de89a070f96c3ab60de4a7bc4fc3a2f87a578ae0fe8a1d68671",
+  "patches": [
+    {
+      "name": "module: App Connect binary files (inserted before the publisher module)",
+      "module": "// src/api/publisher.ts — isolated readable-generation integration",
+      "find_sha256": "404d6845e0c9fe140dce7900992d19346bdde62477d97eaa10d256298ecf7c28",
+      "replace_sha256": "55b0d3470009f8b3bf90387f1bc5d355b66b0b370dc5d23ff3daf5175562e8d2"
+    },
+    {
+      "name": "publisher: file views carry the MIME type",
+      "module": "// src/api/publisher.ts — isolated readable-generation integration",
+      "find_sha256": "19afad10dc2792c17b45a7fc3c776345e74f9b8bba748a8bc8e0c1749291bf81",
+      "replace_sha256": "b2c832382f44177d28069c325be53a8912037a170d8bfaa8cd2bb30d2e3054a7"
+    },
+    {
+      "name": "publisher: me reports the binary upload contract",
+      "module": "// src/api/publisher.ts — isolated readable-generation integration",
+      "find_sha256": "2f96ac8230087031f1ba84d4f35c06c21d12a23fdfd517427af3e193dad81c1b",
+      "replace_sha256": "93105ee216243f43bb3f26f3e27bb3495cbeb0144367fa738aa311b0a8662a14"
+    },
+    {
+      "name": "publisher: file queries read the head MIME type",
+      "module": "// src/api/publisher.ts — isolated readable-generation integration",
+      "find_sha256": "cead276dd93827d21ab18662c20aeb7dc20895556b7c62c667d2b2c2ea3b7ff8",
+      "replace_sha256": "9fc4a841aa7f9bec5f4a4b166a745386cff48521e9ed36c08b0b4ca54fde560c"
+    },
+    {
+      "name": "publisher: routes /v1/publisher/uploads",
+      "module": "// src/api/publisher.ts — isolated readable-generation integration",
+      "find_sha256": "66ffb5e2984c43460563ce29929c7ebb60fc500bc2e5faa79725b52da85a11ad",
+      "replace_sha256": "069ec1798b1bf97ee37ca432efc35de2dceb14aa8101351b7813f34ff1d672e1"
+    },
+    {
+      "name": "publisher: content of binary files comes from R2 (attachment, Range)",
+      "module": "// src/api/publisher.ts — isolated readable-generation integration",
+      "find_sha256": "f4d19c95a0583aeb612b05f72ad5e1477a5da80bd5343c386b6d9b6ca0fb6c07",
+      "replace_sha256": "f1b652f9278b1433f32d5687f93d1b0e089b4782b8aaee126fc97bd128124bd5"
+    },
+    {
+      "name": "cors: publisher preflight allows PUT (byte transfer) and Range",
+      "module": "// src/oauth/server.ts",
+      "find_sha256": "9b60967c19c9a1be7c781651e1758cc284beae1c7bdf952dd451ed64356493e6",
+      "replace_sha256": "13fdc44f440853f7a8baebc7a4d230d24c452f0addad8fbdf134125353b9ddf5"
+    },
+    {
+      "name": "cors: browsers can read download headers",
+      "module": "// src/oauth/server.ts",
+      "find_sha256": "66774a1ad955db43e47861398ecf41638f355be23a49d431cabb479cf5ada52c",
+      "replace_sha256": "a78eccc31e42443794a96b72883a4a226459248351f74128863af97236535445"
+    }
+  ]
+}

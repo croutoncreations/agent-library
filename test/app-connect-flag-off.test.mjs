@@ -32,11 +32,13 @@ test("owner /api artifact shapes are exactly Phase 1", async () => {
   assert.deepEqual(Object.keys(l.body.artifacts[0]).sort(), P1_ARTIFACT_KEYS);
 });
 
-test("owner /api: no json/csv create, no folders/records/app-clients, spreadsheet param ignored, PUT is Markdown-only", async () => {
+test("owner /api: no json/csv create, no records/app-clients, spreadsheet param ignored, PUT is Markdown-only; folders are for everyone", async () => {
   // Phase 1 behaviour: unknown fields (kind/content) are ignored and a Markdown file is created; never a JSON file.
   const j = await owner.req("POST", "/api/projects/off-test/artifacts", { kind: "json", title: "j", content: "{}" });
   if (j.status === 201) assert.equal((await owner.req("GET", `/api/projects/off-test/artifacts/${j.body.artifact_id}`)).body.artifact.kind, "markdown");
-  for (const p of ["/api/projects/off-test/folders", `/api/projects/off-test/artifacts/${aid}/records`, "/api/app-clients"])
+  // Nested folders (docs/folders.md) are a core feature, not an App Connect one.
+  assert.equal((await owner.req("GET", "/api/projects/off-test/folders")).status, 200);
+  for (const p of [`/api/projects/off-test/artifacts/${aid}/records`, "/api/app-clients"])
     assert.ok([400, 404].includes((await owner.req("GET", p)).status), p);
   const c = await fetch(`${APP}/api/projects/off-test/artifacts/${aid}/content?format=spreadsheet`, { headers: { cookie: owner.cookie } });
   assert.equal(c.status, 200, "format=spreadsheet is ignored with the flag off");
@@ -50,8 +52,8 @@ test("owner /api: no json/csv create, no folders/records/app-clients, spreadshee
   assert.equal(replay.status, 200); assert.equal(replay.body.idempotent_replay, true);
 });
 
-test("/v1: records/folders/publisher are 404 before auth; Phase 1 file shape", async () => {
-  for (const p of [`/projects/off-test/files/${aid}/records`, "/projects/off-test/folders", "/publisher/me", "/publisher/snapshots"]) {
+test("/v1: records/publisher are 404 before auth; Phase 1 file shape", async () => {
+  for (const p of [`/projects/off-test/files/${aid}/records`, "/publisher/me", "/publisher/snapshots"]) {
     const r = await v1("GET", p, { token: null });
     assert.equal(r.status, 404, p);
   }

@@ -1,0 +1,21 @@
+/* nested folders (src/folders/browser.js) */
+.fd-panel{margin:0 0 12px}
+.fd-actions{position:relative;margin:0 0 8px}
+.fd-group{display:inline-flex;flex-wrap:wrap;align-items:center;gap:6px;padding:6px 6px 6px 12px;border:1px solid var(--line2);border-radius:var(--r3);background:var(--card)}
+.fd-label{font-size:12px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-right:6px}
+.fd-group button{min-height:34px;padding:6px 12px}
+.fd-menu-btn{display:none}
+.fd-menu-btn svg{width:16px;height:16px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.fd-actions.open .fd-menu-btn svg{transform:rotate(180deg)}
+.fd-panel .card{margin:0 0 8px}
+.fd-sub{margin:0 0 4px}
+.fd-sub .badge{opacity:.8}
+@media (max-width:760px){
+  .fd-menu-btn{display:inline-flex;gap:8px;align-items:center}
+  .fd-group{display:none;position:absolute;left:0;top:calc(100% + 6px);z-index:20;min-width:14rem;flex-direction:column;align-items:stretch;gap:2px;padding:6px;box-shadow:var(--pop)}
+  .fd-actions.open .fd-group{display:flex}
+  .fd-label{display:none}
+  .fd-group button{justify-content:flex-start;width:100%;border:0;background:transparent;min-height:44px;font-weight:500}
+  .fd-group button:hover{background:var(--hover);filter:none}
+  .fd-group button.danger{color:var(--bad)}
+}

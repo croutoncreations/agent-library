@@ -43,7 +43,8 @@ Routes (all under `https://YOUR_MCP_HOST`):
 | `/v1/projects/{project}/files/{file}/text` | GET | a long text document in revision-pinned chunks ([chunked reads](chunked-reads.md)) |
 | `…/files/{file}/revisions`, `…/diff`, `…/revisions/{n}/restore` | GET, GET, POST | version history |
 | `…/files/{file}/meta-versions`, `…/meta-versions/{n}/restore` | GET, POST | title, folder and tag history |
-| `/v1/projects/{project}/folders`, `…/files/{file}/records` | GET (+POST folders) | folders and data records (with App Connect enabled) |
+| `/v1/projects/{project}/folders` | GET, POST | the folder tree (`?parent=`, `?parent_id=`); create by `path` ([folders](folders.md)) |
+| `…/files/{file}/records` | GET | data records (with App Connect enabled) |
 
 Writes need an `Idempotency-Key` header. Request and response shapes are in `src/api/v1.ts`, and `test/api-v1.test.mjs` has working examples. Don't log request headers.
 
