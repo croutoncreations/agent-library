@@ -160,6 +160,11 @@ const PATCHES = [
     '    const f = p.folder_id ? await env.DB.prepare("SELECT id, name, COALESCE(path, name) AS path FROM folders WHERE id = ?").bind(p.folder_id).first() : null;'],
   ['publisher: destination path field', PUB, 'destination: f ? { type: "folder", folder_id: f.id, name: f.name }', 'destination: f ? { type: "folder", folder_id: f.id, name: f.name, path: f.path }'],
   // ------------------------------------------------------------------ browser UI
+  // Browsing a folder lists only that folder's items, so the path on each row repeats the breadcrumbs; keep it for
+  // search results and the trash, where items come from anywhere.
+  ['ui: rows show their folder only in search results and the trash', UI,
+    '" · rev " + a.revision + (a.folder ? " · " + a.folder : "") + (a.tags',
+    '" · rev " + a.revision + (a.folder && (trash || q.value.trim()) ? " · " + a.folder : "") + (a.tags'],
   ['ui: styles', UI, 'var APP_CSS = `', 'var APP_CSS = `' + src['src/folders/browser.css']],
   ['ui: folder helpers', UI, '// ---------- home: authorized', src['src/folders/browser.js'] + '// ---------- home: authorized'],
   ['ui: folder route', UI, '    return viewList(p[1], false);\n  }', '    if (p[2] === "f" && p[3]) return viewList(p[1], false, p[3]);\n    return viewList(p[1], false);\n  }'],

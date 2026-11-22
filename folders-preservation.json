@@ -1,7 +1,7 @@
 {
   "base_artifact_limits_sha256": "17b4483cffa310e7dd709ae04b0362e3e3698330531662923231827c58d15c39",
-  "integrated_sha256": "565e4b0f7f195b8934838e3fe14de005630d7f3251f409d3d42fb1659c6876e9",
-  "preserved_outside_patches_sha256": "8e1cf489ba97a0a40e36dd673dc915cf11fba174ef367b50c284244083c1f92a",
+  "integrated_sha256": "f41fbadac3e38e803482c1063be20ba644e240985c1f7f8d7b90027f641c3b02",
+  "preserved_outside_patches_sha256": "a03169d3e10fb1ef2bbd57bb4d5a1dc8864020bb82c3855eec861d722c5b36e5",
   "sources_sha256": {
     "src/folders/service.js": "b8d780c60eb1dfe62668de2592a99132c34109f833482aa643d14085fd5ad877",
     "src/folders/browser.js": "7bdc65f06bfe2668f6bc2ef7375a22c4e6e066bebc46ce741d1f2fba857e9769",
@@ -277,6 +277,11 @@
       "name": "ui: folder panel",
       "find_sha256": "174a3c841352274846f26dab2cf816393c179a21e1e46d158a816ac6652a8ee5",
       "replace_sha256": "ff6f51e5fb9c49caf1e40b03c284193efb71f8a267aac659a791111b21581ad0"
+    },
+    {
+      "name": "ui: rows show their folder only in search results and the trash",
+      "find_sha256": "46702f1d2c6212684ca51e3f268a684831eb0d7d0ec1706b2523f0af8361c28e",
+      "replace_sha256": "b3a53fe21e9f85711f7bcd306bc78b5c8000ed5aae7e7d0fdb9a60b0d942c74d"
     },
     {
       "name": "ui: browse one folder (search stays project-wide)",

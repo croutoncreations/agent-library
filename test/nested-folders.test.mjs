@@ -304,6 +304,7 @@ test("Chrome: browse folders, breadcrumbs, create a subfolder, upload into it, r
 
       await page.evaluate(() => [...document.querySelectorAll(".fd-sub a")].find((a) => a.textContent === "nesteda").click());
       await page.waitForFunction(() => [...document.querySelectorAll("ul.list:not(.fd-sub) a")].some((a) => a.textContent === "Inside"));
+      assert.equal(await page.evaluate(() => [...document.querySelectorAll("ul.list:not(.fd-sub) .meta")].some((m) => m.textContent.includes("folder1/nesteda"))), false, "no repeated path inside a folder");
       const crumbs = await page.evaluate(() => [...document.querySelectorAll("#crumbs a, #crumbs span:not(.sep)")].map((e) => e.textContent));
       assert.deepEqual(crumbs.slice(-3), ["UI tree", "folder1", "nesteda"], JSON.stringify(crumbs));
       await page.screenshot({ path: `tmp/test-evidence/folders-${vp.n}.png`, fullPage: true });
