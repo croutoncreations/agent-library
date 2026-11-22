@@ -221,6 +221,10 @@ test("legacy free-text folders are adopted into the tree", async () => {
   const id2 = (await owner.req("POST", `/api/projects/${P2}/artifacts`, { title: "Old2", body: "# old" })).body.artifact_id;
   execFileSync("wrangler", ["d1", "--config", LOCAL_CONFIG, "execute", "DB", "--local", "--persist-to", h.dir, "--command",
     `UPDATE artifacts SET folder = 'Legacy/Notes', folder_id = NULL WHERE id = '${id2}'`], { cwd: ROOT, stdio: "ignore", env: { ...process.env, CI: "1" } });
+  // A read-only caller listing folders never writes: nothing is adopted yet.
+  const ro = (await owner.req("POST", `/api/projects/${P2}/grants`, { label: "reader", can_write: false })).body.token;
+  const roList = await fetch(h.appUi + `/api/projects/${P2}/folders`, { headers: { authorization: `Bearer ${ro}` } }).then((r) => r.json());
+  assert.deepEqual(roList.folders, [], "read-only listing adopts nothing");
   const fs2 = (await owner.req("GET", `/api/projects/${P2}/folders`)).body.folders.map((f) => f.path);
   assert.deepEqual(fs2, ["Legacy", "Legacy/Notes"]);
   const a = (await owner.req("GET", `/api/projects/${P2}/artifacts?folder=Legacy/Notes`)).body.artifacts;
@@ -253,6 +257,10 @@ test("App Connect: nested upload names create subfolders inside the destination,
   const fine = await h.pub(deepDest.access_token, "POST", "/publisher/uploads", { idem: key("u"), body: { name: "p.png", mime: "image/png", size: png.length, sha256: sha(png) } });
   assert.equal(fine.status, 201, "no stuck upload: " + JSON.stringify(fine.json));
   for (const bad of ["../x.png", "a/../b.png", "a//b.png", "1/2/3/4/5/6.png"]) assert.equal((await h.pub(pub.access_token, "POST", "/publisher/uploads", { idem: key("u"), body: { name: bad, mime: "image/png", size: 1, sha256: sha("x") } })).status, 400, bad);
+  // The owner can't give an app's file a folder label that disagrees with where it really is.
+  const before = (await owner.req("GET", `${base}/artifacts/${f.json.file.file_id}`)).body.artifact;
+  const relabel = await owner.req("PATCH", `${base}/artifacts/${f.json.file.file_id}`, { expected_meta_version: before.meta_version, folder: "Elsewhere" });
+  assert.equal(relabel.status, 200, JSON.stringify(relabel.body)); assert.equal(relabel.body.folder, "Shots/2026/11");
   // The app's destination can't be deleted while connected; the owner can still rename it (paths follow).
   const dest = await byPath("Shots");
   assert.equal((await owner.req("DELETE", `${base}/folders/${(await byPath("Shots/2026/11")).id}`)).status, 409);
@@ -344,6 +352,13 @@ test("Chrome: browse folders, breadcrumbs, create a subfolder, upload into it, r
         await page.type('.fd-panel input[aria-label="Rename folder"]', "renamed");
         await page.evaluate(() => [...document.querySelectorAll(".fd-panel form button")].find((b) => b.textContent === "Rename").click());
         await page.waitForFunction(() => [...document.querySelectorAll("#crumbs span, #crumbs a")].some((e) => e.textContent === "renamed"));
+        // A folder created elsewhere (here: by an agent) shows up the next time the view opens, without a reload.
+        assert.equal((await owner.req("POST", `/api/projects/${P4}/folders`, { path: "folder1/renamed/from-agent" })).status, 201);
+        await page.goto(h.appUi + `/#/p/${P4}`); await page.waitForFunction(() => [...document.querySelectorAll(".fd-sub a")].some((a) => a.textContent === "folder1"));
+        await page.evaluate(() => [...document.querySelectorAll(".fd-sub a")].find((a) => a.textContent === "folder1").click());
+        await page.waitForFunction(() => [...document.querySelectorAll(".fd-sub a")].some((a) => a.textContent === "renamed"));
+        await page.evaluate(() => [...document.querySelectorAll(".fd-sub a")].find((a) => a.textContent === "renamed").click());
+        await page.waitForFunction(() => [...document.querySelectorAll(".fd-sub a")].some((a) => a.textContent === "from-agent"), { timeout: 10000 });
         // Move the document to the root via Details
         const doc = (await owner.req("GET", `/api/projects/${P4}/artifacts?folder=folder1/renamed`)).body.artifacts.find((a) => a.title === "Inside");
         await page.goto(h.appUi + `/#/p/${P4}/a/${doc.id}`);

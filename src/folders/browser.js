@@ -42,6 +42,9 @@ function fdSelect(folders, value, exclude, label) {
 // box; on narrow screens (CSS, max-width 760px) it collapses behind one "Folder actions" menu button.
 function fdPanel(pid, fid, msg, onChange) {
   if (!ICONS.chevdown) ICONS.chevdown = ["M6 9l6 6 6-6"];
+  // Folders change outside this view too (a Details move to a new path, agents, uploads, other tabs): every time a
+  // project or folder view opens, it re-reads the tree once.
+  fdInvalidate(pid);
   var box = h("div", { class: "fd-panel" });
   var sub = h("ul", { class: "list fd-sub", "aria-label": "Folders" });
   var form = h("div", { class: "card", hidden: true });

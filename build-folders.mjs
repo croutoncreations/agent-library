@@ -36,7 +36,7 @@ const PATCHES = [
     '  const fdDest = await fdResolve(ctx, projectId, input);\n  const folder = fdDest ? fdDest.path : "";\n  const folderId = fdDest ? fdDest.folderId : null;'],
   ['details: folder (path or folder_id) moves the document into a real folder', SERVICE,
     '  const folder = input.folder !== void 0 ? str(input.folder, "folder", 200) : a.folder;',
-    '  const fdMove = a.publisher_id ? void 0 : await fdResolve(ctx, projectId, input, { defer: true });\n  const folder = fdMove ? fdMove.path : input.folder !== void 0 ? str(input.folder, "folder", 200) : a.folder;\n  let folderIdNext = fdMove ? fdMove.folderId : a.folder_id ?? null;'],
+    '  const fdMove = a.publisher_id ? void 0 : await fdResolve(ctx, projectId, input, { defer: true });\n  const folder = fdMove ? fdMove.path : a.publisher_id ? a.folder : input.folder !== void 0 ? str(input.folder, "folder", 200) : a.folder;\n  let folderIdNext = fdMove ? fdMove.folderId : a.folder_id ?? null;'],
   // A new folder path is created only once the change is allowed: after the review gate (a proposal keeps the path;
   // approval creates it), never for a refused or conflicting write.
   ['details: a new folder path is created after the review gate', SERVICE,
@@ -76,12 +76,21 @@ const PATCHES = [
   ['views: folder_id is part of every artifact view (folders are no longer App Connect only)', SERVICE,
     '      } : {},\n      ...rvArtifactReview(a)', '      } : a.folder_id ? { folder_id: a.folder_id } : {},\n      ...rvArtifactReview(a)'],
   // ------------------------------------------------------------------ uploads
+  ['upload: the folder id of a new file is known to the whole function', UPLOADS, '  let rvMeta = null;', '  let rvMeta = null, fdId = null;'],
   ['upload: the folder (path or id) resolves to a real folder', UPLOADS,
     '    const folder = str(input.folder, "folder", 200, { optional: true });\n    rvMeta = await rvNewGated(ctx, projectId, "binary") ? JSON.stringify({ title, folder }) : null;',
-    '    const fdDest = await fdResolve(ctx, projectId, input);\n    const folder = fdDest ? fdDest.path : "", fdId = fdDest ? fdDest.folderId : null;\n    rvMeta = await rvNewGated(ctx, projectId, "binary") ? JSON.stringify({ title, folder, folder_id: fdId }) : null;'],
+    '    const fdDest = await fdResolve(ctx, projectId, input);\n    const folder = fdDest ? fdDest.path : "";\n    fdId = fdDest ? fdDest.folderId : null;\n    rvMeta = await rvNewGated(ctx, projectId, "binary") ? JSON.stringify({ title, folder, folder_id: fdId }) : null;'],
   ['upload: the placeholder is created in its folder', UPLOADS,
     "INSERT INTO artifacts (id, project_id, kind, title, folder, head_rev, created_at, updated_at, review_mode, pending_review)\n      SELECT ?, ?, 'binary', ?, ?, 0, ?, ?, ?, ? WHERE ${az.sql}`).bind(artifactId, projectId, rvMeta ? RV_PLACEHOLDER : title, rvMeta ? \"\" : folder, nowIso(), nowIso(), rvMeta ? \"required\" : \"off\", rvMeta ? 1 : 0, ...az.params));",
-    "INSERT INTO artifacts (id, project_id, kind, title, folder, folder_id, head_rev, created_at, updated_at, review_mode, pending_review)\n      SELECT ?, ?, 'binary', ?, ?, ?, 0, ?, ?, ?, ? WHERE ${az.sql}`).bind(artifactId, projectId, rvMeta ? RV_PLACEHOLDER : title, rvMeta ? \"\" : folder, rvMeta ? null : fdId, nowIso(), nowIso(), rvMeta ? \"required\" : \"off\", rvMeta ? 1 : 0, ...az.params));"],
+    "INSERT INTO artifacts (id, project_id, kind, title, folder, folder_id, head_rev, created_at, updated_at, review_mode, pending_review)\n      SELECT ?, ?, 'binary', ?, ?, ?, 0, ?, ?, ?, ? WHERE ${az.sql} AND (? IS NULL OR EXISTS (SELECT 1 FROM folders WHERE id = ? AND project_id = ?))`).bind(artifactId, projectId, rvMeta ? RV_PLACEHOLDER : title, rvMeta ? \"\" : folder, rvMeta ? null : fdId, nowIso(), nowIso(), rvMeta ? \"required\" : \"off\", rvMeta ? 1 : 0, ...az.params, rvMeta ? null : fdId, rvMeta ? null : fdId, projectId));"],
+  // The placeholder is only inserted while its folder exists (a concurrent folder delete); without it the upload row
+  // is not reserved either, and the caller is told the folder is gone.
+  ['upload: no reservation without its placeholder', UPLOADS,
+    "WHERE ${quotaUsedSql(nowMs())} + ?6 <= ?12 AND ${az.sql}`).bind(projectId, uploadId, artifactId, ctx.principal.id, baseRev, size, sha2, mime, `staging/${projectId}/${uploadId}`, expires, nowIso(), limits.projectBinaryBytes, ...az.params),",
+    "WHERE ${quotaUsedSql(nowMs())} + ?6 <= ?12 AND ${az.sql} AND EXISTS (SELECT 1 FROM artifacts WHERE id = ?3)`).bind(projectId, uploadId, artifactId, ctx.principal.id, baseRev, size, sha2, mime, `staging/${projectId}/${uploadId}`, expires, nowIso(), limits.projectBinaryBytes, ...az.params),"],
+  ['upload: a folder deleted meanwhile is a clear conflict', UPLOADS,
+    "  if (!uploadRow.meta.changes) {\n    if (!input.artifact_id) await db2(ctx)",
+    "  if (!uploadRow.meta.changes) {\n    if (!input.artifact_id && !res[0].meta.changes && fdId && !(await db2(ctx).prepare(\"SELECT 1 AS x FROM folders WHERE id = ?\").bind(fdId).first(\"x\"))) throw new HttpError(409, \"folder_conflict\", \"The folder was deleted meanwhile; choose another and retry\");\n    if (!input.artifact_id) await db2(ctx)"],
   ['review: a gated new upload keeps its folder', SERVICE,
     '    meta = { title: m.title, folder: m.folder ?? "", tags: "[]" };', '    meta = { title: m.title, folder: m.folder ?? "", folderId: m.folder_id ?? null, tags: "[]" };'],
   ['review: a gated new upload\'s proposal stores the folder id', SERVICE,

@@ -55,15 +55,22 @@ __name(fdByPath, "fdByPath");
 var fdAdopted = /* @__PURE__ */ new Set();
 async function fdAdoptLegacy(ctx, projectId) {
   const k = projectId;
-  if (fdAdopted.has(k)) return;
+  // Only write-capable callers (the owner, or a grant that can write here) adopt: a read never writes data.
+  if (ctx.publisher || (ctx.principal.kind === "agent" && !ctx.grant?.can_write)) return;
+  // The per-isolate Set is only a fast path: a cheap check finds labels written later (e.g. by an older Worker
+  // during a rollback window).
+  if (fdAdopted.has(k) && !(await db(ctx).prepare("SELECT 1 AS x FROM artifacts WHERE project_id = ? AND folder_id IS NULL AND folder <> '' AND publisher_id IS NULL LIMIT 1").bind(projectId).first("x"))) return;
+  fdAdopted.delete(k);
   const rows = await db(ctx).prepare("SELECT DISTINCT folder FROM artifacts WHERE project_id = ? AND folder_id IS NULL AND folder <> '' AND publisher_id IS NULL LIMIT 500").bind(projectId).all();
   for (const r of rows.results) {
     let segs;
     try { segs = fdParsePath(r.folder); } catch { continue; }
     if (!segs || !segs.length) continue;
     let f;
-    try { f = await fdEnsure(ctx, projectId, segs, { system: true }); } catch { continue; }
-    await db(ctx).prepare("UPDATE artifacts SET folder_id = ?, folder = ? WHERE project_id = ? AND folder_id IS NULL AND folder = ? AND publisher_id IS NULL").bind(f.id, fdPathOf(f), projectId, r.folder).run();
+    try { f = await fdEnsure(ctx, projectId, segs); } catch { continue; }
+    const az = authzSql(ctx, projectId);
+    const u = await db(ctx).prepare(`UPDATE artifacts SET folder_id = ?, folder = ? WHERE project_id = ? AND folder_id IS NULL AND folder = ? AND publisher_id IS NULL AND ${az.sql}`).bind(f.id, fdPathOf(f), projectId, r.folder, ...az.params).run();
+    if (u.meta.changes) await audit(ctx, projectId, "folder.adopt", f.id, null, "ok").run();
   }
   if (rows.results.length < 500) fdAdopted.add(k);
 }
@@ -233,13 +240,18 @@ async function fdUpdate(ctx, projectId, id, input, key) {
   }));
   const gate = "EXISTS (SELECT 1 FROM folders WHERE id = ? AND name_key = ?)";
   const gp = [f.id, fdKey(newPath)];
+  // The subtree as read: every (id, name_key) under f. The first UPDATE only runs if the live subtree is still
+  // exactly this (no subfolder created, renamed, moved in or out meanwhile), so the descendant rewrite can't miss or
+  // misplace a row; otherwise the whole batch is a no-op and the caller gets 409 folder_conflict.
+  const snap = JSON.stringify(subtree.map((x) => x.id + "\u0000" + x.name_key).sort());
+  const same = `(SELECT json_group_array(k) FROM (SELECT t.id || char(0) || f2.name_key AS k FROM (WITH RECURSIVE t(id) AS (SELECT ? UNION SELECT c.id FROM folders c JOIN t ON c.parent_id = t.id WHERE c.project_id = ?) SELECT id FROM t) t JOIN folders f2 ON f2.id = t.id ORDER BY k)) = ?`;
   const mv = "(SELECT value FROM json_each(?) WHERE json_extract(value, '$.id') = folders.id)";
   const body0 = { ...fdView({ ...f, name, parent_id: parentId, path: parentId ? newPath : null }), moved_items: null };
   const stmts = [
     db(ctx).prepare(`UPDATE folders SET name = ?, parent_id = ?, path = ?, name_key = ? WHERE id = ? AND project_id = ? AND name_key = ? AND ${az.sql}
-        AND (? IS NULL OR EXISTS (SELECT 1 FROM folders WHERE id = ? AND project_id = ? AND name_key = ?))`)
+        AND (? IS NULL OR EXISTS (SELECT 1 FROM folders WHERE id = ? AND project_id = ? AND name_key = ?)) AND ${same}`)
       .bind(name, parentId, parentId ? newPath : null, fdKey(newPath), f.id, projectId, fdKey(oldPath), ...az.params,
-        parent?.id ?? null, parent?.id ?? null, projectId, parent ? fdKey(fdPathOf(parent)) : null),
+        parent?.id ?? null, parent?.id ?? null, projectId, parent ? fdKey(fdPathOf(parent)) : null, f.id, projectId, snap),
     db(ctx).prepare(`UPDATE folders SET path = json_extract(${mv}, '$.p'), name_key = json_extract(${mv}, '$.k')
       WHERE project_id = ? AND json_extract(${mv}, '$.ok') = name_key AND ${gate}`)
       .bind(desc, desc, projectId, desc, ...gp),
@@ -261,6 +273,10 @@ async function fdUpdate(ctx, projectId, id, input, key) {
     if (parent && !(await db(ctx).prepare("SELECT 1 AS x FROM folders WHERE id = ? AND name_key = ?").bind(parent.id, fdKey(fdPathOf(parent))).first("x")))
       throw new HttpError(409, "folder_conflict", "The destination folder was renamed, moved or deleted meanwhile; reload");
     if (cur && fdPathOf(cur) !== oldPath) throw new HttpError(409, "folder_conflict", "This folder was renamed or moved elsewhere; reload", { current_path: fdPathOf(cur) });
+    if (cur) {
+      const now2 = await fdSubtree(ctx, projectId, f);
+      if (JSON.stringify(now2.map((x) => x.id + "\u0000" + x.name_key).sort()) !== snap) throw new HttpError(409, "folder_conflict", "Something inside this folder changed meanwhile; reload and try again");
+    }
     throw new HttpError(403, "forbidden", "Grant no longer valid");
   }
   const after = await fdGet(ctx, projectId, f.id);

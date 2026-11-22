@@ -1,10 +1,10 @@
 {
   "base_artifact_limits_sha256": "17b4483cffa310e7dd709ae04b0362e3e3698330531662923231827c58d15c39",
-  "integrated_sha256": "f41fbadac3e38e803482c1063be20ba644e240985c1f7f8d7b90027f641c3b02",
-  "preserved_outside_patches_sha256": "a03169d3e10fb1ef2bbd57bb4d5a1dc8864020bb82c3855eec861d722c5b36e5",
+  "integrated_sha256": "6fc3a8597a6aba83ebd3ddb43469d5ec7ec60b8ca47b39b8fe009255b3c61418",
+  "preserved_outside_patches_sha256": "16e588aeef89a493ccf62994d36fe78b57f71b7dbbecd31015f0ad8e9b1d6c8c",
   "sources_sha256": {
-    "src/folders/service.js": "b8d780c60eb1dfe62668de2592a99132c34109f833482aa643d14085fd5ad877",
-    "src/folders/browser.js": "7bdc65f06bfe2668f6bc2ef7375a22c4e6e066bebc46ce741d1f2fba857e9769",
+    "src/folders/service.js": "324c47c48a62071448a24120f6ee7791d26c4c20433ceada05b653ddd99525ae",
+    "src/folders/browser.js": "a51fcda3fed67c9cc81bf79cd865032539554d489fdf007a641d7e2b9bd93ea8",
     "src/folders/browser.css": "e8def429d5e10fc4e87b379a94900fd187e10399fd6c776f0e971465c5cf33d7"
   },
   "patches": [
@@ -56,7 +56,7 @@
     {
       "name": "folder service and tools",
       "find_sha256": "990995796303ae28bc68934e504c2b6e7f0f96c0f983ddbb77909c58bbaead9f",
-      "replace_sha256": "c827299b017a3ac44de1a7f62e58db4fbddfce3e04a0e79c0c6c530d482b2afc"
+      "replace_sha256": "5540563fdf7276cc9a5970d051756607c8fbb9521530a231b359fd6d82e51235"
     },
     {
       "name": "list: folder path / folder_id filter, recursive",
@@ -86,7 +86,7 @@
     {
       "name": "details: folder (path or folder_id) moves the document into a real folder",
       "find_sha256": "1a04a749f3534a656f83fce86edfb701a572182133ed920df3bfe42bd08a4d69",
-      "replace_sha256": "cc3d0892ecc8e2210f2efe5e82bce75a88dafe7a1f13cd1726f627a386d6ed0e"
+      "replace_sha256": "8bf39c203c90e22afc50b651f74b1993fa3e5dda2dd7bc2125b9db46ac7facea"
     },
     {
       "name": "details: a proposed folder change keeps its folder id",
@@ -214,14 +214,29 @@
       "replace_sha256": "1e6d7e5d2598dad431dbb9cfdc8b678d7e9bc996bbd7f8d9cfd3b55df0ad2d80"
     },
     {
+      "name": "upload: the folder id of a new file is known to the whole function",
+      "find_sha256": "c31051e7d6855d952c9ddbff4b7db4217a500bd1e0c2853ed2153c1639a0eb5c",
+      "replace_sha256": "321b69956098967a2cc6475231cc07ea0b425fc244a4789f920101cf1df15ddc"
+    },
+    {
       "name": "upload: the folder (path or id) resolves to a real folder",
       "find_sha256": "2dd7edd2a463abb656c50a27129d855e18016cad7631b4e20970464ba46c09d1",
-      "replace_sha256": "7e6891f2b6c4f34dd16a7483cd0aea83af9d51daffbc6a817900435e6164968b"
+      "replace_sha256": "da95d70dd0a134802359c68ca96f56bc2acb12161d4e1a212ed06be7c72b493e"
     },
     {
       "name": "upload: the placeholder is created in its folder",
       "find_sha256": "322e96e6525912e7dc6038a815f64e4efb424dd6fc1ef76889b1ba2d8a97bfb3",
-      "replace_sha256": "7c35770d52fbc77301c3e4fb6a9c13b8aae8ca4ecb5f0d22bec0a1d8e6492222"
+      "replace_sha256": "cf173e159ee18dcd527d114d381a8adb550049dd84c6c640cc578be8ff0e3665"
+    },
+    {
+      "name": "upload: no reservation without its placeholder",
+      "find_sha256": "74cc2116f218a1a3a007f47c26a134ecee19a3a7fe648e81bc5a6838a19ec4e8",
+      "replace_sha256": "edc1fc9b328b3266f5266258d946bac5c14f052952b98d457fb47cf954604712"
+    },
+    {
+      "name": "upload: a folder deleted meanwhile is a clear conflict",
+      "find_sha256": "194c487c8981c0069ef3f70747e39f18b490be9319530fff1a1432e6bef765b3",
+      "replace_sha256": "a75d6bafa04e27381e512b57891d5854c1aaec82fba08bca9ef5ae5866289df4"
     },
     {
       "name": "legacy mcp: folder tools",
@@ -246,7 +261,7 @@
     {
       "name": "ui: folder helpers",
       "find_sha256": "81bcf3ea5954073fece07463dbbe3470c23d9bf7692c635606fabb17e44ff27a",
-      "replace_sha256": "1ff0d50979658975cc430eb65fb5f84c274127d38c6f9ef0962d97fde4e38ef5"
+      "replace_sha256": "0761772e261efdd372cb392fe59850ec92521b37e3a34b40c53a0e953b94f956"
     },
     {
       "name": "ui: binary upload begin sends the folder",
