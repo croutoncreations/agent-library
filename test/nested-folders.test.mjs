@@ -307,9 +307,23 @@ test("Chrome: browse folders, breadcrumbs, create a subfolder, upload into it, r
       const crumbs = await page.evaluate(() => [...document.querySelectorAll("#crumbs a, #crumbs span:not(.sep)")].map((e) => e.textContent));
       assert.deepEqual(crumbs.slice(-3), ["UI tree", "folder1", "nesteda"], JSON.stringify(crumbs));
       await page.screenshot({ path: `tmp/test-evidence/folders-${vp.n}.png`, fullPage: true });
+      // Folder actions: an inline labelled group on desktop; one "Folder actions" menu on phones.
+      const vis = () => page.evaluate(() => [...document.querySelectorAll(".fd-group button")].filter((b) => b.offsetParent).map((b) => b.textContent));
+      if (vp.n === "mobile") {
+        assert.deepEqual(await vis(), [], "collapsed behind the menu");
+        await page.click(".fd-menu-btn");
+        assert.deepEqual(await vis(), ["New subfolder", "Rename", "Move", "Delete folder"]);
+        assert.equal(await page.$eval(".fd-menu-btn", (b) => b.getAttribute("aria-expanded")), "true");
+        await page.screenshot({ path: `tmp/test-evidence/folders-mobile-menu.png` });
+        await page.keyboard.press("Escape");
+        assert.deepEqual(await vis(), []);
+      } else {
+        assert.equal(await page.$eval(".fd-menu-btn", (b) => getComputedStyle(b).display), "none");
+        assert.deepEqual(await vis(), ["New subfolder", "Rename", "Move", "Delete folder"]);
+      }
       if (vp.n === "desktop") {
         // New subfolder here
-        await page.evaluate(() => [...document.querySelectorAll(".fd-actions button")].find((b) => /New folder/.test(b.textContent)).click());
+        await page.evaluate(() => [...document.querySelectorAll(".fd-actions button")].find((b) => b.textContent === "New subfolder").click());
         await page.type('.fd-panel input[aria-label="New folder name"]', "child");
         await page.evaluate(() => [...document.querySelectorAll(".fd-panel form button")].find((b) => b.textContent === "Create folder").click());
         await page.waitForFunction(() => [...document.querySelectorAll(".fd-sub a")].some((a) => a.textContent === "child"));

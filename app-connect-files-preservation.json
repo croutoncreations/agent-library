@@ -1,7 +1,7 @@
 {
-  "base_folders_sha256": "40504e3f2651e20b4b515c4b43e19b970a886acdc8a3f5f2d15b21aa18b75e12",
-  "integrated_sha256": "e0c5c5e42398b8d780b6f497bf0099984592254e87fa1e119c669684bef031a2",
-  "preserved_outside_patches_sha256": "e0335f7f13954e872ba89d2d6db7870fc857bbcc50a9fd39ad67b4173106f59e",
+  "base_folders_sha256": "565e4b0f7f195b8934838e3fe14de005630d7f3251f409d3d42fb1659c6876e9",
+  "integrated_sha256": "a336640166a6cc3ca89c3f15ca502568050cf8f843b2e5f63073fe5d525b910d",
+  "preserved_outside_patches_sha256": "be3434b6a637920d9a44faad3a09da26417694a02ca41126d4c7a2eef12ddbf4",
   "module_sha256": "d99c78a42b2a3de89a070f96c3ab60de4a7bc4fc3a2f87a578ae0fe8a1d68671",
   "patches": [
     {

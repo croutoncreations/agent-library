@@ -1,11 +1,11 @@
 {
   "base_artifact_limits_sha256": "17b4483cffa310e7dd709ae04b0362e3e3698330531662923231827c58d15c39",
-  "integrated_sha256": "40504e3f2651e20b4b515c4b43e19b970a886acdc8a3f5f2d15b21aa18b75e12",
+  "integrated_sha256": "565e4b0f7f195b8934838e3fe14de005630d7f3251f409d3d42fb1659c6876e9",
   "preserved_outside_patches_sha256": "8e1cf489ba97a0a40e36dd673dc915cf11fba174ef367b50c284244083c1f92a",
   "sources_sha256": {
     "src/folders/service.js": "b8d780c60eb1dfe62668de2592a99132c34109f833482aa643d14085fd5ad877",
-    "src/folders/browser.js": "20435769c57a856f437acc6ca933defcf6d24b31958ae4aea6e789f3f40e584e",
-    "src/folders/browser.css": "3a60519cd5403c14ce2ffc0845348a284995321319dae35a31264546e1c7bc36"
+    "src/folders/browser.js": "7bdc65f06bfe2668f6bc2ef7375a22c4e6e066bebc46ce741d1f2fba857e9769",
+    "src/folders/browser.css": "e8def429d5e10fc4e87b379a94900fd187e10399fd6c776f0e971465c5cf33d7"
   },
   "patches": [
     {
@@ -236,7 +236,7 @@
     {
       "name": "ui: styles",
       "find_sha256": "dbf4cdd569563992bd40313f20a86bcb55703a554eed9585301382dce9e6ee4e",
-      "replace_sha256": "6eef6c09965c6e7134bffab8cae4731dfa480000b6c74a1402843fe87be87a25"
+      "replace_sha256": "73d052e67722087acc1c04d496941cf0f66f72c814e5daba32575b4a1971d850"
     },
     {
       "name": "ui: folder route",
@@ -246,7 +246,7 @@
     {
       "name": "ui: folder helpers",
       "find_sha256": "81bcf3ea5954073fece07463dbbe3470c23d9bf7692c635606fabb17e44ff27a",
-      "replace_sha256": "87826dbf86b7ae2b786dc9eb443c17c287edcbfe2a435a2a689a815e1f8946c2"
+      "replace_sha256": "1ff0d50979658975cc430eb65fb5f84c274127d38c6f9ef0962d97fde4e38ef5"
     },
     {
       "name": "ui: binary upload begin sends the folder",
