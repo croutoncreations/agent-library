@@ -5,7 +5,8 @@ App Connect is like Google Drive's app data folder, but in your own library. You
 Typical uses:
 - a personal tracker app exporting its data, such as measurements, logs or notes;
 - a script that publishes reports;
-- a side project that needs somewhere durable to put files, without its own storage or auth.
+- a side project that needs somewhere durable to put files, without its own storage or auth;
+- a capture tool saving screenshots, PDFs or screen recordings (see [Binary files](#binary-files)).
 
 Turn it on with `APP_CONNECT_ENABLED = "1"` (the example config and the self-host generator do this).
 
@@ -61,29 +62,52 @@ https://MCP_HOST/authorize?response_type=code&client_id=…&redirect_uri=…&sco
 
 | Method and path | Purpose |
 |---|---|
-| `GET /me` | Who am I: project, destination folder, current snapshot, limits (`generation_contract`) |
-| `GET /files`, `GET /files/{id}`, `GET /files/{id}/content[?revision=N]` | List and read this app's own files |
+| `GET /me` | Who am I: project, destination folder, current snapshot, limits (`generation_contract`, `files_contract`) |
+| `GET /files`, `GET /files/{id}`, `GET /files/{id}/content[?revision=N]` | List and read this app's own files (binary content supports `Range`) |
 | `POST /snapshots` | Atomically publish a set of JSON/CSV files (with a manifest) as the new current state |
+| `POST /uploads`, `PUT /uploads/{upload_id}`, `POST /uploads/{upload_id}/finish` | Upload a binary file (image, PDF, video, other) as a new file or a new version; see [Binary files](#binary-files) |
 | `GET /snapshots`, `GET /snapshots/current`, `GET /snapshots/{id}` | Snapshot history |
 | `POST /generations`, `PUT /generations/{gid}/parts/{name}`, `POST /generations/{gid}/commit`, `DELETE /generations/{gid}` | Large exports: stage up to 2048 parts of ≤ 32 KiB each, then commit them all at once |
 
 Rules that apply to every call:
 - Every mutation takes an `Idempotency-Key`. Retries replay the stored result.
 - Snapshots use a monotonic `source_revision`, plus an optional compare-and-swap on the current snapshot.
-- Files are JSON or CSV. An optional schema (`agentlib.measurements/1`) validates time-series records.
+- Snapshot and generation files are JSON or CSV. An optional schema (`agentlib.measurements/1`) validates time-series records. Binary files use `/uploads`.
 - For staged generations, the root must be an `agentlib.generation.index/1` document that references every part. Each part is an `agentlib.generation.part/1` document. The legacy names `healthconnect.readable.index/1` and `healthconnect.readable.part/1` are still accepted.
 
-The exact request and response shapes are in `src/api/publisher.ts` and `src/api/generations.ts`. Working examples are in `test/app-connect-phase2.test.mjs`, `test/app-connect-phase3.test.mjs`, `test/generations-regression.test.mjs` and the harness `test/fixtures/app-connect-harness.mjs`.
+The exact request and response shapes are in `src/api/publisher.ts`, `src/api/generations.ts` and `src/app-connect-files/publisher-files.js`. Working examples are in `test/app-connect-phase2.test.mjs`, `test/app-connect-phase3.test.mjs`, `test/generations-regression.test.mjs`, `test/app-connect-files.test.mjs` and the harness `test/fixtures/app-connect-harness.mjs`.
+
+## Binary files
+
+Apps can store images (PNG, JPEG, WebP, GIF), PDFs, video (MP4, WebM) and other files (`application/octet-stream`, download-only) of up to 5 MiB each. They go in the app's destination, next to its JSON and CSV files. The bytes are checked against the declared size, SHA-256 and file type, stored in R2 and counted against the project's binary storage quota and the app's own quota. `GET /me` → `files_contract` lists the allowed types and limits.
+
+A file is identified by a stable **name** (`[A-Za-z0-9._-]{1,64}`, for example `screenshot-2026-11-21.png`). Uploading takes three steps:
+
+1. `POST /v1/publisher/uploads` with an `Idempotency-Key` and a JSON body:
+   ```json
+   { "name": "screenshot.png", "mime": "image/png", "size": 48213, "sha256": "<lowercase hex>", "change_note": "Captured from the dashboard" }
+   ```
+   - A new name creates a file. If the name already exists, also pass `expected_revision` (its current revision) to upload a new version. Without it you get `409 file_exists`; with a stale one, `409 revision_conflict`. Both include `current_revision`.
+   - The response gives `upload_id`, `file_id`, `put_url`, `finish_url` and `expires_at` (15 minutes by default).
+2. `PUT` the raw bytes (exactly `size` bytes) to `put_url`, with the same `Authorization: Bearer` header.
+3. `POST` to `finish_url` with an `Idempotency-Key` (empty body or `{}`). The server verifies the bytes and publishes exactly one version. The response contains `file` (`file_id`, `name`, `mime`, `revision`, `sha256`, `size`, `web_url`).
+
+Begin and finish are safe to retry with the same key. Each app can have one upload in progress at a time (`429 upload_in_progress`). As with snapshots, disabling the app client stops new connections only; revoke the publisher to stop its uploads. Wrong bytes give `422 integrity_mismatch`, and bytes of the wrong type give `415 signature_mismatch`; in both cases nothing is published and the name stays free. `GET /files/{id}/content` returns binary files as downloads (`Content-Disposition: attachment`, sandboxed), with `Range` support.
+
+Binary files follow the same rules as the app's other files: only the app can change their content, the owner can read, rename, move and trash them, agents with access to the project can read them, and every version is kept in History along with its change note. A trashed file refuses new versions (`409 destination_file_trashed`) until the owner restores it. A name used by a JSON or CSV file can't be reused for a binary (`422 unsupported_kind`).
+
+Browser apps on a registered origin can call these routes directly: CORS allows `PUT` and `Range`, and exposes `Content-Range`, `Content-Disposition` and `ETag`.
 
 ## Current limits
 
-- **Formats.** Publishers write JSON and CSV only. Markdown and binary publishing are planned.
+- **Formats.** Publishers write JSON and CSV (snapshots, generations) and binary files (uploads). Markdown and HTML publishing are planned.
+- **File size.** Binary files are limited to 5 MiB each, the same limit as other uploads.
 - **Backup.** The built-in project backup doesn't yet cover projects that contain App Connect files (`backup_unsupported`). See [operations.md](operations.md#supported-release-scope).
 - **One destination.** Each connection writes into one project and folder. To publish somewhere else, connect again (a new publisher).
 
 ## Roadmap toward "app data folder" parity
 
-1. **Any artifact kind for publishers.** Markdown, HTML and binary uploads through the same file APIs agents use, scoped to the publisher's own files.
+1. **Any artifact kind for publishers.** Binary uploads are done. Markdown and HTML through the same file APIs agents use, scoped to the publisher's own files, are still to come.
 2. **Simple per-file CRUD** alongside snapshots and generations, for apps that just want to save and load documents.
 3. **Owner "share with agents" from the app folder.** Today agents see app files through their project grant. A per-folder grant would let you share only one app's folder.
 4. **Publisher-aware backup and restore** that preserves source protection.

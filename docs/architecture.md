@@ -74,7 +74,7 @@ Nothing installation-specific is compiled in. Each installation sets these Worke
 - `APP_CONNECT_ENABLED`;
 - optionally, `OAUTH_EXTRA_REDIRECT_URIS`.
 
-Rate limits and upload TTLs have defaults and optional vars. `PROJECT_ARTIFACT_LIMIT` sets the per-project document cap for every project (default 1,000; whole numbers from 1 to 10,000, otherwise the default applies and the Worker logs a `config_invalid` warning). Ordinary creation, template copies and creation, and approval of new-document proposals all read it through `limitsFor`; App Connect files keep their own per-publisher quota. The ceiling is a supported boundary, not a storage limit: list paging, offline sync (which stops at 2,000 items) and project backup are not designed for more. It is integrated by the last build step, `build-artifact-limits.mjs`. See [wrangler.example.toml](../wrangler.example.toml).
+Rate limits and upload TTLs have defaults and optional vars. `PROJECT_ARTIFACT_LIMIT` sets the per-project document cap for every project (default 1,000; whole numbers from 1 to 10,000, otherwise the default applies and the Worker logs a `config_invalid` warning). Ordinary creation, template copies and creation, and approval of new-document proposals all read it through `limitsFor`; App Connect files keep their own per-publisher quota. The ceiling is a supported boundary, not a storage limit: list paging, offline sync (which stops at 2,000 items) and project backup are not designed for more. It is integrated by the `build-artifact-limits.mjs` step. App Connect binary uploads are added last, by `build-app-connect-files.mjs`. See [wrangler.example.toml](../wrangler.example.toml).
 
 ## Ranked search
 
