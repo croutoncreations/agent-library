@@ -1,7 +1,7 @@
 {
   "base_artifact_limits_sha256": "17b4483cffa310e7dd709ae04b0362e3e3698330531662923231827c58d15c39",
-  "integrated_sha256": "962e9e837cffc86c6d2d57f3741da47e0bca65cceabf11dc80cb6a9e98f4eeec",
-  "preserved_outside_patches_sha256": "16e588aeef89a493ccf62994d36fe78b57f71b7dbbecd31015f0ad8e9b1d6c8c",
+  "integrated_sha256": "63afff4b2138be44ae999eb92e2fb0c9edd5a13b0909e3d945caec1549feaee7",
+  "preserved_outside_patches_sha256": "8e071b9666cfe0a2ef54a1bd02902b2f5707f1eafd54b4c249ca40d01eae1615",
   "sources_sha256": {
     "src/folders/service.js": "da936075faac613b008c78f2486fb0a94e4ac6b8107b75f24691ee6b82d1af30",
     "src/folders/browser.js": "a51fcda3fed67c9cc81bf79cd865032539554d489fdf007a641d7e2b9bd93ea8",
@@ -312,6 +312,11 @@
       "name": "ui: an empty folder with subfolders is not \"empty\"",
       "find_sha256": "00178675d400c92fd36ae8014228609bfda6eb2e9b5716a5e9676d004e064cd3",
       "replace_sha256": "1191907273c693d85ca5ee1a2b449d6af71e5205ec672599234dffb8921a955b"
+    },
+    {
+      "name": "ui: leaving the project view cancels its pending loads",
+      "find_sha256": "33d117e27da50a66a46bcd1cf7a7b052ff073986a0d91bfba3e0128b2d1ab62a",
+      "replace_sha256": "74eac1b527df2efefc2f3699c39a6c7eef0ecf5e76884e1b9f56a1a7c98ebde7"
     },
     {
       "name": "ui: new documents land in the folder being viewed",

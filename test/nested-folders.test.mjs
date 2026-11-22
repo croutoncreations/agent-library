@@ -371,6 +371,14 @@ test("Chrome: browse folders, breadcrumbs, create a subfolder, upload into it, r
         await page.waitForFunction(() => /Details saved/.test(document.body.innerText));
         assert.equal((await owner.req("GET", `/api/projects/${P4}/artifacts/${doc.id}`)).body.artifact.folder, "elsewhere/new");
       }
+      if (vp.n === "mobile") {
+        // Leaving a folder view right away: its late folder lookup must not overwrite the next page's breadcrumbs.
+        await page.goto(h.appUi + `/#/p/${P4}/f/${(await (async () => (await owner.req("GET", `/api/projects/${P4}/folders`)).body.folders.find((f) => f.path === "folder1").id)())}`);
+        await page.goto(h.appUi + "/#/projects");
+        await page.waitForFunction(() => document.querySelector("#crumbs [aria-current=page]")?.textContent === "Projects");
+        await new Promise((r) => setTimeout(r, 1500));
+        assert.equal(await page.$eval("#crumbs [aria-current=page]", (e) => e.textContent), "Projects", "no stale folder breadcrumbs");
+      }
       assert.deepEqual(errors, []);
       await page.close();
     }

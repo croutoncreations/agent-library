@@ -15621,7 +15621,7 @@ async function viewList(pid, trash, fid) {
   }
   q.addEventListener("input", function () { clearTimeout(qTimer); qTimer = setTimeout(function () { load(true); }, 300); });
   more.addEventListener("click", function () { load(false); });
-  S.cleanups.push(function () { clearTimeout(qTimer); });
+  S.cleanups.push(function () { clearTimeout(qTimer); seq++; });
 
   var actions = null, panel = null, newDocBtn = null, uploadBtn = null;
   if (!trash) {

@@ -184,6 +184,10 @@ const PATCHES = [
     '(trash ? "&trashed=1" : "") + "&include=mime" + (!trash && !term ? "&folder_id=" + enc(fid || "root") : "");'],
   ['ui: subfolders render with each reload', UI, 'var r = await api("GET", "/api/projects/" + enc(pid) + "/artifacts" + qs);',
     'var fdInfo = fd ? await fd.render(term).catch(function (e) { if (e.status === 404) throw e; return null; }) : null;\n      if (fdInfo && my === seq) setCrumbs(fdCrumbs(pid, fdInfo.all, fid, []));\n      var r = await api("GET", "/api/projects/" + enc(pid) + "/artifacts" + qs);'],
+  // Leaving the view invalidates its in-flight loads, so a late folder lookup can't overwrite the next page's
+  // breadcrumbs (or render into a detached list).
+  ['ui: leaving the project view cancels its pending loads', UI,
+    '  S.cleanups.push(function () { clearTimeout(qTimer); });', '  S.cleanups.push(function () { clearTimeout(qTimer); seq++; });'],
   ['ui: an empty folder with subfolders is not "empty"', UI, 'if (reset && !r.artifacts.length) {',
     'if (reset && !r.artifacts.length && fdInfo && fdInfo.kids.length && !term) { list.hidden = true; }\n      else if (reset && !r.artifacts.length && fid && !term) { list.hidden = true; empty.hidden = false; empty.replaceChildren(stateBox("", "folder", "This folder is empty", "Write a document or upload a file here, or create a subfolder.")); }\n      else if (reset && !r.artifacts.length) {'],
   ['ui: new documents land in the folder being viewed', UI,
