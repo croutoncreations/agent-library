@@ -52,14 +52,17 @@ async function fdByPath(ctx, projectId, path) {
 __name(fdByPath, "fdByPath");
 // Legacy free-text folder labels (artifacts.folder without folder_id) become real folders once per project, so the
 // tree is the only folder model. Labels that are not valid paths stay as they are (shown, not navigable).
-var fdAdopted = /* @__PURE__ */ new Set();
+// Per isolate: project id -> how many unadopted labelled rows were left after the last scan (labels that are not valid
+// paths). A listing rescans only when that number changes.
+var fdAdopted = /* @__PURE__ */ new Map();
 async function fdAdoptLegacy(ctx, projectId) {
   const k = projectId;
   // Only write-capable callers (the owner, or a grant that can write here) adopt: a read never writes data.
   if (ctx.publisher || (ctx.principal.kind === "agent" && !ctx.grant?.can_write)) return;
-  // The per-isolate Set is only a fast path: a cheap check finds labels written later (e.g. by an older Worker
-  // during a rollback window).
-  if (fdAdopted.has(k) && !(await db(ctx).prepare("SELECT 1 AS x FROM artifacts WHERE project_id = ? AND folder_id IS NULL AND folder <> '' AND publisher_id IS NULL LIMIT 1").bind(projectId).first("x"))) return;
+  // The per-isolate count is only a fast path: a cheap count finds labels written later (e.g. by an older Worker
+  // during a rollback window), while labels that can never be adopted don't force a rescan on every listing.
+  const left = () => db(ctx).prepare("SELECT COUNT(*) AS n FROM artifacts WHERE project_id = ? AND folder_id IS NULL AND folder <> '' AND publisher_id IS NULL").bind(projectId).first("n");
+  if (fdAdopted.has(k) && (await left()) === fdAdopted.get(k)) return;
   fdAdopted.delete(k);
   const rows = await db(ctx).prepare("SELECT DISTINCT folder FROM artifacts WHERE project_id = ? AND folder_id IS NULL AND folder <> '' AND publisher_id IS NULL LIMIT 500").bind(projectId).all();
   for (const r of rows.results) {
@@ -72,7 +75,7 @@ async function fdAdoptLegacy(ctx, projectId) {
     const u = await db(ctx).prepare(`UPDATE artifacts SET folder_id = ?, folder = ? WHERE project_id = ? AND folder_id IS NULL AND folder = ? AND publisher_id IS NULL AND ${az.sql}`).bind(f.id, fdPathOf(f), projectId, r.folder, ...az.params).run();
     if (u.meta.changes) await audit(ctx, projectId, "folder.adopt", f.id, null, "ok").run();
   }
-  if (rows.results.length < 500) fdAdopted.add(k);
+  if (rows.results.length < 500) fdAdopted.set(k, await left());
 }
 __name(fdAdoptLegacy, "fdAdoptLegacy");
 // Find or create every folder of segs (under base, a folder row or null = root). Returns the last folder row.

@@ -1,9 +1,9 @@
 {
   "base_artifact_limits_sha256": "17b4483cffa310e7dd709ae04b0362e3e3698330531662923231827c58d15c39",
-  "integrated_sha256": "6fc3a8597a6aba83ebd3ddb43469d5ec7ec60b8ca47b39b8fe009255b3c61418",
+  "integrated_sha256": "962e9e837cffc86c6d2d57f3741da47e0bca65cceabf11dc80cb6a9e98f4eeec",
   "preserved_outside_patches_sha256": "16e588aeef89a493ccf62994d36fe78b57f71b7dbbecd31015f0ad8e9b1d6c8c",
   "sources_sha256": {
-    "src/folders/service.js": "324c47c48a62071448a24120f6ee7791d26c4c20433ceada05b653ddd99525ae",
+    "src/folders/service.js": "da936075faac613b008c78f2486fb0a94e4ac6b8107b75f24691ee6b82d1af30",
     "src/folders/browser.js": "a51fcda3fed67c9cc81bf79cd865032539554d489fdf007a641d7e2b9bd93ea8",
     "src/folders/browser.css": "e8def429d5e10fc4e87b379a94900fd187e10399fd6c776f0e971465c5cf33d7"
   },
@@ -56,7 +56,7 @@
     {
       "name": "folder service and tools",
       "find_sha256": "990995796303ae28bc68934e504c2b6e7f0f96c0f983ddbb77909c58bbaead9f",
-      "replace_sha256": "5540563fdf7276cc9a5970d051756607c8fbb9521530a231b359fd6d82e51235"
+      "replace_sha256": "8c6569a57114f1745cabb44cdb975a3d9e16d2bc86faadd446ed05f564780a2d"
     },
     {
       "name": "list: folder path / folder_id filter, recursive",
