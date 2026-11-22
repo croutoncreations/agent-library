@@ -244,7 +244,8 @@ test("rename, tag, folder, trash safe tombstones, untrash, content and metadata 
       "artifact.content_updated",
     ],
   );
-  assert.deepEqual(all.changes[1].changed_fields, ["title", "folder", "tags"]);
+  // The folder path is a real folder now (docs/folders.md): its id changes along with the path label.
+  assert.deepEqual(all.changes[1].changed_fields, ["title", "folder", "folder_id", "tags"]);
   assert.equal(all.changes.at(-1).restored_from, 1);
   assert.ok(!all.changes[0].web_url.includes("?v="));
   const meta = await o.req(

@@ -12,7 +12,35 @@
 //  - Per-publisher quota (PUB_QUOTA: files and stored bytes) is checked at begin, next to the project binary quota.
 var PF_UPLOADS = /^\/v1\/publisher\/uploads$/;
 var PF_UPLOAD = /^\/v1\/publisher\/uploads\/(upl_[A-Za-z0-9_-]{1,64})(\/finish)?$/;
-var PF_NAME = /^[A-Za-z0-9._-]{1,64}$/;
+// A file name, optionally inside subfolders of the destination: "shot.png" or "2026/11/shot.png". Each segment is
+// [A-Za-z0-9._-]{1,64} (no "." or ".." segments), at most 4 subfolder levels and 200 characters in all.
+var PF_SEG = /^[A-Za-z0-9._-]{1,64}$/;
+var PF_MAX_SUBDIRS = 4;
+function pfNameOk(name) {
+  if (typeof name !== "string" || name.length > 200) return false;
+  const segs = name.split("/");
+  return segs.length <= PF_MAX_SUBDIRS + 1 && segs.every((s) => PF_SEG.test(s) && s !== "." && s !== "..");
+}
+__name(pfNameOk, "pfNameOk");
+// Subfolders of a nested name, created under the publisher's destination and marked as the publisher's.
+// pfFolderCheck runs before the upload begins, so a name that can't fit (depth, path length) fails with nothing
+// started; pfFolderFor then finds or creates the folders.
+async function pfFolderCheck(env, p, name) {
+  const segs = name.split("/").slice(0, -1);
+  if (!segs.length) return null;
+  const base = p.folder_id ? await env.DB.prepare("SELECT * FROM folders WHERE id = ? AND project_id = ?").bind(p.folder_id, p.project_id).first() : null;
+  if (p.folder_id && !base) throw new HttpError(403, "scope_mismatch", "Publisher destination unavailable or changed");
+  const full = (base ? fdPathOf(base) + "/" : "") + segs.join("/");
+  if (full.length > FD_MAX_PATH) throw new HttpError(400, "invalid_input", `The folder path of ${name} would exceed ${FD_MAX_PATH} characters`, { name });
+  if (full.split("/").length > FD_MAX_DEPTH) throw new HttpError(400, "invalid_input", `The folders of ${name} would be nested more than ${FD_MAX_DEPTH} levels deep`, { name });
+  return { segs, base };
+}
+__name(pfFolderCheck, "pfFolderCheck");
+async function pfFolderFor(p, ctx, plan) {
+  if (!plan) return p.folder_id ?? null;
+  return (await fdEnsure(ctx, p.project_id, plan.segs, { base: plan.base, publisherId: p.id })).id;
+}
+__name(pfFolderFor, "pfFolderFor");
 var PF_BODY_MAX = 16 * 1024;
 // An upload that is not finished for good. Expired-but-not-yet-reconciled uploads count as unfinished: uploadFinish
 // can still seal one that passed its expiry check a moment earlier, so a placeholder is only released once every
@@ -78,7 +106,7 @@ async function pfBegin(req, env, p, ctx, quota) {
   const key = idemKey(req.headers.get("idempotency-key"));
   const b = await pfJsonBody(req);
   const name = b.name;
-  if (typeof name !== "string" || !PF_NAME.test(name)) throw new HttpError(400, "invalid_input", "name must match [A-Za-z0-9._-]{1,64}");
+  if (!pfNameOk(name)) throw new HttpError(400, "invalid_input", `name must be [A-Za-z0-9._-]{1,64}, optionally inside up to ${PF_MAX_SUBDIRS} subfolders ("2026/11/shot.png")`);
   if (name === "manifest.json" || /^g_.*\.manifest\.json$/.test(name)) throw new HttpError(400, "invalid_input", `${name} is reserved for the server`);
   if (b.expected_revision !== void 0 && (!Number.isSafeInteger(b.expected_revision) || b.expected_revision < 0)) throw new HttpError(400, "invalid_input", "expected_revision must be a non-negative integer");
   const note = provenance(ctx, b)[4];
@@ -119,14 +147,23 @@ async function pfBegin(req, env, p, ctx, quota) {
     if (q && (q.n + (artifactId ? 0 : 1) > quota.files || q.bytes + size > quota.bytes))
       throw new HttpError(413, "quota_exceeded", "This app has reached its storage quota in the library; ask the owner", { max_files: quota.files, max_bytes: quota.bytes });
   }
-  const r = pfUnwrap(await uploadBegin(ctx, p.project_id, artifactId ? { artifact_id: artifactId, expected_revision: b.expected_revision, mime: b.mime, size: b.size, sha256: b.sha256 } : { title: name, mime: b.mime, size: b.size, sha256: b.sha256 }, key));
+  const fdPlan = artifactId ? null : await pfFolderCheck(env, p, name);
+  const r = pfUnwrap(await uploadBegin(ctx, p.project_id, artifactId ? { artifact_id: artifactId, expected_revision: b.expected_revision, mime: b.mime, size: b.size, sha256: b.sha256 } : { title: name.split("/").pop(), mime: b.mime, size: b.size, sha256: b.sha256 }, key));
   const up = r.body;
   if (up.base_revision === 0) {
-    // Claim the new file for this publisher: its name, its destination, never review-gated (App Connect files are not).
+    // Claim the new file for this publisher: its name, its folder (the destination or a subfolder of it), never
+    // review-gated (App Connect files are not).
+    let folderId;
+    try { folderId = await pfFolderFor(p, ctx, fdPlan); }
+    catch (e) {
+      await pfFailUpload(env, up.upload_id, "conflict", "The file's folder could not be created");
+      throw e;
+    }
+    const folderPath = folderId ? await env.DB.prepare("SELECT COALESCE(path, name) AS p FROM folders WHERE id = ?").bind(folderId).first("p") : "";
     let claimed = false;
     try {
-      await env.DB.prepare(`UPDATE artifacts SET publisher_id = ?, export_name = ?, folder_id = ?, review_mode = 'off'
-          WHERE id = ? AND project_id = ? AND kind = 'binary' AND head_rev = 0 AND publisher_id IS NULL`).bind(p.id, name, p.folder_id ?? null, up.artifact_id, p.project_id).run();
+      await env.DB.prepare(`UPDATE artifacts SET publisher_id = ?, export_name = ?, folder_id = ?, folder = ?, review_mode = 'off'
+          WHERE id = ? AND project_id = ? AND kind = 'binary' AND head_rev = 0 AND publisher_id IS NULL`).bind(p.id, name, folderId, folderPath ?? "", up.artifact_id, p.project_id).run();
     } catch {
     }
     const a = await env.DB.prepare("SELECT publisher_id, export_name FROM artifacts WHERE id = ? AND project_id = ?").bind(up.artifact_id, p.project_id).first();
@@ -186,7 +223,7 @@ async function pfServeBlob(req, env, a, r) {
   const total = r.size;
   const headers = {
     "content-type": r.mime,
-    "content-disposition": `attachment; filename="${a.export_name}"`,
+    "content-disposition": `attachment; filename="${String(a.export_name).split("/").pop()}"`,
     "x-content-type-options": "nosniff",
     "cache-control": "private, no-store",
     "content-security-policy": "default-src 'none'; frame-ancestors 'none'; sandbox",

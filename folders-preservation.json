@@ -1,0 +1,373 @@
+{
+  "base_artifact_limits_sha256": "17b4483cffa310e7dd709ae04b0362e3e3698330531662923231827c58d15c39",
+  "integrated_sha256": "40504e3f2651e20b4b515c4b43e19b970a886acdc8a3f5f2d15b21aa18b75e12",
+  "preserved_outside_patches_sha256": "8e1cf489ba97a0a40e36dd673dc915cf11fba174ef367b50c284244083c1f92a",
+  "sources_sha256": {
+    "src/folders/service.js": "b8d780c60eb1dfe62668de2592a99132c34109f833482aa643d14085fd5ad877",
+    "src/folders/browser.js": "20435769c57a856f437acc6ca933defcf6d24b31958ae4aea6e789f3f40e584e",
+    "src/folders/browser.css": "3a60519cd5403c14ce2ffc0845348a284995321319dae35a31264546e1c7bc36"
+  },
+  "patches": [
+    {
+      "name": "template copy: the folder (path or id) resolves to a real folder",
+      "find_sha256": "cd6215d1ab7ce15b2c2011e17cde05c4764de55f246c19ae4fc6d5531ff66fb6",
+      "replace_sha256": "5da3f3a8babc211f6276917c7823ae78c7b12171785510753974b2ce46eb9ed3"
+    },
+    {
+      "name": "review: proposals carry the folder id",
+      "find_sha256": "1b50356a80e38f35c6e1b7fe8fd80f3a498668b9496e6dc5b8b43477c1b468c3",
+      "replace_sha256": "ada1fe9ce44cf3b160a3288f38e208a6f3425ebaf678ac27d9f44c968c7e6494"
+    },
+    {
+      "name": "review: a gated new upload keeps its folder",
+      "find_sha256": "b735f1602d6ff1198582a4f6d69cff394d048c3d93124abb558433ab77daae41",
+      "replace_sha256": "6b9cad46cb457638ced31dbb4c374c57705a392c1c4adde5a3b9c445b257b886"
+    },
+    {
+      "name": "review: a gated new upload's proposal stores the folder id",
+      "find_sha256": "12ef03830c8b0ebb03e93bbfd848c5675ae174d64961ee266e3122320734474b",
+      "replace_sha256": "e3d50d5a144f84c0cc516e9f95d960a6cc10c7721804da0984cc3af87b435395"
+    },
+    {
+      "name": "review: gated new upload binds the folder id",
+      "find_sha256": "eabd1786bf4203cfc0d2a680864eaffeac95d6a333be2cd644a1ad2adb7c60ce",
+      "replace_sha256": "b9edd55ae22a4093d28649a1101d1c0d4341a10cee59c2836c3fc89ddc32a160"
+    },
+    {
+      "name": "review: approval uses the proposed folder (or the reviewer's edit)",
+      "find_sha256": "d58cd0b93c9d28f437810fd64fedbeb7016b1914b266318558d87e19d0a4d2d2",
+      "replace_sha256": "480566f1d19bd69a25b1db288ad6e0587eacafdbe3bfd7077665acd38af881ea"
+    },
+    {
+      "name": "review: a reviewer's folder edit resolves to a real folder",
+      "find_sha256": "63907018664d7d1ac4751ac7a1f7dd74b4ea7c5e9fa753541591a0b1af40fbcb",
+      "replace_sha256": "c003b347c81cd59cc745386dd3c696314592667c3d2df574cf90492c9b655f6f"
+    },
+    {
+      "name": "review: a new document approved with an edited folder lands there",
+      "find_sha256": "7bb8c877b5a925e9d3b1c01899a5b96d75af1c09261e416eb9e97ff894d22487",
+      "replace_sha256": "159d5c76bdac58ac7fa03e14925b93c7c585e67f77295b657b73668a4759bff0"
+    },
+    {
+      "name": "review: an approved folder change moves the document",
+      "find_sha256": "e0333ccfdf7170b881d96067f915f59c9d675f9843d8907210bc66a7d1cd51d4",
+      "replace_sha256": "ea0b61cdbd8c6bf1383e11f68434b4240ab9a7ac6ef602a7818076bbe9f416c1"
+    },
+    {
+      "name": "folder service and tools",
+      "find_sha256": "990995796303ae28bc68934e504c2b6e7f0f96c0f983ddbb77909c58bbaead9f",
+      "replace_sha256": "c827299b017a3ac44de1a7f62e58db4fbddfce3e04a0e79c0c6c530d482b2afc"
+    },
+    {
+      "name": "list: folder path / folder_id filter, recursive",
+      "find_sha256": "cb0338e3d64b2ca33147091ad56585712a2d0606f2afc7b6535d8aef02abe9c2",
+      "replace_sha256": "48a81fa007b709d6a70edce3d41ec7aa30aa80718d1971d337ddc426b347003f"
+    },
+    {
+      "name": "list: apply the folder filter",
+      "find_sha256": "d70e895be42f3d5423272786d321076dcb9e3581d5e214961f1439c8eeb27ed8",
+      "replace_sha256": "148d0d5a0311398b0e5d43c672c761745aeaf9e15ba0bead042d09fc980b7988"
+    },
+    {
+      "name": "list: folder filter params",
+      "find_sha256": "4c02987f3344a8ea63fbddd2b82b5251600d9a48aa0f78cc22752aaf5a87f4b0",
+      "replace_sha256": "97f59fd5d0a90e4669add5ee9f61077e57444b813e20bc4375520c211c3453db"
+    },
+    {
+      "name": "create: folder_id no longer needs App Connect",
+      "find_sha256": "e7fa335e85874500fb11db9b7d4bfd79f9acceeeeafabc1e07c113349cad4b07",
+      "replace_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "create: the folder (path or id) resolves to a real folder",
+      "find_sha256": "01d761baa84abb613ebcb23f5e0e9d766dd0e14d8ec841b5c28f9e9076946d34",
+      "replace_sha256": "5da3f3a8babc211f6276917c7823ae78c7b12171785510753974b2ce46eb9ed3"
+    },
+    {
+      "name": "details: folder (path or folder_id) moves the document into a real folder",
+      "find_sha256": "1a04a749f3534a656f83fce86edfb701a572182133ed920df3bfe42bd08a4d69",
+      "replace_sha256": "cc3d0892ecc8e2210f2efe5e82bce75a88dafe7a1f13cd1726f627a386d6ed0e"
+    },
+    {
+      "name": "details: a proposed folder change keeps its folder id",
+      "find_sha256": "9782d2e9e14c2ea06e506eb6384388759a44ba005a684f6752ae79af27102d9f",
+      "replace_sha256": "9592a5f5f1d5711c0ab11b9f4d0b08d67428cfc153093f2ff6768afc6f390c07"
+    },
+    {
+      "name": "details: a new folder path is created after the review gate",
+      "find_sha256": "9078aea2025b54c8e64b4f0908e40d6ec90c9b3770f72772cc9c773c1f3a0baf",
+      "replace_sha256": "6cbd77fb235ae73e9b031f8b7fd059f3fec17f0cdd08b7f7edf9d126ecd3d21b"
+    },
+    {
+      "name": "details: the response carries the folder id",
+      "find_sha256": "4c212e846610b98cacfe8cc9a6d31bca2fd48efdd17b636871d84840f78e19f2",
+      "replace_sha256": "168ba35b890a5bc12c94ebe8d0c78de3c03fc4c19c9fc0c78012b473e9fe3335"
+    },
+    {
+      "name": "details: the folder change is written with the folder id",
+      "find_sha256": "09885e685ac549ca32657a5c530d533b770580edf28d4e3433751ab63f5dae14",
+      "replace_sha256": "a1470b1c835dcdace624bfa5fefda8a5a1310f114509d0e89835b4ee63ad195d"
+    },
+    {
+      "name": "folders: list is the tree, for every installation",
+      "find_sha256": "3bfdb084658df880375be7cca33d873afb8069d8dc20c19e035bcf1357fb4c2d",
+      "replace_sha256": "0d0357566b606b19c2de5e764c3b1ad32f175cf8425406b931270ea6e49c3ad3"
+    },
+    {
+      "name": "folders: create by name/parent or path, for every installation",
+      "find_sha256": "d876f70c4c039539e0e7faf033965ad6e41472190ed8a0ce6cd0c0d32d73925f",
+      "replace_sha256": "1bb41f7af2bd9a5a80eb4b5cacb535826033ed8fb4dc3b216ca966df652f1cfa"
+    },
+    {
+      "name": "views: folder_id is part of every artifact view (folders are no longer App Connect only)",
+      "find_sha256": "f11b1244a725e407bb95c1bf22ef52a80fe54f762f5343f23d06753714335889",
+      "replace_sha256": "2b0be5bf0b7ba856d73d6c40be24bf8083de5645eaa32237cb7da8afab96fcef"
+    },
+    {
+      "name": "oauth mcp: folder tools",
+      "find_sha256": "80c90a2958a661577635a2621a18c45a0fc0b6d7ff60f9b09dc09ed5d5b7fc81",
+      "replace_sha256": "6de1947c9a271cd45fb5e42c40fd4cc5661d26fd264ea85b3b922ebbae81bc33"
+    },
+    {
+      "name": "oauth mcp: list_artifacts filters by folder (documents-only connections)",
+      "find_sha256": "66863a5665c5c981598f64685b35a42eba16fee8b6339486c3a9e0eaf14b9028",
+      "replace_sha256": "4f5d958948ebd54fed7c2b15af2119de04ce2f1a932e9a4a699217d41d52d8b2"
+    },
+    {
+      "name": "oauth mcp: list_artifacts folder filter (App Connect on)",
+      "find_sha256": "c7780c78a2cfebe95f75dbe3d1a1a6c9b1fba7f962e4393ed23191c27e9e4ce2",
+      "replace_sha256": "a839ae3cf4ed065b36b1265dd91fcc90b3a9445d6b38019adaba795dfbd29dcf"
+    },
+    {
+      "name": "oauth mcp: list_artifacts folder filter (App Connect off)",
+      "find_sha256": "8c326b9ade3f3d7a883933c7fb9f3a259bcc3b2ad51912ca960871da14b916b8",
+      "replace_sha256": "9b1a845ea24da571c9bfb377f6f8f951641d2278c8a74dd88785b36d007836c4"
+    },
+    {
+      "name": "oauth mcp: create_markdown takes a folder path",
+      "find_sha256": "b6e101f881dd8cf0f8d2ca9765819cad3d78c91d124b24ab4388d96fb305f4e0",
+      "replace_sha256": "df959549754508474191a09be0f4a1e74e497fd693633ef5856c73b751f54412"
+    },
+    {
+      "name": "oauth mcp: create_markdown passes the folder",
+      "find_sha256": "386ad3c36dd26b03d1f601beb295540b65ce0e03e3e7fdead61f7518a5f19e56",
+      "replace_sha256": "854c2a808a622f5b1352037ee5f98684a1cc97e4e4c6c95a56f5d97ffda53b62"
+    },
+    {
+      "name": "oauth mcp: App Connect list props are the folder props",
+      "find_sha256": "582901026c8af80fe5fcf0e66d83c94b566407a84c084812ce6f7f5df63037de",
+      "replace_sha256": "026edb0087ae35269624032be35e2da4e391579b1ceb16249cd6091292c30523"
+    },
+    {
+      "name": "oauth mcp: file listing filters by folder",
+      "find_sha256": "8c147fcb3830dd377ea2924e02fc18cb60ae2f8c6ac8ba669319c0ade6aca4a2",
+      "replace_sha256": "1e60c31d6a67321c22a671b110b066b58f63a168aeb30cf469f33f0a346390ee"
+    },
+    {
+      "name": "oauth mcp: upload_begin and upload_file take folder paths",
+      "find_sha256": "6642136fe990a5884acb73a2fbc52e7ee41c62f2b975a70c6a5e1b5e7d23b6d1",
+      "replace_sha256": "cf793a88d01b00e0e31512e8fe85c806234dd7e8d042b8bd7b23864afaa8ae64"
+    },
+    {
+      "name": "oauth mcp: upload_begin and upload_file take folder paths",
+      "find_sha256": "6642136fe990a5884acb73a2fbc52e7ee41c62f2b975a70c6a5e1b5e7d23b6d1",
+      "replace_sha256": "cf793a88d01b00e0e31512e8fe85c806234dd7e8d042b8bd7b23864afaa8ae64"
+    },
+    {
+      "name": "oauth mcp: file listing folder props",
+      "find_sha256": "709a8f6c66f1fe3434092d96506b77286256cdb07841596cdf390a85163050c1",
+      "replace_sha256": "cf19d41c0bab7cd579afb4632c7db553f16ae830f51b5e14376902cd886ae0f1"
+    },
+    {
+      "name": "publisher: destination shows the folder path",
+      "find_sha256": "d155a909683ecb3b1be301e0cabecce8c488350c082b8aa9ec00eed7e18980d6",
+      "replace_sha256": "5df442578cbb65b8616953efb049ad890ae088ab9b6a455fa7bc5e65df6d8c93"
+    },
+    {
+      "name": "publisher: destination path field",
+      "find_sha256": "ff7fb537199e85ea306223fbb2571ae5c20e606816696bda6ddc17b5436307dc",
+      "replace_sha256": "5b3bc3ed1e707a80bbebe40f8e1db34e8ba1f473442258dd13ec1e6421be3917"
+    },
+    {
+      "name": "consent: existing folders are shown by path",
+      "find_sha256": "17776fb25451852acbd58181768a9212b1fbac3b663bf1b32e62eb205fa775a5",
+      "replace_sha256": "4d707528d85f1b6af50618ef6e8a686b32c454ecbfdf7e99f62f942ea8cb3480"
+    },
+    {
+      "name": "consent: resume cards show the folder path",
+      "find_sha256": "6bfa6d5dbd06bd3cf7dc130780c392a9719a7e2cd12f4fe9e2d99453b2b57db2",
+      "replace_sha256": "533cd7871d3e1bf651d08624c9fe25d31374e5c3800ff43213c405dd33e2b998"
+    },
+    {
+      "name": "backup: export folder ids",
+      "find_sha256": "ab30c9976c667b5a9aa21823c27d61cd3b573551d3d54e9818dbb31abfca7dc3",
+      "replace_sha256": "d5f68a25aa0635abb942e5f0da34120094e87e69f647fd52d246206a4686df35"
+    },
+    {
+      "name": "backup: export the folder tree",
+      "find_sha256": "f987bb73cc38d85f6a17606ea642c1e78ef19d885d58d6c1301f68de1fe75d15",
+      "replace_sha256": "0e7e199ceaebba99ee234ec5ecdaf2b6ec28f15510d62ad6925afc59db36adae"
+    },
+    {
+      "name": "backup: restore the folder tree (after artifacts)",
+      "find_sha256": "8c6f6d1dcddf4304c4c6b6a67b4f852db079082cfdd9d570b64aa3117a5599ae",
+      "replace_sha256": "1e6d7e5d2598dad431dbb9cfdc8b678d7e9bc996bbd7f8d9cfd3b55df0ad2d80"
+    },
+    {
+      "name": "upload: the folder (path or id) resolves to a real folder",
+      "find_sha256": "2dd7edd2a463abb656c50a27129d855e18016cad7631b4e20970464ba46c09d1",
+      "replace_sha256": "7e6891f2b6c4f34dd16a7483cd0aea83af9d51daffbc6a817900435e6164968b"
+    },
+    {
+      "name": "upload: the placeholder is created in its folder",
+      "find_sha256": "322e96e6525912e7dc6038a815f64e4efb424dd6fc1ef76889b1ba2d8a97bfb3",
+      "replace_sha256": "7c35770d52fbc77301c3e4fb6a9c13b8aae8ca4ecb5f0d22bec0a1d8e6492222"
+    },
+    {
+      "name": "legacy mcp: folder tools",
+      "find_sha256": "6d5b3ab3ff28423fa3c4919beed4cdc0ba27e66969f010c5734bfceb69301230",
+      "replace_sha256": "77bd34daf880a5b055c7e837ef3b49ffca732e6125a2fd8dfffff4d79149eed6"
+    },
+    {
+      "name": "legacy mcp: list_artifacts filters by folder",
+      "find_sha256": "f2ea1cc4dba8e7ad58d62cb081b771cd15f297ddbe982d624fb70534c374aefa",
+      "replace_sha256": "dcbec2eecbba8875bb1f311f78c3821e5942b974806c8473180c81a5c0a7d926"
+    },
+    {
+      "name": "ui: styles",
+      "find_sha256": "dbf4cdd569563992bd40313f20a86bcb55703a554eed9585301382dce9e6ee4e",
+      "replace_sha256": "6eef6c09965c6e7134bffab8cae4731dfa480000b6c74a1402843fe87be87a25"
+    },
+    {
+      "name": "ui: folder route",
+      "find_sha256": "bef69956dfe826e547f556557dde8f29aa6206d06915f780f79b4fc76d58077b",
+      "replace_sha256": "43a99cb6f282798229faeefd2dd4725b816dc11d4b97f523fbdd25808957f404"
+    },
+    {
+      "name": "ui: folder helpers",
+      "find_sha256": "81bcf3ea5954073fece07463dbbe3470c23d9bf7692c635606fabb17e44ff27a",
+      "replace_sha256": "87826dbf86b7ae2b786dc9eb443c17c287edcbfe2a435a2a689a815e1f8946c2"
+    },
+    {
+      "name": "ui: binary upload begin sends the folder",
+      "find_sha256": "30e04ca4b74d28762cd5c2d32076060148d2cf6ad5d56f2645f03b9cac7175a7",
+      "replace_sha256": "c54390b5b9505752a906a9d696b12b2b86139e446e9af9e45b51d60a53429fe7"
+    },
+    {
+      "name": "ui: data file create sends the folder",
+      "find_sha256": "3280552450300a585539187ec3fdd8222e261531ef967958e5287fb31dc14936",
+      "replace_sha256": "66112b41222b8db4356c47dfbf098edd9c6d4f2b11dd2c98dc2045a217c12cbc"
+    },
+    {
+      "name": "ui: upload form takes a folder",
+      "find_sha256": "656f9e94d8382ad980153fa743fc8680c76495ec521e51d45065889de6e88b33",
+      "replace_sha256": "649f5dfec886a166004c9649bde6c1c93f80cfd3b8f7901067112b3bbb29efab"
+    },
+    {
+      "name": "ui: upload target carries the folder",
+      "find_sha256": "90d12db1841218dd1a4b44a50e85d39198c752627339e7230cf80c20cd1cc20f",
+      "replace_sha256": "3fb798c9ae496118c6a9a49cf216012a7cb66996c9d31f22752737d79750b1e4"
+    },
+    {
+      "name": "ui: project view takes a folder",
+      "find_sha256": "2d785ea0a30f79d1f33271b8acdcf243a64b105c00c5a198231382428891238c",
+      "replace_sha256": "1a9ff156998f129c01862ec2c3c4aeb3f47661eeb6d574f7c59419252a37d38e"
+    },
+    {
+      "name": "ui: folder panel",
+      "find_sha256": "174a3c841352274846f26dab2cf816393c179a21e1e46d158a816ac6652a8ee5",
+      "replace_sha256": "ff6f51e5fb9c49caf1e40b03c284193efb71f8a267aac659a791111b21581ad0"
+    },
+    {
+      "name": "ui: browse one folder (search stays project-wide)",
+      "find_sha256": "68542081f54b8cd8d88b038550a84013c310b77fc4290bb601aa6320ab456f09",
+      "replace_sha256": "bd3ec747f7093e8ddbf40697b4e02b3cec7d6b98386920a79127644b6a96e8db"
+    },
+    {
+      "name": "ui: subfolders render with each reload",
+      "find_sha256": "42e7d168eee5f1886b31bcbad07bacbe7bcdb9f9767ade7de3aa13feb9b1de65",
+      "replace_sha256": "62e4273564349064b73e22fd682177d49f3a281c1ca8d5a5118c746ba4b33072"
+    },
+    {
+      "name": "ui: an empty folder with subfolders is not \"empty\"",
+      "find_sha256": "00178675d400c92fd36ae8014228609bfda6eb2e9b5716a5e9676d004e064cd3",
+      "replace_sha256": "1191907273c693d85ca5ee1a2b449d6af71e5205ec672599234dffb8921a955b"
+    },
+    {
+      "name": "ui: new documents land in the folder being viewed",
+      "find_sha256": "28d716a2ad04a3f6b32623182caec405192740072b008a3f47c2da52e4743630",
+      "replace_sha256": "bdce71eca53ee0256c6aa13b40d2333d3b2d79c0f2f1fc4e655fe03d0dc6ad66"
+    },
+    {
+      "name": "ui: uploads land in the folder being viewed",
+      "find_sha256": "ff8412e6996d64eb8020fb984da59c39ce66f71dcd5ce38f41195fbdde316d34",
+      "replace_sha256": "61df7d27db2eab224c5df60e621581e41d6a39c388d84b431779e07f7f68241d"
+    },
+    {
+      "name": "ui: inside a folder the eyebrow names the project",
+      "find_sha256": "124c3db09078a2c57963a4776c708854ee25f7770693d035e504a86babf334e7",
+      "replace_sha256": "ab06ae4c37f2ec02dbe5c4831e6578935896cb201bc26af4cedea0cb932e157b"
+    },
+    {
+      "name": "ui: folder panel above the list",
+      "find_sha256": "a1bd9633c7b309f0ed381505ff60685c513d8697e72aafc581fb6a4b0ab13b0f",
+      "replace_sha256": "3211e9d7b1fac3a74f1b4d4223ec30e173b4bcdc2331800eaf31636dabae9fda"
+    },
+    {
+      "name": "ui: page title is the folder name inside a folder",
+      "find_sha256": "aa2cd7df0552b37346a8e1467357b0bfdce7bef1d13b23cb2b007f82d9d48204",
+      "replace_sha256": "aac7c3bfd6623cb9d6eeca3f29e8cd955ff9fe0c3b41d0d3d94b41c0f4bd4cc3"
+    },
+    {
+      "name": "ui: document breadcrumbs include the folder path",
+      "find_sha256": "4bde100457253c44990e56ea3d8a7b7247bb4b765d3ec56b88e7700b6ac52515",
+      "replace_sha256": "04cc1bf23d199472f1a3c859dc2b6dbe5c855d911cce175d5bc6ea5be65a38b3"
+    },
+    {
+      "name": "ui: Details folder field suggests folder paths",
+      "find_sha256": "4f657b37ab1e0843e9fd6a3eecd806b0eb5039060a8589cd24be57c581f786bb",
+      "replace_sha256": "1d542ff31c5df46fb3a3721bef73e0dfe094098b3402d2af7ba8b843795857c8"
+    },
+    {
+      "name": "v1: one folder route",
+      "find_sha256": "8cc37bd99f8d6900bcca9b4c0bd3444819a856af8bd8d2cda0dde5d511bbbdb8",
+      "replace_sha256": "ef69da2775e19aa7a0bec54c709e3ba6d43d9138516e82d04198e741d3f4bdf7"
+    },
+    {
+      "name": "v1: folder routes for every installation",
+      "find_sha256": "9068e6a7f0b7a8224cba929487526a3c7ec422dadcf7174abf300f216e40b061",
+      "replace_sha256": "e762222e90b50974c4fcb22e1a481a1870cf2b6e95272c731ce3dfe43aaf2b84"
+    },
+    {
+      "name": "v1: list files by folder for every installation",
+      "find_sha256": "a264f8bf0faf59bd2d548975ab16e790a4d2e585b4b79e5ca1537a305620837d",
+      "replace_sha256": "08b230aa2cc27dbf435ed453836861fe424de41009b2b8fbaba3ecd2e581f2fc"
+    },
+    {
+      "name": "v1: list folders (tree, ?parent / ?parent_id)",
+      "find_sha256": "fb88648bd2e5b96391e0510f161a43563e73e8d2020fc88f3d5aef61a3a6fcf7",
+      "replace_sha256": "61f3481e21098401ed1eed2cb8d7c75ce1b4bc6735750dfe31e6ad20b1023264"
+    },
+    {
+      "name": "v1: create folder for every installation",
+      "find_sha256": "a4ba9cc2353bc83494ddaf2a293ef2fd661d82f4cdaec79f4f782e638622fd22",
+      "replace_sha256": "2c1dbe4806a8fc877875f3c92df172a899c12cc6bcf1a8fc374d48512b3255c9"
+    },
+    {
+      "name": "api: folder routes (list, create, rename/move, delete)",
+      "find_sha256": "44203b3b8c151747713bfa6de1079ad2164c8d6076d727415178e3af879904e6",
+      "replace_sha256": "1dca1e9a0433b5a6a7ab61918ada51f4f6c594c83ec22613611f83b514f85187"
+    },
+    {
+      "name": "api: list by folder for every installation",
+      "find_sha256": "7a2f686ea981655b204fdb5a11b52fedb0433d2029e755030d6ded1a9e7eca5c",
+      "replace_sha256": "4f60f842d43cb8a1c2a62e1b17ff268fffc88b31f508d30756ee43811289204d"
+    },
+    {
+      "name": "api: list by folder path, recursive",
+      "find_sha256": "7f616e8fe5b9d394e33cdac33ddeb3d8df3a2faf31679ce799b97d279d2da2dd",
+      "replace_sha256": "9fd9e9918f84de83f852307f93dd207e7fd3aa636603a0f9841724542894085d"
+    }
+  ],
+  "requires_migration": "0018_nested_folders.sql"
+}

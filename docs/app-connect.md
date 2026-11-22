@@ -81,7 +81,7 @@ The exact request and response shapes are in `src/api/publisher.ts`, `src/api/ge
 
 Apps can store images (PNG, JPEG, WebP, GIF), PDFs, video (MP4, WebM) and other files (`application/octet-stream`, download-only) of up to 5 MiB each. They go in the app's destination, next to its JSON and CSV files. The bytes are checked against the declared size, SHA-256 and file type, stored in R2 and counted against the project's binary storage quota and the app's own quota. `GET /me` → `files_contract` lists the allowed types and limits.
 
-A file is identified by a stable **name** (`[A-Za-z0-9._-]{1,64}`, for example `screenshot-2026-11-21.png`). Uploading takes three steps:
+A file is identified by a stable **name** (`[A-Za-z0-9._-]{1,64}`, for example `screenshot-2026-11-21.png`). A name can include up to 4 subfolders of the destination (`2026/11/screenshot.png`); they are created as needed and belong to the app ([folders](folders.md#app-connect)). Uploading takes three steps:
 
 1. `POST /v1/publisher/uploads` with an `Idempotency-Key` and a JSON body:
    ```json

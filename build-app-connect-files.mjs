@@ -1,4 +1,4 @@
-// App Connect binary files (runs last, after build-artifact-limits.mjs; no migration). Publishers upload images, PDFs,
+// App Connect binary files (runs last, after build-folders.mjs; no migration). Publishers upload images, PDFs,
 // video and other files into their own destination through POST /v1/publisher/uploads -> PUT bytes -> POST finish,
 // reusing the existing upload machinery, and download them from /v1/publisher/files/{id}/content.
 // docs/app-connect.md#binary-files. The module src/app-connect-files/publisher-files.js is inserted before
@@ -8,8 +8,8 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 const sha = (s) => createHash('sha256').update(s).digest('hex');
 const input = readFileSync('src/index.js', 'utf8');
-const base = JSON.parse(readFileSync('artifact-limits-preservation.json', 'utf8')).integrated_sha256;
-if (sha(input) !== base) throw Error('Run build-artifact-limits.mjs before build-app-connect-files.mjs');
+const base = JSON.parse(readFileSync('folders-preservation.json', 'utf8')).integrated_sha256;
+if (sha(input) !== base) throw Error('Run build-folders.mjs before build-app-connect-files.mjs');
 const mod = readFileSync('src/app-connect-files/publisher-files.js', 'utf8').replace(/\n*$/, '\n');
 if (/^(import|export)\s/m.test(mod) || !mod.includes('async function pfRoute(req, env, p, requestId, ctx, quota) {\n')) throw Error('src/app-connect-files/publisher-files.js must define pfRoute and nothing importable');
 const once = (needle, what) => { const i = input.indexOf(needle); if (i < 0 || input.indexOf(needle, i + 1) >= 0) throw Error('Expected exactly one ' + what); return i; };
@@ -52,7 +52,7 @@ const gaps = [];
 for (const s of spans) { gaps.push(input.slice(pos, s.a)); out += input.slice(pos, s.a) + s.replace; pos = s.b; }
 gaps.push(input.slice(pos)); out += input.slice(pos);
 writeFileSync('src/index.js', out);
-const meta = { base_artifact_limits_sha256: base, integrated_sha256: sha(out), preserved_outside_patches_sha256: sha(gaps.join('\u0000')),
+const meta = { base_folders_sha256: base, integrated_sha256: sha(out), preserved_outside_patches_sha256: sha(gaps.join('\u0000')),
   module_sha256: sha(mod), patches: spans.map((s) => ({ name: s.name, module: s.module, find_sha256: sha(s.find), replace_sha256: sha(s.replace) })) };
 writeFileSync('app-connect-files-preservation.json', JSON.stringify(meta, null, 2) + '\n');
 console.log('App Connect binary files bundle: ' + sha(out));

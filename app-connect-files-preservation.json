@@ -1,14 +1,14 @@
 {
-  "base_artifact_limits_sha256": "17b4483cffa310e7dd709ae04b0362e3e3698330531662923231827c58d15c39",
-  "integrated_sha256": "a6e1f722a14b73618e0fd067955212694c8cde3030e4ecfe434238b74bea4fa2",
-  "preserved_outside_patches_sha256": "1012c7d516e7433821693fd5c1868c57a34abc6f8ad4f428cf8b7699f08ce321",
-  "module_sha256": "56afb9f60fa1d202fde61ad9dd16cb2ac6a3191d57e6da736025574878378fa8",
+  "base_folders_sha256": "40504e3f2651e20b4b515c4b43e19b970a886acdc8a3f5f2d15b21aa18b75e12",
+  "integrated_sha256": "e0c5c5e42398b8d780b6f497bf0099984592254e87fa1e119c669684bef031a2",
+  "preserved_outside_patches_sha256": "e0335f7f13954e872ba89d2d6db7870fc857bbcc50a9fd39ad67b4173106f59e",
+  "module_sha256": "d99c78a42b2a3de89a070f96c3ab60de4a7bc4fc3a2f87a578ae0fe8a1d68671",
   "patches": [
     {
       "name": "module: App Connect binary files (inserted before the publisher module)",
       "module": "// src/api/publisher.ts — isolated readable-generation integration",
       "find_sha256": "404d6845e0c9fe140dce7900992d19346bdde62477d97eaa10d256298ecf7c28",
-      "replace_sha256": "20f4870ca50c851aed6830185e35eef427152eff26a7c0356e1131622a718e1e"
+      "replace_sha256": "55b0d3470009f8b3bf90387f1bc5d355b66b0b370dc5d23ff3daf5175562e8d2"
     },
     {
       "name": "publisher: file views carry the MIME type",

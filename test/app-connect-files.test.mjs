@@ -141,7 +141,7 @@ test("integrity: wrong bytes, wrong type and oversize are refused; nothing is pu
   assert.equal(big.status, 413);
   const html = await begin(P.access_token, { name: "page.html", mime: "text/html", size: 10, sha256: sha("x") });
   assert.equal(html.status, 415); assert.equal(html.json.error.code, "unsupported_type");
-  for (const name of ["manifest.json", "../x", "a/b", ""]) assert.equal((await begin(P.access_token, { name, mime: "image/png", size: 1, sha256: sha("x") })).status, 400, name);
+  for (const name of ["manifest.json", "../x", "a//b", "a/./b", "1/2/3/4/5/6", ""]) assert.equal((await begin(P.access_token, { name, mime: "image/png", size: 1, sha256: sha("x") })).status, 400, name);
   const names = (await h.pub(P.access_token, "GET", "/publisher/files")).json.files.map((x) => x.name);
   for (const n of ["bad-hash.png", "fake.png"]) assert.ok(!names.includes(n), `${n} never published`);
   assert.equal((await h.pub(P.access_token, "POST", `/publisher/uploads/${b.json.upload_id}/finish`, { body: { extra: 1 }, idem: key("x") })).status, 400, "finish body must be empty");
