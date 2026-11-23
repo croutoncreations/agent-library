@@ -100,14 +100,13 @@ Browser apps on a registered origin can call these routes directly: CORS allows 
 
 ## Current limits
 
-- **Formats.** Publishers write JSON and CSV (snapshots, generations) and binary files (uploads). Markdown and HTML publishing are planned.
+- **Formats.** In this release, publishers write JSON and CSV (snapshots, generations) and binary files (uploads); they can't write Markdown or HTML here. The next release replaces `/v1/publisher/*` with one path-addressed App Files API (`/v1/app/files/{path}`) for Markdown, HTML, JSON, CSV and binary files, with path folders inside the destination. Its release notes will say what existing publisher apps need to change.
 - **File size.** Binary files are limited to 5 MiB each, the same limit as other uploads.
 - **Backup.** The built-in project backup doesn't yet cover projects that contain App Connect files (`backup_unsupported`). See [operations.md](operations.md#supported-release-scope).
 - **One destination.** Each connection writes into one project and folder. To publish somewhere else, connect again (a new publisher).
 
 ## Roadmap toward "app data folder" parity
 
-1. **Any artifact kind for publishers.** Binary uploads are done. Markdown and HTML through the same file APIs agents use, scoped to the publisher's own files, are still to come.
-2. **Simple per-file CRUD** alongside snapshots and generations, for apps that just want to save and load documents.
-3. **Owner "share with agents" from the app folder.** Today agents see app files through their project grant. A per-folder grant would let you share only one app's folder.
-4. **Publisher-aware backup and restore** that preserves source protection.
+1. **Any artifact kind for publishers, by path** (next release): text and binary files on one per-file API, `/v1/app/files/{path}`, replacing snapshots, generations and upload slots.
+2. **Owner "share with agents" from the app folder.** Today agents see app files through their project grant. A per-folder grant would let you share only one app's folder.
+3. **Publisher-aware backup and restore** that preserves source protection.
