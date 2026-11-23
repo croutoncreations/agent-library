@@ -100,7 +100,7 @@ Browser apps on a registered origin can call these routes directly: CORS allows 
 
 ## Current limits
 
-- **Formats.** In this release, publishers write JSON and CSV (snapshots, generations) and binary files (uploads); they can't write Markdown or HTML here. The next release replaces `/v1/publisher/*` with one path-addressed App Files API (`/v1/app/files/{path}`) for Markdown, HTML, JSON, CSV and binary files, with path folders inside the destination; see [self-hosting.md](self-hosting.md) when upgrading.
+- **Formats.** In this release, publishers write JSON and CSV (snapshots, generations) and binary files (uploads); they can't write Markdown or HTML here. The next release replaces `/v1/publisher/*` with one path-addressed App Files API (`/v1/app/files/{path}`) for Markdown, HTML, JSON, CSV and binary files, with path folders inside the destination. Its release notes will say what existing publisher apps need to change.
 - **File size.** Binary files are limited to 5 MiB each, the same limit as other uploads.
 - **Backup.** The built-in project backup doesn't yet cover projects that contain App Connect files (`backup_unsupported`). See [operations.md](operations.md#supported-release-scope).
 - **One destination.** Each connection writes into one project and folder. To publish somewhere else, connect again (a new publisher).
