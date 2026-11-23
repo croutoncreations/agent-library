@@ -34,21 +34,20 @@ before(async () => {
 });
 after(async () => { await sdk?.close(); await h?.stop(); });
 
-test("OAuth upload_begin with the flag off: no schema or folder_id, binaries plus Markdown and HTML, flag-off mime wording", async () => {
+test("OAuth upload_begin with the flag off: no schema (folder_id is for every installation), binaries plus Markdown and HTML, flag-off mime wording", async () => {
   const b = (await sdk.listTools()).tools.find((t) => t.name === "upload_begin");
-  assert.ok(!("schema" in b.inputSchema.properties) && !("folder_id" in b.inputSchema.properties));
+  assert.ok(!("schema" in b.inputSchema.properties) && "folder_id" in b.inputSchema.properties);
   assert.deepEqual(b.inputSchema.properties.mime.enum, [...BINARIES, "text/markdown", "text/html"]);
   assert.equal(b.inputSchema.properties.mime.description, MIME_OFF);
 });
 
-test("OAuth with the flag off: schema/folder_id are unknown arguments, JSON/CSV and unknown types are refused, nothing written", async () => {
+test("OAuth with the flag off: schema is an unknown argument, a missing folder_id is 404, JSON/CSV and unknown types are refused, nothing written", async () => {
   const before = rowCounts();
   const md = Buffer.from("# x\n");
   const decl = { title: "Refused", mime: "text/markdown", size: md.length, sha256: sha256(md) };
-  for (const extra of [{ schema: "agentlib.measurements/1" }, { folder_id: "fld_synthetic" }]) {
-    const r = await raw.call("upload_begin", { project_id: P, change_note: "x", idempotency_key: key("ub"), ...decl, ...extra });
-    assert.deepEqual([r.isError, r.data], [true, { code: -32602, message: `Unknown argument ${Object.keys(extra)[0]}` }]);
-  }
+  const r = await raw.call("upload_begin", { project_id: P, change_note: "x", idempotency_key: key("ub"), ...decl, schema: "agentlib.measurements/1" });
+  assert.deepEqual([r.isError, r.data], [true, { code: -32602, message: "Unknown argument schema" }]);
+  assert.equal((await call({ ...decl, folder_id: "fld_synthetic" })).data.error.code, "not_found");
   for (const mime of ["application/json", "text/csv"]) for (const size of [2, 10 * 1024 * 1024 + 1]) {
     const r = await call({ title: "Data", mime, size, sha256: sha256("{}") });
     assert.deepEqual(r.data.error, NOT_FOUND, `${mime} ${size}`);

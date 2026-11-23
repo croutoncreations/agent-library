@@ -20,35 +20,53 @@ To edit an app's file, make a copy. Revoking the app (Settings → Publishing ap
 2. **The app sends you to** `https://MCP_HOST/authorize` with `response_type=code`, its `client_id`, an exact `redirect_uri`, `scope=agentlib:publish offline_access`, `resource=https://MCP_HOST/v1`, `state` and a PKCE S256 `code_challenge`. You sign in and pick the project and destination (a new folder, an existing folder or the project root), or resume the app's earlier connection. The page lists who can already read that project.
 3. **Token exchange:** `POST https://MCP_HOST/oauth/token` returns an access token (15 minutes) and a refresh token. Dynamic client registration can never obtain `agentlib:publish`.
 
-**Suggested destination.** The app may add `agentlib_project` (an id or title) and `agentlib_folder` (a name, 1–80 characters, no `/`) to the authorize URL; you can also set defaults when registering (`suggested_project`, `suggested_folder` on `PUT /api/app-clients/{id}`). These only pre-fill the consent page. You always choose, and invalid values are ignored.
+**Suggested destination.** The app may add `agentlib_project` (an id or title) and `agentlib_folder` (a top-level folder name, 1–80 characters, no `/`) to the authorize URL; you can also set defaults when registering (`suggested_project`, `suggested_folder` on `PUT /api/app-clients/{id}`). These only pre-fill the consent page. You always choose, and invalid values are ignored.
 
 ## API (`https://MCP_HOST/v1/app...`, `Authorization: Bearer <access token>`)
 
+One path-addressed API for every kind of file: text (Markdown, HTML, JSON, CSV) and binary (images, PDF, video, any other bytes).
+
 | Request | Answer |
 |---|---|
-| `GET /v1/app` | `{ app_id, publisher_id, display_name, project: {id, title}, folder: {id, name} or null, limits: { max_file_bytes } }` |
-| `GET /v1/app/files?prefix=&cursor=&limit=` | `{ files, next_cursor }` in path order, `limit` 1–100. Each file: `path`, `file_id`, `kind`, `revision`, `etag`, `sha256`, `size`, `updated_at` |
-| `GET` / `HEAD /v1/app/files/{path}` | The bytes, with `ETag: "<sha256>"`. Supports `If-None-Match` (`304`) and `Range` |
-| `PUT /v1/app/files/{path}` | Needs `Content-Type`, `Content-Length` (at most 1 MiB, refused before the body is read), `Idempotency-Key`, and `If-None-Match: *` (create) or `If-Match: "<sha256>"` (replace). `201`/`200 { file }`; `200 { file, unchanged: true }` when the bytes are the current ones (nothing is written); `412` with `current_etag` and `current_revision` when the precondition fails |
+| `GET /v1/app` | `{ app_id, publisher_id, display_name, project: {id, title}, folder: {id, name, path} or null, limits: { max_file_bytes, max_text_bytes, max_binary_bytes, max_path_chars, max_path_segments } }` (`max_file_bytes` is the text limit, kept for older apps) |
+| `GET /v1/app/files?prefix=&cursor=&limit=` | `{ files, next_cursor }` in path order, `limit` 1–100. Each file: `path`, `file_id`, `kind`, `mime`, `content_type`, `title`, `folder: {id, path}` (or null at the project root), `revision`, `etag`, `sha256`, `size`, `created_at`, `updated_at`, `web_url` (and `preview_url` for text) |
+| `GET` / `HEAD /v1/app/files/{path}` | The bytes, with `ETag: "<sha256>"`. Supports `If-None-Match` (`304`) and `Range` (`206`, `416`) |
+| `PUT /v1/app/files/{path}` | Needs `Content-Type` (the path's type), `Content-Length`, `Idempotency-Key`, and `If-None-Match: *` (create) or `If-Match: "<sha256>"` (replace). Binary files also need `X-Content-SHA256: <64 hex>`. `201`/`200 { file }`; `200 { file, unchanged: true }` when the bytes are the current ones (nothing is written); `412` with `current_etag` and `current_revision` when the precondition fails |
 | `DELETE /v1/app/files/{path}` | Needs `If-Match` and `Idempotency-Key`. Moves the file to your trash and frees the path |
 | `GET /v1/app/connection-info` | Diagnostic: the app's destination and whether writes are allowed |
 
-**Paths.** Lowercase `[a-z0-9._-]` segments, not starting with `.`; 1–8 segments, at most 200 characters. The last segment ends in `.md`, `.html`, `.json` or `.csv`, and no other segment does. So `summary/steps.json` is fine and `Steps.json`, `a.json/b.csv` and `notes.txt` are `400 invalid_path`. The path never chooses where a file goes: every file lives in the folder you approved.
+**Paths.** Lowercase `[a-z0-9._-]` segments, not starting with `.`; 1–8 segments, at most 200 characters. The last segment is the file name and ends in an extension; no folder segment ends in `.md`, `.html`, `.json` or `.csv`. Lowercase only means a path is unique by its name alone, for every kind of file. `notes/2026-11-22-brief.md` and `shots/a.png` are fine; `Brief.md`, `a.json/b.csv`, `notes.txt` and `logo.svg` are `400 invalid_path`.
 
-**Files are text.** The extension chooses the kind. `Content-Type` must be `text/markdown`, `text/html`, `application/json` or `text/csv` and match it (`charset=utf-8` if given). Content is validated (strict UTF-8, valid JSON or CSV). Reads come back as data (`text/plain`, `nosniff`, a sandboxing CSP), so nothing an app stores ever runs on the library's origin. Binary files and files over 1 MiB are not supported yet.
+**Folders.** The folder segments of a path are real folders inside the destination you approved: `neo/reports/2026-11-22-brief.md` lives in `<destination>/neo/reports`, created on the first write and shown in your library like any folder. They belong to the app while it is connected: you can't rename or move them, or a folder below the destination that contains them (`409 folder_app_owned`), and you can't move its files elsewhere. You can delete an empty one; the app recreates it on its next write. An app can create at most 200 folders (`409 limit_reached`). You can rename or move the destination itself; the app keeps writing to the same folders. The app can never reach anything outside its destination. Files written before paths became folders sit in the destination itself and move into their path's folder on their next replace.
 
-**Idempotency.** Every `PUT` and `DELETE` needs an `Idempotency-Key` (8–128 characters). A retry with the same key and request replays the first answer (`idempotent_replay: true`); the same key with a different request is `422`. A client that lost a response can also treat `412` with `current_etag` equal to the SHA-256 of its own body as success.
+**Kinds and types.** The extension chooses the kind and the one `Content-Type` a `PUT` must send:
+
+| Extension | Kind | Content-Type | Limit |
+|---|---|---|---|
+| `.md`, `.html`, `.json`, `.csv` | text (`markdown`, `html`, `json`, `csv`) | `text/markdown`, `text/html`, `application/json`, `text/csv` (`charset=utf-8` if given) | 1 MiB |
+| `.png`, `.jpg`/`.jpeg`, `.webp`, `.gif` | `binary` | `image/png`, `image/jpeg`, `image/webp`, `image/gif` | plan `file_bytes` (default 25 MiB) |
+| `.pdf`, `.mp4`, `.webm` | `binary` | `application/pdf`, `video/mp4`, `video/webm` | plan `file_bytes` |
+| any other 1–10 character `[a-z0-9]` extension (`.bin`, `.gz`, …) | `binary` | `application/octet-stream` | plan `file_bytes` |
+
+Text is validated (strict UTF-8, valid JSON or CSV). A binary is streamed to storage in one pass: its length must equal `Content-Length` and its SHA-256 must equal `X-Content-SHA256`, or nothing is stored (`400 incomplete_body`, `422 integrity_mismatch`); its first bytes must carry the type's signature (`422 signature_mismatch`; octet-stream takes any non-empty bytes). A 5 MiB (or 25 MiB) file is one `PUT`; there is no separate upload session.
+
+**Safe serving.** Reads carry `X-Content-Type-Options: nosniff`, a sandboxing `Content-Security-Policy` and `Cross-Origin-Resource-Policy: same-origin`. Markdown, HTML, JSON and CSV come back as data (`text/plain` or their data type); images and video are inline; PDF, HTML, JSON, CSV and octet-stream are `Content-Disposition: attachment`. SVG is not accepted. Nothing an app stores ever runs on the library's origin.
+
+**Idempotency.** Every `PUT` and `DELETE` needs an `Idempotency-Key` (8–128 characters). A retry with the same key and request (for a binary: the same declared SHA-256 and length) replays the first answer (`idempotent_replay: true`) without reading the body again; the same key with a different request is `422`. A client that lost a response can also treat `412` with `current_etag` equal to the SHA-256 of its own body as success.
 
 **Every request re-checks authorization:** a revoked or disabled app, a superseded token, a removed creator, a deleted project or destination stop it at once, and writes are fenced in the same D1 statement that stores them. A suspended workspace stops writes (`403 workspace_read_only`) but not reads. Other limits: the workspace storage limit (`402 limit_reached`) and a per-app request rate (`429`, `Retry-After`).
 
 | Status | Code | When |
 |---|---|---|
-| 400 | `invalid_path`, `invalid_input` | Path rule, malformed headers, `prefix`, `cursor` or `limit` |
-| 411 / 413 | `length_required`, `file_too_large` | No `Content-Length`; over 1 MiB |
-| 415 / 422 | `unsupported_type`, `invalid_content` | Wrong `Content-Type`; invalid UTF-8, JSON or CSV |
-| 428 / 412 | `precondition_required`, `precondition_failed` | No precondition; stale `If-Match`, or the file exists or is missing |
-| 409 | `destination_file_trashed` | You moved the file to trash; restore it first |
+| 400 | `invalid_path`, `invalid_input`, `incomplete_body` | Path rule (or folders too deep under the destination); malformed headers, `prefix`, `cursor` or `limit`; body length differs from `Content-Length` |
+| 411 / 413 | `length_required`, `file_too_large` (text), `too_large` (binary) | No `Content-Length`; over the limit (refused from the headers) |
+| 415 | `unsupported_type` | `Content-Type` is not the path's type |
+| 422 | `invalid_content`, `integrity_mismatch`, `signature_mismatch`, `idempotency_key_reused` | Invalid UTF-8, JSON or CSV; SHA-256 differs from `X-Content-SHA256`; bytes are not the declared type; key reused for another request |
+| 428 / 412 | `precondition_required`, `precondition_failed` | No precondition (or no `X-Content-SHA256` on a binary); stale `If-Match`, or the file exists or is missing |
+| 409 | `destination_file_trashed`, `conflict`, `folder_conflict` | You moved the file to trash (restore it first); another writer won; a folder on the path changed meanwhile |
 | 401 / 403 | `unauthenticated`, `publisher_revoked`, `scope_mismatch`, `workspace_read_only` | Authorization changed |
+| 402 / 429 | `limit_reached`, `rate_limited` | Workspace storage (checked before the body is read); request rate, or more than 20 file uploads in progress in the project at once (retry after `retry_after_seconds`) |
+| 409 | `limit_reached` | The app has created 200 folders; reuse or delete some |
 
 ## Updating several files at once: index last
 
@@ -64,7 +82,7 @@ A `412` on the index means another writer won: re-read the index, rebuild and re
 
 ## Backup
 
-A project backup includes app files as ordinary files, each marked `app: { name, path }` (`path` is null for a trashed file; backup schema 3). Restoring or importing makes them ordinary, editable files in your project: title = the path, tag `app:<name>`, in a folder of the same name as before (`folder_name` in the backup; recreated, owned by you), no connection to an app. See [operations.md](operations.md#what-backups-cover).
+A project backup includes app files as ordinary files, each marked `app: { name, path }` (`path` is null for a trashed file; backup schema 3). Restoring or importing makes them ordinary, editable files in your project: title = the path, tag `app:<name>`, in the same folder path as before (`folder_name` in the backup holds the full path; recreated, owned by you), no connection to an app. See [operations.md](operations.md#what-backups-cover).
 
 ## Limits
 
@@ -72,4 +90,4 @@ See [limits.md](limits.md#app-connect-publishers). One destination per connectio
 
 ## Not yet
 
-Binary app files and files over 1 MiB (planned through the upload flow); sharing only one app's folder with agents.
+Sharing only one app's folder with agents; binary files larger than the plan's file limit (a resumable upload session).

@@ -75,7 +75,8 @@ test("GET /v1/app says who the app is, with its destination and limit", async ()
   assert.deepEqual(Object.keys(me).sort(), ["app_id", "display_name", "folder", "limits", "project", "publisher_id"]);
   assert.equal(me.app_id, c.app.app_client_id); assert.equal(me.publisher_id, c.P.publisher_id);
   assert.deepEqual(me.project, { id: "files-own", title: "Files own" });
-  assert.match(me.folder.id, /^fld_/); assert.deepEqual(me.limits, { max_file_bytes: 1048576 });
+  assert.match(me.folder.id, /^fld_/); assert.equal(me.folder.path, me.folder.name);
+  assert.deepEqual(me.limits, { max_file_bytes: 1048576, max_text_bytes: 1048576, max_binary_bytes: 25 * 1048576, max_path_chars: 200, max_path_segments: 8 });
   assert.equal(ok(await h.pub((await connect("files-own")).tok, "GET", "/app")).folder, null, "project root");
 });
 
@@ -88,7 +89,7 @@ test("create, read back, replace, delete: ETags, revisions, headers and a freed 
   assert.deepEqual([f.path, f.kind, f.revision, f.sha256, f.size, f.etag], ["notes/day.md", "markdown", 1, sha(body), Buffer.byteLength(body), etagOf(body)]);
   assert.equal(created.headers.get("etag"), etagOf(body));
   const row = sql(`SELECT publisher_id, export_name, title, kind FROM artifacts WHERE id = '${f.file_id}'`)[0];
-  assert.deepEqual(row, { publisher_id: c.P.publisher_id, export_name: "notes/day.md", title: "notes/day.md", kind: "markdown" });
+  assert.deepEqual(row, { publisher_id: c.P.publisher_id, export_name: "notes/day.md", title: "day.md", kind: "markdown" });
 
   const r = await get(c.tok, "notes/day.md");
   assert.equal(r.status, 200); assert.equal(r.text, body); assert.equal(r.headers.get("etag"), etagOf(body));
@@ -360,8 +361,10 @@ test("backup: a project with app files exports them with app:{name,path}; import
   assert.deepEqual(byId[kept.file_id].app, { name: appName, path: "summary/steps.json" });
   assert.deepEqual(byId[gone.file_id].app, { name: appName, path: null }, "a trashed app file has no path");
   assert.ok(!("publisher_id" in byId[kept.file_id]) && !("export_name" in byId[kept.file_id]));
-  const folder = sql(`SELECT f.name FROM artifacts a JOIN folders f ON f.id = a.folder_id WHERE a.id = '${kept.file_id}'`)[0].name;
-  assert.equal(byId[kept.file_id].folder_name, folder, "the app's folder is exported by name");
+  const dest = sql(`SELECT f.name FROM publishers p JOIN folders f ON f.id = p.folder_id WHERE p.id = '${c.P.publisher_id}'`)[0].name;
+  const folder = `${dest}/summary`;
+  assert.equal(byId[kept.file_id].folder_name, folder, "the file's folder is exported by its full path");
+  assert.equal(byId[gone.file_id].folder_name, dest);
 
   const personal = ok(await owner.req("GET", "/api/workspaces")).workspaces.find((w) => w.personal).id;
   const imported = ok(await owner.req("POST", `/api/workspaces/${personal}/import`, { backup, title: "Imported app project" }), 201);
@@ -369,12 +372,12 @@ test("backup: a project with app files exports them with app:{name,path}; import
   assert.equal(rows.length, 2);
   const restored = rows.find((r) => r.title === "summary/steps.json");
   assert.deepEqual([restored.publisher_id, restored.export_name, JSON.parse(restored.tags)], [null, null, [`app:${appName}`]]);
-  // The folder is recreated by name in the new project, owned by the owner (no app), and both files sit in it.
-  const placed = sql(`SELECT a.title, f.name, f.publisher_id, f.project_id FROM artifacts a JOIN folders f ON f.id = a.folder_id WHERE a.project_id = '${imported.project_id}' ORDER BY a.title`);
-  assert.deepEqual(placed.map((r) => [r.name, r.publisher_id, r.project_id]), [[folder, null, imported.project_id], [folder, null, imported.project_id]]);
-  assert.equal(sql(`SELECT COUNT(*) AS n FROM folders WHERE project_id = '${imported.project_id}'`)[0].n, 1);
+  // The folders are recreated by path in the new project, owned by the owner (no app), each file in its own.
+  const placed = sql(`SELECT a.title, COALESCE(f.path, f.name) AS path, f.publisher_id, f.project_id FROM artifacts a JOIN folders f ON f.id = a.folder_id WHERE a.project_id = '${imported.project_id}' ORDER BY a.title`);
+  assert.deepEqual(placed.map((r) => [r.title, r.path, r.publisher_id, r.project_id]), [["old.md", dest, null, imported.project_id], ["summary/steps.json", folder, null, imported.project_id]]);
+  assert.equal(sql(`SELECT COUNT(*) AS n FROM folders WHERE project_id = '${imported.project_id}'`)[0].n, 2);
   // A backup naming an invalid folder is refused before anything is written.
-  const badFolder = { ...backup, artifacts: backup.artifacts.map((a) => ({ ...a, folder_name: "a/b" })) };
+  const badFolder = { ...backup, artifacts: backup.artifacts.map((a) => ({ ...a, folder_name: "a/../b" })) };
   assert.equal((await owner.req("POST", `/api/workspaces/${personal}/import`, { backup: badFolder })).status, 400);
   assert.equal(rows.find((r) => r.trashed).publisher_id, null);
   // Ordinary and editable: the owner can save a new version of the restored file.

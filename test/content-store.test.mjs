@@ -50,10 +50,12 @@ test("backup.js writes and cleans up files only through writeBlobBytes and the p
   for (const name of ["putBlob", "deleteBlob", "getBlob", "getBlobBytes", "getBlobHead", "headBlob", "blobSha256Hex", "putBlobStream"]) assert.ok(!imported.includes(name), name);
   assert.ok(imported.includes("writeBlobBytes") && imported.includes("dropUnreferencedBlobs") && imported.includes("deleteBlobs"));
 });
-test("exactly one writeUploadBlob( call site and one putBlobStream( call site outside content-store.js", () => {
-  const count = (re) => jsFiles(join(ROOT, "packages")).filter((f) => !f.endsWith("content-store.js")).reduce((n, f) => n + [...readFileSync(f, "utf8").matchAll(re)].length, 0);
-  assert.equal(count(/\bwriteUploadBlob\(/g), 1);
-  assert.equal(count(/\bputBlobStream\(/g), 1);
+test("writeUploadBlob( is called only by the binary upload PUT and the App Files binary PUT; putBlobStream( once, outside content-store.js", () => {
+  const sites = (re) => jsFiles(join(ROOT, "packages")).filter((f) => !f.endsWith("content-store.js"))
+    .flatMap((f) => [...readFileSync(f, "utf8").matchAll(re)].map(() => f.slice(ROOT.length + 1)));
+  // Both stream straight to R2 with length and SHA-256 checked; the App Files PUT also records a content_writes intent.
+  assert.deepEqual(sites(/\bwriteUploadBlob\(/g).sort(), ["packages/core/src/api/app-files.js", "packages/core/src/uploads.js"]);
+  assert.equal(sites(/\bputBlobStream\(/g).length, 1);
 });
 
 // Legacy fallback SELECTs still fetch inline bodies, but SQL must not match against them (search reads the FTS

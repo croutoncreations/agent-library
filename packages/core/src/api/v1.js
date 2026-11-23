@@ -91,9 +91,9 @@ var writeAllowed = (k, pid) => {
   if (!p.can_write && p.read_only) throw readOnlyError(); // writable key, suspended workspace
   if (!p.can_write) throw new HttpError(403, "forbidden", "This credential cannot write to this project");
 };
-var P1_FIELDS = ["id", "project_id", "kind", "title", "folder", "tags", "revision", "meta_version", "trashed", "updated_at"];
+var P1_FIELDS = ["id", "project_id", "kind", "title", "folder", "folder_id", "tags", "revision", "meta_version", "trashed", "updated_at"];
 function fileView2(origin, a, env) {
-  const base = appConnectEnabled(env) ? a : Object.fromEntries(P1_FIELDS.map((k) => [k, a[k]]));
+  const base = appConnectEnabled(env) ? a : Object.fromEntries(P1_FIELDS.filter((k) => a[k] !== void 0).map((k) => [k, a[k]]));
   const linkable = appConnectEnabled(env) ? ["markdown", "html", "json", "csv"].includes(a.kind) : a.kind === "markdown" || a.kind === "html";
   return { ...base, ...a.review ? { review: a.review } : {}, ...a.is_template ? { is_template: true, template_description: a.template_description } : {}, ...a.source ? { source: a.source } : {}, ...origin ? { web_url: artifactWebUrl(origin, a.project_id, a.id), ...linkable ? { preview_url: previewWebUrl(origin, a.project_id, a.id) } : {} } : {} };
 }
@@ -115,7 +115,7 @@ async function route2(req, env, url, requestId, seen = {}) {
     return new Response(null, { status: code, headers: { location: "https://redirect-probe.invalid/v1/projects", "cache-control": "no-store" } });
   }
   const ac = appConnectEnabled(env);
-  const known = Object.entries(R2).some(([name, re]) => (ac || name !== "records" && name !== "folders") && re.test(path));
+  const known = Object.entries(R2).some(([name, re]) => (ac || name !== "records") && re.test(path));
   if (!known) throw new HttpError(404, "not_found", "Not found");
   if (req.headers.get("cookie")) throw new HttpError(400, "invalid_request", "Cookies are not accepted on the API");
   let k;
@@ -194,8 +194,8 @@ async function route2(req, env, url, requestId, seen = {}) {
       const ctx = projectCtx(env, k, requestId, pid);
       const cursor = url.searchParams.get("cursor") ?? void 0;
       const kind = url.searchParams.get("kind") ?? void 0, folderId = url.searchParams.get("folder_id") ?? void 0, appPath = url.searchParams.get("app_path") ?? void 0;
-      if ((kind !== void 0 || folderId !== void 0 || appPath !== void 0) && !appConnectEnabled(env)) throw new HttpError(400, "invalid_input", "Unknown query parameter");
-      const r = await listArtifacts(ctx, pid, { query: url.searchParams.get("query") ?? void 0, cursor, kind, folderId, appPath });
+      if ((kind !== void 0 || appPath !== void 0) && !appConnectEnabled(env)) throw new HttpError(400, "invalid_input", "Unknown query parameter");
+      const r = await listArtifacts(ctx, pid, { query: url.searchParams.get("query") ?? void 0, cursor, kind, folderId, folder: url.searchParams.get("folder") ?? void 0, recursive: url.searchParams.get("recursive") ?? void 0, appPath });
       return json({ files: r.artifacts.map((a) => fileView2(origin, a, env)), next_cursor: r.next_cursor });
     }
     if (m === "POST") {
@@ -263,9 +263,8 @@ async function route2(req, env, url, requestId, seen = {}) {
   }
   if (g = R2.folders.exec(path)) {
     const pid = g[1];
-    if (m === "GET") return json(await listFolders(projectCtx(env, k, requestId, pid), pid));
+    if (m === "GET") return json(await listFolders(projectCtx(env, k, requestId, pid), pid, { parent: url.searchParams.get("parent") ?? void 0, parent_id: url.searchParams.get("parent_id") ?? void 0 }));
     if (m === "POST") {
-      requireAppConnect(projectCtx(env, k, requestId, pid));
       writeAllowed(k, pid);
       const key = idemKey(req.headers.get("idempotency-key"));
       const r = await createFolder(projectCtx(env, k, requestId, pid), pid, await readJson(req), key);

@@ -32,6 +32,7 @@ import { APP_CSS, APP_HTML, APP_JS } from "./ui.js";
 import { applyReviewSettings, getReviewSettings, listProposals, listReviewGrants, readProposal, reviewProposal, reviewQueue, reviewRevision, serveProposalContent, setReviewGrant, setReviewMode, setReviewSettings, withdrawProposal } from "./review/service.js";
 import { serveContent, uploadBegin, uploadFinish, uploadPut } from "./uploads.js";
 import { HttpError, errorBody, errorLogFields, idemKey, json, nowIso, nowMs, randomId, readTextCapped, sha256Hex, str } from "./util.js";
+import { fdDelete, fdUpdate } from "./folders.js";
 
 var SEC_HEADERS = {
   "x-content-type-options": "nosniff",
@@ -270,8 +271,13 @@ function legalLinks(env) {
   if (rest[0] === "changes" && rest.length === 1 && m === "GET") return json(await listChanges(ctx,pid,chQuery(url.searchParams)));
   if (rest[0] === "audit" && m === "GET") return json(await listAudit(ctx, pid));
   if (rest[0] === "folders" && rest.length === 1) {
-    if (m === "GET") return json(await listFolders(ctx, pid));
+    if (m === "GET") return json(await listFolders(ctx, pid, { parent: url.searchParams.get("parent") ?? void 0, parent_id: url.searchParams.get("parent_id") ?? void 0 }));
     if (m === "POST") return out(await createFolder(ctx, pid, await body(req), key()));
+  }
+  if (rest[0] === "folders" && rest.length === 2) {
+    const fid = str(rest[1], "folder", 64);
+    if (m === "PATCH") return out(await fdUpdate(ctx, pid, fid, await body(req), key()));
+    if (m === "DELETE") return out(await fdDelete(ctx, pid, fid));
   }
   if (rest[0] === "connections" && rest.length === 1 && m === "GET") return json(await listConnections(ctx, pid));
   if (rest[0] === "connections" && rest.length === 3 && rest[2] === "revoke" && m === "POST") return json(await revokeConnection(ctx, pid, str(rest[1], "connection", 80)));
@@ -302,8 +308,8 @@ function legalLinks(env) {
   if (rest[0] === "artifacts") {
     if (rest.length === 1 && m === "GET") {
       const kind = url.searchParams.get("kind") ?? void 0, folderId = url.searchParams.get("folder_id") ?? void 0;
-      if (kind !== void 0 || folderId !== void 0) requireAppConnect(ctx);
-      return json(await listArtifacts(ctx, pid, { query: url.searchParams.get("q") ?? void 0, cursor: url.searchParams.get("cursor") ?? void 0, trashed: url.searchParams.get("trashed") === "1", kind, folderId, withMime: ctx.principal.kind === "human" && url.searchParams.get("include") === "mime" }));
+      if (kind !== void 0) requireAppConnect(ctx);
+      return json(await listArtifacts(ctx, pid, { query: url.searchParams.get("q") ?? void 0, cursor: url.searchParams.get("cursor") ?? void 0, trashed: url.searchParams.get("trashed") === "1", kind, folderId, folder: url.searchParams.get("folder") ?? void 0, recursive: url.searchParams.get("recursive") ?? void 0, withMime: ctx.principal.kind === "human" && url.searchParams.get("include") === "mime" }));
     }
     if (rest.length === 1 && m === "POST") {
       const b = await body(req, TEXT_WRITE_BODY_BYTES);

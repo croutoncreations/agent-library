@@ -30,8 +30,8 @@ const FIELDS = {
   title: "Title for a new document or file.",
   artifact_id: "Existing document or file to add a version to; also pass expected_revision.",
   schema: "New JSON/CSV: agentlib.measurements/1 to validate measurement records; omit for no schema. Existing documents keep their stored schema.",
-  folder: "Legacy folder label for a new document or file.",
-  folder_id: "Same-project folder ID for a new text document (App Connect required); omit for project root.",
+  folder: 'Folder path, e.g. "Reports/2026/Q1" ("/" separates nested folders; missing folders are created). Empty or omitted = project root.',
+  folder_id: "Same-project folder ID (fld_\u2026) for a new document or file, instead of folder; omit for project root.",
 };
 const OAUTH_BEGIN_INSTRUCTIONS = "HTTP PUT exactly size raw bytes to put_url; no Authorization header is needed. Text must be UTF-8. Then call upload_finish with upload_id. This link is only for this upload and expires at expires_at.";
 const LEGACY_TEXT_INSTRUCTIONS = "PUT the raw bytes to put_url with the same credentials (and CSRF token for a cookie session), then call upload_finish. Text must be UTF-8.";

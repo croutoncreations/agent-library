@@ -159,7 +159,8 @@ async function sweepContentWrites(env, { projectId, limit = 50 } = {}) {
   const rows = await env.DB.prepare(`SELECT key FROM content_writes WHERE created_at < ?${projectId ? " AND project_id = ?" : ""} ORDER BY created_at LIMIT ?`)
     .bind(cutoff, ...projectId ? [projectId] : [], limit).all();
   for (const { key } of rows.results) {
-    const referenced = await env.DB.prepare("SELECT 1 FROM revisions WHERE body_key = ? UNION ALL SELECT 1 FROM comments WHERE body_key = ? UNION ALL SELECT 1 FROM proposals WHERE body_key = ? LIMIT 1").bind(key, key, key).first();
+    // Text objects are referenced by body_key; file objects written straight from a request (App Files) by blob_key.
+    const referenced = await env.DB.prepare("SELECT 1 FROM revisions WHERE body_key = ?1 UNION ALL SELECT 1 FROM revisions WHERE blob_key = ?1 UNION ALL SELECT 1 FROM comments WHERE body_key = ?1 UNION ALL SELECT 1 FROM proposals WHERE body_key = ?1 UNION ALL SELECT 1 FROM proposals WHERE blob_key = ?1 LIMIT 1").bind(key).first();
     if (!referenced) await deleteBlob(env, key);
     await env.DB.prepare("DELETE FROM content_writes WHERE key = ? AND created_at < ?").bind(key, cutoff).run();
   }

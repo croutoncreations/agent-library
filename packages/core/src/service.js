@@ -9,6 +9,7 @@ import { __name } from "./runtime.js";
 import { headIndexInput, indexDocument, repairIfStale, unindexDocument } from "./search/indexing.js";
 import { RS_SCHEMA, rsQuery, rsReady, rsToolReady, searchArtifacts } from "./search/service.js";
 import { createFromTemplate, listTemplates, previewTemplate, saveAsTemplate, tplAssertMaintenance, tplDate, tplProvenance, tplTools } from "./templates/service.js";
+import { fdList, fdCreate, fdListFilter, fdRecursive, fdResolve, fdEnsure, fdParsePath } from "./folders.js";
 import { ROLE_RANK, memberRoleSql, personalWorkspaceId, projectRole, workspaceRoleSql, requireProjectRole, requireWorkspaceRole, visibleProjects } from "./tenancy.js";
 import { HttpError, b64url, cutLists, int, nowIso, nowMs, randomId, sha256Hex, str } from "./util.js";
 import { checkSlug, ensureHandle, ensureSlug, projectPaths, slugify } from "./paths.js";
@@ -229,8 +230,8 @@ async function listArtifacts(ctx, projectId, q) {
   const term = q.query ? str(q.query, "query", 200) : "";
   const kind = q.kind ?? "";
   if (kind && !["markdown", "html", "json", "csv", "binary"].includes(kind)) throw new HttpError(400, "invalid_input", "kind must be markdown, html, json, csv or binary");
-  const folder = q.folderId ?? "";
-  if (folder && folder !== "root" && !/^fld_[A-Za-z0-9_-]{1,40}$/.test(folder)) throw new HttpError(400, "invalid_input", "folder_id must be a folder id or root");
+  // Folder filter: folder_id ("root" or fld_…) or a folder path, optionally with every subfolder (recursive).
+  const fdF = await fdListFilter(ctx, projectId, { folder_id: q.folderId, folder: q.folder, recursive: fdRecursive(q.recursive) });
   const appPath = q.appPath ?? "";
   if (appPath && !/^[a-z0-9._/-]{1,200}$/.test(appPath)) throw new HttpError(400, "invalid_input", "app_path must be an app file path (lowercase letters, digits, '.', '_', '-', '/')");
   const r = await db(ctx).prepare(
@@ -239,9 +240,9 @@ async function listArtifacts(ctx, projectId, q) {
        AND (? = '' OR (a.publisher_id IS NOT NULL AND a.export_name = ?))
        AND (? = '' OR instr(lower(a.title), lower(?)) > 0) -- same as LIKE with ESCAPE, without D1's 50-byte pattern limit
        AND (? = '' OR a.kind = ?)
-       AND (? = '' OR (? = 'root' AND a.folder_id IS NULL) OR a.folder_id = ?)
+       AND ${fdF ? fdF.sql : "1"}
      ORDER BY a.updated_at DESC, a.id LIMIT ? OFFSET ?`
-  ).bind(projectId, q.trashed ? 1 : 0, appPath, appPath, term, term, kind, kind, folder, folder, folder, LIMITS.pageSize + 1, offset).all();
+  ).bind(projectId, q.trashed ? 1 : 0, appPath, appPath, term, term, kind, kind, ...fdF ? fdF.params : [], LIMITS.pageSize + 1, offset).all();
   const rows = r.results.slice(0, LIMITS.pageSize);
   return {
     artifacts: rows.map((a) => q.withMime ? { ...artifactView(a, appConnectEnabled(ctx.env)), mime: a.head_mime ?? null } : artifactView(a, appConnectEnabled(ctx.env))),
@@ -288,13 +289,14 @@ async function createFile(ctx, projectId, input, key) {
   const kind = input.kind === void 0 || input.kind === null ? "markdown" : input.kind;
   if (kind === "markdown" || kind === "html") {
     if (input.schema !== void 0 && input.schema !== null) throw new HttpError(400, "invalid_input", "schema is only allowed for json or csv files");
-    if (input.folder_id !== void 0 && input.folder_id !== null) requireAppConnect(ctx);
     return createMarkdown(ctx, projectId, { ...input, body: input.body ?? input.content ?? "" }, key, kind);
   }
   if (kind !== "json" && kind !== "csv") throw new HttpError(422, "unsupported_kind", "kind must be markdown, html, json or csv");
   requireAppConnect(ctx);
   return createMarkdown(ctx, projectId, input, key, kind);
 }
+// A folder id that must exist in the project (null/undefined = project root). Writes that take a folder path use
+// fdResolve (folders.js), which also creates missing folders.
 async function folderCheck(ctx, projectId, folderId) {
   if (folderId === void 0 || folderId === null) return null;
   const id = str(folderId, "folder_id", 64);
@@ -304,14 +306,16 @@ async function folderCheck(ctx, projectId, folderId) {
 }
 // Upload create metadata. JSON-route callers retain their own checks and error order; tags default to [].
 async function textCreateMetadata(ctx, projectId, input, kind) {
-  if (kind === "json" || kind === "csv" || input.folder_id != null) requireAppConnect(ctx);
+  if (kind === "json" || kind === "csv") requireAppConnect(ctx);
   const schema = input.schema == null ? null : String(input.schema);
   if (kind === "markdown" || kind === "html") {
     if (schema !== null) throw new HttpError(400, "invalid_input", "schema is only allowed for json or csv files");
   } else if (schema !== null && schema !== MEASUREMENTS) {
     throw new HttpError(400, "invalid_input", `unknown schema (supported: ${MEASUREMENTS})`);
   }
-  return { title: str(input.title, "title", 200, { min: 1 }), folder: str(input.folder, "folder", 200, { optional: true }), folderId: await folderCheck(ctx, projectId, input.folder_id), schema };
+  const title = str(input.title, "title", 200, { min: 1 });
+  const dest = await fdResolve(ctx, projectId, input);
+  return { title, folder: dest ? dest.path : "", folderId: dest ? dest.folderId : null, schema };
 }
 /**
  * Create a text artifact. `internal` (App Files only) makes it a publisher's file: { publisherId, exportName, idem,
@@ -331,9 +335,14 @@ async function createMarkdown(ctx, projectId, input, key, kind = "markdown", int
     schema = c.schema;
     mime = MIME[kind];
   }
-  const folder = str(input.folder, "folder", 200, { optional: true });
-  const folderId = await folderCheck(ctx, projectId, input.folder_id);
-  const digestParts = kind === "markdown" && folderId === null ? ["md", title, body2, folder] : [kind, title, body2, folder, folderId, schema];
+  // App Files (internal) name their folder by id only; everyone else may pass a path (created as needed) or an id.
+  const dest = await fdResolve(ctx, projectId, internal ? { folder_id: input.folder_id } : input);
+  const folder = dest ? dest.path : "";
+  const folderId = dest ? dest.folderId : null;
+  // The digest names the request as sent (its folder text, not the resolved path), so a retry across a release or a
+  // folder rename still replays.
+  const asSent = str(input.folder, "folder", 200, { optional: true });
+  const digestParts = kind === "markdown" && folderId === null ? ["md", title, body2, asSent] : [kind, title, body2, asSent, folderId, schema];
   const i = internal ? internal.idem : { op: "artifact.create", key, projectId, digest: await sha256Hex(JSON.stringify(digestParts)) };
   const prior = await idemLookup(ctx, i);
   if (prior) return prior;
@@ -388,7 +397,8 @@ async function publishRevision(ctx, projectId, artifactId, expected, i, rev, ext
   // Text revisions count against storage here; new file revisions were reserved (and counted) when the upload began.
   // A restored file version adds a revision row of its size (counted in usage), so it is checked here too.
   const reserved = rev.reservedUpload;
-  const addBytes = reserved || rev.blobKey && !rev.restoredFrom ? 0 : rev.size ?? 0;
+  // rev.chargeBlob: a file version written straight from its request (App Files), with no upload reservation.
+  const addBytes = reserved || rev.blobKey && !rev.restoredFrom && !rev.chargeBlob ? 0 : rev.size ?? 0;
   // A text reservation is exchanged for its revision in this batch. Check today's plan even at zero increment.
   const lg = addBytes || reserved ? await projectLimitGuard(ctx.env, projectId, { storage_bytes: addBytes }) : { sql: "1", params: [], limits: {} };
   const reservation = reserved ? {
@@ -540,7 +550,11 @@ async function updateMetadata(ctx, projectId, artifactId, input, key, internal) 
   if (restoredFrom && ctx.principal.kind !== "human" && a.trashed_at) throw new HttpError(404, "not_found", "Artifact not found");
   assertWritable(ctx, a, "meta");
   const title = input.title !== void 0 ? str(input.title, "title", 200, { min: 1 }) : a.title;
-  const folder = input.folder !== void 0 ? str(input.folder, "folder", 200) : a.folder;
+  // Moving a document is a details change: folder (a path, created on save) or folder_id. An app's file stays where
+  // the app put it (its folder is part of its path): a folder sent with its details is ignored.
+  const fdMove = a.publisher_id ? void 0 : await fdResolve(ctx, projectId, input, { defer: true });
+  const folder = fdMove ? fdMove.path : a.folder;
+  let folderIdNext = fdMove ? fdMove.folderId : a.folder_id ?? null;
   if (input.template_description !== undefined && !a.is_template) throw new HttpError(400, "invalid_input", "Not a template");
   const description = input.template_description !== undefined ? str(input.template_description, "template_description", 280) : a.template_description;
   let tags = a.tags;
@@ -552,15 +566,20 @@ async function updateMetadata(ctx, projectId, artifactId, input, key, internal) 
   if (input.trashed === true) trashed = trashed ?? nowIso();
   if (input.trashed === false) trashed = null;
   {
-    const g = await rvGateMeta(ctx, projectId, a, i, expected, input, { title, folder, tags }, restoredFrom);
+    const g = await rvGateMeta(ctx, projectId, a, i, expected, input, { title, folder, folderId: folderIdNext, tags }, restoredFrom);
     if (g) return g;
+  }
+  // A new folder path is created only once the change is allowed (after the review gate; a proposal keeps the path).
+  if (fdMove?.missing) {
+    if (a.meta_version !== expected) throw new HttpError(409, "metadata_conflict", "Expected metadata version is stale", { current_meta_version: a.meta_version });
+    folderIdNext = (await fdEnsure(ctx, projectId, fdParsePath(fdMove.path))).id;
   }
   const az0 = authzSql(ctx, projectId), pr = protectSql(ctx, artifactId);
   const az = { sql: `${az0.sql} AND ${pr.sql}`, params: [...az0.params, ...pr.params] };
   const next = expected + 1;
   const gate = "EXISTS (SELECT 1 FROM artifacts WHERE id = ? AND meta_version = ? AND meta_request_id = ?)";
   const gp = [artifactId, next, ctx.requestId];
-  const body2 = { artifact_id: artifactId, meta_version: next, title, folder, tags: JSON.parse(tags), trashed: !!trashed, ...a.is_template ? { template_description: description } : {} };
+  const body2 = { artifact_id: artifactId, meta_version: next, title, folder, folder_id: folderIdNext, tags: JSON.parse(tags), trashed: !!trashed, ...a.is_template ? { template_description: description } : {} };
   // The index follows the title and the trash: out of the trash it goes at once, back into it (or under a new title) with
   // the head's text, which is read first. A head that moves meanwhile makes these no-ops; repairIfStale below fixes that.
   let searchStatements = [];
@@ -570,8 +589,9 @@ async function updateMetadata(ctx, projectId, artifactId, input, key, internal) 
     if (head) searchStatements = indexDocument(db(ctx), { artifactId, revisionId: head.revisionId, sha256: head.sha256, text: head.text });
   }
   const out2 = await runBatch(ctx, [
-    db(ctx).prepare(`UPDATE artifacts SET title = ?, folder = ?, tags = ?, trashed_at = ?, template_description = ?, meta_version = ?, meta_request_id = ?, updated_at = ?
-      WHERE id = ? AND project_id = ? AND meta_version = ? AND ${az.sql}`).bind(title, folder, tags, trashed, description, next, ctx.requestId, nowIso(), artifactId, projectId, expected, ...az.params),
+    db(ctx).prepare(`UPDATE artifacts SET title = ?, folder = ?, folder_id = ?, tags = ?, trashed_at = ?, template_description = ?, meta_version = ?, meta_request_id = ?, updated_at = ?
+      WHERE id = ? AND project_id = ? AND meta_version = ? AND ${az.sql} AND (? IS NULL OR EXISTS (SELECT 1 FROM folders WHERE id = ? AND project_id = ?))`)
+      .bind(title, folder, folderIdNext, tags, trashed, description, next, ctx.requestId, nowIso(), artifactId, projectId, expected, ...az.params, folderIdNext, folderIdNext, projectId),
     metaBaselineInsert(ctx, a, gate, gp),
     metaVersionInsert(ctx, a, next, { title, folder, tags, trashed: !!trashed, description, restoredFrom }, input, gate, gp),
     idemInsert(ctx, i, 200, body2, gate, gp),
@@ -593,6 +613,8 @@ async function updateMetadata(ctx, projectId, artifactId, input, key, internal) 
     const replay = await idemLookup(ctx, i);
     if (replay) return replay;
     const cur = await db(ctx).prepare("SELECT meta_version FROM artifacts WHERE id = ? AND project_id = ?").bind(artifactId, projectId).first("meta_version");
+    if (cur === expected && folderIdNext && !(await db(ctx).prepare("SELECT 1 AS x FROM folders WHERE id = ?").bind(folderIdNext).first("x")))
+      throw new HttpError(409, "folder_conflict", "The folder was deleted meanwhile; choose another and retry");
     if (cur === expected) throw new HttpError(403, "forbidden", "Grant no longer valid");
     throw new HttpError(409, "metadata_conflict", "Expected metadata version is stale", { current_meta_version: cur });
   }
@@ -610,47 +632,12 @@ function folderName(v) {
   if (/[\/\u0000-\u001f\u007f]/.test(raw)) throw new HttpError(400, "invalid_input", "Folder name cannot contain / or control characters");
   return { name: raw, key: raw.toLowerCase() };
 }
-async function listFolders(ctx, projectId) {
-  requireAppConnect(ctx);
-  await authorizeProject(ctx, projectId, false);
-  const r = await db(ctx).prepare("SELECT id, name, publisher_id, created_at FROM folders WHERE project_id = ? ORDER BY name_key LIMIT ?").bind(projectId, FOLDERS_PER_PROJECT).all();
-  return { folders: r.results };
+// Folders are a tree (folders.js, docs/folders.md); available on every installation.
+async function listFolders(ctx, projectId, q) {
+  return fdList(ctx, projectId, q);
 }
 async function createFolder(ctx, projectId, input, key) {
-  requireAppConnect(ctx);
-  await authorizeProject(ctx, projectId, true);
-  if (ctx.publisher) throw new HttpError(403, "forbidden", "Publishers cannot create folders");
-  const { name, key: nameKey } = folderName(input?.name);
-  const i = { op: "folder.create", key, projectId, digest: await sha256Hex(JSON.stringify([nameKey])) };
-  const prior = await idemLookup(ctx, i);
-  if (prior) return prior;
-  const existing = await db(ctx).prepare("SELECT id FROM folders WHERE project_id = ? AND name_key = ?").bind(projectId, nameKey).first("id");
-  if (existing) throw new HttpError(409, "folder_exists", "A folder with this name already exists", { folder_id: existing });
-  const id = randomId("fld");
-  const az = authzSql(ctx, projectId);
-  const body2 = { id, name };
-  const gate = "EXISTS (SELECT 1 FROM folders WHERE id = ?)";
-  let out2;
-  try {
-    out2 = await runBatch(ctx, [
-      db(ctx).prepare(`INSERT INTO folders (id, project_id, name, name_key, created_at, created_by) SELECT ?, ?, ?, ?, ?, ? WHERE ${az.sql} AND ${FOLDER_ROOM_SQL}`).bind(id, projectId, name, nameKey, nowIso(), ctx.principal.id, ...az.params, projectId, FOLDERS_PER_PROJECT),
-      idemInsert(ctx, i, 201, body2, gate, [id]),
-      audit(ctx, projectId, "folder.create", id, null, "ok", gate, [id])
-    ], i);
-  } catch (e) {
-    if (e instanceof HttpError && e.code === "conflict") {
-      const ex = await db(ctx).prepare("SELECT id FROM folders WHERE project_id = ? AND name_key = ?").bind(projectId, nameKey).first("id");
-      if (ex) throw new HttpError(409, "folder_exists", "A folder with this name already exists", { folder_id: ex });
-    }
-    throw e;
-  }
-  if (!Array.isArray(out2)) return out2;
-  if (!out2[0].meta.changes) {
-    const n = await db(ctx).prepare("SELECT COUNT(*) AS n FROM folders WHERE project_id = ?").bind(projectId).first("n");
-    if (n >= FOLDERS_PER_PROJECT) throw tooManyFolders();
-    throw new HttpError(403, "forbidden", "Grant no longer valid");
-  }
-  return { status: 201, body: body2 };
+  return fdCreate(ctx, projectId, input, key);
 }
 async function readRecords(ctx, projectId, artifactId, q) {
   requireAppConnect(ctx);
@@ -805,7 +792,7 @@ artifactView = (a, appConnect = true) => ({
     schema: a.schema_id ?? null,
     publisher: a.publisher_id ? { id: a.publisher_id, display_name: a.pub_name ?? null, protected: true } : null,
     app_path: a.publisher_id ? a.export_name ?? null : null
-  } : {},
+  } : a.folder_id ? { folder_id: a.folder_id } : {},
   ...rvArtifactReview(a)
 });
 ART_COLS = "a.*, (SELECT display_name FROM publishers WHERE id = a.publisher_id) AS pub_name" + RV_ART_COLS;

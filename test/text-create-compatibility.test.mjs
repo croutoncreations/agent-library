@@ -18,7 +18,8 @@ for (const enabled of [false, true]) for (const wrapper of [false, true]) for (c
       const input = { kind, title: "Pinned", body: "body", ...variant.includes("schema") ? { schema: "ignored" } : {}, ...variant === "folder" ? { folder_id: "fld_present" } : {}, ...variant.includes("missing-folder") ? { folder_id: "fld_absent" } : {}, ...variant === "bad-title-and-schema" ? { title: "" } : {} };
       const call = () => wrapper ? lib.createFile(w.ctx, P, input, "pinned") : lib.createMarkdown(w.ctx, P, input, "pinned", kind);
       const schemaError = wrapper && variant.includes("schema");
-      const folderGate = wrapper && !enabled && (variant === "folder" || variant === "missing-folder");
+      // Since nested folders (0036), folder_id needs no App Connect: the c980189 404 gate is gone on purpose.
+      const folderGate = false;
       const message = schemaError ? "schema is only allowed for json or csv files" : folderGate ? "Not found" : variant.includes("missing-folder") ? "Folder not found" : variant === "bad-title-and-schema" ? "title too short" : null;
       if (message) {
         const status = message === "Not found" || message === "Folder not found" ? 404 : 400;

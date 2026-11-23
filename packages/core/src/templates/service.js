@@ -9,6 +9,7 @@ import { audit, db, folderCheck, idemInsert, idemLookup, mdBody, runBatch } from
 import { HttpError, idemKey, int, nowIso, randomId, sha256Hex, str } from "../util.js";
 import { explainLimit, projectLimitGuard } from "../limits.js";
 import { rvCreateNew, rvNewGated } from "../review/service.js";
+import { FD_FOLDER_PROP, fdResolve } from "../folders.js";
 
 
 // Project-scoped Markdown starting content. Template identity and copy provenance are immutable;
@@ -68,8 +69,10 @@ async function tplCopy(ctx, projectId, input, key, definition = false) {
   const title = str(input.title, "title", 200, { min: 1 });
   const description = definition ? str(input.description ?? "", "description", 280) : "";
   const date = definition ? null : tplDate(input.date, false);
-  const folder = str(input.folder, "folder", 200, { optional: true });
-  const folderId = input.folder_id ?? null;
+  // A folder path (created as needed) or folder_id; resolved before the replay check, like every create.
+  const fdDest = await fdResolve(ctx, projectId, input);
+  const folder = fdDest ? fdDest.path : "";
+  const folderId = fdDest ? fdDest.folderId : null;
   const note = provenance(ctx, input)[4];
   const i = { projectId, op: definition ? "template.create" : "template.use", key,
     digest: await sha256Hex(JSON.stringify([sourceId, revision, title, description, date, folder, folderId, note])) };
@@ -163,7 +166,7 @@ function tplTools(oauth = false) {
     { name: "create_from_template", title: "Create document from template", write: true, annotations: rw,
       description: "Create one independent Markdown document from a pinned template revision in this project. Returns ID, revision/hash, authenticated document/preview URLs (not sharing links) and source template ID/revision. Read the template first. Supply date as YYYY-MM-DD from the user's date/timezone context when {{date}} occurs. Only {{title}}, {{project}}, {{date}} are replaced, once; other braces stay literal. Then fill the copy with ordinary save_markdown. Always set change_note to one line on why. Reuse the same inputs and idempotency_key on retry.",
       inputSchema: schema({ template_id: text, template_revision: { type: "integer", minimum: 1 }, title: { type: "string", minLength: 1, maxLength: 200 },
-        date: { type: "string", pattern: "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" }, folder: { type: "string", maxLength: 200 }, folder_id: text,
+        date: { type: "string", pattern: "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" }, folder: FD_FOLDER_PROP, folder_id: text,
         change_note: { type: "string", maxLength: 280 }, idempotency_key: { type: "string", minLength: 8, maxLength: 128 } }, ["template_id", "template_revision", "title", "idempotency_key"]),
       run: oauth ? async (c, p, a) => (await createFromTemplate(c, p, a, idemKey(a.idempotency_key))).body
         : async (c, a) => (await createFromTemplate(c, a.project_id, a, idemKey(a.idempotency_key))).body }

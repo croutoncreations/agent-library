@@ -316,8 +316,12 @@ The hosted Worker's Stripe adapter is in the private hosted repository.
 
 An app (publisher) writes files through [App Files](app-connect.md). Its limits are few:
 
-- **1 MiB per file** (`413 file_too_large`, refused from `Content-Length` before the body is read) and text only (Markdown, HTML, JSON, CSV).
+- **Text files (Markdown, HTML, JSON, CSV): 1 MiB each** (`413 file_too_large`, refused from `Content-Length` before the body is read).
+- **Binary files (PNG, JPEG, WebP, GIF, PDF, MP4, WebM, octet-stream): the plan's `file_bytes`** (default 25 MiB, never above 90 MiB; `413 too_large` from `Content-Length`). One `PUT` carries the whole file, streamed to storage. `GET /v1/app` reports both limits.
+- **Paths:** at most 8 segments and 200 characters; the folder segments become folders under the destination, so the destination's own depth counts toward the 8-level folder limit (`400 invalid_path` if it would be exceeded). The folders count toward the 1,000 folders per project.
 - **The workspace storage limit** applies to every write (`402 limit_reached`). App files are not counted in `items_per_project`.
 - **The app's request rate** (`429 rate_limited`, `Retry-After`): the same per-minute read and write limits as other agents, scaled by the plan's rate multiplier.
+- **Folders an app creates:** at most 200 per app (`409 limit_reached`), within the project's 1,000. An empty app folder can be deleted by a project admin.
+- **File uploads in progress:** at most 20 per project at once (`429 rate_limited`). Workspace storage is checked before the body is read.
 
 Deleting a file moves it to the owner's trash; its versions stay in history and count toward storage until the owner purges it. There are no per-app lifetime counters, upload slots or file-count quotas.

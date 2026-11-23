@@ -29,14 +29,20 @@ test("livePublisher call sites: exactly the three known callers, each checking r
   for (const s of sites) assert.match(s.after, /\.disabled\b/, `${s.file}: a livePublisher caller checks disabled`);
 });
 
-test("parseAppPath: lowercase [a-z0-9._-] segments, 1-8 of them, kind from the last segment's extension", () => {
-  assert.deepEqual(W.parseAppPath("a/b.md"), { path: "a/b.md", kind: "markdown" });
-  assert.deepEqual(W.parseAppPath("x.html"), { path: "x.html", kind: "html" });
-  assert.deepEqual(W.parseAppPath("summary/steps.json"), { path: "summary/steps.json", kind: "json" });
-  assert.deepEqual(W.parseAppPath("x_y-1.v2.csv"), { path: "x_y-1.v2.csv", kind: "csv" });
+test("parseAppPath: lowercase [a-z0-9._-] segments, 1-8 of them, kind and type from the last segment's extension", () => {
+  const kindOf = (p) => { const r = W.parseAppPath(p); return [r.kind, r.mime]; };
+  assert.deepEqual(W.parseAppPath("a/b.md"), { path: "a/b.md", kind: "markdown", mime: "text/markdown", folders: ["a"], name: "b.md" });
+  assert.deepEqual(W.parseAppPath("x.html"), { path: "x.html", kind: "html", mime: "text/html", folders: [], name: "x.html" });
+  assert.deepEqual(kindOf("summary/steps.json"), ["json", "application/json"]);
+  assert.deepEqual(kindOf("x_y-1.v2.csv"), ["csv", "text/csv"]);
   assert.equal(W.parseAppPath("a/b/c/d/e/f/g/h.md").kind, "markdown");
-  const bad = ["", "X.md", "a/B.md", ".hidden.md", "a/.x/b.md", "a//b.md", "a/", "/a.md", "x.txt", "x", "x.markdown", "x.htm", "x.MD", "a.md/b.md", "a.json/b.csv", "x.constructor",
-    "x.__proto__", "a%2Fb.md", "a b.md", "é.md", "a/b/c/d/e/f/g/h/i.md", "a".repeat(198) + ".md"];
+  // Binaries: a fixed type per extension; any other short [a-z0-9] extension is application/octet-stream.
+  for (const [p, mime] of [["test/sub/a.png", "image/png"], ["a.jpg", "image/jpeg"], ["a.jpeg", "image/jpeg"], ["a.webp", "image/webp"], ["a.gif", "image/gif"],
+    ["r/2026-11-22.pdf", "application/pdf"], ["v.mp4", "video/mp4"], ["v.webm", "video/webm"], ["data.bin", "application/octet-stream"], ["a.tar.gz", "application/octet-stream"], ["x.valueof", "application/octet-stream"]])
+    assert.deepEqual(kindOf(p), ["binary", mime], p);
+  const bad = ["", "X.md", "a/B.md", ".hidden.md", "a/.x/b.md", "a//b.md", "a/", "/a.md", "x.txt", "x", "x.markdown", "x.htm", "x.MD", "a.md/b.md", "a.json/b.csv", "x.svg", "x.svgz", "x.xhtml",
+    "x.__proto__", "x.constructor", "x.toolongextension", "a%2Fb.md", "a b.md", "é.md", "a/b/c/d/e/f/g/h/i.md", "a".repeat(198) + ".md", "A.png", "a/B/c.png", ".png", "f".repeat(81) + "/a.png"];
+  assert.equal(W.parseAppPath("f".repeat(80) + "/a.png").folders[0].length, 80, "a folder segment is a folder name: 1-80 characters");
   for (const p of bad) assert.throws(() => W.parseAppPath(p), (e) => e.status === 400 && e.code === "invalid_path", JSON.stringify(p));
   assert.equal(W.parseAppPath("a".repeat(197) + ".md").kind, "markdown", "200 characters is allowed");
   // A folder may end in a dot-extension that is not one of the four.
