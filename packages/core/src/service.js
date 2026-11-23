@@ -341,8 +341,11 @@ async function createMarkdown(ctx, projectId, input, key, kind = "markdown", int
   const folderId = dest ? dest.folderId : null;
   // The digest names the request as sent (its folder text, not the resolved path), so a retry across a release or a
   // folder rename still replays.
+  // Only a folder_id the client sent counts; one resolved from a path would change if the folder were renamed and
+  // recreated between attempts. A path-only Markdown create keeps the pre-folders "md" shape.
   const asSent = str(input.folder, "folder", 200, { optional: true });
-  const digestParts = kind === "markdown" && folderId === null ? ["md", title, body2, asSent] : [kind, title, body2, asSent, folderId, schema];
+  const sentId = internal ? folderId : input.folder_id === void 0 || input.folder_id === null || input.folder_id === "" ? null : folderId;
+  const digestParts = kind === "markdown" && sentId === null ? ["md", title, body2, asSent] : [kind, title, body2, asSent, sentId, schema];
   const i = internal ? internal.idem : { op: "artifact.create", key, projectId, digest: await sha256Hex(JSON.stringify(digestParts)) };
   const prior = await idemLookup(ctx, i);
   if (prior) return prior;

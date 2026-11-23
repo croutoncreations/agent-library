@@ -234,3 +234,37 @@ test("files written before paths became folders are refiled into their path's fo
   assert.equal(b.status, 200, b.text); assert.equal(b.json.file.folder.path, `${c.dest}/old`);
   assert.equal(sql(`SELECT folder FROM artifacts WHERE id = '${a.json.file.file_id}'`)[0].folder, `${c.dest}/old`);
 });
+
+test("a full workspace still replays a stored binary PUT (same key) and answers unchanged bytes; a new write is 402", async () => {
+  const ws = ok(await owner.req("POST", "/api/workspaces", { name: uniq("Tiny") }), 201).id;
+  sql(`UPDATE workspaces SET plan = 'tiny' WHERE id = '${ws}'`);
+  const pid = ok(await owner.req("POST", "/api/projects", { title: uniq("Tiny bin"), workspace_id: ws }), 201).id;
+  const c = await connect(pid);
+  // 4096 bytes allowed: a ~2.5 KiB PNG fits once, not twice.
+  const big = Buffer.alloc(2600); PNG.copy(big, 0); for (let i = PNG.length; i < big.length; i++) big[i] = i & 255;
+  const key = uniq("put");
+  const first = await putBin(c.tok, "full/a.png", big, { create: true, type: "image/png", key });
+  assert.equal(first.status, 201, first.text);
+  const replay = await putBin(c.tok, "full/a.png", big, { create: true, type: "image/png", key });
+  assert.equal(replay.status, 201, replay.text); assert.equal(replay.json.idempotent_replay, true);
+  const same = await putBin(c.tok, "full/a.png", big, { match: `"${sha(big)}"`, type: "image/png" });
+  assert.equal(same.status, 200, same.text); assert.equal(same.json.unchanged, true);
+  const more = await putBin(c.tok, "full/b.png", big, { create: true, type: "image/png" });
+  assert.equal(more.status, 402, more.text); assert.equal(more.json.error.code, "limit_reached");
+});
+
+test("an app whose destination is the project root locks a person's folder it writes into; a case-only rename is refused too", async () => {
+  const pid = ok(await owner.req("POST", "/api/projects", { title: uniq("Root dest") }), 201).id;
+  const data = ok(await owner.req("POST", `/api/projects/${pid}/folders`, { path: "data" }), 201);
+  const c = await connect(pid, { destination: "root" });
+  const w = await putBin(c.tok, "data/x.png", PNG, { create: true, type: "image/png" });
+  assert.equal(w.status, 201, w.text); assert.equal(w.json.file.folder.path, "data");
+  for (const body of [{ name: "renamed" }, { name: "Data" }, { parent_id: "root", name: "data2" }]) {
+    const r = await owner.req("PATCH", `/api/projects/${pid}/folders/${data.id}`, body);
+    assert.equal(r.status, 409, JSON.stringify(body) + " " + JSON.stringify(r.body)); assert.equal(r.body.error.code, "folder_app_owned");
+  }
+  assert.equal(ok(await owner.req("GET", `/api/projects/${pid}/folders`)).folders.find((f) => f.id === data.id).path, "data", "nothing changed");
+  // Revoked: the owner manages it again, including a case-only rename (which now does change the row).
+  ok(await owner.req("POST", `/api/publishers/${c.P.publisher_id}/revoke`, {}));
+  assert.equal(ok(await owner.req("PATCH", `/api/projects/${pid}/folders/${data.id}`, { name: "Data" })).path, "Data");
+});

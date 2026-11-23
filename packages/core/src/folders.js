@@ -209,8 +209,9 @@ async function fdSubtree(ctx, projectId, f) {
 const APP_OWNED_SQL = `EXISTS (SELECT 1 FROM publishers pb WHERE pb.id = folders.publisher_id AND pb.revoked_at IS NULL AND pb.folder_id IS NOT folders.id)`;
 // A live app's files and folders map to paths below its destination. A folder whose subtree (JSON ids, param 1) holds
 // some of them, while that app's destination lies outside the subtree, can't be renamed, moved or deleted: that would
-// change paths relative to the destination. Moving the destination itself (or an ancestor) keeps them all.
-const APP_SUBTREE_SQL = `EXISTS (SELECT 1 FROM publishers pb WHERE pb.revoked_at IS NULL AND pb.folder_id NOT IN (SELECT value FROM json_each(?1))
+// change paths relative to the destination. Moving the destination itself (or an ancestor) keeps them all. An app
+// whose destination is the project root (folder_id NULL) has every folder below its destination.
+const APP_SUBTREE_SQL = `EXISTS (SELECT 1 FROM publishers pb WHERE pb.revoked_at IS NULL AND (pb.folder_id IS NULL OR pb.folder_id NOT IN (SELECT value FROM json_each(?1)))
     AND (EXISTS (SELECT 1 FROM folders d WHERE d.publisher_id = pb.id AND d.id IN (SELECT value FROM json_each(?1)))
       OR EXISTS (SELECT 1 FROM artifacts a WHERE a.publisher_id = pb.id AND a.export_name IS NOT NULL AND a.trashed_at IS NULL AND a.folder_id IN (SELECT value FROM json_each(?1)))))`;
 const appLockedError = () => new HttpError(409, "folder_app_owned", "A connected app keeps its files in this folder; revoke the app first");
@@ -262,8 +263,11 @@ export async function fdUpdate(ctx, projectId, id, input, key) {
     const p2 = newPath + fdPathOf(x).slice(oldPath.length);
     return { id: x.id, p: p2, k: fdKey(p2), ok: x.name_key };
   }));
-  const gate = "EXISTS (SELECT 1 FROM folders WHERE id = ? AND name_key = ?)";
-  const gp = [f.id, fdKey(newPath)];
+  // The follow-on statements run only if the folder row now holds exactly the new name, parent and path (compared
+  // case-sensitively): a case-only rename has the same key before and after, so the key alone would not prove that
+  // statement 0 ran.
+  const gate = "EXISTS (SELECT 1 FROM folders WHERE id = ? AND name_key = ? AND name = ? AND parent_id IS ? AND path IS ?)";
+  const gp = [f.id, fdKey(newPath), name, parentId, parentId ? newPath : null];
   const snap = JSON.stringify(subtree.map((x) => x.id + "\u0000" + x.name_key).sort());
   const same = `(SELECT json_group_array(k) FROM (SELECT t.id || char(0) || f2.name_key AS k FROM (WITH RECURSIVE t(id) AS (SELECT ? UNION SELECT c.id FROM folders c JOIN t ON c.parent_id = t.id WHERE c.project_id = ?) SELECT id FROM t) t JOIN folders f2 ON f2.id = t.id ORDER BY k)) = ?`;
   const mv = "(SELECT value FROM json_each(?) WHERE json_extract(value, '$.id') = folders.id)";

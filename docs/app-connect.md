@@ -33,9 +33,9 @@ One path-addressed API for every kind of file: text (Markdown, HTML, JSON, CSV) 
 | `GET` / `HEAD /v1/app/files/{path}` | The bytes, with `ETag: "<sha256>"`. Supports `If-None-Match` (`304`) and `Range` (`206`, `416`) |
 | `PUT /v1/app/files/{path}` | Needs `Content-Type` (the path's type), `Content-Length`, `Idempotency-Key`, and `If-None-Match: *` (create) or `If-Match: "<sha256>"` (replace). Binary files also need `X-Content-SHA256: <64 hex>`. `201`/`200 { file }`; `200 { file, unchanged: true }` when the bytes are the current ones (nothing is written); `412` with `current_etag` and `current_revision` when the precondition fails |
 | `DELETE /v1/app/files/{path}` | Needs `If-Match` and `Idempotency-Key`. Moves the file to your trash and frees the path |
+| `GET /v1/app/connection-info` | Diagnostic: the app's destination and whether writes are allowed |
 
 The ETag is always the quoted SHA-256 of the bytes, and the same value is in `etag` in every listing and answer. Reads are sent `Cache-Control: private, no-store, no-transform`. If something on the way still weakens it to `W/"<sha256>"`, that form is accepted in `If-Match` too.
-| `GET /v1/app/connection-info` | Diagnostic: the app's destination and whether writes are allowed |
 
 **Paths.** Lowercase `[a-z0-9._-]` segments, not starting with `.`; 1–8 segments, at most 200 characters. The last segment is the file name and ends in an extension; no folder segment ends in `.md`, `.html`, `.json` or `.csv`. Lowercase only means a path is unique by its name alone, for every kind of file. `notes/2026-11-22-brief.md` and `shots/a.png` are fine; `Brief.md`, `a.json/b.csv`, `notes.txt` and `logo.svg` are `400 invalid_path`.
 

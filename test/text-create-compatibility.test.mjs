@@ -35,3 +35,15 @@ for (const enabled of [false, true]) for (const wrapper of [false, true]) for (c
     });
   }
 }
+
+test("a create by folder path replays with the same key after the folder was renamed (the digest ignores the resolved id)", async () => {
+  const w = world(); w.env.APP_CONNECT_ENABLED = "1"; w.ctx.env = lib.withAdapters(w.env, lib.defaultAdapters());
+  const input = { kind: "markdown", title: "Pathed", body: "body", folder: "Reports/2026" };
+  const first = await lib.createMarkdown(w.ctx, P, input, "path-key", "markdown");
+  assert.equal(first.status, 201);
+  // Someone renames the folder; a retry with the same key recreates the old path (a new id) and must still replay.
+  w.sql.prepare("UPDATE folders SET name = 'Old', name_key = 'reports/old', path = 'Reports/Old' WHERE name_key = 'reports/2026'").run();
+  const again = await lib.createMarkdown(w.ctx, P, input, "path-key", "markdown");
+  assert.equal(again.body.idempotent_replay, true, JSON.stringify(again.body));
+  assert.equal(again.body.artifact_id, first.body.artifact_id);
+});

@@ -300,12 +300,7 @@ async function put({ req, env, db, p, requestId }, rest) {
   if (declared === 0) throw new HttpError(422, "signature_mismatch", `An empty body is not a valid ${parsed.mime}`);
   const lg = await projectLimitGuard(env, p.project_id, { storage_bytes: declared });
   if (declared > lg.limits.file_bytes) throw fileTooLarge(lg.limits.file_bytes);
-  // Storage is checked before any byte is read (and again inside the publish statement).
-  if (lg.workspaceId && !(await db.prepare(`SELECT ${lg.sql} AS ok`).bind(...lg.params).first("ok"))) {
-    await explainLimit(env, lg.workspaceId, { storage_bytes: declared }, lg.limits, p.project_id);
-    throw new HttpError(402, "limit_reached", "This workspace has reached its storage limit");
-  }
-  return putBinary({ req, env, db, p, ctx, key, pre, parsed, declared, sha });
+  return putBinary({ req, env, db, p, ctx, key, pre, parsed, declared, sha, lg });
 }
 
 /** The row and precondition checks shared by text and binary PUT. Returns the row to replace, or null to create. */
@@ -396,7 +391,7 @@ function signatureTap(body) {
   return { stream, head: () => head.subarray(0, Math.min(seen, head.length)) };
 }
 
-async function putBinary({ req, env, db, p, ctx, key, pre, parsed, declared, sha }) {
+async function putBinary({ req, env, db, p, ctx, key, pre, parsed, declared, sha, lg }) {
   const { path, mime } = parsed;
   const op = "app.put";
   // The declared SHA-256 is part of the request: a same-key retry with the same bytes replays before any byte is read.
@@ -408,6 +403,12 @@ async function putBinary({ req, env, db, p, ctx, key, pre, parsed, declared, sha
   if (cur && cur.sha256 === sha && cur.size === declared)
     return json({ file: fileView(path, cur.id, cur.kind, cur.mime, cur.head_rev, cur.sha256, cur.size, folderOf(cur)), unchanged: true }, 200, { etag: `"${cur.sha256}"` });
   if (cur && cur.kind !== "binary") throw new HttpError(409, "conflict", "A text file exists at this path");
+  // Storage is checked before any byte is read (and again inside the publish statement), but after a replay or an
+  // unchanged-bytes answer: neither adds anything, so a full workspace can still recover a write whose answer was lost.
+  if (lg.workspaceId && !(await db.prepare(`SELECT ${lg.sql} AS ok`).bind(...lg.params).first("ok"))) {
+    await explainLimit(env, lg.workspaceId, { storage_bytes: declared }, lg.limits, p.project_id);
+    throw new HttpError(402, "limit_reached", "This workspace has reached its storage limit");
+  }
   if (!req.body) throw new HttpError(400, "incomplete_body", "Body does not match Content-Length; PUT the whole file again");
 
   const artId = cur?.id ?? randomId("art");
