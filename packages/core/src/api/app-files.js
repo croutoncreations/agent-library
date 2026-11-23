@@ -56,7 +56,7 @@ const tooLargeText = () => new HttpError(413, "file_too_large", "A text file sen
  */
 export const APP_FILE_RESPONSE_HEADERS = Object.freeze({
   "x-content-type-options": "nosniff",
-  "cache-control": "private, no-store",
+  "cache-control": "private, no-store, no-transform",
   "content-security-policy": "default-src 'none'; img-src 'self'; media-src 'self'; style-src 'unsafe-inline'; frame-ancestors 'self'; sandbox",
   "cross-origin-resource-policy": "same-origin"
 });
@@ -169,7 +169,12 @@ async function read({ req, env, db, p, requestId }, rest) {
   // attachment (images, video and Markdown inline; PDF, HTML, JSON, CSV and octet-stream as attachments).
   const range = req.headers.get("range");
   const clean = new Request(new URL(req.url).origin + "/content", { method: req.method, headers: range === null ? {} : { range } });
-  return serveContent(pubCtx(env, p, requestId), clean, p.project_id, a.id, null);
+  const res = await serveContent(pubCtx(env, p, requestId), clean, p.project_id, a.id, null);
+  // no-transform: an edge that compresses the body (text) would otherwise weaken the ETag to W/"…", which the app
+  // then can't send back as If-Match. The bytes and the strong ETag stay exactly what was stored.
+  const headers = new Headers(res.headers);
+  headers.set("cache-control", APP_FILE_RESPONSE_HEADERS["cache-control"]);
+  return new Response(res.body, { status: res.status, headers });
 }
 
 /** /v1/app/files and /v1/app/files/{path}. route() has already checked the token (livePublisher) and the rate limit. */
@@ -209,9 +214,11 @@ function parsePrecondition(req, allowCreate) {
   const bad = () => new HttpError(400, "invalid_input", allowCreate ? "If-Match must be one quoted SHA-256 ETag; If-None-Match must be *; not both" : "If-Match must be one quoted SHA-256 ETag");
   if (im !== null && inm !== null) throw bad();
   if (inm !== null) { if (!allowCreate || inm.trim() !== "*") throw bad(); return { create: true, cond: "*" }; }
-  const m = /^"([0-9a-f]{64})"$/.exec(im.trim());
+  // A W/ prefix is accepted: an edge that compressed a read may have weakened the ETag the app received. The tag is
+  // the content's SHA-256 either way, and the match below is on those bytes.
+  const m = /^(?:W\/)?"([0-9a-f]{64})"$/.exec(im.trim());
   if (!m) throw bad();
-  return { create: false, etag: m[1], cond: im.trim() };
+  return { create: false, etag: m[1], cond: im.trim().replace(/^W\//, "") };
 }
 const fileView = (path, id, kind, mime, revision, sha256, size, folder) => ({ path, file_id: id, kind, mime, revision, etag: `"${sha256}"`, sha256, size, folder });
 /** A stored or fresh answer as App Files sends it (publishRevision stores its own shape; map it). */

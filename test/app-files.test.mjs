@@ -144,6 +144,17 @@ test("preconditions: create over an existing file, stale If-Match, missing or ma
   assert.equal(revsOf(c.P.publisher_id), 1);
 });
 
+test("reads are no-transform; a weak (W/) ETag from a compressing edge still works as If-Match", async () => {
+  const c = await connect("files-own");
+  const v1 = "weak\n";
+  await put(c.tok, "w.md", v1, { create: true });
+  const g = await get(c.tok, "w.md");
+  assert.equal(g.headers.get("cache-control"), "private, no-store, no-transform");
+  err(await put(c.tok, "w.md", "x", { match: "W/" + etagOf("other") }), 412, "precondition_failed");
+  assert.equal((await put(c.tok, "w.md", "weak 2\n", { match: "W/" + etagOf(v1) })).status, 200);
+  assert.equal((await del(c.tok, "w.md", { match: "W/" + etagOf("weak 2\n") })).status, 200);
+});
+
 test("unchanged bytes answer 200 {unchanged:true} and write no revision", async () => {
   const c = await connect("files-own");
   const body = "same\n";
