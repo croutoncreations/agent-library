@@ -67,12 +67,20 @@ before(async () => {
 });
 after(async () => { await browser?.close(); await s?.stop(); oidc?.close(); cbServer?.close(); });
 
-// No gateway or other installation-specific callback is trusted unless the operator configures
-// OAUTH_EXTRA_REDIRECT_URIS (this server does not; test/oauth-chatgpt.test.mjs covers the configured case).
-test("without OAUTH_EXTRA_REDIRECT_URIS, arbitrary https callbacks (e.g. a gateway) cannot register", async () => {
-  for (const cb of ["https://mcp-gateway.example.test/upstream/callback/library", "https://some-gateway.example.workers.dev/upstream/callback/library"]) {
+// Registration is open (docs/architecture.md, "Because registration is open"): a gateway's https callback registers,
+// but without OAUTH_EXTRA_REDIRECT_URIS (this server sets none) it is never vouched for. The consent page shows the
+// amber "can't verify" warning naming the host, not "Known app". test/oauth-chatgpt.test.mjs covers the configured case.
+test("without OAUTH_EXTRA_REDIRECT_URIS, an arbitrary https callback (e.g. a gateway) registers but is shown as not verified", async () => {
+  for (const cb of ["https://mcp-gateway.example.com/upstream/callback/library", "https://some-gateway.example.net/upstream/callback/library"]) {
     const r = await fetch(`${MCP}/oauth/register`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ client_name: "gateway", redirect_uris: [cb], token_endpoint_auth_method: "none" }) });
-    assert.equal(r.status, 400, cb);
+    assert.equal(r.status, 201, cb);
+    const { client_id } = await r.json();
+    const q = new URLSearchParams({ response_type: "code", client_id, redirect_uri: cb, scope: "agentlib:read", state: "g1", resource: RESOURCE, code_challenge: s256("v".repeat(43)), code_challenge_method: "S256" });
+    const page = await (await fetch(`${MCP}/authorize?${q}`)).text();
+    const host = new URL(cb).host;
+    assert.match(page, /Agent Library can't verify this app/, cb);
+    assert.ok(page.includes(host), `the warning names ${host}`);
+    assert.doesNotMatch(page, /Known app|Verified \u00B7/, cb);
   }
 });
 

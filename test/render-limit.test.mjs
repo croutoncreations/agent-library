@@ -542,9 +542,12 @@ test("Chrome: exact owner/viewer notes, small views, offline copies, and synthet
                   await page.waitForSelector(".preview-note a", { visible: true });
                   await page.evaluate(() => { window.renderLimitDocument = true; });
                   if (width === 390) {
+                    // Probe each line box of the link: where fonts make it wrap (CI's Linux fonts do at 390px), the middle of
+                    // its union rectangle can fall beside the text and hit nothing, though nothing covers the link.
                     const placement = await page.$eval(".preview-note a", e => {
-                      const r = e.getBoundingClientRect();
-                      return { top: r.top, bottom: r.bottom, scrollY, hit: document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2)?.closest("a") === e };
+                      const r = e.getBoundingClientRect(), header = document.querySelector(".top").getBoundingClientRect().bottom;
+                      const lines = [...e.getClientRects()].map((b) => ({ top: b.top, hit: document.elementFromPoint(b.left + b.width / 2, b.top + b.height / 2)?.closest("a") === e }));
+                      return { top: r.top, bottom: r.bottom, scrollY, header, lines: lines.length, hit: r.top >= header && lines.every((l) => l.hit && l.top >= header) };
                     });
                     console.log("390px kept diff landing → Preview link placement:", JSON.stringify(placement));
                     assert.equal(placement.hit, true, "the repeated link click is not under the sticky header");
