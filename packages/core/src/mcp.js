@@ -3,6 +3,7 @@ import { WEB_URL_OUTPUT_SCHEMAS, WEB_URL_TOOL_NOTE, appOrigin, withWebUrls } fro
 import { addressLinks, resolveProjectRef } from "./paths.js";
 import { __name } from "./runtime.js";
 import { RS_SCHEMA, RT_ID_TOO_LONG, addComment, appConnectEnabled, auditDenied, createMarkdown, diffRevisions, getArtifact, history, legacyConnectionInfo, listArtifacts, listChanges, listComments, listProjects, provenance, readTextChunk, restoreMetadata, restoreRevision, rsToolReady, rtChunkLimit, rtFit, rtIdBytes, saveMarkdown, searchArtifacts, tplTools, updateMetadata } from "./service.js";
+import { FD_FOLDER_PROP, FD_LIST_PROPS, fdTools } from "./folders.js";
 import { TEXT_UPLOAD_KINDS, UPLOAD_BEGIN_DESCRIPTION, UPLOAD_FINISH_DESCRIPTION, uploadBegin, uploadBeginFields, uploadFinish } from "./uploads.js";
 import { RV_REVIEWED_ARG, rvReviewedArgs, rvTools } from "./review/tools.js";
 import { rvAnyReview } from "./review/service.js";
@@ -17,6 +18,7 @@ var unwrap2 = /* @__PURE__ */ __name((r) => r && typeof r.status === "number" &&
 var TOOLS2 = [
   { name: "connection_info", description: "Identify this authenticated grant and current project access. Read-only; compare the safe ID in Connections.", inputSchema: S2({}, []), annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }, run: (c) => legacyConnectionInfo(c) },
   ...tplTools(false),
+  ...fdTools(false),
   ...rvTools(false),
   { name: "list_changes", description: "Poll published changes in one explicit project. WITHOUT cursor establishes a current checkpoint and returns NO history (initialized=true). Store next_cursor; follow has_more, then poll again. At-least-once: deduplicate by event_id. Cursors expire after 30 days; checkpoint BEFORE reconciling current content. Publishers excluded. No bodies or push notifications.", inputSchema: S2({ project_id: { type: "string", maxLength: 110, description: "Project ID or path (workspace/project)" }, cursor: { type: "string", maxLength: 2048 }, limit: { type: "integer", minimum: 1, maximum: 50 } }, ["project_id"]), run: (c,a) => listChanges(c,a.project_id,a) },
   { name: "search_artifacts", description: "Ranked keyword search of currently readable projects, with excerpts and revision-pinned links. Word forms and word starts match; documents with every word first, else some of them (match: \"some\"). Live pagination.", inputSchema: RS_SCHEMA, annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }, run: (c,a) => searchArtifacts(c,a,"mcp") },
@@ -24,8 +26,8 @@ var TOOLS2 = [
   {
     name: "list_artifacts",
     description: "List artifacts; optional query filters by title. Paginated (50). To search document text, use search_artifacts if it is listed.",
-    inputSchema: S2({ project_id: P2, query: { type: "string" }, cursor: { type: "string" } }, ["project_id"]),
-    run: (c, a) => listArtifacts(c, a.project_id, { query: a.query, cursor: a.cursor })
+    inputSchema: S2({ project_id: P2, query: { type: "string" }, cursor: { type: "string" }, ...FD_LIST_PROPS }, ["project_id"]),
+    run: (c, a) => listArtifacts(c, a.project_id, { query: a.query, cursor: a.cursor, folderId: a.folder_id, folder: a.folder, recursive: a.recursive })
   },
   {
     name: "read_artifact",
@@ -61,7 +63,7 @@ var TOOLS2 = [
   {
     name: "create_markdown",
     description: 'Create a document: Markdown by default, or format "html" for a static HTML page (scripts/external resources removed when shown; embed same-project media with src="art_\u2026"). For large text, use upload_begin \u2192 HTTP PUT \u2192 upload_finish when available.',
-    inputSchema: S2({ project_id: P2, title: { type: "string" }, body: { type: "string" }, folder: { type: "string" }, format: { type: "string", enum: ["markdown", "html"] }, change_note: CHANGE_NOTE_SCHEMA, idempotency_key: K2 }, ["project_id", "title", "idempotency_key"]),
+    inputSchema: S2({ project_id: P2, title: { type: "string" }, body: { type: "string" }, folder: FD_FOLDER_PROP, format: { type: "string", enum: ["markdown", "html"] }, change_note: CHANGE_NOTE_SCHEMA, idempotency_key: K2 }, ["project_id", "title", "idempotency_key"]),
     run: async (c, a) => unwrap2(await createMarkdown(c, a.project_id, a, idemKey(a.idempotency_key), a.format === "html" ? "html" : "markdown"))
   },
   {
@@ -107,7 +109,7 @@ function legacyUploadBegin(appConnect) {
     name: "upload_begin",
     description: UPLOAD_BEGIN_DESCRIPTION + " Resolve a relative put_url against this server and use the same bearer credential.",
     inputSchema: S2(
-      { project_id: P2, title: { type: "string", description: f.title }, folder: { type: "string", description: f.folder }, ...f.appConnect, artifact_id: { ...A2, description: f.artifact_id }, expected_revision: { type: "integer" }, mime: f.mime, size: f.size, sha256: { type: "string" }, change_note: CHANGE_NOTE_SCHEMA, idempotency_key: K2 },
+      { project_id: P2, title: { type: "string", description: f.title }, folder: { ...FD_FOLDER_PROP, description: f.folder }, folder_id: f.folder_id, ...f.appConnect, artifact_id: { ...A2, description: f.artifact_id }, expected_revision: { type: "integer" }, mime: f.mime, size: f.size, sha256: { type: "string" }, change_note: CHANGE_NOTE_SCHEMA, idempotency_key: K2 },
       ["project_id", "mime", "size", "sha256", "idempotency_key"]
     ),
     run: async (c, a) => {

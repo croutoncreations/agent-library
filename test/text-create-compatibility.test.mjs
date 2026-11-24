@@ -18,7 +18,8 @@ for (const enabled of [false, true]) for (const wrapper of [false, true]) for (c
       const input = { kind, title: "Pinned", body: "body", ...variant.includes("schema") ? { schema: "ignored" } : {}, ...variant === "folder" ? { folder_id: "fld_present" } : {}, ...variant.includes("missing-folder") ? { folder_id: "fld_absent" } : {}, ...variant === "bad-title-and-schema" ? { title: "" } : {} };
       const call = () => wrapper ? lib.createFile(w.ctx, P, input, "pinned") : lib.createMarkdown(w.ctx, P, input, "pinned", kind);
       const schemaError = wrapper && variant.includes("schema");
-      const folderGate = wrapper && !enabled && (variant === "folder" || variant === "missing-folder");
+      // Since nested folders (0036), folder_id needs no App Connect: the c980189 404 gate is gone on purpose.
+      const folderGate = false;
       const message = schemaError ? "schema is only allowed for json or csv files" : folderGate ? "Not found" : variant.includes("missing-folder") ? "Folder not found" : variant === "bad-title-and-schema" ? "title too short" : null;
       if (message) {
         const status = message === "Not found" || message === "Folder not found" ? 404 : 400;
@@ -34,3 +35,15 @@ for (const enabled of [false, true]) for (const wrapper of [false, true]) for (c
     });
   }
 }
+
+test("a create by folder path replays with the same key after the folder was renamed (the digest ignores the resolved id)", async () => {
+  const w = world(); w.env.APP_CONNECT_ENABLED = "1"; w.ctx.env = lib.withAdapters(w.env, lib.defaultAdapters());
+  const input = { kind: "markdown", title: "Pathed", body: "body", folder: "Reports/2026" };
+  const first = await lib.createMarkdown(w.ctx, P, input, "path-key", "markdown");
+  assert.equal(first.status, 201);
+  // Someone renames the folder; a retry with the same key recreates the old path (a new id) and must still replay.
+  w.sql.prepare("UPDATE folders SET name = 'Old', name_key = 'reports/old', path = 'Reports/Old' WHERE name_key = 'reports/2026'").run();
+  const again = await lib.createMarkdown(w.ctx, P, input, "path-key", "markdown");
+  assert.equal(again.body.idempotent_replay, true, JSON.stringify(again.body));
+  assert.equal(again.body.artifact_id, first.body.artifact_id);
+});

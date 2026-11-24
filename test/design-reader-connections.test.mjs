@@ -135,24 +135,27 @@ test("connections: publishing apps are separate; only a connected publisher show
   assert.equal(await page.$eval(".tabs a[aria-current=page]", (b) => b.textContent), "Publishing apps");
 });
 
-test("project list: an app's files show their folder, and the folder filter narrows the list", { skip: !haveChrome && "Chrome not installed" }, async () => {
+test("project list: an app's folder is a subfolder row; opening it lists the app's files; search shows each item's folder", { skip: !haveChrome && "Chrome not installed" }, async () => {
   await page.goto(`${APP}/#/p/solo`);
-  await page.waitForFunction(() => document.querySelectorAll("ul.list li").length === 2);
-  const rows = await page.$$eval("ul.list li", (ls) => Object.fromEntries(ls.map((l) => [l.querySelector(".grow a, .grow span").textContent, l.querySelector(".meta").textContent])));
-  assert.match(rows["summary/day.json"], / · in Exports$/);
-  assert.doesNotMatch(rows["Loose note"], / in /);
-  const sel = "select[aria-label='Filter by folder']";
-  assert.deepEqual(await page.$eval(sel, (s) => [...s.options].map((o) => o.text)), ["All folders", "Not in a folder", "Exports"]);
-  const pick = (label) => page.evaluate((sel, label) => { const s = document.querySelector(sel); s.value = [...s.options].find((o) => o.text === label).value; s.dispatchEvent(new Event("change")); }, sel, label);
-  await pick("Exports");
-  await page.waitForFunction(() => [...document.querySelectorAll("ul.list li")].map((l) => l.textContent).join() .includes("summary/day.json") && document.querySelectorAll("ul.list li").length === 1);
-  await pick("Not in a folder");
-  await page.waitForFunction(() => document.querySelectorAll("ul.list li").length === 1 && document.querySelector("ul.list li").textContent.includes("Loose note"));
-  // A project without folders shows no folder filter.
+  // The root lists the folder (above the documents) and only the root's own items.
+  await page.waitForFunction(() => [...document.querySelectorAll(".fd-sub a")].some((a) => a.textContent === "Exports"));
+  await page.waitForFunction(() => [...document.querySelectorAll("ul.list:not(.fd-sub) a")].some((a) => a.textContent === "Loose note"));
+  assert.equal(await page.evaluate(() => [...document.querySelectorAll("ul.list:not(.fd-sub) li")].some((l) => l.textContent.includes("day.json"))), false);
+  // The app's path summary/day.json is Exports/summary/day.json.
+  await page.evaluate(() => [...document.querySelectorAll(".fd-sub a")].find((a) => a.textContent === "Exports").click());
+  await page.waitForFunction(() => [...document.querySelectorAll(".fd-sub a")].some((a) => a.textContent === "summary"));
+  await page.evaluate(() => [...document.querySelectorAll(".fd-sub a")].find((a) => a.textContent === "summary").click());
+  await page.waitForFunction(() => [...document.querySelectorAll("ul.list:not(.fd-sub) li")].some((l) => l.textContent.includes("day.json")));
+  // Project-wide search shows where each match lives.
+  await page.goto(`${APP}/#/p/solo`);
+  await page.waitForSelector(".toolbar input[type=search]");
+  await page.type(".toolbar input[type=search]", "day");
+  await page.waitForFunction(() => [...document.querySelectorAll("ul.list:not(.fd-sub) .meta")].some((m) => / · in Exports\/summary/.test(m.textContent)));
+  // A project without folders shows no folder rows.
   await page.goto(`${APP}/#/p/read-b`);
   await page.waitForSelector(".toolbar input[type=search]");
   await new Promise((r) => setTimeout(r, 300));
-  assert.equal(await page.$eval(sel, (s) => s.hidden), true);
+  assert.equal(await page.$eval(".fd-sub", (s) => s.hidden), true);
 });
 
 test("connections: API key project picker is one aligned list with a live selected count", { skip: !haveChrome && "Chrome not installed" }, async () => {

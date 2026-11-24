@@ -302,7 +302,37 @@ export async function stageTextWrites(env, writes) {
 
 /** Include in the same transaction that references the immutable key. */
 export function textWriteComplete(env, key) {
-  return env.DB.prepare("DELETE FROM content_writes WHERE key = ? AND (EXISTS (SELECT 1 FROM revisions WHERE body_key = ?) OR EXISTS (SELECT 1 FROM comments WHERE body_key = ?) OR EXISTS (SELECT 1 FROM proposals WHERE body_key = ?))").bind(key, key, key, key);
+  return env.DB.prepare("DELETE FROM content_writes WHERE key = ? AND (EXISTS (SELECT 1 FROM revisions WHERE body_key = ?) OR EXISTS (SELECT 1 FROM comments WHERE body_key = ?) OR EXISTS (SELECT 1 FROM proposals WHERE body_key = ?) OR EXISTS (SELECT 1 FROM revisions WHERE blob_key = ?))").bind(key, key, key, key, key);
+}
+
+/**
+ * Intent for a file object written straight from a request (App Files binaries), before any byte is stored: a request
+ * that dies leaves the intent, and the sweep deletes the object unless a revision references it (blob_key). Publish
+ * with blobWriteFence in the same statement and textWriteComplete in the same batch.
+ */
+export async function stageBlobWrite(env, projectId, key, maxOutstanding = 20) {
+  // At most maxOutstanding unpublished file intents per project: an object written by a request that died is not
+  // counted toward storage until the sweep removes it, so the number of such objects is bounded here.
+  const r = await env.DB.prepare(`INSERT INTO content_writes (key, project_id, created_at) SELECT ?1, ?2, ?3
+    WHERE (SELECT COUNT(*) FROM content_writes WHERE project_id = ?2 AND key LIKE 'blobs/%') < ?4`).bind(key, projectId, Date.now(), maxOutstanding).run();
+  return r.meta.changes === 1;
+}
+/** SQL condition: the blob intent is still there and within the publish deadline (else the sweep may delete it). */
+export function blobWriteFence(key) {
+  return { sql: "EXISTS (SELECT 1 FROM content_writes WHERE key = ? AND created_at >= ?)", params: [key, Date.now() - TEXT_WRITE_DEADLINE_MS] };
+}
+/** Best effort after a refused or failed publish: delete the object and its intent unless something references it. */
+export async function dropBlobWrite(env, key) {
+  try {
+    // Expire the intent first, in one statement and only while nothing references the object: a publish batch still
+    // in flight then fails its blobWriteFence (the intent is past the deadline) and can never reference a deleted
+    // object. Only then is the object deleted; a failed delete leaves an expired intent for the sweep.
+    const r = await env.DB.prepare(`UPDATE content_writes SET created_at = 0 WHERE key = ?1
+      AND NOT EXISTS (SELECT 1 FROM revisions WHERE blob_key = ?1) AND NOT EXISTS (SELECT 1 FROM proposals WHERE blob_key = ?1)`).bind(key).run();
+    if (r.meta.changes !== 1) return;
+    await deleteBlob(env, key);
+    await env.DB.prepare("DELETE FROM content_writes WHERE key = ? AND created_at = 0").bind(key).run();
+  } catch { console.error(JSON.stringify({ event: "blob_write_cleanup_failed" })); }
 }
 
 // The sweep age must stay well above the publish deadline: an intent eligible for deletion can never publish.
@@ -345,9 +375,9 @@ export async function commitTextWrites(env, keys, commit) {
     if (settled && keys.length) {
       try {
         const unreferenced = await env.DB.prepare(`SELECT j.value AS key FROM json_each(?) j
-          WHERE NOT EXISTS (SELECT 1 FROM revisions WHERE body_key = j.value)
+          WHERE NOT EXISTS (SELECT 1 FROM revisions WHERE body_key = j.value OR blob_key = j.value)
             AND NOT EXISTS (SELECT 1 FROM comments WHERE body_key = j.value)
-            AND NOT EXISTS (SELECT 1 FROM proposals WHERE body_key = j.value)`).bind(JSON.stringify(keys)).all();
+            AND NOT EXISTS (SELECT 1 FROM proposals WHERE body_key = j.value OR blob_key = j.value)`).bind(JSON.stringify(keys)).all();
         const orphanKeys = unreferenced.results.map(r => r.key);
         if (orphanKeys.length) {
           await deleteBlobs(env, orphanKeys);

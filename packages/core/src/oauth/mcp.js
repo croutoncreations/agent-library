@@ -10,6 +10,7 @@ import { __name } from "../runtime.js";
 import { FILE_BYTES_CEILING } from "../limits.js";
 import { BINARY_TYPES, IMAGE_TYPES, RS_SCHEMA, RT_ID_TOO_LONG, RT_KINDS_ALL, RT_KINDS_DOCS, appConnectEnabled, connectionInfo, createMarkdown, db, diffRevisions, getArtifact, history, listArtifacts, listChanges, loadArtifact, provenance, readRecords, readTextChunk, restoreMetadata, restoreRevision, rsToolReady, rtChunkLimit, rtFit, rtIdBytes, saveMarkdown, searchArtifacts, tplTools } from "../service.js";
 import { RV_REVIEWED_ARG, rvReviewedArgs, rvTools } from "../review/tools.js";
+import { FD_FOLDER_PROP, FD_LIST_PROPS, fdTools } from "../folders.js";
 import { rvAnyReview, rvGatedActor, serveProposalContent } from "../review/service.js";
 import { TEXT_UPLOAD_KINDS, UPLOAD_BEGIN_DESCRIPTION, UPLOAD_FINISH_DESCRIPTION, serveContent, uploadBegin, uploadBeginFields, uploadFinish, uploadPut } from "../uploads.js";
 import { CHANGE_NOTE_SCHEMA, HttpError, errorBody, errorLogFields, idemKey, json, mcpClientInfo, nowIso, nowMs, randomId, readTextCapped, rememberClientInfo, sha256Hex, str } from "../util.js";
@@ -191,6 +192,7 @@ RW = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openW
 TOOLS = [
   { name: "connection_info", title: "Check connection access", description: "Identify this authenticated connection and its current effective project access. No document reads or writes. Compare the safe ID in Connections.", inputSchema: S({}, []), annotations: RO, write: false },
   ...tplTools(true),
+  ...fdTools(true),
   ...rvTools(true, () => ({ ttlMs: FT_DOWNLOAD_TTL_MS, inlineBytes: FT_INLINE_IMAGE_BYTES, base64: ftBase64, blocksKey: FT_BLOCKS })),
   { name: "list_changes", title: "List project changes", description: "Poll published changes in one explicit project. WITHOUT cursor establishes a current checkpoint and returns NO history (initialized=true). Store next_cursor; follow has_more, then poll again. At-least-once: deduplicate by event_id. Cursors expire after 30 days; checkpoint BEFORE reconciling current content. Publishers excluded. No bodies or push notifications.", inputSchema: S({ project_id: { type: "string", maxLength: 110, description: "Project ID or path (workspace/project)" }, cursor: { type: "string", maxLength: 2048 }, limit: { type: "integer", minimum: 1, maximum: 50 } }, ["project_id"]), annotations: RO, write: false, run: (c,p,a) => listChanges(c,p,a) },
   { name: "search_artifacts", title: "Search library", description: "Ranked keyword search across currently readable projects. Matches word forms and word starts (plan, plans, planning); documents with every word rank first, then title and exact-phrase matches. If no document has every word, returns ones with some of them (match: \"some\"); punctuation separates words. Returns bounded plain-text excerpts and revision-pinned links. Live pagination expires after 15 minutes.", inputSchema: RS_SCHEMA, annotations: RO, write: false, run: (c, p, a) => searchArtifacts(c,a,"mcp") },
@@ -209,16 +211,17 @@ TOOLS = [
     name: "list_artifacts",
     title: "List documents",
     description: "List documents (Markdown and HTML) in a connected project; optional query filters by title. Paginated. To search document text, use search_artifacts if it is listed.",
-    inputSchema: S({ project_id: P, query: { type: "string", maxLength: 200 }, cursor: { type: "string", maxLength: 12 } }, []),
+    inputSchema: S({ project_id: P, query: { type: "string", maxLength: 200 }, cursor: { type: "string", maxLength: 12 }, ...FD_LIST_PROPS }, []),
     annotations: RO,
     write: false,
     run: async (c, p, a) => {
+      const fd = { folderId: a.folder_id, folder: a.folder, recursive: a.recursive };
       if (appConnectEnabled(c.env)) {
-        const r2 = await listArtifacts(c, p, { query: a.query, cursor: a.cursor, kind: a.kind, folderId: a.folder_id, appPath: a.app_path });
+        const r2 = await listArtifacts(c, p, { query: a.query, cursor: a.cursor, kind: a.kind, appPath: a.app_path, ...fd });
         return { ...r2, artifacts: r2.artifacts.filter((x) => x.kind !== "binary") };
       }
-      if (a.kind !== void 0 || a.folder_id !== void 0) throw new HttpError(400, "invalid_input", "kind/folder_id filters are not available");
-      const r = await listArtifacts(c, p, { query: a.query, cursor: a.cursor });
+      if (a.kind !== void 0) throw new HttpError(400, "invalid_input", "kind filter is not available");
+      const r = await listArtifacts(c, p, { query: a.query, cursor: a.cursor, ...fd });
       return { ...r, artifacts: r.artifacts.filter((x) => x.kind === "markdown" || x.kind === "html") };
     }
   },
@@ -288,10 +291,10 @@ TOOLS = [
     name: "create_markdown",
     title: "Create document",
     description: 'Create a new document in a connected project that allows editing. Markdown by default; set format "html" for an HTML page (static HTML/CSS: scripts and external resources are removed when shown; embed same-project images/videos with src="art_\u2026"). For large text, use upload_begin \u2192 HTTP PUT \u2192 upload_finish when available.',
-    inputSchema: S({ project_id: P, title: { type: "string", minLength: 1, maxLength: 200 }, body: { type: "string" }, format: { type: "string", enum: ["markdown", "html"], description: "Document format (default markdown)" }, change_note: NOTE, idempotency_key: K }, ["title", "idempotency_key"]),
+    inputSchema: S({ project_id: P, title: { type: "string", minLength: 1, maxLength: 200 }, body: { type: "string" }, format: { type: "string", enum: ["markdown", "html"], description: "Document format (default markdown)" }, folder: FD_FOLDER_PROP, change_note: NOTE, idempotency_key: K }, ["title", "idempotency_key"]),
     annotations: RW,
     write: true,
-    run: async (c, p, a) => unwrap(await createMarkdown(c, p, { title: a.title, body: a.body ?? "", change_note: a.change_note }, idemKey(a.idempotency_key), a.format === "html" ? "html" : "markdown"))
+    run: async (c, p, a) => unwrap(await createMarkdown(c, p, { title: a.title, body: a.body ?? "", folder: a.folder, change_note: a.change_note }, idemKey(a.idempotency_key), a.format === "html" ? "html" : "markdown"))
   },
   {
     name: "save_markdown",
@@ -309,7 +312,6 @@ TOOLS = [
 ];
 AC_LIST_PROPS = {
   kind: { type: "string", enum: ["markdown", "json", "csv"], description: "Only files of this kind" },
-  folder_id: { type: "string", maxLength: 64, description: 'Only files in this folder (fld_\u2026), or "root"' },
   app_path: { type: "string", maxLength: 200, description: 'Only the file a connected app wrote at this path, e.g. "index.json" (each item\'s app_path says which app path it is)' }
 };
 READ_RECORDS = {
@@ -452,7 +454,7 @@ async function ftUploadBegin(c, p, a, opts = {}) {
   }
   const r = unwrap(await uploadBegin(uc, p, textKind
     ? { title: a.title, folder: a.folder, folder_id: a.folder_id, schema: a.schema, artifact_id: a.artifact_id, expected_revision: a.expected_revision, mime: a.mime, size: a.size, sha256: a.sha256, change_note: a.change_note }
-    : { title: a.title, folder: a.folder, artifact_id: a.artifact_id, expected_revision: a.expected_revision, mime: a.mime, size: a.size, sha256: a.sha256 }, key, { allowText: !opts.binaryOnly }));
+    : { title: a.title, folder: a.folder, folder_id: a.folder_id, artifact_id: a.artifact_id, expected_revision: a.expected_revision, mime: a.mime, size: a.size, sha256: a.sha256 }, key, { allowText: !opts.binaryOnly }));
   const u = await db(c).prepare("SELECT state, expires_at FROM uploads WHERE id = ? AND principal_id = ?").bind(r.upload_id, uc.principal.id).first();
   if (!u) throw new HttpError(404, "not_found", "Upload not found");
   const open = u.state === "pending" && u.expires_at > nowMs();
@@ -517,7 +519,7 @@ async function ftUploadInline(c, p, a) {
 }
 async function ftList(c, p, a) {
   const prefix = a.mime_prefix === void 0 ? "" : str(a.mime_prefix, "mime_prefix", 100).toLowerCase();
-  const r = await listArtifacts(c, p, { query: a.query, cursor: a.cursor, kind: a.kind, folderId: appConnectEnabled(c.env) ? a.folder_id : void 0, appPath: appConnectEnabled(c.env) ? a.app_path : void 0 });
+  const r = await listArtifacts(c, p, { query: a.query, cursor: a.cursor, kind: a.kind, folderId: a.folder_id, folder: a.folder, recursive: a.recursive, appPath: appConnectEnabled(c.env) ? a.app_path : void 0 });
   const ids = r.artifacts.map((x) => x.id);
   const info = /* @__PURE__ */ new Map();
   if (ids.length) {
@@ -543,7 +545,8 @@ function ftUploadBeginTool(appConnect) {
     inputSchema: S({
       project_id: P,
       title: { type: "string", minLength: 1, maxLength: 200, description: f.title },
-      folder: { type: "string", maxLength: 200, description: f.folder },
+      folder: { ...FD_FOLDER_PROP, description: f.folder },
+      folder_id: f.folder_id,
       ...f.appConnect,
       artifact_id: { ...A, description: f.artifact_id },
       expected_revision: { type: "integer", minimum: 0, description: "Current revision of artifact_id (0 for your own new file while it waits for review)" },
@@ -598,7 +601,8 @@ function ftToolsFor(env, conn) {
       inputSchema: S({
         project_id: P,
         title: { type: "string", minLength: 1, maxLength: 200, description: "Title of a new file" },
-        folder: { type: "string", maxLength: 200 },
+        folder: FD_FOLDER_PROP,
+        folder_id: FD_LIST_PROPS.folder_id,
         artifact_id: { ...A, description: "File to add a new version to" },
         expected_revision: { type: "integer", minimum: 0, description: "Current revision of artifact_id (0 for your own new file while it waits for review)" },
         mime: { type: "string", enum: Object.keys(BINARY_TYPES) },
@@ -633,7 +637,8 @@ function ftToolsFor(env, conn) {
           cursor: { type: "string", maxLength: 12 },
           kind: { type: "string", enum: ["markdown", "html", "json", "csv", "binary"], description: 'Only this kind; "binary" means files (images, PDFs, video)' },
           mime_prefix: { type: "string", maxLength: 100, description: 'Only items whose MIME type starts with this, e.g. "image/" or "application/pdf". A page can then hold fewer than 50 items; keep following next_cursor.' },
-          ...appConnectEnabled(env) ? { folder_id: AC_LIST_PROPS.folder_id, app_path: AC_LIST_PROPS.app_path } : {}
+          ...FD_LIST_PROPS,
+          ...appConnectEnabled(env) ? { app_path: AC_LIST_PROPS.app_path } : {}
         }, []),
         run: (c, p, a) => ftList(c, p, a)
       });

@@ -509,6 +509,7 @@ function route() {
     if (p[2] === "review" && p[3]) return viewProposal(p[1], p[3]);
     if (p[2] === "review") return viewProjectReview(p[1]);
     if (p[2] === "grants") { location.replace("#/settings/tokens"); return; }
+    if (p[2] === "f" && p[3]) return viewList(p[1], false, p[3]);
     return viewList(p[1], false);
   }
   if (p[0] === "search") return viewSearch();
@@ -1925,6 +1926,168 @@ function rvReviewToggles(kind, id, projects, active) {
   });
   return box;
 }
+// ---------- nested folders (docs/folders.md; folders.js) ----------
+// The project view browses one folder at a time: #/p/<pid> is the project root, #/p/<pid>/f/<folder_id> a folder.
+// Breadcrumbs follow the folder path; subfolders are listed above the folder's documents. Search stays project-wide.
+// New documents and uploads land in the folder being viewed. Rename, move and delete need the project admin role; a
+// subfolder a connected app created stays the app's (the server refuses with folder_app_owned).
+var FD = { cache: {} };
+function fdLoad(pid, force) {
+  if (!force && FD.cache[pid]) return FD.cache[pid];
+  FD.cache[pid] = api("GET", "/api/projects/" + enc(pid) + "/folders", undefined, { noAuthRedirect: true })
+    .then(function (r) { return r.folders || []; }, function (e) { delete FD.cache[pid]; throw e; });
+  return FD.cache[pid];
+}
+function fdInvalidate(pid) { delete FD.cache[pid]; }
+function fdHref(pid, fid) { return "#/p/" + enc(pid) + (fid ? "/f/" + enc(fid) : ""); }
+// Breadcrumb items for a folder: project, then each ancestor (by path prefix), then the folder itself.
+function fdCrumbs(pid, folders, fid, extra) {
+  var items = [{ t: projectTitles[pid] || pid, href: "#/p/" + enc(pid) }];
+  var f = fid ? folders.filter(function (x) { return x.id === fid; })[0] : null;
+  if (f) {
+    var byPath = Object.create(null);
+    folders.forEach(function (x) { byPath[x.path.toLowerCase()] = x; });
+    var segs = f.path.split("/"), acc = "";
+    segs.forEach(function (s, i) {
+      acc = acc ? acc + "/" + s : s;
+      var a = byPath[acc.toLowerCase()];
+      items.push({ t: s, href: a ? fdHref(pid, a.id) : null });
+    });
+  }
+  return items.concat(extra || []);
+}
+// A <select> of every folder of the project (paths), with "Project root" first.
+function fdSelect(folders, value, exclude, label) {
+  var sel = h("select", { "aria-label": label || "Folder" }, h("option", { value: "", text: "Project root" }));
+  folders.forEach(function (f) {
+    if (exclude && (f.id === exclude.id || f.path.toLowerCase().indexOf(exclude.path.toLowerCase() + "/") === 0)) return;
+    sel.append(h("option", { value: f.id, text: f.path }));
+  });
+  sel.value = value || "";
+  return sel;
+}
+// Folder header for the project view: a "Folder actions" group (New folder at the root; inside a folder New
+// subfolder / Rename / Move / Delete folder), then the subfolder rows. On desktop the group is an inline labelled
+// box; on narrow screens (CSS, max-width 760px) it collapses behind one "Folder actions" menu button.
+function fdPanel(pid, fid, msg, onChange) {
+  if (!ICONS.chevdown) ICONS.chevdown = ["M6 9l6 6 6-6"];
+  // Folders change outside this view too (a Details move to a new path, agents, uploads, other tabs): every time a
+  // project or folder view opens, it re-reads the tree once.
+  fdInvalidate(pid);
+  var box = h("div", { class: "fd-panel" });
+  var sub = h("ul", { class: "list fd-sub", "aria-label": "Folders" });
+  var form = h("div", { class: "card", hidden: true });
+  var group = h("div", { class: "fd-group", role: "group", "aria-label": "Folder actions" }, h("span", { class: "fd-label", "aria-hidden": "true" }, "Folder actions"));
+  var menuBtn = h("button", { type: "button", class: "secondary fd-menu-btn", "aria-expanded": "false", "aria-haspopup": "true",
+    onclick: function (e) { e.stopPropagation(); bar.classList.contains("open") ? closeMenu() : openMenu(); } }, "Folder actions", icon("chevdown"));
+  var bar = h("div", { class: "fd-actions" }, menuBtn, group);
+  var cur = null;
+  function items() { return Array.prototype.slice.call(group.querySelectorAll("button")); }
+  function onDoc(e) { if (!group.contains(e.target)) closeMenu(); }
+  function onKey(e) {
+    if (e.key === "Escape") { closeMenu(); menuBtn.focus(); return; }
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault(); var xs = items(), i = xs.indexOf(document.activeElement);
+      xs[(i + (e.key === "ArrowDown" ? 1 : xs.length - 1)) % xs.length].focus();
+    }
+  }
+  function openMenu() { bar.classList.add("open"); menuBtn.setAttribute("aria-expanded", "true"); document.addEventListener("click", onDoc); document.addEventListener("keydown", onKey); var f = items()[0]; if (f) f.focus(); }
+  function closeMenu() { bar.classList.remove("open"); menuBtn.setAttribute("aria-expanded", "false"); document.removeEventListener("click", onDoc); document.removeEventListener("keydown", onKey); }
+  // Every action closes the narrow-screen menu first.
+  function act(fn) { return function (e) { closeMenu(); return fn(e); }; }
+  function closeForm() { form.hidden = true; form.replaceChildren(); }
+  function nameForm(title, initial, submitText, onSubmit) {
+    closeForm();
+    var name = h("input", { type: "text", maxLength: 80, required: true, value: initial || "", "aria-label": title });
+    var btn = h("button", { type: "submit" }, submitText);
+    form.append(h("form", { class: "row", onsubmit: async function (e) {
+      e.preventDefault(); var v = name.value.trim(); if (!v) return;
+      btn.disabled = true;
+      try { await onSubmit(v); closeForm(); } catch (err) { showErr(msg, err); }
+      btn.disabled = false;
+    } }, h("label", null, title, name), btn, h("button", { type: "button", class: "secondary", onclick: closeForm }, "Cancel")));
+    form.hidden = false; name.focus();
+  }
+  var newBtn = h("button", { type: "button", class: "secondary", onclick: act(function () {
+    nameForm("New folder name", "", "Create folder", async function (v) {
+      var r = await api("POST", "/api/projects/" + enc(pid) + "/folders", fid ? { name: v, parent_id: fid } : { name: v }, { key: uuid() });
+      fdInvalidate(pid); showMsg(msg, "Created folder \u201C" + r.path + "\u201D.", true); onChange();
+    });
+  }) }, icon("plus"), fid ? "New subfolder" : "New folder");
+  if (canWrite(pid)) group.append(newBtn);
+  if (fid && rvAdmin(pid)) {
+    group.append(
+      h("button", { type: "button", class: "secondary", onclick: act(function () {
+        if (!cur) return;
+        nameForm("Rename folder", cur.name, "Rename", async function (v) {
+          var r = await api("PATCH", "/api/projects/" + enc(pid) + "/folders/" + enc(fid), { name: v, expected_path: cur.path }, { key: uuid() });
+          fdInvalidate(pid); showMsg(msg, "Renamed to \u201C" + r.path + "\u201D.", true); onChange();
+        });
+      }) }, "Rename"),
+      h("button", { type: "button", class: "secondary", onclick: act(async function () {
+        if (!cur) return;
+        closeForm();
+        var all = await fdLoad(pid);
+        var sel = fdSelect(all, cur.parent_id, cur, "Move into");
+        var btn = h("button", { type: "submit" }, "Move");
+        form.append(h("form", { class: "row", onsubmit: async function (e) {
+          e.preventDefault(); btn.disabled = true;
+          try {
+            var r = await api("PATCH", "/api/projects/" + enc(pid) + "/folders/" + enc(fid), { parent_id: sel.value || "root", expected_path: cur.path }, { key: uuid() });
+            fdInvalidate(pid); closeForm(); showMsg(msg, "Moved to \u201C" + r.path + "\u201D.", true); onChange();
+          } catch (err) { showErr(msg, err); }
+          btn.disabled = false;
+        } }, h("label", null, "Move into", sel), btn, h("button", { type: "button", class: "secondary", onclick: closeForm }, "Cancel")));
+        form.hidden = false; sel.focus();
+      }) }, "Move"),
+      h("button", { type: "button", class: "danger", onclick: act(async function () {
+        if (!cur || !confirm("Delete the empty folder \u201C" + cur.path + "\u201D?")) return;
+        try {
+          await api("DELETE", "/api/projects/" + enc(pid) + "/folders/" + enc(fid), undefined, { key: uuid() });
+          fdInvalidate(pid); toast("Deleted folder " + cur.path); location.hash = fdHref(pid, cur.parent_id);
+        } catch (err) { showErr(msg, err); }
+      }) }, "Delete folder"));
+  }
+  box.append(bar, form, sub);
+  bar.hidden = !group.querySelector("button");
+  return {
+    el: box,
+    // Re-render subfolders of fid; resolves the current folder (or null at the root) for the caller.
+    render: async function (term) {
+      var all = await fdLoad(pid);
+      cur = fid ? all.filter(function (x) { return x.id === fid; })[0] || null : null;
+      if (fid && !cur) throw Object.assign(new Error("Folder not found"), { status: 404 });
+      sub.replaceChildren();
+      var kids = all.filter(function (x) { return (x.parent_id || null) === (fid || null); });
+      sub.hidden = !!term || !kids.length;
+      kids.forEach(function (f) {
+        var n = f.item_count + f.folder_count;
+        sub.append(h("li", { class: "link" }, h("span", { class: "ficon-sm", "aria-hidden": "true" }, icon("folder")),
+          h("div", { class: "grow" }, rowLink(fdHref(pid, f.id), f.name), h("span", { class: "meta", text: n ? (f.folder_count ? f.folder_count + " folder" + (f.folder_count === 1 ? "" : "s") + (f.item_count ? " · " : "") : "") + (f.item_count ? f.item_count + " item" + (f.item_count === 1 ? "" : "s") : "") : "Empty" })),
+          h("span", { class: "badge", text: "Folder" })));
+      });
+      return { all: all, cur: cur, kids: kids };
+    }
+  };
+}
+// Folder path suggestions for a text input (the Details editor). Typing a new path creates it on save.
+var fdListSeq = 0;
+function fdDatalist(pid, input) {
+  var id = "fd-paths-" + (++fdListSeq);
+  var dl = h("datalist", { id: id });
+  input.setAttribute("list", id);
+  input.setAttribute("placeholder", "e.g. Reports/2026 (blank = project root)");
+  fdLoad(pid).then(function (all) { all.forEach(function (f) { dl.append(h("option", { value: f.path })); }); }, function () {});
+  return dl;
+}
+// Document breadcrumbs: project / folder path (each folder linked) / document title.
+function fdArtifactCrumbs(pid, meta) {
+  if (!meta || !meta.folder) return;
+  fdLoad(pid).then(function (all) {
+    var f = all.filter(function (x) { return x.path.toLowerCase() === meta.folder.toLowerCase(); })[0];
+    if (f && location.hash.indexOf(enc(meta.id)) >= 0) setCrumbs(fdCrumbs(pid, all, f.id, [{ t: meta.title }]));
+  }, function () {});
+}
 // ---------- home: authorized recents and browser-local personal favorites ----------
 function favoriteButton(pid, aid, changed, title) {
   var uid = S.me && S.me.id;
@@ -2144,7 +2307,7 @@ async function uploadFile(pid, file, target, keys, status) {
   if (keys.fp !== fp) { keys.fp = fp; keys.begin = uuid(); keys.finish = uuid(); }
   var begin = target.artifact_id
     ? { artifact_id: target.artifact_id, expected_revision: target.expected_revision, mime: mime, size: buf.byteLength, sha256: sha }
-    : { title: target.title || file.name, mime: mime, size: buf.byteLength, sha256: sha };
+    : { title: target.title || file.name, folder_id: target.folder_id, mime: mime, size: buf.byteLength, sha256: sha };
   status("Starting upload (" + fmtBytes(buf.byteLength) + ", sha256 " + sha.slice(0, 12) + "...)");
   var b = await api("POST", "/api/projects/" + enc(pid) + "/uploads", begin, { key: keys.begin });
   status("Sending bytes...");
@@ -2208,7 +2371,7 @@ async function uploadDataFile(pid, file, kind, target, keys, status) {
   status("Checking and saving…");
   var r = target.artifact_id
     ? await api("PUT", base + "/" + enc(target.artifact_id), { expected_revision: target.expected_revision, content: text }, { key: keys.begin })
-    : await api("POST", base, { kind: kind, title: target.title || file.name, content: text }, { key: keys.begin });
+    : await api("POST", base, { kind: kind, title: target.title || file.name, folder_id: target.folder_id, content: text }, { key: keys.begin });
   keys.fp = null;
   return { artifact_id: r.artifact_id || target.artifact_id, revision: r.revision, size: utf8Len(text) };
 }
@@ -2225,7 +2388,7 @@ function dataFilesEnabled(pid) {
   return dataFilesP[pid];
 }
 // accept: "all" (new items: media, PDF, CSV, JSON), "binary" (replace a media/PDF file), "csv" or "json" (replace a data file).
-function uploadForm(pid, target, onDone, accept) {
+function uploadForm(pid, target, onDone, accept, folderId) {
   accept = accept || "binary";
   var msg = h("p", { class: "msg", role: "status" });
   var file = h("input", { type: "file", "aria-label": "File to upload", accept: accept === "all" ? BINARY_ACCEPT + "," + DATA_ACCEPT.csv + "," + DATA_ACCEPT.json : accept === "binary" ? BINARY_ACCEPT : DATA_ACCEPT[accept] });
@@ -2239,7 +2402,7 @@ function uploadForm(pid, target, onDone, accept) {
     if (!f) { showMsg(msg, "Choose a file first."); return; }
     btn.disabled = true;
     try {
-      var t = target ? target() : { title: title.value.trim() || f.name };
+      var t = target ? target() : { title: title.value.trim() || f.name, folder_id: folderId || undefined };
       var dk = dataKindOf(f), status = function (s) { showMsg(msg, s, true); };
       if (accept === "binary" && dk) throw localUploadError("This is a " + dk.toUpperCase() + " file; upload it as a new item instead");
       if (dk && dataOff) throw localUploadError("CSV and JSON files aren't enabled on this installation (App Connect is off)");
@@ -2272,23 +2435,20 @@ function kindLabel(a) {
 }
 function isTextDoc(kind) { return kind === "markdown" || kind === "html"; }
 function escHtml(s) { return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
-async function viewList(pid, trash) {
+async function viewList(pid, trash, fid) {
+  fid = trash ? null : fid || null;
+  var fd = null;
   var msg = h("p", { class: "msg", role: "status", "aria-live": "polite" });
   var list = h("ul", { class: "list", "aria-label": trash ? "Trashed items" : "Documents and files" }), empty = h("div", { hidden: true });
   var more = h("button", { type: "button", class: "secondary", hidden: true }, "Load more");
   var q = h("input", { type: "search", placeholder: trash ? "Filter trash by title" : "Filter titles", "aria-label": trash ? "Filter trash by title" : "Filter titles in this project" });
   var cursor = null, seq = 0, qTimer = null;
-  // Folders (App Connect: an app's files live in its folder). Shown on each row and as a filter when the project has
-  // any; the list without App Connect (404) or offline simply has none.
-  var folderNames = {};
-  var folderSel = h("select", { "aria-label": "Filter by folder", hidden: true, onchange: function () { load(true); } }, h("option", { value: "", text: "All folders" }), h("option", { value: "root", text: "Not in a folder" }));
-  var foldersReady = trash ? Promise.resolve() : api("GET", "/api/projects/" + enc(pid) + "/folders", undefined, { noAuthRedirect: true }).then(function (r) {
-    (r.folders || []).forEach(function (f) { folderNames[f.id] = f.name; folderSel.append(h("option", { value: f.id, text: f.name })); });
-    folderSel.hidden = !(r.folders || []).length;
-  }, function () {});
+  // Folders: the project view browses one folder at a time (#/p/<pid>/f/<folder>); subfolders are listed first.
+  // Search covers the whole project; search results and the trash show each item's folder path.
+  if (!trash) fd = fdPanel(pid, fid, msg, function () { load(true); });
 
   function row(a) {
-    var where = a.folder_id && folderNames[a.folder_id] ? " · in " + folderNames[a.folder_id] : a.folder ? " · " + a.folder : "";
+    var where = a.folder && (trash || q.value.trim()) ? " · in " + a.folder : "";
     var info = h("span", { class: "meta", text: (a.is_template ? "Template" : kindLabel(a)) + " · Updated " + fmtDate(a.updated_at) + " · rev " + a.revision + where + (a.tags && a.tags.length ? " · #" + a.tags.join(" #") : "") });
     var href = "#/p/" + enc(pid) + "/a/" + enc(a.id);
     var main = h("div", { class: "grow" }, trash ? h("span", { text: a.title }) : rowLink(href, a.title), info);
@@ -2301,8 +2461,6 @@ async function viewList(pid, trash) {
     return li;
   }
   function emptyFor(term) {
-    if (!term && folderSel.value) return stateBox("", "folder", "Nothing here", "No items in this project match the folder filter.",
-      h("button", { type: "button", class: "secondary", onclick: function () { folderSel.value = ""; load(true); } }, "Show all folders"));
     if (term) return stateBox("", "search", "No matches for \u201C" + term + "\u201D", trash ? "Nothing in trash matches. Try a different word." : "The filter matches titles in this project. Try a different word or clear the filter.",
       h("button", { type: "button", class: "secondary", onclick: function () { q.value = ""; load(true); q.focus(); } }, "Clear filter"));
     if (trash) return stateBox("", "trash", "Trash is empty", "Items you move to trash stay here with their history until you restore them.");
@@ -2315,15 +2473,18 @@ async function viewList(pid, trash) {
     if (reset) { cursor = null; list.hidden = false; empty.hidden = true; if (!list.children.length) skeletonRows(list, 3); else list.setAttribute("aria-busy", "true"); }
     var term = q.value.trim();
     try {
-      await foldersReady;
+      var qs = "?q=" + enc(term) + (cursor ? "&cursor=" + enc(cursor) : "") + (trash ? "&trashed=1" : "") + "&include=mime" + (!trash && !term ? "&folder_id=" + enc(fid || "root") : "");
+      var fdInfo = fd && reset ? await fd.render(term).catch(function (e) { if (e.status === 404 && fid) throw e; return null; }) : null;
       if (my !== seq) return;
-      var qs = "?q=" + enc(term) + (cursor ? "&cursor=" + enc(cursor) : "") + (trash ? "&trashed=1" : "") + (folderSel.value ? "&folder_id=" + enc(folderSel.value) : "") + "&include=mime";
+      if (fdInfo) setCrumbs(fdCrumbs(pid, fdInfo.all, fid, []));
       var r = await api("GET", "/api/projects/" + enc(pid) + "/artifacts" + qs);
       if (my !== seq) return;
       doneLoading(list);
       if (reset) list.replaceChildren();
       r.artifacts.forEach(function (a) { list.append(row(a)); });
-      if (reset && !r.artifacts.length) { list.hidden = true; empty.hidden = false; empty.replaceChildren(emptyFor(term)); }
+      if (reset && !r.artifacts.length && fdInfo && fdInfo.kids.length && !term) { list.hidden = true; }
+      else if (reset && !r.artifacts.length && fid && !term) { list.hidden = true; empty.hidden = false; empty.replaceChildren(stateBox("", "folder", "This folder is empty", canWrite(pid) ? "Write a document or upload a file here, or create a subfolder." : "Nothing has been added to this folder yet.")); }
+      else if (reset && !r.artifacts.length) { list.hidden = true; empty.hidden = false; empty.replaceChildren(emptyFor(term)); }
       cursor = r.next_cursor; more.hidden = !cursor;
       if (reset) resumeApply("list");
     } catch (err) {
@@ -2339,7 +2500,7 @@ async function viewList(pid, trash) {
   }
   q.addEventListener("input", function () { clearTimeout(qTimer); qTimer = setTimeout(function () { load(true); }, 300); });
   more.addEventListener("click", function () { load(false); });
-  S.cleanups.push(function () { clearTimeout(qTimer); });
+  S.cleanups.push(function () { clearTimeout(qTimer); seq++; });
 
   var actions = null, panel = null, newDocBtn = null, uploadBtn = null;
   if (!trash) {
@@ -2408,6 +2569,7 @@ async function viewList(pid, trash) {
         var t = dtitle.value.trim(); if (!t) return;
         var kind = dkind.value === "html" ? "html" : "markdown";
         var req = selectedTemplate ? previewInput() : { title: t, body: kind === "html" ? "<h1>" + escHtml(t) + "</h1>\n<p></p>\n" : "# " + t + "\n\n", kind: kind };
+        if (fid) req.folder_id = fid;
         var path = "/api/projects/" + enc(pid) + "/artifacts" + (selectedTemplate ? "/from-template" : "");
         var signature = JSON.stringify([path, req]);
         if (!pending || pending.signature !== signature) pending = { signature: signature, key: uuid() };
@@ -2429,7 +2591,7 @@ async function viewList(pid, trash) {
     var upWs = projectAccess[pid] && projectAccess[pid].workspace_id;
     if (upWs) api("GET", "/api/workspaces/" + enc(upWs) + "/usage", undefined, { noAuthRedirect: true })
       .then(function (u) { fileMax = u && u.file_bytes && u.file_bytes.limit; drawUpHelp(); }, function () {});
-    var upload = h("div", { class: "card", hidden: true }, upHelp, uploadForm(pid, null, function () { load(true); }, "all"));
+    var upload = h("div", { class: "card", hidden: true }, upHelp, uploadForm(pid, null, function () { load(true); }, "all", fid));
     var keepBtn = h("button", { type: "button", class: "ghost", title: "Save every document and file in this project on this device, and keep them up to date" }, icon("offline"), "Keep offline");
     OFF.get("projects", pid).then(function (p) { if (p) { keepBtn.classList.add("on"); keepBtn.lastChild.textContent = "Kept offline"; } }).catch(function () {});
     keepBtn.addEventListener("click", async function () {
@@ -2479,9 +2641,10 @@ async function viewList(pid, trash) {
     if (focusAddrAfterRender) { focusAddrAfterRender = false; var c = addr.querySelector("code"); c.tabIndex = -1; c.focus(); }
   }
   shell(projCrumbs(pid, trash ? [{ t: "Trash" }] : []),
-    pageHead(titleH1, { eyebrow: trash ? (projectTitles[pid] || "Project") : "Project", actions: actions }),
-    addr, panel, h("div", { class: "toolbar" }, projectTabs(pid, trash ? "trash" : "list"), h("label", { class: "search" }, icon("search"), q), folderSel), msg, list, empty, more);
-  ensureProjectTitle(pid).then(showAddr);
+    pageHead(titleH1, { eyebrow: trash || fid ? (projectTitles[pid] || "Project") : "Project", actions: actions }),
+    addr, panel, fd ? fd.el : null, h("div", { class: "toolbar" }, projectTabs(pid, trash ? "trash" : "list"), h("label", { class: "search" }, icon("search"), q)), msg, list, empty, more);
+  if (fid) { addr = null; fdLoad(pid).then(function (all) { var f = all.filter(function (x) { return x.id === fid; })[0]; if (f) { titleH1.textContent = f.name; delete titleH1.dataset.projectTitle; } }, function () {}); }
+  ensureProjectTitle(pid).then(function () { if (addr) showAddr(); });
   if (resumePending && resumePending.hash === location.hash && resumePending.q) q.value = resumePending.q;
   load(true);
   if (!trash) offTouch(pid, null);
@@ -3018,7 +3181,7 @@ async function viewArtifact(pid, aid, initialTab) {
       if (A.meta.source) A.templateSourceNote.append(h("a", { href: "#/p/" + enc(pid) + "/a/" + enc(A.meta.source.artifact_id) + "?v=" + A.meta.source.revision, text: (A.meta.source.role === "template" ? "Created from " : "Copied from ") + A.meta.source.title + " · v" + A.meta.source.revision }));
     }
     titleEl.textContent = A.meta.title;
-    setCrumbs(projCrumbs(pid, [{ t: A.meta.title }]));
+    setCrumbs(projCrumbs(pid, [{ t: A.meta.title }])); fdArtifactCrumbs(pid, A.meta);
   }
   async function reloadMeta() { try { var r = await api("GET", base); A.meta = r.artifact; fillMeta(); if (A.rvRedraw) A.rvRedraw(); } catch (e) {} }
   async function patchMeta(fields, okText) {
@@ -3034,7 +3197,7 @@ async function viewArtifact(pid, aid, initialTab) {
     }
   }
   var details = h("details", null, h("summary", { text: "Details" }),
-    h("div", { class: "grid2" }, h("label", null, "Title", fTitle), h("label", null, "Folder", fFolder), h("label", null, "Tags", fTags), fDescription ? h("label", null, "Template description", fDescription) : null),
+    h("div", { class: "grid2" }, h("label", null, "Title", fTitle), h("label", null, "Folder", fFolder, fdDatalist(pid, fFolder)), h("label", null, "Tags", fTags), fDescription ? h("label", null, "Template description", fDescription) : null),
     h("div", { class: "row" },
       h("button", { type: "button", onclick: function () {
         patchMeta({ ...(fDescription ? { template_description: fDescription.value } : {}), title: fTitle.value.trim(), folder: fFolder.value.trim(), tags: fTags.value.split(",").map(function (s) { return s.trim(); }).filter(Boolean) }, "Details saved.");

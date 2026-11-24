@@ -22,6 +22,7 @@ import { rtReadAuthzSql } from "../reads/service.js";
 import { headIndexInput, indexDocument, repairIfStale } from "../search/indexing.js";
 import { audit, db, folderCheck, idemInsert, idemLookup, IMAGE_TYPES, loadArtifact, mdBody, runBatch, servedContentType, VIDEO_TYPES } from "../service.js";
 import { tplDenyPublisher } from "../templates/service.js";
+import { fdProposalMeta, fdResolve } from "../folders.js";
 import { memberRoleSql, requireProjectRole } from "../tenancy.js";
 import { CHANGE_NOTE_MAX, HttpError, int, nowIso, nowMs, randomId, sha256Hex, str } from "../util.js";
 import { RV_REVIEWED_SQL } from "./sql.js";
@@ -211,7 +212,7 @@ async function rvGateContent(ctx, projectId, a, i, expected, rev) {
 async function rvGateMeta(ctx, projectId, a, i, expected, input, v, restoredFrom) {
   if (!rvGated(ctx, a)) return null;
   if (input.trashed !== undefined) throw new HttpError(403, "review_required", "This document requires review; only a person can move it to or from the trash");
-  return rvPropose(ctx, projectId, a, i, { meta: { title: v.title, folder: v.folder, tags: v.tags }, metaInput: input, expectedMeta: expected, note: input.change_note ?? (restoredFrom ? "Restored details from version " + restoredFrom : void 0), metaRestoredFrom: restoredFrom, status: 200 });
+  return rvPropose(ctx, projectId, a, i, { meta: { title: v.title, folder: v.folder, folderId: v.folderId, tags: v.tags }, metaInput: input, expectedMeta: expected, note: input.change_note ?? (restoredFrom ? "Restored details from version " + restoredFrom : void 0), metaRestoredFrom: restoredFrom, status: 200 });
 }
 // upload_finish: the gate is evaluated at finish, so a mode change after upload_begin is honored. rev is the
 // verified content: { body, size, sha256, mime } for text or { blobKey, size, sha256, mime } for a file.
@@ -536,9 +537,9 @@ async function reviewProposal(ctx, projectId, proposalId, input, key) {
   }
   let meta = null;
   if (p.has_meta) {
-    meta = { title: p.title, folder: p.folder ?? "", tags: p.tags ?? "[]" };
+    meta = await fdProposalMeta(ctx, projectId, p);
     if (input.title !== undefined && input.title !== null) meta.title = str(input.title, "title", 200, { min: 1 });
-    if (input.folder !== undefined && input.folder !== null) meta.folder = str(input.folder, "folder", 200);
+    if (input.folder !== undefined && input.folder !== null) { const fdR = await fdResolve(ctx, projectId, { folder: input.folder }); meta.folder = fdR.path; meta.folderId = fdR.folderId; meta.fdSet = true; }
     if (input.tags !== undefined && input.tags !== null) {
       if (!Array.isArray(input.tags) || input.tags.length > 20) throw new HttpError(400, "invalid_input", "tags must be an array (max 20)");
       meta.tags = JSON.stringify(input.tags.map((t) => str(t, "tag", 50, { min: 1 })));
@@ -571,11 +572,11 @@ async function reviewProposal(ctx, projectId, proposalId, input, key) {
   if (meta && p.is_new) {
     // Title written while the head is still 0 (no feed or search event), then the head moves: one "created" event.
     stmts.push(db(ctx).prepare(`UPDATE artifacts SET title = ?, folder = ?, folder_id = ?, tags = ?, pending_review = 0, updated_at = ? WHERE id = ? AND head_rev = 0 AND pending_review = 1 AND ${RV_OPEN}`)
-      .bind(meta.title, meta.folder, p.folder_id ?? null, meta.tags, now, p.artifact_id, ...og));
+      .bind(meta.title, meta.folder, meta.fdSet ? meta.folderId ?? null : p.folder_id ?? null, meta.tags, now, p.artifact_id, ...og));
   } else if (meta) {
     stmts.push(
-      db(ctx).prepare(`UPDATE artifacts SET title = ?, folder = ?, tags = ?, meta_version = ?, meta_request_id = ?, updated_at = ? WHERE id = ? AND meta_version = ? AND ${RV_OPEN}`)
-        .bind(meta.title, meta.folder, meta.tags, newMeta, ctx.requestId, now, p.artifact_id, guardMeta, ...og),
+      db(ctx).prepare(`UPDATE artifacts SET title = ?, folder = ?, folder_id = CASE WHEN ? = 1 THEN ? ELSE folder_id END, tags = ?, meta_version = ?, meta_request_id = ?, updated_at = ? WHERE id = ? AND meta_version = ? AND ${RV_OPEN}`)
+        .bind(meta.title, meta.folder, meta.fdSet ? 1 : 0, meta.folderId ?? null, meta.tags, newMeta, ctx.requestId, now, p.artifact_id, guardMeta, ...og),
       metaBaselineInsert(ctx, a, RV_OPEN, og),
       db(ctx).prepare(`INSERT INTO meta_versions (id, artifact_id, project_id, version, title, folder, tags, trashed, template_description, author_id, via_kind, via_id, via_label, client_info, change_note, restored_from, created_at, proposal_id)
         SELECT ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${RV_OPEN}`).bind(randomId("mv"), p.artifact_id, projectId, newMeta, meta.title, meta.folder, meta.tags,

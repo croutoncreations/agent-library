@@ -3,23 +3,24 @@
 // publisher's current authorization (assertStillAuthorized); nothing here is cached between requests.
 import { agentRate, rateLimit } from "../auth.js";
 import { addressLinksResponse } from "../paths.js";
-import { projectWorkspaceId } from "../limits.js";
+import { projectLimitGuard, projectWorkspaceId } from "../limits.js";
 import { SCOPES, livePublisher } from "../oauth/server.js";
-import { APP_FILE_MAX_BYTES, isAppFileContentPath, isAppFilesPath, routeAppFiles } from "./app-files.js";
+import { APP_FILE_MAX_BYTES, APP_PATH_MAX_CHARS, APP_PATH_MAX_SEGMENTS, isAppFileContentPath, isAppFilesPath, routeAppFiles } from "./app-files.js";
 import { connectionInfo } from "../service.js";
 import { APP_DISABLED, assertStillAuthorized } from "./app-auth.js";
 import { HttpError, errorBody, json, randomId } from "../util.js";
 
-async function me(db, p) {
+async function me(env, db, p) {
   const proj = await db.prepare("SELECT id, title FROM projects WHERE id = ?").bind(p.project_id).first();
-  const f = p.folder_id ? await db.prepare("SELECT id, name FROM folders WHERE id = ?").bind(p.folder_id).first() : null;
+  const f = p.folder_id ? await db.prepare("SELECT id, name, COALESCE(path, name) AS path FROM folders WHERE id = ?").bind(p.folder_id).first() : null;
   return {
     app_id: p.app_client_id,
     publisher_id: p.id,
     display_name: p.display_name,
     project: { id: proj.id, title: proj.title },
-    folder: f ? { id: f.id, name: f.name } : null,
-    limits: { max_file_bytes: APP_FILE_MAX_BYTES }
+    folder: f ? { id: f.id, name: f.name, path: f.path } : null,
+    // max_file_bytes: text files (kept for older apps); max_binary_bytes: binary files, the workspace plan's file limit.
+    limits: { max_file_bytes: APP_FILE_MAX_BYTES, max_text_bytes: APP_FILE_MAX_BYTES, max_binary_bytes: (await projectLimitGuard(env, p.project_id, {})).limits.file_bytes, max_path_chars: APP_PATH_MAX_CHARS, max_path_segments: APP_PATH_MAX_SEGMENTS }
   };
 }
 
@@ -51,7 +52,7 @@ async function route(req, env, p, requestId) {
   if (isAppFilesPath(url.pathname)) return routeAppFiles({ req, env, db, p, requestId });
   if (url.pathname !== "/v1/app" && url.pathname !== "/v1/app/connection-info") throw new HttpError(404, "not_found", "Not found");
   if (m !== "GET" && m !== "HEAD") throw new HttpError(405, "method_not_allowed", "Method not allowed");
-  if (url.pathname === "/v1/app") return json(await me(db, p));
+  if (url.pathname === "/v1/app") return json(await me(env, db, p));
   return connectionDiagnostic(db, p, url);
 }
 

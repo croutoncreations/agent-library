@@ -7,6 +7,7 @@ import { FILE_BYTES_CEILING, explainLimit, fileTooLarge, guardSql, projectLimitG
 import { BINARY_TYPES, IMAGE_TYPES, VIDEO_TYPES, appConnectEnabled, assertWritable, audit, idemLookup, loadArtifact, mdBody, provenance, publishRevision, requireAppConnect, servedContentType, textCreateMetadata } from "./service.js";
 import { RV_PLACEHOLDER, rvGateUpload, rvGatedActor, rvNewCap, rvNewGated, rvResolveRev } from "./review/service.js";
 import { TEXT_MAX_BYTES } from "./text-limits.js";
+import { FD_FOLDER_PROP, fdResolve } from "./folders.js";
 import { HttpError, int, nowIso, nowMs, randomId, sha256Hex, str } from "./util.js";
 
 var db2 = /* @__PURE__ */ __name((ctx) => ctx.env.DB, "db");
@@ -58,10 +59,10 @@ function uploadBeginFields(appConnect) {
     size: { type: "integer", minimum: 0, maximum: FILE_BYTES_CEILING, description: "Raw byte length, not JSON-escaped length. Text: at most 10,485,760 bytes; binaries: plan file limit." },
     title: "Title for a new document or file.",
     artifact_id: "Existing document or file to add a version to; also pass expected_revision.",
-    folder: "Legacy folder label for a new document or file.",
+    folder: FD_FOLDER_PROP.description,
+    folder_id: { type: "string", maxLength: 64, description: "Same-project folder ID (fld_…) for a new document or file, instead of folder; omit for project root." },
     appConnect: appConnect ? {
-      schema: { type: ["string", "null"], enum: [MEASUREMENTS, null], description: "New JSON/CSV: agentlib.measurements/1 to validate measurement records; omit for no schema. Existing documents keep their stored schema." },
-      folder_id: { type: "string", maxLength: 64, description: "Same-project folder ID for a new text document (App Connect required); omit for project root." }
+      schema: { type: ["string", "null"], enum: [MEASUREMENTS, null], description: "New JSON/CSV: agentlib.measurements/1 to validate measurement records; omit for no schema. Existing documents keep their stored schema." }
     } : {}
   };
 }
@@ -88,7 +89,7 @@ async function uploadBegin(ctx, projectId, input, key, { allowText = false, allo
   if (!kind && size > lg.limits.file_bytes) throw fileTooLarge(lg.limits.file_bytes);
   const sha2 = str(input.sha256, "sha256", 64);
   if (!/^[0-9a-f]{64}$/.test(sha2)) throw new HttpError(400, "invalid_input", "sha256 must be 64 lowercase hex chars");
-  let metadata, note = null, targetId, target;
+  let metadata, note = null, targetId, target, binDest;
   if (kind) {
     note = provenance(ctx, input)[4];
     if (input.artifact_id) {
@@ -99,9 +100,15 @@ async function uploadBegin(ctx, projectId, input, key, { allowText = false, allo
       if (input.expected_revision !== void 0) throw new HttpError(400, "invalid_input", "Pass title and optional create metadata for a new document, or artifact_id and expected_revision for a new version");
       metadata = await textCreateMetadata(ctx, projectId, input, kind);
     }
+  } else if (!input.artifact_id) {
+    // A new file's folder: a path (created as needed) or folder_id.
+    str(input.title, "title", 200, { min: 1 });
+    binDest = await fdResolve(ctx, projectId, input);
+  } else if (input.folder !== void 0 || input.folder_id !== void 0) {
+    throw new HttpError(400, "invalid_input", "A new version keeps its file's folder; move it with a details change");
   }
   // Preserve the binary digest byte-for-byte for old replay compatibility.
-  const parts = [mime, size, sha2, input.artifact_id ?? null, input.expected_revision ?? null, input.title ?? null];
+  const parts = [mime, size, sha2, input.artifact_id ?? null, input.expected_revision ?? null, input.title ?? null, ...binDest?.folderId ? [binDest.folderId] : []];
   // Replacement digests depend only on the request, so replay needs no read of a changed or trashed document.
   const i = { op: "upload.begin", key, projectId, digest: await sha256Hex(JSON.stringify(kind ? [mime, size, sha2, targetId ?? null, input.expected_revision ?? null, metadata ?? input.schema ?? null, note] : parts)) };
   const prior = await idemLookup(ctx, i);
@@ -132,14 +139,15 @@ async function uploadBegin(ctx, projectId, input, key, { allowText = false, allo
     const title = metadata?.title ?? str(input.title, "title", 200, { min: 1 });
     artifactId = randomId("art");
     baseRev = 0;
-    const folder = metadata?.folder ?? str(input.folder, "folder", 200, { optional: true });
+    const folder = metadata?.folder ?? binDest?.path ?? "";
+    const folderId = metadata?.folderId ?? binDest?.folderId ?? null;
     if (gatedNew) {
       await rvNewCap(ctx, projectId);
-      reviewMeta = JSON.stringify({ title, folder, folder_id: metadata?.folderId ?? null });
+      reviewMeta = JSON.stringify({ title, folder, folder_id: folderId });
     }
     stmts.push(db2(ctx).prepare(`INSERT INTO artifacts (id, project_id, kind, title, folder, folder_id, schema_id, head_rev, created_at, updated_at, review_mode, pending_review)
       SELECT ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ? WHERE ${az.sql} AND ${lg.sql}
-      AND (? IS NULL OR EXISTS (SELECT 1 FROM folders WHERE id = ? AND project_id = ?))`).bind(artifactId, projectId, kind ?? "binary", gatedNew ? RV_PLACEHOLDER : title, gatedNew ? "" : folder, gatedNew ? null : metadata?.folderId ?? null, metadata?.schema ?? null, nowIso(), nowIso(), gatedNew ? "required" : "off", gatedNew ? 1 : 0, ...az.params, ...lg.params, metadata?.folderId ?? null, metadata?.folderId ?? null, projectId));
+      AND (? IS NULL OR EXISTS (SELECT 1 FROM folders WHERE id = ? AND project_id = ?))`).bind(artifactId, projectId, kind ?? "binary", gatedNew ? RV_PLACEHOLDER : title, gatedNew ? "" : folder, gatedNew ? null : folderId, metadata?.schema ?? null, nowIso(), nowIso(), gatedNew ? "required" : "off", gatedNew ? 1 : 0, ...az.params, ...lg.params, folderId, folderId, projectId));
   }
   const uploadId = randomId("upl", 18);
   const expires = nowMs() + limits.uploadTtlMs;
@@ -182,6 +190,8 @@ async function uploadBegin(ctx, projectId, input, key, { allowText = false, allo
   if (!Array.isArray(res)) return res;
   const uploadRow = res[input.artifact_id ? 0 : 1];
   if (!uploadRow.meta.changes) {
+    const fdId = metadata?.folderId ?? binDest?.folderId ?? null;
+    if (!input.artifact_id && !res[0].meta.changes && fdId && !(await db2(ctx).prepare("SELECT 1 AS x FROM folders WHERE id = ?").bind(fdId).first("x"))) throw new HttpError(409, "folder_conflict", "The folder was deleted meanwhile; choose another and retry");
     if (!input.artifact_id) await db2(ctx).prepare("DELETE FROM artifacts WHERE id = ? AND head_rev = 0 AND NOT EXISTS (SELECT 1 FROM uploads WHERE artifact_id = ?)").bind(artifactId, artifactId).run();
     const used = await db2(ctx).prepare(`SELECT ${quotaUsedSql(nowMs())} AS n`).bind(projectId).first("n");
     if (!kind && limits.projectBinaryBytes > 0 && (used ?? 0) + size > limits.projectBinaryBytes)

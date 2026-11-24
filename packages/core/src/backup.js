@@ -3,7 +3,8 @@ import { personalWorkspaceId } from "./tenancy.js";
 import { blobKeyFits, blobPrefix, commitTextWrites, deleteBlobs, dropUnreferencedBlobs, getText, isTextWriteFenceError, mapContent, readBlobBytes, stageTextWrites, storedText, textKey, textWriteComplete, writeBlobBytes } from "./content-store.js";
 import { indexDocument } from "./search/indexing.js";
 import { limitsFor, requireHuman } from "./auth.js";
-import { BINARY_TYPES, FOLDERS_PER_PROJECT, LIMITS, folderName, tplDate } from "./service.js";
+import { BINARY_TYPES, LIMITS, tplDate } from "./service.js";
+import { fdBackupCheck, fdBackupName, fdRestoreRows as folderRows } from "./folders.js";
 import { requireProjectRole, requireWorkspaceRole, workspaceRoleSql } from "./tenancy.js";
 import { HttpError, b64, int, nowIso, randomId, sha256Hex, str, unb64 } from "./util.js";
 import { exportReview, pendingIds, reviewAuthors, reviewStatements, validateReview } from "./review/backup.js";
@@ -38,7 +39,7 @@ async function exportBackup(ctx, projectId) {
            AND NOT EXISTS (SELECT 1 FROM revisions r WHERE r.body_key = p.body_key)) AS n`).bind(projectId).first("n");
   if (textBytes > BACKUP_EXPORT_TEXT_BYTES) throw new HttpError(413, "backup_too_large", "This project's text versions exceed 32 MiB for a single backup. Download documents individually or export a smaller project.");
   const [arts, revs, comments] = await DB.batch([
-    DB.prepare("SELECT id, kind, title, folder, tags, head_rev, head_revision_id, meta_version, trashed_at, created_at, updated_at, is_template, template_description, source_artifact_id, source_revision, source_role, template_date, publisher_id, export_name, (SELECT display_name FROM publishers WHERE id = artifacts.publisher_id) AS app_name, (SELECT name FROM folders WHERE id = artifacts.folder_id AND project_id = artifacts.project_id) AS folder_name FROM artifacts WHERE project_id = ? AND (head_rev > 0 OR pending_review = 1)").bind(projectId),
+    DB.prepare("SELECT id, kind, title, folder, tags, head_rev, head_revision_id, meta_version, trashed_at, created_at, updated_at, is_template, template_description, source_artifact_id, source_revision, source_role, template_date, publisher_id, export_name, (SELECT display_name FROM publishers WHERE id = artifacts.publisher_id) AS app_name, " + fdBackupName + " AS folder_name FROM artifacts WHERE project_id = ? AND (head_rev > 0 OR pending_review = 1)").bind(projectId),
     DB.prepare("SELECT id, artifact_id, rev_no, author_id, body, body_key, blob_key, size, sha256, mime, restored_from, created_at, via_kind, via_id, via_label, client_info, change_note FROM revisions WHERE project_id = ?").bind(projectId),
     DB.prepare("SELECT id, artifact_id, rev_no, author_id, body, body_key, created_at FROM comments WHERE project_id = ?").bind(projectId),
     DB.prepare("SELECT id, artifact_id, version, title, folder, tags, trashed, author_id, via_kind, via_id, via_label, client_info, change_note, restored_from, created_at, template_description FROM meta_versions WHERE project_id = ?").bind(projectId)
@@ -79,24 +80,6 @@ function restoredIdentity(a) {
   const tag = `app:${a.app.name}`.slice(0, 50);
   return { title: a.app.path ?? a.title, tags: JSON.stringify(tags.includes(tag) || tags.length >= 20 ? tags : [...tags, tag]) };
 }
-/**
- * The folders a backup's documents sit in, recreated in project `pid` with fresh ids: statements that insert them
- * (owned by the restoring person, not by any app) and folderOf(document) -> new folder id or null. Names match
- * case-insensitively, as folder names are unique per project.
- */
-function folderRows(DB, backup, pid, me, at) {
-  const byKey = new Map(), stmts = [];
-  for (const a of backup.artifacts) {
-    if (a.folder_name == null) continue;
-    const { name, key } = folderName(a.folder_name);
-    if (byKey.has(key)) continue;
-    if (byKey.size >= FOLDERS_PER_PROJECT) throw new HttpError(400, "bad_backup", `A project can have up to ${FOLDERS_PER_PROJECT.toLocaleString("en-US")} folders`);
-    const id = randomId("fld");
-    byKey.set(key, id);
-    stmts.push(DB.prepare("INSERT INTO folders (id, project_id, name, name_key, created_at, created_by) VALUES (?, ?, ?, ?, ?, ?)").bind(id, pid, name, key, at, me));
-  }
-  return { stmts, folderOf: (a) => a.folder_name == null ? null : byKey.get(folderName(a.folder_name).key) };
-}
 // Checks a backup's shape, ids and every hash; returns its project id and decoded blobs (nothing is written).
 async function validateBackup(backup) {
   if (backup?.schema !== SCHEMA && backup?.schema !== "agent-library-backup/2" && backup?.schema !== APP_SCHEMA && backup?.schema !== CURRENT_SCHEMA) throw new HttpError(400, "bad_backup", "Unsupported backup schema");
@@ -108,7 +91,7 @@ async function validateBackup(backup) {
     if (a.is_template != null && a.is_template !== 0 && a.is_template !== 1) throw new HttpError(400, "bad_backup", "Invalid template identity");
     if (a.is_template && (a.kind !== "markdown" || a.publisher_id)) throw new HttpError(400, "bad_backup", "Invalid template kind");
     str(a.template_description ?? "", "template_description", 280);
-    if (a.folder_name != null) folderName(a.folder_name);
+    if (a.folder_name != null) fdBackupCheck(a.folder_name);
     if (a.app != null) {
       if (typeof a.app !== "object" || Array.isArray(a.app)) throw new HttpError(400, "bad_backup", "Invalid app origin");
       str(a.app.name, "app.name", 120, { min: 1 });
