@@ -1,6 +1,6 @@
 {
-  "input": "f686130247ce6db1f1dfbc6dec7849fcfc78f1036c08d4dcb8af660af7f7ed4a",
-  "output": "fbcdd72f0d74648dcd112c7d3e5bcb7ac3e6a2532eef7c1525a506fb31cbadc8",
+  "input": "227d1b0f3013dff9e58da298b7feffed8e6d7548f74d09d7c4fd0d2b814d6230",
+  "output": "014da5a0143651585df98dbb39af86995a6a4cfb3b49bde9d6273b4ccf317486",
   "replacements": [
     {
       "before": "return json({ principal: ctx.principal, csrf: ctx.csrf ?? null });",

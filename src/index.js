@@ -13607,6 +13607,14 @@ textarea.half{width:100%;min-height:12rem;font-family:ui-monospace,Menlo,monospa
 .preview{background:var(--card);border:1px solid var(--line);border-radius:var(--r3);padding:10px 20px;overflow-x:auto;overflow-wrap:anywhere}
 .preview img{max-width:100%;cursor:zoom-in;border-radius:var(--r2);background:#fff}
 .preview pre{overflow-x:auto;background:var(--sunk);padding:12px;border-radius:var(--r2)}
+.preview .code-block{position:relative;margin:0 0 1em}
+.preview .code-block pre{margin:0;padding-right:48px;white-space:pre-wrap;overflow-wrap:anywhere}
+.preview pre code{padding:0;background:none}
+.preview .code-copy{position:absolute;top:6px;right:6px;width:32px;height:32px;min-height:32px;background:var(--card);border:1px solid var(--line);opacity:.85}
+.preview .code-copy:hover,.preview .code-copy:focus-visible{opacity:1;color:var(--fg)}
+.preview .code-copy.done{color:var(--ok)}
+.preview .code-copy svg{width:16px;height:16px}
+@media print{.preview .code-copy{display:none}}
 pre.raw{white-space:pre-wrap;overflow-wrap:anywhere;background:var(--card);border:1px solid var(--line);border-radius:var(--r2);padding:12px;max-height:50vh;overflow:auto}
 .media img,.media video{max-width:100%;height:auto;display:block;border-radius:var(--r3);background:#000}
 .media img{background:#fff;border:1px solid var(--line);cursor:zoom-in}
@@ -16684,6 +16692,17 @@ function softBreakLongTokens(cell) {
     node.parentNode.replaceChild(frag, node);
   });
 }
+// Fenced code blocks in a rendered preview get a copy button (copies the block's text exactly, not the button).
+function enhanceCodeBlocks(root) {
+  root.querySelectorAll("pre").forEach(function (pre) {
+    if (pre.parentNode && pre.parentNode.classList && pre.parentNode.classList.contains("code-block")) return;
+    var wrap = h("div", { class: "code-block" });
+    pre.parentNode.insertBefore(wrap, pre); wrap.appendChild(pre);
+    var b = copyIcon("copy", "Copy text", function () { return pre.textContent; });
+    b.classList.add("code-copy");
+    wrap.appendChild(b);
+  });
+}
 function enhanceTables(root) {
   // A refreshed preview replaces its tables: release the previous observers/listeners first.
   (root.tableCleanups || []).forEach(function (f) { f(); }); root.tableCleanups = [];
@@ -17341,7 +17360,7 @@ function renderMarkdownEditor(A, data, ui) {
       return;
     }
     try {
-      var r = await api("GET", A.base + "/preview?rev=" + A.rev); previewBox.innerHTML = r.html; enhanceTables(previewBox);
+      var r = await api("GET", A.base + "/preview?rev=" + A.rev); previewBox.innerHTML = r.html; enhanceTables(previewBox); enhanceCodeBlocks(previewBox);
       previewBox.querySelectorAll("video[data-artifact]").forEach(function (v) { v.preload = "metadata"; });
       previewBox.querySelectorAll("img[data-artifact]").forEach(function (im) {
         im.tabIndex = 0; im.title = "View full size";
@@ -17609,7 +17628,7 @@ async function viewOfflineItem(pid, aid, tab) {
   var info = h("p", { class: "muted small", text: "Saved copy · rev " + it.rev + " · " + offAge(it.saved_at) + " · " + fmtBytes(it.size) });
   var body = h("div");
   if (it.kind === "markdown") {
-    var pv = h("div", { class: "preview" }); pv.innerHTML = it.html || ""; enhanceTables(pv); // server-sanitized HTML saved while online
+    var pv = h("div", { class: "preview" }); pv.innerHTML = it.html || ""; enhanceTables(pv); enhanceCodeBlocks(pv); // server-sanitized HTML saved while online
     pv.querySelectorAll("img").forEach(function (im) {
       var src = im.getAttribute("src"), b = it.images && it.images[src];
       if (b) { var u = blobUrl(b); im.src = u; im.tabIndex = 0; im.addEventListener("click", function () { openLightbox(u, im.alt || "image"); }); }
