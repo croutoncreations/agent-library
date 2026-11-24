@@ -297,3 +297,31 @@ test("desktop 1440: narrow tables fit the reading column without scrolling; wide
   assert.deepEqual(errors, []);
   await ctx.close();
 });
+
+test("code blocks: each fenced block gets a labelled copy button that copies exactly the block text", { skip: !haveChrome && "Chrome not installed" }, async () => {
+  const first = "Line one with **stars** and `ticks`\n\n- a list-looking line\n<b>not html</b>";
+  const md = "# Drafts\n\n```text\n" + first + "\n```\n\nBetween.\n\n```\nsecond block\n```\n";
+  const id = (await owner.req("POST", "/api/projects/tables/artifacts", { title: "Synthetic code blocks", body: md })).body.artifact_id;
+  for (const vp of [DESKTOP, PIXEL9]) {
+    const ctx = await browser.createBrowserContext(); const page = await ctx.newPage();
+    const errors = []; page.on("pageerror", (e) => errors.push(e.message));
+    await page.setViewport(vp);
+    await page.evaluateOnNewDocument(() => { Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: async (s) => { window.copied = s; } } }); });
+    const [cn, cv] = owner.cookie.split("="); await page.setCookie({ name: cn, value: cv, url: h.appUi });
+    await page.goto(`${h.appUi}/#/p/tables/a/${id}`); await page.waitForSelector(".preview .code-block .code-copy");
+    const info = await page.evaluate(() => [...document.querySelectorAll(".preview .code-block")].map((w) => {
+      const b = w.querySelector(".code-copy"), pre = w.querySelector("pre"), br = b.getBoundingClientRect(), pr = pre.getBoundingClientRect();
+      return { label: b.getAttribute("aria-label"), type: b.type, inside: br.top >= pr.top && br.right <= pr.right + 0.5, overflow: document.documentElement.scrollWidth - document.documentElement.clientWidth };
+    }));
+    assert.equal(info.length, 2);
+    for (const i of info) { assert.equal(i.label, "Copy text"); assert.equal(i.type, "button"); assert.ok(i.inside, "button sits in the block's top-right corner"); assert.equal(i.overflow, 0); }
+    await page.click(".preview .code-block .code-copy");
+    await page.waitForFunction(() => window.copied !== undefined);
+    assert.equal(await page.evaluate(() => window.copied), first, "copies the raw block text, not the button or markup");
+    await page.waitForSelector(".preview .code-copy.done");
+    const blocks = await page.$$(".preview .code-block .code-copy"); await blocks[1].click();
+    await page.waitForFunction(() => window.copied === "second block");
+    assert.deepEqual(errors, []);
+    await ctx.close();
+  }
+});
