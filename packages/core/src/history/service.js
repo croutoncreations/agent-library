@@ -24,6 +24,8 @@ function provenance(ctx, input) {
 }
 // Display name for a version's author, from data already on the row (no lookups of other principals).
 function whoLabel(r, me) {
+  // An app's per-write author label (X-Agentlib-Author): "<label> via <app>". Display only; the app is the actor.
+  if (r.via_kind === "publisher" && r.on_behalf_of) return `${r.on_behalf_of} via ${r.via_label || "Connected app"}`;
   if (r.via_kind === "browser") return r.author_id === me ? "You" : "Owner";
   // Before 0010, OAuth connections (and API keys) wrote as the owner's own principal, so an owner-authored version
   // without via_kind may be the owner or a connected app: say so rather than claim it (never grouped as autosaves).
@@ -42,7 +44,7 @@ async function historyPage(ctx, projectId, artifactId, opts) {
   const before = opts.cursor === void 0 || opts.cursor === null || opts.cursor === "" ? null : int(Number(opts.cursor), "cursor", 1);
   // Direct rev_no range (no "? IS NULL OR") so SQLite seeks the UNIQUE (artifact_id, rev_no) index on every page.
   const cols = `SELECT r.rev_no AS rev, r.id, r.size, r.sha256, r.mime, r.author_id, r.restored_from, r.created_at,
-       r.via_kind, r.via_id, r.via_label, r.client_info, r.change_note, p.kind AS author_kind, p.label AS author_label
+       r.via_kind, r.via_id, r.via_label, r.client_info, r.change_note, r.on_behalf_of, p.kind AS author_kind, p.label AS author_label
      FROM revisions r LEFT JOIN principals p ON p.id = r.author_id
      WHERE r.artifact_id = ? AND r.project_id = ?`;
   const r = await (before === null
@@ -54,7 +56,7 @@ async function historyPage(ctx, projectId, artifactId, opts) {
     revisions: rows.map((v) => ({
       rev: v.rev, id: v.id, size: v.size, sha256: v.sha256, mime: v.mime, author_id: v.author_id, restored_from: v.restored_from, created_at: v.created_at,
       who: whoLabel(v, me), via: v.via_kind ? { kind: v.via_kind, id: v.via_id, label: v.via_label } : null,
-      client_info: v.client_info, change_note: v.change_note
+      client_info: v.client_info, change_note: v.change_note, on_behalf_of: v.on_behalf_of ?? null
     })),
     next_cursor: r.results.length > HISTORY_PAGE ? String(rows[rows.length - 1].rev) : null
   };
@@ -188,9 +190,9 @@ function metaBaselineInsert(ctx, a, gate, gp) {
 function metaVersionInsert(ctx, a, version, v, input, gate, gp) {
   const note = input?.change_note ?? (v.restoredFrom ? "Restored details from version " + v.restoredFrom : null);
   return db(ctx).prepare(
-    `INSERT INTO meta_versions (id, artifact_id, project_id, version, title, folder, tags, trashed, template_description, author_id, via_kind, via_id, via_label, client_info, change_note, restored_from, created_at)
-     SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${gate}`
-  ).bind(randomId("mv"), a.id, a.project_id, version, v.title, v.folder, v.tags, v.trashed ? 1 : 0, v.description, ctx.principal.id, ...provenance(ctx, { change_note: note }), v.restoredFrom, nowIso(), ...gp);
+    `INSERT INTO meta_versions (id, artifact_id, project_id, version, title, folder, tags, trashed, template_description, author_id, via_kind, via_id, via_label, client_info, change_note, restored_from, created_at, on_behalf_of)
+     SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${gate}`
+  ).bind(randomId("mv"), a.id, a.project_id, version, v.title, v.folder, v.tags, v.trashed ? 1 : 0, v.description, ctx.principal.id, ...provenance(ctx, { change_note: note }), v.restoredFrom, nowIso(), ctx.publisher ? ctx.onBehalfOf ?? null : null, ...gp);
 }
 async function metaHistory(ctx, projectId, artifactId, authorized = false, cursor) {
   if (!authorized) {
@@ -198,7 +200,7 @@ async function metaHistory(ctx, projectId, artifactId, authorized = false, curso
     await loadArtifact(ctx, projectId, artifactId, { allowTrashed: ctx.principal.kind === "human" });
   }
   const before = cursor === void 0 || cursor === null || cursor === "" ? null : int(Number(cursor), "cursor", 1);
-  const cols = `SELECT m.version, m.title, m.folder, m.tags, m.trashed, m.template_description, m.author_id, m.via_kind, m.via_id, m.via_label, m.client_info, m.change_note, m.restored_from, m.created_at,
+  const cols = `SELECT m.version, m.title, m.folder, m.tags, m.trashed, m.template_description, m.author_id, m.via_kind, m.via_id, m.via_label, m.client_info, m.change_note, m.restored_from, m.created_at, m.on_behalf_of,
        p.label AS author_label
      FROM meta_versions m LEFT JOIN principals p ON p.id = m.author_id
      WHERE m.artifact_id = ? AND m.project_id = ?`;
@@ -213,7 +215,8 @@ async function metaHistory(ctx, projectId, artifactId, authorized = false, curso
     baseline: m.change_note === "baseline" && !m.via_kind,
     who: m.change_note === "baseline" && !m.via_kind ? "Before history was recorded" : whoLabel(m, me),
     via: m.via_kind ? { kind: m.via_kind, id: m.via_id, label: m.via_label } : null,
-    client_info: m.client_info, change_note: m.change_note === "baseline" && !m.via_kind ? null : m.change_note, restored_from: m.restored_from
+    client_info: m.client_info, change_note: m.change_note === "baseline" && !m.via_kind ? null : m.change_note, restored_from: m.restored_from,
+    on_behalf_of: m.on_behalf_of ?? null
   })) };
 }
 // Restore title, folder and tags (and trash state) from an earlier metadata version, as a new metadata version.

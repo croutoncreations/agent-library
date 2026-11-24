@@ -52,7 +52,16 @@ test("Chrome: Home hides Needs review when empty and shows it when an edit waits
     assert.equal((await owner.req("GET", base + "/artifacts/" + doc)).body.artifact.review, undefined, "choosing alone saves nothing");
     let asked = ""; page.once("dialog", (d) => { asked = d.message(); d.accept(); });
     await page.evaluate(() => [...document.querySelectorAll(".rv-docmode button")].find((b) => b.textContent === "Save review setting").click());
-    await page.waitForFunction(() => /Review is now required/i.test(document.querySelector(".rv-docmode")?.textContent || "") || /Review required/.test(document.querySelector(".rv-chip")?.textContent || ""));
+    // Intermittent on CI (the PUT answers 200, yet neither the message nor the chip appears): on a timeout, record what the
+    // page shows and any page errors instead of only "30000ms exceeded", so the cause can be found.
+    await page.waitForFunction(() => /Review is now required/i.test(document.querySelector(".rv-docmode")?.textContent || "") || /Review required/.test(document.querySelector(".rv-chip")?.textContent || ""))
+      .catch(async (e) => {
+        const state = await page.evaluate(() => ({ hash: location.hash, message: document.querySelector(".rv-docmode .msg")?.textContent, chip: document.querySelector(".rv-chip-row")?.textContent,
+          chipHidden: document.querySelector(".rv-chip-row")?.hidden, save: [...document.querySelectorAll(".rv-docmode button")].map((b) => [b.textContent, b.hidden, b.disabled]),
+          checked: document.querySelector(".rv-docmode input:checked")?.value })).catch((x) => String(x));
+        await page.screenshot({ path: "tmp/test-evidence/review-ui-save-timeout.png", fullPage: true }).catch(() => {});
+        throw new Error(`review setting save: ${e.message}; dialog=${JSON.stringify(asked)} page=${JSON.stringify(state)} pageerrors=${JSON.stringify(errors)}`);
+      });
     assert.match(asked, /Version 1 counts as reviewed/);
     await page.waitForFunction(() => /Review required/.test(document.querySelector(".rv-chip")?.textContent || ""));
     assert.equal((await owner.req("GET", base + "/artifacts/" + doc)).body.artifact.review.mode, "required");
