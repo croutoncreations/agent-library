@@ -196,6 +196,37 @@ test("the same Idempotency-Key with a different title, author or note is 422; wi
   assert.deepEqual([t1.status, t2.status, t2.json.idempotent_replay, t2.json.file.title], [200, 200, true, "Alpha 3"]);
 });
 
+test("a no-op write with display headers records its key: after the owner renames the file, its retry replays and keeps the rename", async () => {
+  const c = await connect();
+  for (const [path, body, type] of [["n/doc.md", "# same\n", "text/markdown"], ["n/pic.png", makePng(9, 9), "image/png"]]) {
+    const a = await put(c.tok, path, body, { create: true, type, meta: { title: enc("App title") } });
+    const id = a.json.file.file_id;
+    const key = uniq("noop");
+    const first = await put(c.tok, path, body, { match: a.json.file.etag, type, key, meta: { title: enc("App title") } });
+    assert.deepEqual([first.status, first.json.unchanged], [200, true]);
+    // The owner renames the file.
+    const art = await artifact(id);
+    assert.equal((await owner.req("PATCH", `/api/projects/${PID}/artifacts/${id}`, { expected_meta_version: art.meta_version, title: "Owner's name" })).status, 200);
+    // The same request again replays the first answer; it does not put the app's title back.
+    const retry = await put(c.tok, path, body, { match: a.json.file.etag, type, key, meta: { title: enc("App title") } });
+    assert.deepEqual([retry.status, retry.json.idempotent_replay, retry.json.unchanged], [200, true, true]);
+    assert.equal((await artifact(id)).title, "Owner's name");
+  }
+});
+
+test("change note: controls and invisible formatting are refused; an empty note is the same as none", async () => {
+  const c = await connect();
+  for (const bad of [enc("line\nbreak"), enc("\u202Enote"), enc("a\u200Bb")])
+    err(await put(c.tok, "cn/a.md", "# a\n", { create: true, meta: { note: bad } }), 400, "invalid_input");
+  const key = uniq("cn");
+  const a = await put(c.tok, "cn/a.md", "# a\n", { create: true, key, meta: { note: "" } });
+  assert.equal(a.status, 201, a.text);
+  assert.equal((await history(a.json.file.file_id)).revisions[0].change_note, null);
+  // Same fingerprint as sending no header at all.
+  const replay = await put(c.tok, "cn/a.md", "# a\n", { create: true, key });
+  assert.equal(replay.json.idempotent_replay, true);
+});
+
 test("the browser preflight allows the three headers; a project backup keeps the author label", async () => {
   const c = await connect();
   const pre = await fetch(`${h.api}/app/files/a.md`, { method: "OPTIONS", headers: { origin: c.origin, "access-control-request-method": "PUT", "access-control-request-headers": "x-agentlib-title, x-agentlib-author, x-agentlib-change-note" } });

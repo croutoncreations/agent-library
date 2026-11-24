@@ -263,7 +263,9 @@ export function parseWriteMeta(req) {
   const a = headerText(req, "X-Agentlib-Author");
   const author = a === null ? null : appAuthorLabel(a);
   const n = headerText(req, "X-Agentlib-Change-Note");
-  const note = n === null ? null : str(n, "X-Agentlib-Change-Note", CHANGE_NOTE_MAX);
+  if (n !== null && TITLE_BAD.test(n)) throw new HttpError(400, "invalid_input", "X-Agentlib-Change-Note must not contain control or invisible formatting characters");
+  // An empty note is the same as none (stored as no note, and the same fingerprint).
+  const note = n === null || !n.trim() ? null : str(n.normalize("NFC").trim(), "X-Agentlib-Change-Note", CHANGE_NOTE_MAX);
   const sent = title !== null || author !== null || note !== null;
   // Fingerprint part: absent when no header is sent, so retries from before these headers existed still replay.
   return { title, author, note, digest: sent ? [["meta", title, author, note]] : [] };
@@ -375,6 +377,21 @@ function refileStatement(db, cur, folder, revId) {
     .bind(folder.id, folder.path, cur.id, folder.id, revId);
 }
 
+/**
+ * An unchanged write (same bytes, nothing to retitle). Without display headers nothing is stored, as before. With them,
+ * the answer is recorded under the key (fenced on the live publisher and the grant): otherwise a retry after the owner
+ * renamed the file would see a title that differs and retitle it, changing state on the retry of a no-op.
+ */
+async function unchanged(ctx, p, path, cur, idem, meta) {
+  const body = { file: fileView(path, cur.id, cur.kind, cur.mime, cur.head_rev, cur.sha256, cur.size, folderOf(cur), cur.title), unchanged: true };
+  if (meta.digest.length) {
+    const az = authzSql(ctx, p.project_id);
+    const out = await runBatch(ctx, [idemInsert(ctx, idem, 200, body, `${BASE_SQL} AND ${az.sql}`, [...baseParams(p), ...az.params])], idem);
+    if (!Array.isArray(out)) return answer(out, null);
+    if (!out[0].meta.changes) { await assertStillAuthorized(ctx.env.DB, p); throw new HttpError(403, "forbidden", "Grant no longer valid"); }
+  }
+  return json(body, 200, { etag: `"${cur.sha256}"` });
+}
 /** The new title of a replace, or null to keep it: only a sent X-Agentlib-Title that differs changes it. */
 const newTitle = (cur, meta) => meta.title !== null && meta.title !== cur.title ? meta.title : null;
 /** A replace's title change as a new details version, in the same batch as (and gated on) the content revision. */
@@ -433,7 +450,7 @@ async function putText({ req, env, db, p, ctx, key, pre, parsed, declared, meta 
   const title = cur ? newTitle(cur, meta) : null;
   if (cur && cur.sha256 === sha256) {
     if (title !== null) return retitle(ctx, db, p, path, cur, idem, title, meta.note);
-    return json({ file: fileView(path, cur.id, cur.kind, cur.mime, cur.head_rev, cur.sha256, cur.size, folderOf(cur), cur.title), unchanged: true }, 200, { etag: `"${cur.sha256}"` });
+    return unchanged(ctx, p, path, cur, idem, meta);
   }
 
   let text;
@@ -499,7 +516,7 @@ async function putBinary({ req, env, db, p, ctx, key, pre, parsed, declared, sha
   const title = cur ? newTitle(cur, meta) : null;
   if (cur && cur.sha256 === sha && cur.size === declared) {
     if (title !== null) return retitle(ctx, db, p, path, cur, idem, title, meta.note);
-    return json({ file: fileView(path, cur.id, cur.kind, cur.mime, cur.head_rev, cur.sha256, cur.size, folderOf(cur), cur.title), unchanged: true }, 200, { etag: `"${cur.sha256}"` });
+    return unchanged(ctx, p, path, cur, idem, meta);
   }
   if (cur && cur.kind !== "binary") throw new HttpError(409, "conflict", "A text file exists at this path");
   // Storage is checked before any byte is read (and again inside the publish statement), but after a replay or an
