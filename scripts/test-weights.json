@@ -14,6 +14,7 @@
   "app-connect-phase2.test.mjs": 9,
   "app-connect-phase3.test.mjs": 15,
   "app-files-binary.test.mjs": 18,
+  "app-files-meta.test.mjs": 20,
   "app-files-unit.test.mjs": 1,
   "app-files.test.mjs": 37,
   "artifact-cap.test.mjs": 90,

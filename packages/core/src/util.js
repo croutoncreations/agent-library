@@ -39,6 +39,23 @@ function int(v, name, min = 0, max = Number.MAX_SAFE_INTEGER) {
     throw new HttpError(400, "invalid_input", `${name} must be an integer in [${min}, ${max}]`);
   return v;
 }
+// An app's per-write author label (App Files X-Agentlib-Author, docs/app-connect.md), shown as "<label> via <app>". Shared
+// by the API and backup restore/import. NFC; no control, format (bidi, zero-width), separator, private-use or unassigned
+// characters and no blank fillers, so a label can't hide or reorder the app's name; at least one letter or digit; not
+// a name the UI uses for people ("You", "Owner", "Unknown") and no " via " of its own. Returns the clean label or throws.
+var APP_AUTHOR_MAX = 80;
+var AUTHOR_BAD = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Co}\p{Cn}\u115F\u1160\u3164\uFFA0]/u;
+var AUTHOR_RESERVED = new Set(["you", "owner", "unknown"]);
+function appAuthorLabel(v, name = "X-Agentlib-Author") {
+  if (typeof v !== "string") throw new HttpError(400, "invalid_input", `${name} must be a string`);
+  const s = v.normalize("NFC");
+  if (AUTHOR_BAD.test(s)) throw new HttpError(400, "invalid_input", `${name} must not contain control, formatting or invisible characters`);
+  const label = s.replace(/\s+/gu, " ").trim();
+  if (!/[\p{L}\p{N}]/u.test(label)) throw new HttpError(400, "invalid_input", `${name} needs at least one letter or digit`);
+  if (label.length > APP_AUTHOR_MAX) throw new HttpError(413, "too_large", `${name} exceeds ${APP_AUTHOR_MAX} characters`);
+  if (AUTHOR_RESERVED.has(label.toLowerCase()) || / via /i.test(label)) throw new HttpError(400, "invalid_input", `${name} can't be "You", "Owner" or "Unknown", or contain " via "`);
+  return label;
+}
 // Version history: shared input schema and the MCP client name reader (docs/version-history.md).
 var CHANGE_NOTE_MAX = 280;
 var CHANGE_NOTE_SCHEMA = { type: "string", maxLength: 280, description: "Always include: why you made this change, in one line (e.g. \"Fixed the broken table in Results\"). The owner sees it in the document's history next to who made it. Optional only for old clients." };
@@ -143,4 +160,4 @@ const b64 = (b) => {
   return btoa(s);
 };
 const unb64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
-export { b64, unb64, NEVER_EXPIRES_AT, CHANGE_NOTE_MAX, CHANGE_NOTE_SCHEMA, DRAIN_BYTES, HttpError, b64url, cutLists, errorBody, errorLogFields, hex, idemKey, int, json, mcpClientInfo, nowIso, nowMs, randomId, readTextCapped, rememberClientInfo, sha256Hex, str };
+export { b64, unb64, NEVER_EXPIRES_AT, APP_AUTHOR_MAX, appAuthorLabel, CHANGE_NOTE_MAX, CHANGE_NOTE_SCHEMA, DRAIN_BYTES, HttpError, b64url, cutLists, errorBody, errorLogFields, hex, idemKey, int, json, mcpClientInfo, nowIso, nowMs, randomId, readTextCapped, rememberClientInfo, sha256Hex, str };

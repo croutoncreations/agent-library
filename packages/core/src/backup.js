@@ -6,7 +6,7 @@ import { limitsFor, requireHuman } from "./auth.js";
 import { BINARY_TYPES, LIMITS, tplDate } from "./service.js";
 import { fdBackupCheck, fdBackupName, fdRestoreRows as folderRows } from "./folders.js";
 import { requireProjectRole, requireWorkspaceRole, workspaceRoleSql } from "./tenancy.js";
-import { HttpError, b64, int, nowIso, randomId, sha256Hex, str, unb64 } from "./util.js";
+import { HttpError, appAuthorLabel, b64, int, nowIso, randomId, sha256Hex, str, unb64 } from "./util.js";
 import { exportReview, pendingIds, reviewAuthors, reviewStatements, validateReview } from "./review/backup.js";
 import { explainLimit, fmtBytes, limitGuard, workspaceLimits } from "./limits.js";
 
@@ -40,9 +40,9 @@ async function exportBackup(ctx, projectId) {
   if (textBytes > BACKUP_EXPORT_TEXT_BYTES) throw new HttpError(413, "backup_too_large", "This project's text versions exceed 32 MiB for a single backup. Download documents individually or export a smaller project.");
   const [arts, revs, comments] = await DB.batch([
     DB.prepare("SELECT id, kind, title, folder, tags, head_rev, head_revision_id, meta_version, trashed_at, created_at, updated_at, is_template, template_description, source_artifact_id, source_revision, source_role, template_date, publisher_id, export_name, (SELECT display_name FROM publishers WHERE id = artifacts.publisher_id) AS app_name, " + fdBackupName + " AS folder_name FROM artifacts WHERE project_id = ? AND (head_rev > 0 OR pending_review = 1)").bind(projectId),
-    DB.prepare("SELECT id, artifact_id, rev_no, author_id, body, body_key, blob_key, size, sha256, mime, restored_from, created_at, via_kind, via_id, via_label, client_info, change_note FROM revisions WHERE project_id = ?").bind(projectId),
+    DB.prepare("SELECT id, artifact_id, rev_no, author_id, body, body_key, blob_key, size, sha256, mime, restored_from, created_at, via_kind, via_id, via_label, client_info, change_note, on_behalf_of FROM revisions WHERE project_id = ?").bind(projectId),
     DB.prepare("SELECT id, artifact_id, rev_no, author_id, body, body_key, created_at FROM comments WHERE project_id = ?").bind(projectId),
-    DB.prepare("SELECT id, artifact_id, version, title, folder, tags, trashed, author_id, via_kind, via_id, via_label, client_info, change_note, restored_from, created_at, template_description FROM meta_versions WHERE project_id = ?").bind(projectId)
+    DB.prepare("SELECT id, artifact_id, version, title, folder, tags, trashed, author_id, via_kind, via_id, via_label, client_info, change_note, restored_from, created_at, template_description, on_behalf_of FROM meta_versions WHERE project_id = ?").bind(projectId)
   ]).then(([a, r, c, mv]) => (metaVersionsExport = mv.results, [a, r, c]));
   const blobs = {};
   for (const r of revs.results) {
@@ -159,14 +159,16 @@ function checkBindable(backup, { strict = false, docKey = (v) => v } = {}) {
     ids.add(docKey(a.id));
   }
   for (const r of backup.revisions) {
-    fields(r, ["id", "artifact_id", "rev_no", "author_id", "size", "sha256", "mime", "created_at", "via_kind", "via_id", "via_label", "client_info", "change_note"], "version");
+    fields(r, ["id", "artifact_id", "rev_no", "author_id", "size", "sha256", "mime", "created_at", "via_kind", "via_id", "via_label", "client_info", "change_note", "on_behalf_of"], "version");
     intOrNull(r.restored_from, "version");
     if (!ids.has(docKey(r.artifact_id))) bad("Revision for an unknown document");
+    authorLabel(r);
   }
   for (const v of backup.meta_versions ?? []) {
-    fields(v, ["id", "artifact_id", "version", "title", "folder", "tags", ...strict ? ["trashed"] : [], "author_id", "via_kind", "via_id", "via_label", "client_info", "change_note", "created_at", "template_description"], "details version");
+    fields(v, ["id", "artifact_id", "version", "title", "folder", "tags", ...strict ? ["trashed"] : [], "author_id", "via_kind", "via_id", "via_label", "client_info", "change_note", "created_at", "template_description", "on_behalf_of"], "details version");
     intOrNull(v.restored_from, "details version");
     if (!ids.has(docKey(v.artifact_id))) bad("Details version for an unknown document");
+    authorLabel(v);
   }
   for (const c of backup.comments) {
     fields(c, ["id", "artifact_id", "rev_no", "author_id", ...strict ? ["body"] : [], "created_at"], "comment");
@@ -329,8 +331,8 @@ async function restoreBackup(ctx, backup) {
   }
   const tail = [];
   for (const v of backup.meta_versions ?? [])
-    tail.push(DB.prepare(`INSERT INTO meta_versions (id, artifact_id, project_id, version, title, folder, tags, trashed, author_id, via_kind, via_id, via_label, client_info, change_note, restored_from, created_at, template_description)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(v.id, v.artifact_id, pid, v.version, v.title, v.folder, v.tags, v.trashed ? 1 : 0, v.author_id, v.via_kind ?? null, v.via_id ?? null, v.via_label ?? null, v.client_info ?? null, v.change_note ?? null, v.restored_from ?? null, v.created_at, v.template_description ?? ""));
+    tail.push(DB.prepare(`INSERT INTO meta_versions (id, artifact_id, project_id, version, title, folder, tags, trashed, author_id, via_kind, via_id, via_label, client_info, change_note, restored_from, created_at, template_description, on_behalf_of)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(v.id, v.artifact_id, pid, v.version, v.title, v.folder, v.tags, v.trashed ? 1 : 0, v.author_id, v.via_kind ?? null, v.via_id ?? null, v.via_label ?? null, v.client_info ?? null, v.change_note ?? null, v.restored_from ?? null, v.created_at, v.template_description ?? "", v.on_behalf_of ?? null));
   for (const c of backup.comments) {
     const bodyKey = textKey(pid, c.artifact_id, c.id, attempt);
     textWrites.push({ projectId: pid, artifactId: c.artifact_id, revisionId: c.id, text: c.body, attempt });
@@ -358,8 +360,8 @@ async function restoreBackup(ctx, backup) {
   const out = await publishBackup(ctx.env, {
     objects: [...objects.values()], textKeys,
     build: () => [...head, ...backup.revisions.map((r) => {
-      return DB.prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, body_key, blob_key, size, sha256, mime, restored_from, created_at, via_kind, via_id, via_label, client_info, change_note)
-      VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(r.id, r.artifact_id, pid, r.rev_no, r.author_id, bodyKeys.get(r.id) ?? null, r.blob_key ? restoreKey(r) : null, r.size, r.sha256, r.mime, r.restored_from ?? null, r.created_at, r.via_kind ?? null, r.via_id ?? null, r.via_label ?? null, r.client_info ?? null, r.change_note ?? null);
+      return DB.prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, body_key, blob_key, size, sha256, mime, restored_from, created_at, via_kind, via_id, via_label, client_info, change_note, on_behalf_of)
+      VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(r.id, r.artifact_id, pid, r.rev_no, r.author_id, bodyKeys.get(r.id) ?? null, r.blob_key ? restoreKey(r) : null, r.size, r.sha256, r.mime, r.restored_from ?? null, r.created_at, r.via_kind ?? null, r.via_id ?? null, r.via_label ?? null, r.client_info ?? null, r.change_note ?? null, r.on_behalf_of ?? null);
     }), ...tail, ...searchStatements(DB, backup), ...bridges],
   });
   if (out.error) {
@@ -383,6 +385,13 @@ const VIA_KINDS = new Set(["browser", "oauth", "api_key", "grant", "publisher"])
 // One import is one D1 batch: at most this many documents and files, versions, comments or details versions each
 // (documents and files are also capped by the plan's items_per_project).
 var IMPORT_MAX_ROWS = 2000;
+/** A version's app author label in a backup (restore and import): only on an app's version, and the API's rule. */
+function authorLabel(row) {
+  const v = row.on_behalf_of;
+  if (v === void 0 || v === null) return;
+  if (row.via_kind !== "publisher") throw new HttpError(400, "bad_backup", "An author label belongs only to an app's version");
+  try { if (appAuthorLabel(v, "on_behalf_of") !== v) throw new Error(); } catch { throw new HttpError(400, "bad_backup", "Bad version author label"); }
+}
 function checkImportRows(env, backup, decoded, limits) {
   const bad = (m) => { throw new HttpError(400, "bad_backup", m); };
   // Hidden new documents (waiting for their first review) have no version yet and take no item slot until approved.
@@ -410,7 +419,7 @@ function checkImportRows(env, backup, decoded, limits) {
     if (!Number.isInteger(r.rev_no) || r.rev_no < 1 || revKeys.has(k)) bad("Duplicate or bad version number");
     revKeys.add(k);
     if (r.via_kind != null && !VIA_KINDS.has(r.via_kind)) bad("Bad version provenance");
-    str(r.via_label ?? "", "via_label", 200); str(r.change_note ?? "", "change_note", 280); str(r.client_info ?? "", "client_info", 500);
+    str(r.via_label ?? "", "via_label", 200); str(r.change_note ?? "", "change_note", 280); str(r.client_info ?? "", "client_info", 500); authorLabel(r);
     if (typeof r.created_at !== "string" || typeof r.mime !== "string" || /[\u0000-\u001f\u007f]/.test(r.mime) || r.mime.length > 100) bad("Bad version fields");
     if (!Number.isInteger(r.size) || r.size < 0) bad("Bad version size");
     if (r.blob_key === null && r.size !== new TextEncoder().encode(r.body).length) bad("A version's size doesn't match its text");
@@ -440,7 +449,7 @@ function checkImportRows(env, backup, decoded, limits) {
     str(v.title ?? "", "title", 200); str(v.folder ?? "", "folder", 200);
     if (v.via_kind != null && !VIA_KINDS.has(v.via_kind)) bad("Bad details provenance");
     // Import's content rules for details versions, as for versions and documents (restore keeps only checkBindable).
-    str(v.via_label ?? "", "via_label", 200); str(v.client_info ?? "", "client_info", 500); str(v.change_note ?? "", "change_note", 280);
+    str(v.via_label ?? "", "via_label", 200); str(v.client_info ?? "", "client_info", 500); str(v.change_note ?? "", "change_note", 280); authorLabel(v);
     let vtags; try { vtags = JSON.parse(v.tags ?? "[]"); } catch { bad("tags must be a JSON list"); }
     if (!Array.isArray(vtags) || vtags.some((x) => typeof x !== "string" || x.length > 50) || vtags.length > 20) bad("tags must be a list of short strings");
   }
@@ -516,12 +525,12 @@ async function importBackup(ctx, workspaceId, input, idemKeyValue, digest = "") 
     textWrites.push({ projectId: pid, artifactId: aid, revisionId: rid, text: r.body });
     textKeys.push(bodyKey); bridges.push(textWriteComplete(ctx.env, bodyKey));
   }
-  const revisionStmt = (r) => DB.prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, body_key, blob_key, size, sha256, mime, restored_from, created_at, via_kind, via_id, via_label, client_info, change_note)
-      VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(revId.get(r.id), artId.get(r.artifact_id), pid, r.rev_no, me, bodyKeys.get(r.id) ?? null, r.blob_key === null ? null : keyMap.get(r.blob_key), r.size, r.sha256, r.mime, r.restored_from ?? null, r.created_at, r.via_kind ?? null, null, r.via_label ? `${r.via_label} (imported)` : "imported", r.client_info ?? null, r.change_note ?? null);
+  const revisionStmt = (r) => DB.prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, body_key, blob_key, size, sha256, mime, restored_from, created_at, via_kind, via_id, via_label, client_info, change_note, on_behalf_of)
+      VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(revId.get(r.id), artId.get(r.artifact_id), pid, r.rev_no, me, bodyKeys.get(r.id) ?? null, r.blob_key === null ? null : keyMap.get(r.blob_key), r.size, r.sha256, r.mime, r.restored_from ?? null, r.created_at, r.via_kind ?? null, null, r.via_label ? `${r.via_label} (imported)` : "imported", r.client_info ?? null, r.change_note ?? null, r.on_behalf_of ?? null);
   const head = stmts.splice(0);
   for (const v of backup.meta_versions ?? [])
-    stmts.push(DB.prepare(`INSERT INTO meta_versions (id, artifact_id, project_id, version, title, folder, tags, trashed, author_id, via_kind, via_id, via_label, client_info, change_note, restored_from, created_at, template_description)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(randomId("mv"), artId.get(v.artifact_id), pid, v.version, v.title ?? "", v.folder ?? "", v.tags ?? "[]", v.trashed ? 1 : 0, me, v.via_kind ?? null, null, v.via_label ?? null, v.client_info ?? null, v.change_note ?? null, v.restored_from ?? null, v.created_at, v.template_description ?? ""));
+    stmts.push(DB.prepare(`INSERT INTO meta_versions (id, artifact_id, project_id, version, title, folder, tags, trashed, author_id, via_kind, via_id, via_label, client_info, change_note, restored_from, created_at, template_description, on_behalf_of)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(randomId("mv"), artId.get(v.artifact_id), pid, v.version, v.title ?? "", v.folder ?? "", v.tags ?? "[]", v.trashed ? 1 : 0, me, v.via_kind ?? null, null, v.via_label ?? null, v.client_info ?? null, v.change_note ?? null, v.restored_from ?? null, v.created_at, v.template_description ?? "", v.on_behalf_of ?? null));
   for (const c of backup.comments) {
     const aid = artId.get(c.artifact_id), cid = randomId("cmt"), bodyKey = textKey(pid, aid, cid);
     textWrites.push({ projectId: pid, artifactId: aid, revisionId: cid, text: c.body });

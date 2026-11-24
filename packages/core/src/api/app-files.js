@@ -9,12 +9,12 @@ import { blobPrefix, blobWriteFence, dropBlobWrite, isBlobWriteError, stageBlobW
 import { MIME, checkFile } from "../formats.js";
 import { fdEnsure, fdPathOf } from "../folders.js";
 import { BINARY_TYPES, audit, createMarkdown, idemInsert, idemLookup, mdBody, publishRevision, runBatch, servedContentType } from "../service.js";
-import { metaBaselineInsert, metaVersionInsert } from "../history/service.js";
+import { metaBaselineInsert, metaVersionInsert, provenance } from "../history/service.js";
 import { explainLimit, fileTooLarge, projectLimitGuard } from "../limits.js";
-import { indexDocument, unindexDocument } from "../search/indexing.js";
+import { headIndexInput, indexDocument, unindexDocument } from "../search/indexing.js";
 import { appOrigin, artifactWebUrl, previewWebUrl } from "../links.js";
 import { serveContent } from "../uploads.js";
-import { HttpError, b64url, idemKey, int, json, nowIso, randomId, sha256Hex } from "../util.js";
+import { CHANGE_NOTE_MAX, HttpError, appAuthorLabel, b64url, idemKey, int, json, nowIso, randomId, sha256Hex, str } from "../util.js";
 import { assertStillAuthorized, pubCtx, testPause } from "./app-auth.js";
 
 /**
@@ -220,12 +220,53 @@ function parsePrecondition(req, allowCreate) {
   if (!m) throw bad();
   return { create: false, etag: m[1], cond: im.trim().replace(/^W\//, "") };
 }
-const fileView = (path, id, kind, mime, revision, sha256, size, folder) => ({ path, file_id: id, kind, mime, revision, etag: `"${sha256}"`, sha256, size, folder });
+const fileView = (path, id, kind, mime, revision, sha256, size, folder, title) => ({ path, file_id: id, kind, mime, revision, etag: `"${sha256}"`, sha256, size, folder, title });
 /** A stored or fresh answer as App Files sends it (publishRevision stores its own shape; map it). */
 function answer(res, view) {
   const b = res.body;
   const body = b.file ? b : { file: view(b), ...b.idempotent_replay ? { idempotent_replay: true } : {} };
   return json(body, res.status, { etag: body.file.etag });
+}
+/** A replayed answer: a replace stored publishRevision's shape, so its title and folder are the file's as it is now. */
+async function replayAnswer(db, p, prior, view) {
+  if (prior.body.file) return answer(prior, null);
+  const a = await db.prepare(`SELECT a.title, a.folder_id, (SELECT COALESCE(f.path, f.name) FROM folders f WHERE f.id = a.folder_id) AS folder_path
+    FROM artifacts a WHERE a.id = ? AND a.project_id = ?`).bind(prior.body.artifact_id, p.project_id).first();
+  return answer(prior, (b) => view(b, a?.folder_id ? { id: a.folder_id, path: a.folder_path } : null, a?.title ?? null));
+}
+
+/**
+ * Optional display headers of a PUT (docs/app-connect.md#title-author-and-change-note). Each is ASCII on the wire: UTF-8
+ * percent-encoded, either plain or as an RFC 8187 ext-value (UTF-8''…). None of them affects paths, ETags, idempotency
+ * keys or authorization; all three are part of the request's idempotency fingerprint.
+ */
+// Characters a title from an app header may not contain: controls and invisible format characters (bidi overrides,
+// zero-width), which an owner's own title field never produces. Length and the rest are the document title rule.
+const TITLE_BAD = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
+function headerText(req, name) {
+  const raw = req.headers.get(name);
+  if (raw === null) return null;
+  const bad = (why) => new HttpError(400, "invalid_input", `${name} ${why}`);
+  const v = raw.trim();
+  const ext = /^utf-8'[A-Za-z0-9-]*'(.*)$/i.exec(v);
+  const enc = ext ? ext[1] : v;
+  if (/[^\x20-\x7e]/.test(enc)) throw bad("must be ASCII: percent-encode its UTF-8 bytes (or send UTF-8''<percent-encoded>, RFC 8187)");
+  try { return decodeURIComponent(enc); } catch { throw bad("is not valid percent-encoded UTF-8 (send '%' as %25)"); }
+}
+export function parseWriteMeta(req) {
+  const t = headerText(req, "X-Agentlib-Title");
+  let title = null;
+  if (t !== null) {
+    if (TITLE_BAD.test(t)) throw new HttpError(400, "invalid_input", "X-Agentlib-Title must not contain control or invisible formatting characters");
+    title = str(t.normalize("NFC").trim(), "X-Agentlib-Title", 200, { min: 1 });
+  }
+  const a = headerText(req, "X-Agentlib-Author");
+  const author = a === null ? null : appAuthorLabel(a);
+  const n = headerText(req, "X-Agentlib-Change-Note");
+  const note = n === null ? null : str(n, "X-Agentlib-Change-Note", CHANGE_NOTE_MAX);
+  const sent = title !== null || author !== null || note !== null;
+  // Fingerprint part: absent when no header is sent, so retries from before these headers existed still replay.
+  return { title, author, note, digest: sent ? [["meta", title, author, note]] : [] };
 }
 
 /** Read exactly `declared` bytes (already known to be within the limit); a body that differs in length is refused. */
@@ -290,22 +331,25 @@ async function put({ req, env, db, p, requestId }, rest) {
   if (cl === null) throw new HttpError(411, "length_required", "Content-Length is required");
   if (!/^\d+$/.test(cl)) throw new HttpError(400, "invalid_input", "Content-Length must be a non-negative integer");
   const declared = Number(cl);
-  const ctx = pubCtx(env, p, requestId);
+  const meta = parseWriteMeta(req);
+  // Display only: stored on the version as "<label> via <app>"; the app stays the actor (via_*, author_id, the fences).
+  const ctx = { ...pubCtx(env, p, requestId), onBehalfOf: meta.author };
   if (kind !== "binary") {
     if (req.headers.get("x-content-sha256") !== null) throw new HttpError(400, "invalid_input", "X-Content-SHA256 is for binary files only");
     if (declared > APP_FILE_MAX_BYTES) throw tooLargeText();
-    return putText({ req, env, db, p, ctx, key, pre, parsed, declared });
+    return putText({ req, env, db, p, ctx, key, pre, parsed, declared, meta });
   }
   const sha = declaredSha(req);
   if (declared === 0) throw new HttpError(422, "signature_mismatch", `An empty body is not a valid ${parsed.mime}`);
   const lg = await projectLimitGuard(env, p.project_id, { storage_bytes: declared });
   if (declared > lg.limits.file_bytes) throw fileTooLarge(lg.limits.file_bytes);
-  return putBinary({ req, env, db, p, ctx, key, pre, parsed, declared, sha, lg });
+  return putBinary({ req, env, db, p, ctx, key, pre, parsed, declared, sha, lg, meta });
 }
 
 /** The row and precondition checks shared by text and binary PUT. Returns the row to replace, or null to create. */
 async function rowChecks(db, p, path, pre) {
-  const row = await db.prepare(`SELECT a.id, a.kind, a.head_rev, a.trashed_at, a.folder_id, r.sha256, r.size, r.mime FROM artifacts a
+  const row = await db.prepare(`SELECT a.id, a.project_id, a.kind, a.title, a.folder, a.tags, a.template_description, a.meta_version, a.updated_at, a.head_rev,
+      a.trashed_at, a.folder_id, r.sha256, r.size, r.mime FROM artifacts a
     LEFT JOIN revisions r ON r.id = a.head_revision_id
     WHERE a.publisher_id = ? AND a.project_id = ? AND a.export_name = ? AND a.head_rev > 0`).bind(...ownParams(p), path).first();
   if (row?.trashed_at) throw trashedErr(path, row.id);
@@ -331,17 +375,66 @@ function refileStatement(db, cur, folder, revId) {
     .bind(folder.id, folder.path, cur.id, folder.id, revId);
 }
 
-async function putText({ req, env, db, p, ctx, key, pre, parsed, declared }) {
+/** The new title of a replace, or null to keep it: only a sent X-Agentlib-Title that differs changes it. */
+const newTitle = (cur, meta) => meta.title !== null && meta.title !== cur.title ? meta.title : null;
+/** A replace's title change as a new details version, in the same batch as (and gated on) the content revision. */
+function titleStatements(ctx, cur, title, folderPath, gate, gateParams, note = null) {
+  const db = ctx.env.DB, next = cur.meta_version + 1;
+  const mGate = "EXISTS (SELECT 1 FROM artifacts WHERE id = ? AND meta_version = ? AND meta_request_id = ?)";
+  const gp = [cur.id, next, ctx.requestId];
+  return [
+    db.prepare(`UPDATE artifacts SET title = ?, meta_version = ?, meta_request_id = ?, updated_at = ? WHERE id = ? AND meta_version = ? AND ${gate}`)
+      .bind(title, next, ctx.requestId, nowIso(), cur.id, cur.meta_version, ...gateParams),
+    metaBaselineInsert(ctx, cur, mGate, gp),
+    metaVersionInsert(ctx, cur, next, { title, folder: folderPath, tags: cur.tags, trashed: false, description: cur.template_description, restoredFrom: null }, { change_note: note }, mGate, gp),
+    audit(ctx, cur.project_id, "artifact.meta", cur.id, null, "ok", mGate, gp)
+  ];
+}
+/** The replace's fence, plus (when the title changes) the details version it was read at: a concurrent change is a 409. */
+function replaceFence(p, cur, path, title) {
+  const f = rowFence(p, cur, path);
+  return title === null ? f : { sql: `${f.sql} AND EXISTS (SELECT 1 FROM artifacts WHERE id = ? AND meta_version = ?)`, params: [...f.params, cur.id, cur.meta_version] };
+}
+/**
+ * The same bytes with a new title: only a details version (no content version), fenced like a delete on the live
+ * publisher, the row as checked and the grant. The search index follows the title.
+ */
+async function retitle(ctx, db, p, path, cur, idem, title, note) {
+  const az = authzSql(ctx, p.project_id);
+  const body = { file: fileView(path, cur.id, cur.kind, cur.mime, cur.head_rev, cur.sha256, cur.size, folderOf(cur), title) };
+  const head = await headIndexInput(ctx.env, cur.id);
+  const gate = `publisher_id = ? AND project_id = ? AND export_name = ? AND trashed_at IS NULL AND head_rev = ? AND ${BASE_SQL} AND ${az.sql}`;
+  // No content version here, so the change note goes on the details version.
+  const [upd, ...rest] = titleStatements(ctx, cur, title, cur.folder, gate, [...ownParams(p), path, cur.head_rev, ...baseParams(p), ...az.params], note);
+  const mGate = "EXISTS (SELECT 1 FROM artifacts WHERE id = ? AND meta_version = ? AND meta_request_id = ?)";
+  const out = await runBatch(ctx, [upd, ...rest, idemInsert(ctx, idem, 200, body, mGate, [cur.id, cur.meta_version + 1, ctx.requestId]),
+    ...head ? indexDocument(db, { artifactId: cur.id, revisionId: head.revisionId, sha256: head.sha256, text: head.text }) : []], idem);
+  if (!Array.isArray(out)) return answer(out, null);
+  if (!out[0].meta.changes) {
+    // A same-key request that committed meanwhile wins over a state refusal.
+    const again = await idemLookup(ctx, idem);
+    if (again) return answer(again, null);
+    await assertStillAuthorized(db, p);
+    await rowChecks(db, p, path, { create: false, etag: cur.sha256 });
+    throw new HttpError(409, "conflict", "Concurrent modification");
+  }
+  return json(body, 200, { etag: body.file.etag });
+}
+
+async function putText({ req, env, db, p, ctx, key, pre, parsed, declared, meta }) {
   const { path, kind, mime } = parsed;
   const bytes = await readBody(req, declared);
   const sha256 = await sha256Hex(bytes);
   const op = "app.put";
-  const idem = { op, key, projectId: p.project_id, digest: await sha256Hex(JSON.stringify([op, path, pre.cond, kind, sha256])) };
+  const idem = { op, key, projectId: p.project_id, digest: await sha256Hex(JSON.stringify([op, path, pre.cond, kind, sha256, ...meta.digest])) };
   const prior = await idemLookup(ctx, idem);
-  if (prior) return answer(prior, (b) => fileView(path, b.artifact_id, kind, mime, b.revision, b.sha256, bytes.byteLength, null));
+  if (prior) return replayAnswer(db, p, prior, (b, folder, title) => fileView(path, b.artifact_id, kind, mime, b.revision, b.sha256, bytes.byteLength, folder, title));
   const cur = await rowChecks(db, p, path, pre);
-  if (cur && cur.sha256 === sha256)
-    return json({ file: fileView(path, cur.id, cur.kind, cur.mime, cur.head_rev, cur.sha256, cur.size, folderOf(cur)), unchanged: true }, 200, { etag: `"${cur.sha256}"` });
+  const title = cur ? newTitle(cur, meta) : null;
+  if (cur && cur.sha256 === sha256) {
+    if (title !== null) return retitle(ctx, db, p, path, cur, idem, title, meta.note);
+    return json({ file: fileView(path, cur.id, cur.kind, cur.mime, cur.head_rev, cur.sha256, cur.size, folderOf(cur), cur.title), unchanged: true }, 200, { etag: `"${cur.sha256}"` });
+  }
 
   let text;
   try { text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes); }
@@ -354,17 +447,20 @@ async function putText({ req, env, db, p, ctx, key, pre, parsed, declared }) {
   try {
     if (!cur) {
       const folder = await folderFor(ctx, p, parsed, true);
+      const createTitle = meta.title ?? parsed.name;
       const res = await createMarkdown(ctx, p.project_id,
-        { title: parsed.name, folder_id: folder.id, [kind === "markdown" || kind === "html" ? "body" : "content"]: text, schema: null }, key, kind,
+        { title: createTitle, folder_id: folder.id, [kind === "markdown" || kind === "html" ? "body" : "content"]: text, schema: null, change_note: meta.note }, key, kind,
         { publisherId: p.id, exportName: path, idem, revId: randomId("rev"), extra: [], fence,
-          body: (x) => ({ file: fileView(path, x.artId, kind, mime, 1, x.sha256, x.size, folder.id ? { id: folder.id, path: folder.path } : null) }) });
-      return answer(res, (b) => fileView(path, b.artifact_id, kind, mime, b.revision, b.sha256, bytes.byteLength, null));
+          body: (x) => ({ file: fileView(path, x.artId, kind, mime, 1, x.sha256, x.size, folder.id ? { id: folder.id, path: folder.path } : null, createTitle) }) });
+      return answer(res, (b) => fileView(path, b.artifact_id, kind, mime, b.revision, b.sha256, bytes.byteLength, null, createTitle));
     }
     const folder = await folderFor(ctx, p, parsed, true);
     const revId = randomId("rev");
+    const revGate = "EXISTS (SELECT 1 FROM revisions WHERE id = ?)";
     const res = await publishRevision(ctx, p.project_id, cur.id, cur.head_rev, idem,
-      { revId, body: text, size: bytes.byteLength, sha256, mime, fence: rowFence(p, cur, path) }, [refileStatement(db, cur, folder, revId)]);
-    return answer(res, (b) => fileView(path, b.artifact_id, kind, mime, b.revision, b.sha256, bytes.byteLength, folderView(folder)));
+      { revId, body: text, size: bytes.byteLength, sha256, mime, change_note: meta.note, fence: replaceFence(p, cur, path, title) },
+      [refileStatement(db, cur, folder, revId), ...title === null ? [] : titleStatements(ctx, cur, title, folder.path, revGate, [revId])]);
+    return answer(res, (b) => fileView(path, b.artifact_id, kind, mime, b.revision, b.sha256, bytes.byteLength, folderView(folder), title ?? cur.title));
   } catch (e) {
     if (!(e instanceof HttpError) || [400, 402, 413, 422, 500, 503].includes(e.status)) throw e;
     // A refused publish: an authorization change answers first, then the row as it is now (another writer won).
@@ -391,17 +487,20 @@ function signatureTap(body) {
   return { stream, head: () => head.subarray(0, Math.min(seen, head.length)) };
 }
 
-async function putBinary({ req, env, db, p, ctx, key, pre, parsed, declared, sha, lg }) {
+async function putBinary({ req, env, db, p, ctx, key, pre, parsed, declared, sha, lg, meta }) {
   const { path, mime } = parsed;
   const op = "app.put";
   // The declared SHA-256 is part of the request: a same-key retry with the same bytes replays before any byte is read.
-  const idem = { op, key, projectId: p.project_id, digest: await sha256Hex(JSON.stringify([op, path, pre.cond, "binary", mime, sha, declared])) };
-  const view = (folder) => (b) => fileView(path, b.artifact_id, "binary", mime, b.revision, b.sha256, b.size ?? declared, folder);
+  const idem = { op, key, projectId: p.project_id, digest: await sha256Hex(JSON.stringify([op, path, pre.cond, "binary", mime, sha, declared, ...meta.digest])) };
+  const view = (folder, title) => (b) => fileView(path, b.artifact_id, "binary", mime, b.revision, b.sha256, b.size ?? declared, folder, title);
   const prior = await idemLookup(ctx, idem);
-  if (prior) return answer(prior, view(null));
+  if (prior) return replayAnswer(db, p, prior, (b, folder, title) => view(folder, title)(b));
   const cur = await rowChecks(db, p, path, pre);
-  if (cur && cur.sha256 === sha && cur.size === declared)
-    return json({ file: fileView(path, cur.id, cur.kind, cur.mime, cur.head_rev, cur.sha256, cur.size, folderOf(cur)), unchanged: true }, 200, { etag: `"${cur.sha256}"` });
+  const title = cur ? newTitle(cur, meta) : null;
+  if (cur && cur.sha256 === sha && cur.size === declared) {
+    if (title !== null) return retitle(ctx, db, p, path, cur, idem, title, meta.note);
+    return json({ file: fileView(path, cur.id, cur.kind, cur.mime, cur.head_rev, cur.sha256, cur.size, folderOf(cur), cur.title), unchanged: true }, 200, { etag: `"${cur.sha256}"` });
+  }
   if (cur && cur.kind !== "binary") throw new HttpError(409, "conflict", "A text file exists at this path");
   // Storage is checked before any byte is read (and again inside the publish statement), but after a replay or an
   // unchanged-bytes answer: neither adds anything, so a full workspace can still recover a write whose answer was lost.
@@ -436,13 +535,14 @@ async function putBinary({ req, env, db, p, ctx, key, pre, parsed, declared, sha
     const wf = blobWriteFence(blobKey);
     if (cur) {
       // A new version of the app's own file: fenced on the live publisher, the row as checked and the intent.
-      const fence = rowFence(p, cur, path);
+      const fence = replaceFence(p, cur, path, title);
       replaceFolder = await folderFor(ctx, p, parsed, true);
       return publishRevision(ctx, p.project_id, cur.id, cur.head_rev, idem,
-        { revId, blobKey, size: declared, sha256: sha, mime, chargeBlob: true, fence: { sql: `${fence.sql} AND ${wf.sql}`, params: [...fence.params, ...wf.params] } },
-        [refileStatement(db, cur, replaceFolder, revId), textWriteComplete(env, blobKey)]);
+        { revId, blobKey, size: declared, sha256: sha, mime, chargeBlob: true, change_note: meta.note, fence: { sql: `${fence.sql} AND ${wf.sql}`, params: [...fence.params, ...wf.params] } },
+        [refileStatement(db, cur, replaceFolder, revId), ...title === null ? [] : titleStatements(ctx, cur, title, replaceFolder.path, "EXISTS (SELECT 1 FROM revisions WHERE id = ?)", [revId]),
+          textWriteComplete(env, blobKey)]);
     }
-    return createBinary(ctx, p, parsed, { artId, revId, blobKey, size: declared, sha256: sha, idem, wf });
+    return createBinary(ctx, p, parsed, { artId, revId, blobKey, size: declared, sha256: sha, idem, wf, title: meta.title ?? parsed.name, note: meta.note });
   })().catch(async (e) => {
     // Only a definite refusal drops the object; an unknown failure (a lost acknowledgement may hide a commit) is left
     // to the sweep, which deletes it only if no revision references it.
@@ -455,11 +555,11 @@ async function putBinary({ req, env, db, p, ctx, key, pre, parsed, declared, sha
     await rowChecks(db, p, path, pre);
     throw e.status === 409 ? e : new HttpError(409, "conflict", "Concurrent modification");
   });
-  return answer(published, view(folderView(replaceFolder)));
+  return answer(published, view(folderView(replaceFolder), cur ? title ?? cur.title : meta.title ?? parsed.name));
 }
 
 /** A new binary file of the app: its folder (created as needed), artifact and first revision in one fenced batch. */
-async function createBinary(ctx, p, parsed, { artId, revId, blobKey, size, sha256, idem, wf }) {
+async function createBinary(ctx, p, parsed, { artId, revId, blobKey, size, sha256, idem, wf, title, note }) {
   const { path, mime } = parsed;
   const folder = await folderFor(ctx, p, parsed, true);
   const adds = { storage_bytes: size };
@@ -467,7 +567,7 @@ async function createBinary(ctx, p, parsed, { artId, revId, blobKey, size, sha25
   const az0 = authzSql(ctx, p.project_id);
   const az = { sql: `${az0.sql} AND ${lg.sql} AND ${BASE_SQL} AND ${wf.sql}`, params: [...az0.params, ...lg.params, ...baseParams(p), ...wf.params] };
   const now = nowIso();
-  const body = { file: fileView(path, artId, "binary", mime, 1, sha256, size, folder.id ? { id: folder.id, path: folder.path } : null) };
+  const body = { file: fileView(path, artId, "binary", mime, 1, sha256, size, folder.id ? { id: folder.id, path: folder.path } : null, title) };
   const db = ctx.env.DB;
   const created = "EXISTS (SELECT 1 FROM artifacts WHERE id = ?)";
   const out = await runBatch(ctx, [
@@ -475,10 +575,10 @@ async function createBinary(ctx, p, parsed, { artId, revId, blobKey, size, sha25
     db.prepare(`INSERT INTO artifacts (id, project_id, kind, title, folder, folder_id, schema_id, publisher_id, export_name, head_rev, head_revision_id, created_at, updated_at)
       SELECT ?, ?, 'binary', ?, ?, ?, NULL, ?, ?, 1, ?, ?, ? WHERE ${az.sql}
         AND (? IS NULL OR EXISTS (SELECT 1 FROM folders WHERE id = ? AND project_id = ?))`)
-      .bind(artId, p.project_id, parsed.name, folder.path, folder.id, p.id, path, revId, now, now, ...az.params, folder.id, folder.id, p.project_id),
-    db.prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, body_key, blob_key, size, sha256, mime, created_at, via_kind, via_id, via_label, client_info, change_note)
-      SELECT ?, ?, ?, 1, ?, NULL, NULL, ?, ?, ?, ?, ?, 'publisher', ?, ?, NULL, NULL WHERE ${created}`)
-      .bind(revId, artId, p.project_id, ctx.principal.id, blobKey, size, sha256, mime, now, p.id, p.display_name, artId),
+      .bind(artId, p.project_id, title, folder.path, folder.id, p.id, path, revId, now, now, ...az.params, folder.id, folder.id, p.project_id),
+    db.prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, body_key, blob_key, size, sha256, mime, created_at, via_kind, via_id, via_label, client_info, change_note, on_behalf_of)
+      SELECT ?, ?, ?, 1, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${created}`)
+      .bind(revId, artId, p.project_id, ctx.principal.id, blobKey, size, sha256, mime, now, ...provenance(ctx, { change_note: note }), ctx.onBehalfOf ?? null, artId),
     audit(ctx, p.project_id, "artifact.create", artId, 1, "ok", created, [artId]),
     // A file is indexed by its title only.
     ...indexDocument(db, { artifactId: artId, revisionId: revId, sha256, text: "" }),

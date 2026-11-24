@@ -373,8 +373,8 @@ async function createMarkdown(ctx, projectId, input, key, kind = "markdown", int
     db(ctx).prepare(`INSERT INTO artifacts (id, project_id, kind, title, folder, folder_id, schema_id, publisher_id, export_name, head_rev, head_revision_id, created_at, updated_at)
       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ? WHERE ${az.sql}
         AND (? IS NULL OR EXISTS (SELECT 1 FROM folders WHERE id = ? AND project_id = ?))`).bind(artId, projectId, kind, title, folder, folderId, schema, internal?.publisherId ?? null, internal?.exportName ?? null, revId, now, now, ...az.params, folderId, folderId, projectId),
-    db(ctx).prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, body_key, size, sha256, mime, created_at, via_kind, via_id, via_label, client_info, change_note)
-      SELECT ?, ?, ?, 1, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM artifacts WHERE id = ?)`).bind(revId, artId, projectId, ctx.principal.id, bodyKey, new TextEncoder().encode(body2).length, sha2, mime, now, ...provenance(ctx, input), artId),
+    db(ctx).prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, body_key, size, sha256, mime, created_at, via_kind, via_id, via_label, client_info, change_note, on_behalf_of)
+      SELECT ?, ?, ?, 1, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM artifacts WHERE id = ?)`).bind(revId, artId, projectId, ctx.principal.id, bodyKey, new TextEncoder().encode(body2).length, sha2, mime, now, ...provenance(ctx, input), ctx.publisher ? ctx.onBehalfOf ?? null : null, artId),
     audit(ctx, projectId, "artifact.create", artId, 1, "ok", "EXISTS (SELECT 1 FROM artifacts WHERE id = ?)", [artId]),
     ...internal?.extra ?? [],
     ...indexDocument(db(ctx), { artifactId: artId, revisionId: revId, sha256: sha2, text: body2 }), textWriteComplete(ctx.env, bodyKey)
@@ -417,8 +417,8 @@ async function publishRevision(ctx, projectId, artifactId, expected, i, rev, ext
   const body2 = { artifact_id: artifactId, revision: next, revision_id: revId, sha256: rev.sha256, ...reserved ? { size: rev.size } : {} };
   const bodyKey = rev.body == null ? null : await stageTextWrite(ctx.env, projectId, artifactId, revId, rev.body);
   const out2 = await commitTextWrites(ctx.env, [bodyKey], (guarded) => runBatch(ctx, guarded([
-    db(ctx).prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, body_key, blob_key, size, sha256, mime, restored_from, created_at, via_kind, via_id, via_label, client_info, change_note)
-      SELECT ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+    db(ctx).prepare(`INSERT INTO revisions (id, artifact_id, project_id, rev_no, author_id, body, body_key, blob_key, size, sha256, mime, restored_from, created_at, via_kind, via_id, via_label, client_info, change_note, on_behalf_of)
+      SELECT ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
       WHERE EXISTS (SELECT 1 FROM artifacts WHERE id = ? AND project_id = ? AND head_rev = ? AND trashed_at IS NULL) AND ${az.sql}`).bind(
       revId,
       artifactId,
@@ -433,6 +433,7 @@ async function publishRevision(ctx, projectId, artifactId, expected, i, rev, ext
       rev.restoredFrom ?? null,
       now,
       ...provenance(ctx, rev),
+      ctx.publisher ? ctx.onBehalfOf ?? null : null,
       artifactId,
       projectId,
       expected,

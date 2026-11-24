@@ -31,7 +31,7 @@ One path-addressed API for every kind of file: text (Markdown, HTML, JSON, CSV) 
 | `GET /v1/app` | `{ app_id, publisher_id, display_name, project: {id, title}, folder: {id, name, path} or null, limits: { max_file_bytes, max_text_bytes, max_binary_bytes, max_path_chars, max_path_segments } }` (`max_file_bytes` is the text limit, kept for older apps) |
 | `GET /v1/app/files?prefix=&cursor=&limit=` | `{ files, next_cursor }` in path order, `limit` 1–100. Each file: `path`, `file_id`, `kind`, `mime`, `content_type`, `title`, `folder: {id, path}` (or null at the project root), `revision`, `etag`, `sha256`, `size`, `created_at`, `updated_at`, `web_url` (and `preview_url` for text) |
 | `GET` / `HEAD /v1/app/files/{path}` | The bytes, with `ETag: "<sha256>"`. Supports `If-None-Match` (`304`) and `Range` (`206`, `416`) |
-| `PUT /v1/app/files/{path}` | Needs `Content-Type` (the path's type), `Content-Length`, `Idempotency-Key`, and `If-None-Match: *` (create) or `If-Match: "<sha256>"` (replace). Binary files also need `X-Content-SHA256: <64 hex>`. `201`/`200 { file }`; `200 { file, unchanged: true }` when the bytes are the current ones (nothing is written); `412` with `current_etag` and `current_revision` when the precondition fails |
+| `PUT /v1/app/files/{path}` | Needs `Content-Type` (the path's type), `Content-Length`, `Idempotency-Key`, and `If-None-Match: *` (create) or `If-Match: "<sha256>"` (replace). Binary files also need `X-Content-SHA256: <64 hex>`. Optional: `X-Agentlib-Title`, `X-Agentlib-Author`, `X-Agentlib-Change-Note` ([below](#title-author-and-change-note)). `201`/`200 { file }` (`file.title` included); `200 { file, unchanged: true }` when the bytes are the current ones (nothing is written); `412` with `current_etag` and `current_revision` when the precondition fails |
 | `DELETE /v1/app/files/{path}` | Needs `If-Match` and `Idempotency-Key`. Moves the file to your trash and frees the path |
 | `GET /v1/app/connection-info` | Diagnostic: the app's destination and whether writes are allowed |
 
@@ -54,7 +54,19 @@ Text is validated (strict UTF-8, valid JSON or CSV). A binary is streamed to sto
 
 **Safe serving.** Reads carry `X-Content-Type-Options: nosniff`, a sandboxing `Content-Security-Policy` and `Cross-Origin-Resource-Policy: same-origin`. Markdown, HTML, JSON and CSV come back as data (`text/plain` or their data type); images and video are inline; PDF, HTML, JSON, CSV and octet-stream are `Content-Disposition: attachment`. SVG is not accepted. Nothing an app stores ever runs on the library's origin.
 
-**Idempotency.** Every `PUT` and `DELETE` needs an `Idempotency-Key` (8–128 characters). A retry with the same key and request (for a binary: the same declared SHA-256 and length) replays the first answer (`idempotent_replay: true`) without reading the body again; the same key with a different request is `422`. A client that lost a response can also treat `412` with `current_etag` equal to the SHA-256 of its own body as success.
+### Title, author and change note
+
+Three optional `PUT` headers, for display only. They don't change the rules for paths, ETags, idempotency keys or authorization.
+
+| Header | Value | Effect |
+|---|---|---|
+| `X-Agentlib-Title` | 1–200 characters (the document title rule), trimmed; no control or invisible formatting characters | The file's title. Set on create; on a replace, whenever it differs from the file's current title, as a new details version. So an app that sends its title on every write also puts it back after you rename the file; an app that wants to respect your renames sends the header only on create. With the same bytes and a new title, nothing but the title changes: no new content version, same ETag. Without the header a new file is titled by its file name (`brief.md`) and a replace keeps the title |
+| `X-Agentlib-Author` | 1–80 characters with at least one letter or digit; whitespace runs collapse; no control, invisible formatting (bidi, zero-width) or blank characters; not `You`, `Owner` or `Unknown`, and no ` via ` | Who in the app made this write. History shows "`<label> via <app>`" (for example "Chief via Brigade"). The app is still the actor: the label is stored on the version and never changes what the app may do. Without it, History shows the app's name |
+| `X-Agentlib-Change-Note` | at most 280 characters | The version's change note (on a title-only replace, the note of the details version) |
+
+Header values are ASCII. Send any other character as percent-encoded UTF-8 (`R%C3%A9sum%C3%A9`), either plain or as an RFC 8187 value (`UTF-8''R%C3%A9sum%C3%A9`); a literal `%` is `%25`, and a title that itself starts with `UTF-8''` must send its `'` as `%27`. A header sent twice is read as both values joined by `, ` (standard HTTP). A value that is too long is `413 too_large`; an empty, malformed or control-character value is `400 invalid_input`, before anything is read. Browser apps may send all three (they are in the CORS preflight's allowed headers).
+
+**Idempotency.** Every `PUT` and `DELETE` needs an `Idempotency-Key` (8–128 characters). A retry with the same key and request (for a binary: the same declared SHA-256 and length; and the same title, author and change note headers, sent or not) replays the first answer (`idempotent_replay: true`) without reading the body again; the same key with a different request is `422`. A client that lost a response can also treat `412` with `current_etag` equal to the SHA-256 of its own body as success.
 
 **Every request re-checks authorization:** a revoked or disabled app, a superseded token, a removed creator, a deleted project or destination stop it at once, and writes are fenced in the same D1 statement that stores them. A suspended workspace stops writes (`403 workspace_read_only`) but not reads. Other limits: the workspace storage limit (`402 limit_reached`) and a per-app request rate (`429`, `Retry-After`).
 

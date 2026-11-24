@@ -1147,7 +1147,7 @@ async function publisherPreflight(req, env) {
   return new Response(null, { status: 204, headers: {
     "access-control-allow-origin": origin,
     "access-control-allow-methods": "GET, HEAD, PUT, DELETE, POST",
-    "access-control-allow-headers": "Authorization, Content-Type, Idempotency-Key, If-Match, If-None-Match, Range, X-Content-SHA256",
+    "access-control-allow-headers": "Authorization, Content-Type, Idempotency-Key, If-Match, If-None-Match, Range, X-Content-SHA256, X-Agentlib-Title, X-Agentlib-Author, X-Agentlib-Change-Note",
     "access-control-max-age": "600",
     vary: "Origin"
   } });
