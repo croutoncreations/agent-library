@@ -1456,6 +1456,17 @@ function softBreakLongTokens(cell) {
     node.parentNode.replaceChild(frag, node);
   });
 }
+// Fenced code blocks in a rendered preview get a copy button (copies the block's text exactly, not the button).
+function enhanceCodeBlocks(root) {
+  root.querySelectorAll("pre").forEach(function (pre) {
+    if (pre.parentNode && pre.parentNode.classList && pre.parentNode.classList.contains("code-block")) return;
+    var wrap = h("div", { class: "code-block" });
+    pre.parentNode.insertBefore(wrap, pre); wrap.appendChild(pre);
+    var b = copyIcon("copy", "Copy text", function () { return pre.textContent; });
+    b.classList.add("code-copy");
+    wrap.appendChild(b);
+  });
+}
 function enhanceTables(root) {
   // A refreshed preview replaces its tables: release the previous observers/listeners first.
   (root.tableCleanups || []).forEach(function (f) { f(); }); root.tableCleanups = [];
@@ -2113,7 +2124,7 @@ function renderMarkdownEditor(A, data, ui) {
       return;
     }
     try {
-      var r = await api("GET", A.base + "/preview?rev=" + A.rev); previewBox.innerHTML = r.html; enhanceTables(previewBox);
+      var r = await api("GET", A.base + "/preview?rev=" + A.rev); previewBox.innerHTML = r.html; enhanceTables(previewBox); enhanceCodeBlocks(previewBox);
       previewBox.querySelectorAll("video[data-artifact]").forEach(function (v) { v.preload = "metadata"; });
       previewBox.querySelectorAll("img[data-artifact]").forEach(function (im) {
         im.tabIndex = 0; im.title = "View full size";
@@ -2385,7 +2396,7 @@ async function viewOfflineItem(pid, aid, tab) {
   var info = h("p", { class: "muted small", text: "Saved copy · rev " + it.rev + " · " + offAge(it.saved_at) + " · " + fmtBytes(it.size) });
   var body = h("div");
   if (it.kind === "markdown") {
-    var pv = h("div", { class: "preview" }); pv.innerHTML = it.html || ""; enhanceTables(pv); // server-sanitized HTML saved while online
+    var pv = h("div", { class: "preview" }); pv.innerHTML = it.html || ""; enhanceTables(pv); enhanceCodeBlocks(pv); // server-sanitized HTML saved while online
     pv.querySelectorAll("img").forEach(function (im) {
       var src = im.getAttribute("src"), b = it.images && it.images[src];
       if (b) { var u = blobUrl(b); im.src = u; im.tabIndex = 0; im.addEventListener("click", function () { openLightbox(u, im.alt || "image"); }); }
