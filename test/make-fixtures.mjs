@@ -1,5 +1,7 @@
-// Generates small synthetic fixtures into tmp/fixtures: PNG (zlib-built), minimal PDF, MP4 (ffmpeg lavfi testsrc).
-import { mkdirSync, writeFileSync, existsSync, statSync } from "node:fs";
+// Small synthetic fixtures: PNG (zlib-built) and a minimal PDF are generated into tmp/fixtures; the MP4 is
+// test/fixtures/fixture.mp4 (committed, 7.5 KB: 2 s of ffmpeg's lavfi testsrc, H.264), so test runs need no ffmpeg.
+// Regenerate it with `node test/make-fixtures.mjs --regenerate-mp4` (needs ffmpeg).
+import { mkdirSync, writeFileSync, statSync } from "node:fs";
 import { deflateSync, crc32 } from "node:zlib";
 import { execFileSync } from "node:child_process";
 import { join, dirname } from "node:path";
@@ -8,6 +10,7 @@ import { fileURLToPath } from "node:url";
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 export const FIXTURE_DIR = join(ROOT, "tmp", "fixtures");
 const MAX = 5 * 1024 * 1024;
+const MP4 = join(ROOT, "test", "fixtures", "fixture.mp4");
 
 function chunk(type, data) {
   const len = Buffer.alloc(4); len.writeUInt32BE(data.length);
@@ -51,18 +54,20 @@ export function makeFixtures() {
   mkdirSync(FIXTURE_DIR, { recursive: true });
   const png = join(FIXTURE_DIR, "fixture.png");
   const pdf = join(FIXTURE_DIR, "fixture.pdf");
-  const mp4 = join(FIXTURE_DIR, "fixture.mp4");
+  const mp4 = MP4;
   writeFileSync(png, makePng());
   writeFileSync(pdf, makePdf());
-  if (!existsSync(mp4)) {
-    execFileSync("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc=duration=2:size=160x120:rate=10",
-      "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart", mp4], { stdio: "inherit" });
-  }
   for (const f of [png, pdf, mp4]) if (statSync(f).size > MAX) throw new Error(`${f} exceeds 5 MiB`);
   return { png, pdf, mp4 };
 }
 
+export function regenerateMp4() {
+  execFileSync("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc=duration=2:size=160x120:rate=10",
+    "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart", MP4], { stdio: "inherit" });
+}
+
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+  if (process.argv.includes("--regenerate-mp4")) regenerateMp4();
   const f = makeFixtures();
   for (const [k, p] of Object.entries(f)) console.log(k, p, statSync(p).size, "bytes");
 }

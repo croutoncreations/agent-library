@@ -61,19 +61,6 @@ test("MCP: rate limit returns HTTP 429 to the real client; mutations use the wri
   await m.close().catch(() => {});
 });
 
-test("auth failures from one source are throttled to 429", async () => {
-  await freshWindow();
-  const bad = agentHttp(s.base, "alt_" + "x".repeat(40));
-  const codes = [];
-  for (let i = 0; i < 12; i++) codes.push((await bad("GET", `/api/projects/${P}/artifacts`)).status);
-  // Limit is 10 failures/min per source; earlier failures in the same window (e.g. readiness probes) also count.
-  const first429 = codes.indexOf(429);
-  assert.ok(first429 > 0 && first429 <= 10, codes.join(","));
-  assert.ok(codes.slice(0, first429).every((c) => c === 401));
-  assert.ok(codes.slice(first429).every((c) => c === 429));
-  await sleep(60_000 - (Date.now() % 60_000) + 200); // let the shared "local" auth-failure window reset
-});
-
 test("one active upload per identity: concurrent begins -> exactly one 201, others 429", async () => {
   await freshWindow();
   const A = agentHttp(s.base, (await grant(h, P, "uploader-race")).token);
@@ -137,7 +124,7 @@ test("transfer PUT counts against the write budget", async () => {
 });
 
 test("PDF content is download-only: attachment + sandbox CSP + nosniff", async () => {
-  await sleep(60_000 - (Date.now() % 60_000) + 200);
+  // Its own identity and three writes (budget 8): no rate window to wait for.
   const g = await grant(h, P, "pdf-check");
   const A = agentHttp(s.base, g.token);
   const pdf = Buffer.from("%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n");
@@ -151,4 +138,18 @@ test("PDF content is download-only: attachment + sandbox CSP + nosniff", async (
   assert.match(r.headers.get("content-disposition"), /^attachment;/);
   assert.match(r.headers.get("content-security-policy"), /sandbox/);
   assert.equal(r.headers.get("x-content-type-options"), "nosniff");
+});
+
+// Last on purpose: every local request shares one auth-failure source ("local"), so a test after this one would start
+// inside a throttled window (it used to wait for the next minute instead).
+test("auth failures from one source are throttled to 429", async () => {
+  await freshWindow();
+  const bad = agentHttp(s.base, "alt_" + "x".repeat(40));
+  const codes = [];
+  for (let i = 0; i < 12; i++) codes.push((await bad("GET", `/api/projects/${P}/artifacts`)).status);
+  // Limit is 10 failures/min per source; earlier failures in the same window (e.g. readiness probes) also count.
+  const first429 = codes.indexOf(429);
+  assert.ok(first429 > 0 && first429 <= 10, codes.join(","));
+  assert.ok(codes.slice(0, first429).every((c) => c === 401));
+  assert.ok(codes.slice(first429).every((c) => c === 429));
 });
