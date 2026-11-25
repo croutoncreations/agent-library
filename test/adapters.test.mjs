@@ -219,6 +219,43 @@ test("Turnstile fails closed on configuration mistakes (never silently off)", as
   assert.ok(logs.some((l) => /turnstile_not_configured bad_site_key/.test(l)));
 });
 
+test("Turnstile: SIGNIN_HUMAN_CHECK_EXEMPT skips the check only for an exact listed address; malformed lists exempt nobody", async () => {
+  const T = await loadWorker({ "identity/turnstile.js": ["requireHuman", "humanCheckExempt"] });
+  const realFetch = globalThis.fetch, realErr = console.error, realLog = console.log;
+  let verifies = 0; const logs = [];
+  // siteverify rejects every token here: anything that passes did so without calling it.
+  globalThis.fetch = async () => { verifies++; return new Response(JSON.stringify({ success: false, "error-codes": ["invalid-input-response"] }), { headers: { "content-type": "application/json" } }); };
+  console.error = (...a) => logs.push(a.join(" ")); console.log = (...a) => logs.push(a.join(" "));
+  try {
+    const base = { TURNSTILE_SITE_KEY: "0x4AAAAAAAsynthetic", TURNSTILE_SECRET_KEY: "s" };
+    const env = (v) => ({ ...base, SIGNIN_HUMAN_CHECK_EXEMPT: v });
+    const pass = (e, email) => T.requireHuman(e, "", null, "app.example.test", email);
+    const blocked = (e, email) => assert.rejects(pass(e, email), (x) => x.status === 400 && x.code === "human_check_required", `${email} must still need the check`);
+    // Listed: no token needed, siteverify never called.
+    await pass(env("bot@example.test"), "bot@example.test");
+    await pass(env(" one@example.test , bot@example.test "), "bot@example.test");
+    assert.equal(verifies, 0);
+    assert.ok(logs.some((l) => /turnstile_exempt/.test(l)));
+    // Not listed, near misses, or no email: the check applies as before.
+    await blocked(env("bot@example.test"), "other@example.test");
+    await blocked(env("bot@example.test"), "bot@example.test.evil.example");
+    await blocked(env("bot@example.test"), "xbot@example.test");
+    await blocked(env("bot@example.test"), null);
+    await blocked(base, "bot@example.test");
+    await blocked(env(""), "bot@example.test");
+    // Malformed lists (wildcards, uppercase, a bare domain, too many entries) exempt nobody, and say so in the log.
+    for (const bad of ["*@example.test", "Bot@example.test", "example.test", "a@b.co,b@b.co,c@b.co,d@b.co,e@b.co,f@b.co", "bot@example.test,,"])
+      await blocked(env(bad), "bot@example.test");
+    assert.ok(logs.some((l) => /signin_exempt_invalid/.test(l)));
+    // A broken configuration refuses the exempt address too (automated tests must notice it like real visitors).
+    await assert.rejects(T.requireHuman({ TURNSTILE_SITE_KEY: "0x4AAAAAAAsynthetic", SIGNIN_HUMAN_CHECK_EXEMPT: "bot@example.test" }, "", null, "app.example.test", "bot@example.test"), (e) => e.status === 503 && e.code === "turnstile_not_configured");
+    await assert.rejects(T.requireHuman({ TURNSTILE_SITE_KEY: "0x4AAAAAAAsynthetic\n", TURNSTILE_SECRET_KEY: "s", SIGNIN_HUMAN_CHECK_EXEMPT: "bot@example.test" }, "", null, "app.example.test", "bot@example.test"), (e) => e.status === 503);
+    // The exemption never switches the check on: with no site key there is nothing to skip.
+    await T.requireHuman({ SIGNIN_HUMAN_CHECK_EXEMPT: "bot@example.test" }, "", null, "app.example.test", "other@example.test");
+    assert.equal(T.humanCheckExempt({ SIGNIN_HUMAN_CHECK_EXEMPT: "bot@example.test" }, "BOT@example.test"), false, "callers pass lowercased addresses; matching is exact");
+  } finally { globalThis.fetch = realFetch; console.error = realErr; console.log = realLog; }
+});
+
 test("Turnstile: the test-key hostname exception needs local dev AND a Cloudflare test secret", async () => {
   const T = await loadWorker({ "identity/turnstile.js": ["requireHuman"] });
   const realFetch = globalThis.fetch;

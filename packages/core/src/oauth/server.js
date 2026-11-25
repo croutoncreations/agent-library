@@ -605,7 +605,7 @@ ${cxStart(handle, cxChoices(env), cxTurnstile(env))}${cxTurnstileScript(env)}`),
       if (!EMAIL_RE.test(email) || email.length > 254) return errorPage("That doesn't look like an email address. Go back and check it.");
     }
     try {
-      if (email) await requireHuman(env, String(form.get("cf-turnstile-response") ?? ""), req.headers.get("cf-connecting-ip"), new URL(req.url).hostname);
+      if (email) await requireHuman(env, String(form.get("cf-turnstile-response") ?? ""), req.headers.get("cf-connecting-ip"), new URL(req.url).hostname, email);
       await limitSigninStart(env, req, email);
     }
     catch (e) { const f = startFailure(e); return errorPage(`${f.title}. ${f.msg}`, f.status); }

@@ -260,10 +260,10 @@ async function authMethods(signal) {
 }
 function redirectSignIn() { return !!(AUTH && AUTH.redirect); }
 // Loads Cloudflare's Turnstile script once (allowed by the shell's CSP only when the installation enables it) and
-// renders the widget into el. The submit button stays disabled until the check passes.
+// renders the widget into el. The submit button stays enabled: the server decides (an installation may exempt its own
+// test addresses, which the page can't know), and without a passed check it answers "Complete the human check".
 var turnstileLoading = null;
 function renderTurnstile(el, siteKey, submit) {
-  submit.disabled = true;
   var note = h("p", { class: "small muted", role: "status", text: "Checking that you're human\u2026" });
   el.appendChild(note);
   turnstileLoading = turnstileLoading || new Promise(function (resolve, reject) {
@@ -274,9 +274,7 @@ function renderTurnstile(el, siteKey, submit) {
   turnstileLoading.then(function () {
     note.remove();
     window.turnstile.render(el, { sitekey: siteKey, size: "flexible",
-      callback: function () { submit.disabled = false; },
-      "expired-callback": function () { submit.disabled = true; },
-      "error-callback": function () { submit.disabled = true; el.appendChild(h("p", { class: "small msg", role: "alert", text: "The human check couldn't load. Use a sign-in button above, or reload the page." })); } });
+      "error-callback": function () { el.appendChild(h("p", { class: "small msg", role: "alert", text: "The human check couldn't load. Use a sign-in button above, or reload the page." })); } });
   }).catch(function () { note.textContent = "The human check couldn't load. Use a sign-in button above, or reload the page."; note.setAttribute("role", "alert"); });
 }
 function signInHref() { var n = location.hash && location.hash !== "#/" ? location.hash : ""; return "/auth/signin" + (n ? "?next=" + encodeURIComponent(n) : ""); }
