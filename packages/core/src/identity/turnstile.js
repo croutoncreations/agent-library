@@ -28,11 +28,35 @@ function verifyUrl(env) {
 }
 
 /**
- * Throws HttpError unless the request's Turnstile token is valid. No-op when the check is off.
+ * Addresses that skip the human check (SIGNIN_HUMAN_CHECK_EXEMPT: comma-separated, at most 5). For the operator's own
+ * automated test accounts: an exempt address only ever receives the link itself, so the check's purpose (not letting
+ * anyone make us email arbitrary addresses) holds, and the sign-in rate limits still apply. Exact, lowercase matches
+ * only; anything malformed exempts nobody.
+ */
+const EXEMPT_MAX = 5;
+const EXEMPT_RE = /^[a-z0-9._+-]{1,64}@[a-z0-9.-]{1,190}\.[a-z]{2,24}$/;
+export function humanCheckExempt(env, email) {
+  const v = env?.SIGNIN_HUMAN_CHECK_EXEMPT;
+  if (typeof v !== "string" || !v || typeof email !== "string" || !email) return false;
+  const list = v.split(",").map((s) => s.trim());
+  if (list.length > EXEMPT_MAX || !list.every((s) => EXEMPT_RE.test(s))) {
+    console.error("signin_exempt_invalid");
+    return false;
+  }
+  return list.includes(email);
+}
+
+/**
+ * Throws HttpError unless the request's Turnstile token is valid. No-op when the check is off, or for an address the
+ * installation exempts (email: the address the link goes to, already trimmed and lowercased; null for no email).
  * token: the form's cf-turnstile-response; ip: the client IP (cf-connecting-ip).
  */
-export async function requireHuman(env, token, ip, hostname) {
+export async function requireHuman(env, token, ip, hostname, email = null) {
   if (!turnstileOn(env)) return;
+  if (humanCheckExempt(env, email)) {
+    console.log("turnstile_exempt");
+    return;
+  }
   // Fail closed: a malformed key (copy-paste whitespace, quotes) or a key without its secret would otherwise let
   // every request through.
   if (!turnstileSiteKey(env)) throw notConfigured("bad_site_key");
