@@ -30,5 +30,8 @@
     "style-mod": "4.1.4",
     "w3c-keyname": "2.2.8",
     "esbuild": "0.28.2"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true
   }
 }
