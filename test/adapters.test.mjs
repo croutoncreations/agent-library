@@ -247,6 +247,9 @@ test("Turnstile: SIGNIN_HUMAN_CHECK_EXEMPT skips the check only for an exact lis
     for (const bad of ["*@example.test", "Bot@example.test", "example.test", "a@b.co,b@b.co,c@b.co,d@b.co,e@b.co,f@b.co", "bot@example.test,,"])
       await blocked(env(bad), "bot@example.test");
     assert.ok(logs.some((l) => /signin_exempt_invalid/.test(l)));
+    // A broken configuration refuses the exempt address too (automated tests must notice it like real visitors).
+    await assert.rejects(T.requireHuman({ TURNSTILE_SITE_KEY: "0x4AAAAAAAsynthetic", SIGNIN_HUMAN_CHECK_EXEMPT: "bot@example.test" }, "", null, "app.example.test", "bot@example.test"), (e) => e.status === 503 && e.code === "turnstile_not_configured");
+    await assert.rejects(T.requireHuman({ TURNSTILE_SITE_KEY: "0x4AAAAAAAsynthetic\n", TURNSTILE_SECRET_KEY: "s", SIGNIN_HUMAN_CHECK_EXEMPT: "bot@example.test" }, "", null, "app.example.test", "bot@example.test"), (e) => e.status === 503);
     // The exemption never switches the check on: with no site key there is nothing to skip.
     await T.requireHuman({ SIGNIN_HUMAN_CHECK_EXEMPT: "bot@example.test" }, "", null, "app.example.test", "other@example.test");
     assert.equal(T.humanCheckExempt({ SIGNIN_HUMAN_CHECK_EXEMPT: "bot@example.test" }, "BOT@example.test"), false, "callers pass lowercased addresses; matching is exact");

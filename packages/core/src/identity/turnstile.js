@@ -53,14 +53,15 @@ export function humanCheckExempt(env, email) {
  */
 export async function requireHuman(env, token, ip, hostname, email = null) {
   if (!turnstileOn(env)) return;
+  // Fail closed: a malformed key (copy-paste whitespace, quotes) or a key without its secret would otherwise let
+  // every request through. Checked before the exemption, so automated test accounts notice a broken configuration
+  // exactly as real visitors would.
+  if (!turnstileSiteKey(env)) throw notConfigured("bad_site_key");
+  if (!env.TURNSTILE_SECRET_KEY) throw notConfigured("no_secret");
   if (humanCheckExempt(env, email)) {
     console.log("turnstile_exempt");
     return;
   }
-  // Fail closed: a malformed key (copy-paste whitespace, quotes) or a key without its secret would otherwise let
-  // every request through.
-  if (!turnstileSiteKey(env)) throw notConfigured("bad_site_key");
-  if (!env.TURNSTILE_SECRET_KEY) throw notConfigured("no_secret");
   if (typeof token !== "string" || !token || token.length > 2048) throw new HttpError(400, "human_check_required", "Complete the human check, then try again.");
   let r;
   try {
