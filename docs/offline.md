@@ -1,6 +1,6 @@
 # Offline launch and the installed app shell
 
-Status: implemented. Build step `build-offline-shell.mjs` (last in `npm run build:design`). Sources: `src/offline/sw.js` (service worker body) and `src/offline/boot.js` (browser boot). Tests: `test/offline-shell.test.mjs`.
+Status: implemented. Build step `build-offline-shell.mjs` (after `build-review.mjs` and before `build-artifact-limits.mjs` in `npm run build:design`). Sources: `src/offline/sw.js` (service worker body) and `src/offline/boot.js` (browser boot). Tests: `test/offline-shell.test.mjs`.
 
 ## What it does
 
