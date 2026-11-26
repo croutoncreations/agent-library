@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Rendered HTML pages are readable in dark mode again. A page shows in light colors on the app's white frame, as on `main`. Before this, a page that set only a dark text color came out as dark grey on near-black. Pages that style themselves for dark mode with `prefers-color-scheme` still switch.
+
 - Full-screen reading: a button on the Preview / Page panel opens it over the whole window (also on phones, where it covers the bottom tab bar); Escape or "Exit full screen" leaves it and keeps your place. Clicking an image in a document now opens a gallery of all its images and videos, with Previous/Next buttons, arrow keys, swipe on touch screens and a position counter.
 
 - **App Files: title, author and change note** ([docs/app-connect.md](docs/app-connect.md#title-author-and-change-note)). `PUT /v1/app/files/{path}` takes three optional display headers:
