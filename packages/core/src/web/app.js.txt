@@ -3296,6 +3296,14 @@ async function viewArtifact(pid, aid, initialTab) {
     if (!fsBtn.hidden) fsBtn.focus({ preventScroll: true });
   }
   S.cleanups.push(function () { exitFs(true); });
+  // Offered only on Preview, and only when there is a view to enlarge: not for a PDF card (no inline view) or
+  // a page too large to render (only its notice is shown). Called again when the preview changes.
+  function syncFsBtn() {
+    var p = panels.preview, nothing = !!(p && ((p.querySelector(".filecard") && !p.querySelector("img, video")) || p.querySelector(".render-notice:not([hidden]) .state")));
+    fsBtn.hidden = A.tab !== "preview" || nothing;
+    if (fsBtn.hidden) exitFs(true);
+  }
+  A.syncFsBtn = syncFsBtn;
   function addTab(name, label, onShow) {
     panels[name] = h("section", { hidden: true });
     tabBtns[name] = tabButton(label, panels[name], function () { showTab(name); });
@@ -3305,10 +3313,8 @@ async function viewArtifact(pid, aid, initialTab) {
   function showTab(name) {
     for (var k in panels) panels[k].hidden = k !== name;
     selectTab(tabNav, tabBtns[name]);
-    if (name !== "preview") exitFs(true);
-    // Files with no inline view (a PDF card) gain nothing from full screen.
-    fsBtn.hidden = name !== "preview" || !!(panels.preview && panels.preview.querySelector(".filecard") && !panels.preview.querySelector("img, video"));
     A.tab = name;
+    syncFsBtn();
     if (isTextDoc(A.meta.kind) && (name === "preview" || name === "edit")) {
       var want = "#/p/" + enc(pid) + "/a/" + enc(aid) + (name === "edit" ? "/edit" : "");
       if (location.hash !== want) history.replaceState(null, "", want);
@@ -4590,8 +4596,9 @@ function renderMarkdownEditor(A, data, ui) {
       setPreviewNote(savedNote, false);
       var largePage = savedSize > HTML_RENDER_MAX_BYTES;
       renderNotice.hidden = !largePage; frame.hidden = largePage;
-      if (largePage) { showPageLimit(); frame.removeAttribute("src"); return; }
+      if (largePage) { showPageLimit(); frame.removeAttribute("src"); if (A.syncFsBtn) A.syncFsBtn(); return; }
       if (renderNotice !== smallRenderNotice) { renderNotice.replaceWith(smallRenderNotice); renderNotice = smallRenderNotice; renderNotice.hidden = true; }
+      if (A.syncFsBtn) A.syncFsBtn();
       // The response carries CSP script-src 'none' + sandbox, and the iframe sandbox has no allow-scripts.
       var src = A.base + "/render?rev=" + A.rev;
       if (frame.getAttribute("src") !== src) frame.setAttribute("src", src);

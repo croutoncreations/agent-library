@@ -497,6 +497,8 @@ test("Chrome: exact owner/viewer notes, small views, offline copies, and synthet
             if (html) { assert.deepEqual(requests, []); assert.equal(await page.$eval("iframe.htmlview", e => e.getAttribute("src")), null); }
             else await page.waitForFunction(() => document.querySelector(".preview h1")?.textContent === "early-render-marker");
             if (role === "owner" && html) onlineGaps[width] = await measureLayout(page, "online-too-large-html", width);
+            // Only the notice is shown, so there is nothing to enlarge: no Full screen button above it.
+            if (html) assert.equal(await page.$eval('button[aria-label="Full screen"]', (b) => b.hidden), true, "no Full screen for a page too large to show");
             if (captures && role === "owner" && html && width === 1280) await page.screenshot({ path: `${out}/1-button-owner-1280.png` });
             if (html || role === "viewer") {
               // Start at the tab row, walk with real Tab keys, then activate the supported next step.
