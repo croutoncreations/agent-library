@@ -1,0 +1,13 @@
+{
+  "base_app_connect_files_sha256": "da082b6022bfe8d10be871254eb41c92af87ecce0e772cd1025bca2e7a6669e4",
+  "integrated_sha256": "389a5af457240c86855cbfe0890480b2a2e5735b3b891b0d4c1b5944d6584911",
+  "preserved_outside_patches_sha256": "c1a18159a3ab1b89d6aebac8169cfcbd4ab47b509f853b2501c1cfa93e1dc2a4",
+  "patches": [
+    {
+      "name": "html: the page wrapper declares the light scheme of its white canvas",
+      "module": "// src/html.ts",
+      "find_sha256": "e4a4ae6c6caedf8b99c55eb2bb9ed6845d245babcb5020445e339ffce060cdd6",
+      "replace_sha256": "168d5279a297b5f0cf7fb0d1e269a02fcaa660f65077b9a88e3cbbb7ae94b5c8"
+    }
+  ]
+}

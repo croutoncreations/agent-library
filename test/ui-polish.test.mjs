@@ -16,7 +16,7 @@ const PUPPETEER = `${process.env.HOME}/.npm-packages/lib/node_modules/puppeteer`
 const haveChrome = existsSync(CHROME) && existsSync(PUPPETEER);
 const PORT = SERVER_PORTS.uipolish, ORIGIN = `http://127.0.0.1:${PORT}`;
 const PID = "ui-polish", OTHER = "ui-other";
-let s, h, browser, page, docId, imgId, otherImg, img2Id, galleryDocId, longDocId;
+let s, h, browser, page, docId, imgId, otherImg, img2Id, galleryDocId, longDocId, plainPageId, darkPageId;
 
 async function uploadPng(token, pid, title, bytes) {
   const a = agentHttp(ORIGIN, token);
@@ -40,6 +40,9 @@ before(async () => {
   docId = (await h.req("POST", `/api/projects/${PID}/artifacts`, { title: "Polish doc", body })).body.artifact_id;
   img2Id = await uploadPng(tok, PID, "Second", makePng(40, 30));
   galleryDocId = (await h.req("POST", `/api/projects/${PID}/artifacts`, { title: "Gallery doc", body: `# G\n\n![First](${imgId})\n\nText between.\n\n![Second](${img2Id})\n` })).body.artifact_id;
+  plainPageId = (await h.req("POST", `/api/projects/${PID}/artifacts`, { title: "Plain page", kind: "html", body: "<h1>Plain page</h1><p>No colors of its own.</p>" })).body.artifact_id;
+  darkPageId = (await h.req("POST", `/api/projects/${PID}/artifacts`, { title: "Self-styled page", kind: "html",
+    body: "<style>body{background:#fff;color:#111}@media (prefers-color-scheme:dark){body{background:#1d2330;color:#e8ecf3}}</style><h1>Self-styled page</h1>" })).body.artifact_id;
   longDocId = (await h.req("POST", `/api/projects/${PID}/artifacts`, { title: "Long doc", body: "# Long\n\n" + Array.from({ length: 60 }, (_, i) => `## Section ${i + 1}\n\nParagraph ${i + 1} of synthetic filler text for scrolling.`).join("\n\n") })).body.artifact_id;
   if (haveChrome) {
     browser = await require(PUPPETEER).launch({ executablePath: CHROME, headless: true, args: ["--no-first-run"] });
@@ -152,6 +155,36 @@ test("browser: inline image in preview opens a full-size overlay with download; 
   await page.waitForSelector(".lightbox img");
   await page.click('.lightbox .bar button[aria-label="Close"]');
   assert.equal(await page.$(".lightbox"), null);
+});
+
+test("browser: rendered HTML pages stay readable in dark mode", { skip: !haveChrome && "Chrome not installed" }, async () => {
+  await page.emulateMediaFeatures([{ name: "prefers-color-scheme", value: "dark" }]);
+  // Text color and the effective background behind it (the frame is a white canvas unless the page paints its own).
+  const colors = async () => {
+    const frame = await (await page.waitForSelector("iframe.htmlview")).contentFrame();
+    await frame.waitForFunction(() => document.querySelector("h1"));
+    const inner = await frame.evaluate(() => ({ text: getComputedStyle(document.querySelector("h1")).color, bg: getComputedStyle(document.body).backgroundColor }));
+    const canvas = await page.$eval("iframe.htmlview", (f) => getComputedStyle(f).backgroundColor);
+    return { text: inner.text, bg: inner.bg === "rgba(0, 0, 0, 0)" ? canvas : inner.bg };
+  };
+  const lum = (rgb) => { const [r, g, b] = rgb.match(/\d+/g).map(Number); return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255; };
+  try {
+    // A page with no colors of its own: dark text on the white canvas (was white on white).
+    await page.goto(`${ORIGIN}/#/p/${PID}/a/${plainPageId}`);
+    let c = await colors();
+    assert.equal(c.bg, "rgb(255, 255, 255)"); assert.ok(lum(c.text) < 0.3, "plain page text is dark: " + JSON.stringify(c));
+    await page.screenshot({ path: "tmp/test-evidence/ui-html-page-dark.png" });
+    // A page that styles itself for dark mode still does.
+    await page.goto(`${ORIGIN}/#/p/${PID}/a/${darkPageId}`);
+    c = await colors();
+    assert.deepEqual(c, { text: "rgb(232, 236, 243)", bg: "rgb(29, 35, 48)" });
+    // Offline copies store these exact /render bytes and show them in the same white frame.
+    const saved = await h.req("GET", `/api/projects/${PID}/artifacts/${plainPageId}/render`, undefined, { binary: true });
+    const text = typeof saved.body === "string" ? saved.body : Buffer.from(saved.body).toString("utf8");
+    assert.match(text, /html\{color-scheme:light\}/); assert.doesNotMatch(text, /color-scheme:light dark/);
+  } finally {
+    await page.emulateMediaFeatures([{ name: "prefers-color-scheme", value: "light" }]);
+  }
 });
 
 test("browser: document media open as a gallery with Previous/Next, arrow keys and a position counter", { skip: !haveChrome && "Chrome not installed" }, async () => {
