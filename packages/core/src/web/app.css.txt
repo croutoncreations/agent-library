@@ -271,8 +271,43 @@ details summary:hover{color:var(--fg)}
 .search svg{position:absolute;left:12px;top:50%;width:16px;height:16px;margin-top:-8px;stroke:var(--faint);fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;pointer-events:none}
 .search input{width:100%;padding-left:36px}
 .lightbox{position:fixed;inset:0;z-index:50;background:rgba(0,0,0,.94);display:flex;flex-direction:column;align-items:center;justify-content:center;padding:56px 16px 16px}
+.lightbox .stage{flex:1;min-height:0;width:100%;display:flex;align-items:center;justify-content:center}
 .lightbox img{width:100%;height:100%;object-fit:contain;image-rendering:auto}
+.lightbox video{max-width:100%;max-height:100%;background:#000}
 .lightbox img.small{image-rendering:pixelated}
+.lightbox .bar .count{color:#aaa;font-size:13.5px;font-variant-numeric:tabular-nums;padding:0 8px;white-space:nowrap}
+.lightbox .gnav{position:absolute;top:50%;margin-top:-24px;width:48px;height:48px;min-height:48px;border-radius:50%;background:rgba(0,0,0,.55);color:#eee;border:1px solid rgba(255,255,255,.18)}
+.lightbox .gnav:hover{background:rgba(40,40,40,.85);color:#fff}
+.lightbox .gnav svg{width:24px;height:24px}
+.lightbox .gnav.prev{left:calc(10px + env(safe-area-inset-left,0px))}.lightbox .gnav.prev svg{transform:scaleX(-1)}
+.lightbox .gnav.next{right:calc(10px + env(safe-area-inset-right,0px))}
+.lightbox.multi{padding-left:72px;padding-right:72px}
+@media (max-width:760px){.lightbox .gnav{top:auto;bottom:calc(14px + env(safe-area-inset-bottom,0px));margin-top:0}
+ .lightbox.multi{padding-left:16px;padding-right:16px;padding-bottom:calc(76px + env(safe-area-inset-bottom,0px))}}
+/* full-screen reading: the Preview panel covers the app chrome (header, sidebar, mobile tab bar) */
+.fs-host{position:relative}
+.fs-host > .fs-toggle{position:absolute;top:8px;right:8px;z-index:3;background:color-mix(in srgb,var(--card) 88%,transparent);color:var(--muted);border:1px solid var(--line2);box-shadow:0 1px 3px rgba(0,0,0,.12);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.fs-host > .fs-toggle:hover{background:var(--card);color:var(--fg)}
+section.fs-on > .fs-toggle{display:none!important}
+/* keep the first line of content clear of the corner button */
+.fs-host > .preview > :first-child,.fs-host > p.muted:first-of-type{margin-right:52px}
+@media (pointer:coarse){.fs-host > .preview > :first-child,.fs-host > p.muted:first-of-type{margin-right:56px}}
+/* pages, media and data: the button sits in its own row above the content instead of floating over it */
+.fs-host.fs-inline > .fs-toggle{position:static;display:flex;margin:0 0 8px auto}
+.fs-host.fs-inline > .fs-toggle[hidden]{display:none}
+.fs-host.fs-inline > p.muted:first-of-type{margin-right:0}
+section.fs-on > .preview > :first-child{margin-right:0}
+body.reading{overflow:hidden}
+section.fs-on{position:fixed;inset:0;z-index:40;background:var(--bg);overflow:auto;overscroll-behavior:contain;display:flex;flex-direction:column;
+ padding:0 max(16px,env(safe-area-inset-right,0px)) calc(16px + env(safe-area-inset-bottom,0px)) max(16px,env(safe-area-inset-left,0px))}
+.fs-bar{position:sticky;top:0;z-index:2;display:flex;align-items:center;gap:10px;margin:0 -16px 12px;padding:8px 16px;padding-top:calc(8px + env(safe-area-inset-top,0px));background:color-mix(in srgb,var(--bg) 92%,transparent);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);border-bottom:1px solid var(--line)}
+.fs-bar .fs-title{flex:1;min-width:0;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+section.fs-on > .preview{width:100%;max-width:calc(var(--read) + 64px);margin:0 auto;border:0;background:transparent}
+section.fs-on > :not(iframe){flex-shrink:0} /* the panel scrolls, not a squeezed child */
+section.fs-on iframe.htmlview{flex:1;min-height:0;border-radius:var(--r2)}
+section.fs-on > div:not(.fs-bar):not(.preview),section.fs-on > p{width:100%;max-width:1200px;margin-left:auto;margin-right:auto}
+section.fs-on .media img,section.fs-on .media video{max-height:calc(100dvh - 160px);margin:0 auto;width:auto}
+@media (max-width:760px){section.fs-on > .preview{padding:4px 2px 24px}}
 .lightbox .bar{position:absolute;top:0;right:0;left:0;padding:8px 10px;padding-top:calc(8px + env(safe-area-inset-top,0px));background:#000;display:flex;gap:4px;justify-content:flex-end;align-items:center}
 .lightbox .bar .cap{flex:1;color:#ddd;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-left:6px}
 .lightbox .bar .icon{color:#ddd}.lightbox .bar .icon:hover{background:rgba(255,255,255,.12);color:#fff}
