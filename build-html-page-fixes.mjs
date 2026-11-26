@@ -1,5 +1,6 @@
 // Rendered HTML page fixes (runs last, after build-app-connect-files.mjs; no migration).
-// The page wrapper written around a sanitized HTML document (renderHtmlDocument in // src/html.ts) declared
+// The page wrapper written around a sanitized HTML document (renderHtmlDocument, in the bundle's "// src/html.ts"
+// module; there is no maintained source file for it, it comes from baseline/index.js) declared
 // html{color-scheme:light dark}. The app shows the page on a white canvas (iframe.htmlview, and the offline copy),
 // so on a dark-mode device the browser's default text turned white on white and plain pages looked blank. The
 // wrapper now declares the light scheme that matches that canvas; a page that styles itself for dark mode
