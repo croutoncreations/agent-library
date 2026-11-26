@@ -1334,6 +1334,37 @@ async function viewArtifact(pid, aid, initialTab) {
   // shared panels
   var panels = {}, tabBtns = {};
   var tabNav = tabList("Document views");
+  // Full screen: the Preview/Page panel fills the viewport (over the app header and the mobile tab bar) with a
+  // slim title bar. CSS only, so it works on phones too (iPhone Safari has no element Fullscreen API).
+  // The button floats in the top-right corner of the Preview panel, so the tab row keeps its full width on phones.
+  var fsBtn = iconButton("expand", "Full screen", function () { enterFs(); }, { class: "icon fs-toggle", hidden: true });
+  var fsBar = null, fsInert = null;
+  function fsKey(e) { if (e.key === "Escape" && !e.defaultPrevented && !document.querySelector(".lightbox")) exitFs(); }
+  function enterFs() {
+    var p = panels.preview; if (!p || fsBar) return;
+    var exit = h("button", { type: "button", class: "secondary", onclick: function () { exitFs(); } }, icon("x"), "Exit full screen");
+    fsBar = h("div", { class: "fs-bar" }, h("span", { class: "fs-title", text: A.meta.title }), exit);
+    // Keep the reader's place: the panel becomes its own scroller, so carry the current offset into it.
+    var y = Math.max(0, -p.getBoundingClientRect().top);
+    p.prepend(fsBar); p.classList.add("fs-on"); document.body.classList.add("reading");
+    p.setAttribute("aria-label", "Full screen: " + A.meta.title);
+    p.scrollTop = y;
+    // The covered app chrome must not take focus or be read out while hidden behind the panel.
+    fsInert = inertOutside(p);
+    document.addEventListener("keydown", fsKey);
+    // Focus the panel itself (not Exit), so Space/arrows scroll the content instead of leaving full screen.
+    p.tabIndex = -1; p.focus({ preventScroll: true });
+  }
+  function exitFs(leaving) {
+    if (!fsBar) return;
+    fsBar.remove(); fsBar = null;
+    fsInert(); fsInert = null;
+    panels.preview.classList.remove("fs-on"); panels.preview.removeAttribute("tabindex"); panels.preview.removeAttribute("aria-label");
+    document.body.classList.remove("reading");
+    document.removeEventListener("keydown", fsKey);
+    if (!leaving && !fsBtn.hidden) fsBtn.focus();
+  }
+  S.cleanups.push(function () { exitFs(true); });
   function addTab(name, label, onShow) {
     panels[name] = h("section", { hidden: true });
     tabBtns[name] = tabButton(label, panels[name], function () { showTab(name); });
@@ -1343,6 +1374,9 @@ async function viewArtifact(pid, aid, initialTab) {
   function showTab(name) {
     for (var k in panels) panels[k].hidden = k !== name;
     selectTab(tabNav, tabBtns[name]);
+    if (name !== "preview") exitFs(true);
+    // Files with no inline view (a PDF card) gain nothing from full screen.
+    fsBtn.hidden = name !== "preview" || !!(panels.preview && panels.preview.querySelector(".filecard") && !panels.preview.querySelector("img, video"));
     A.tab = name;
     if (isTextDoc(A.meta.kind) && (name === "preview" || name === "edit")) {
       var want = "#/p/" + enc(pid) + "/a/" + enc(aid) + (name === "edit" ? "/edit" : "");
@@ -1415,6 +1449,12 @@ async function viewArtifact(pid, aid, initialTab) {
   if (isTextDoc(A.meta.kind)) renderMarkdownEditor(A, data, { titleEl: titleEl, details: details, tabNav: tabNav, panels: panels, addTab: addTab, showTab: showTab, fillMeta: fillMeta, below: below });
   else if (isDataKind(A.meta.kind)) renderDataFile(A, data, { titleEl: titleEl, details: details, tabNav: tabNav, panels: panels, addTab: addTab, showTab: showTab, below: below });
   else renderBinary(A, data, { titleEl: titleEl, details: details, tabNav: tabNav, panels: panels, addTab: addTab, showTab: showTab, below: below });
+  if (panels.preview) {
+    panels.preview.classList.add("fs-host"); panels.preview.prepend(fsBtn);
+    // Only rendered documents float the button over their own padded corner; pages (iframe), media and data
+    // previews get it in a row above the content so it never covers anything.
+    if (!panels.preview.querySelector(":scope > .preview")) panels.preview.classList.add("fs-inline");
+  }
 
   addTab("history", "History", loadHistory);
   panels.history.append(histMsg, histList, histView);
@@ -1519,25 +1559,99 @@ function enhanceTables(root) {
     root.tableCleanups.push(stop); S.cleanups.push(stop);
   });
 }
-function openLightbox(src, title) {
-  var opener = document.activeElement;
-  var img = h("img", { src: src, alt: title || "image" });
-  // Fill the viewport (contain); crisp scaling for tiny images. Natural size is shown in the caption.
-  img.addEventListener("load", function () { if (img.naturalWidth < 300) img.classList.add("small"); cap.textContent = (title || "") + " - " + img.naturalWidth + "x" + img.naturalHeight; });
-  var cap = h("span", { class: "cap", text: title || "" });
-  var close;
-  var box = h("div", { class: "lightbox", role: "dialog", "aria-modal": "true", "aria-label": title || "Image" },
-    h("div", { class: "bar" }, cap,
-      iconLink("external", "Open original", src, { target: "_blank", rel: "noopener" }),
-      iconLink("download", "Download", downloadUrl(src), { download: title || "image.png" }),
-      close = iconButton("x", "Close", function () { done(); })),
-    img);
-  function onKey(e) { if (e.key === "Escape") done(); }
-  function done() { document.removeEventListener("keydown", onKey); box.remove(); if (opener && opener.focus) opener.focus(); }
-  box.addEventListener("click", function (e) { if (e.target === box) done(); });
+function openLightbox(src, title) { openGallery([{ src: src, title: title, type: "image" }], 0); }
+// Make everything outside "keep" inert (no focus, hidden from assistive tech): each sibling along keep's ancestor
+// path up to <body>. Returns a function that undoes exactly what it changed, so overlays can nest.
+function inertOutside(keep) {
+  var changed = [];
+  for (var el = keep; el && el !== document.body && el.parentNode; el = el.parentNode) {
+    Array.prototype.forEach.call(el.parentNode.children, function (sib) {
+      if (sib === el || sib.inert || sib.classList.contains("toast") || /^(SCRIPT|STYLE)$/.test(sib.tagName)) return;
+      sib.inert = true; changed.push(sib);
+    });
+  }
+  return function () { changed.forEach(function (s) { s.inert = false; }); };
+}
+// Full-size media overlay. With more than one item it is a gallery: Previous/Next buttons, Left/Right arrow keys
+// and a horizontal swipe move through the items (wrapping at the ends). Escape / click outside / Close dismisses;
+// focus returns to the opener.
+function openGallery(items, start) {
+  var opener = document.activeElement, i = Math.max(0, Math.min(items.length - 1, start || 0)), multi = items.length > 1;
+  var cap = h("span", { class: "cap" }), count = h("span", { class: "count", "aria-hidden": "true" });
+  var said = h("span", { class: "sr", "aria-live": "polite" });
+  var openLink = iconLink("external", "Open original", "#", { target: "_blank", rel: "noopener" });
+  var dlLink = iconLink("download", "Download", "#");
+  var stage = h("div", { class: "stage" });
+  var close = iconButton("x", "Close", function () { done(); });
+  var box = h("div", { class: "lightbox" + (multi ? " multi" : ""), role: "dialog", "aria-modal": "true" },
+    h("div", { class: "bar" }, cap, multi ? count : null, multi ? said : null, openLink, dlLink, close), stage,
+    multi ? iconButton("chevron", "Previous", function () { go(-1); }, { class: "icon gnav prev" }) : null,
+    multi ? iconButton("chevron", "Next", function () { go(1); }, { class: "icon gnav next" }) : null);
+  function show() {
+    var it = items[i], title = it.title || (it.type === "video" ? "video" : "image"), el;
+    cap.textContent = title; box.setAttribute("aria-label", title);
+    count.textContent = (i + 1) + " / " + items.length;
+    said.textContent = title + ", " + (i + 1) + " of " + items.length;
+    openLink.href = it.src;
+    // blob: URLs (offline copies) are downloaded as they are; server URLs ask for an attachment.
+    dlLink.href = /^blob:/.test(it.src) ? it.src : downloadUrl(it.src); dlLink.setAttribute("download", it.title || (it.type === "video" ? "video.mp4" : "image.png"));
+    if (it.type === "video") el = h("video", { src: it.src, controls: true, playsInline: true, preload: "metadata" });
+    else {
+      // Fill the viewport (contain); crisp scaling for tiny images. Natural size is shown in the caption.
+      el = h("img", { src: it.src, alt: title });
+      el.addEventListener("load", function () { if (!stage.contains(el)) return; if (el.naturalWidth < 300) el.classList.add("small"); cap.textContent = title + " - " + el.naturalWidth + "x" + el.naturalHeight; });
+    }
+    stage.replaceChildren(el);
+    // Warm the neighbours so moving through the gallery feels instant.
+    if (multi) [items[(i + 1) % items.length], items[(i - 1 + items.length) % items.length]].forEach(function (n) { if (n.type !== "video") new Image().src = n.src; });
+  }
+  function go(d) { i = (i + d + items.length) % items.length; show(); }
+  function onKey(e) {
+    if (e.key === "Escape") { e.preventDefault(); done(); } // handled: an enclosing full screen stays open
+    else if (multi && (e.key === "ArrowLeft" || e.key === "ArrowRight") && !(document.activeElement && document.activeElement.tagName === "VIDEO")) { e.preventDefault(); go(e.key === "ArrowLeft" ? -1 : 1); }
+  }
+  var restore = null;
+  function done(leaving) {
+    if (!box.isConnected) return;
+    document.removeEventListener("keydown", onKey); if (restore) restore(); box.remove();
+    if (leaving !== true && opener && opener.focus) opener.focus();
+  }
+  // Leaving the view (Back, a link, sign-out) closes the gallery too, before that view releases its blob: URLs.
+  S.cleanups.push(function () { done(true); });
+  box.addEventListener("click", function (e) { if (e.target === box || e.target === stage) done(); });
+  if (multi) {
+    // Swipe left/right on touch screens (not on a video, where horizontal drags scrub the timeline).
+    var sx = null, sy = 0;
+    stage.addEventListener("touchstart", function (e) { sx = e.touches.length === 1 && e.target.tagName !== "VIDEO" ? e.touches[0].clientX : null; sy = e.touches[0].clientY; }, { passive: true });
+    stage.addEventListener("touchend", function (e) {
+      if (sx === null) return;
+      if (window.visualViewport && visualViewport.scale > 1.01) { sx = null; return; } // panning a pinch-zoomed view
+      var dx = e.changedTouches[0].clientX - sx, dy = e.changedTouches[0].clientY - sy; sx = null;
+      if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy) * 1.5) go(dx < 0 ? 1 : -1);
+    });
+  }
+  show();
   document.addEventListener("keydown", onKey);
   document.body.append(box);
+  restore = inertOutside(box); // keep Tab inside the dialog
   close.focus();
+}
+// Make every image in rendered content open the gallery of all media there (images and videos, in document order).
+function wireGallery(root, selector) {
+  function items() {
+    return Array.prototype.map.call(root.querySelectorAll(selector), function (el) {
+      return el.tagName === "VIDEO" ? { src: el.getAttribute("src"), title: el.getAttribute("title") || "video", type: "video" }
+        : { src: el.getAttribute("src"), title: el.getAttribute("alt") || "image", type: "image", el: el };
+    });
+  }
+  root.querySelectorAll("img").forEach(function (im) {
+    if (!im.matches(selector)) return;
+    im.tabIndex = 0; im.title = "View full size"; im.setAttribute("role", "button");
+    im.setAttribute("aria-label", "View full size: " + (im.getAttribute("alt") || "image"));
+    var open = function () { var list = items(), k = list.findIndex(function (x) { return x.el === im; }); openGallery(list, k < 0 ? 0 : k); };
+    im.addEventListener("click", open);
+    im.addEventListener("keydown", function (e) { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); } });
+  });
 }
 
 // version: label of an older version shown in History ("v3"), for data-file messages.
@@ -2126,12 +2240,7 @@ function renderMarkdownEditor(A, data, ui) {
     try {
       var r = await api("GET", A.base + "/preview?rev=" + A.rev); previewBox.innerHTML = r.html; enhanceTables(previewBox); enhanceCodeBlocks(previewBox);
       previewBox.querySelectorAll("video[data-artifact]").forEach(function (v) { v.preload = "metadata"; });
-      previewBox.querySelectorAll("img[data-artifact]").forEach(function (im) {
-        im.tabIndex = 0; im.title = "View full size";
-        var open = function () { openLightbox(im.getAttribute("src"), im.getAttribute("alt") || "image"); };
-        im.addEventListener("click", open);
-        im.addEventListener("keydown", function (e) { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); } });
-      });
+      wireGallery(previewBox, "img[data-artifact], video[data-artifact]");
     }
     catch (err) { previewBox.replaceChildren(h("p", { class: "msg", role: "alert", text: "Preview failed: " + err.message })); }
   }
@@ -2399,9 +2508,10 @@ async function viewOfflineItem(pid, aid, tab) {
     var pv = h("div", { class: "preview" }); pv.innerHTML = it.html || ""; enhanceTables(pv); enhanceCodeBlocks(pv); // server-sanitized HTML saved while online
     pv.querySelectorAll("img").forEach(function (im) {
       var src = im.getAttribute("src"), b = it.images && it.images[src];
-      if (b) { var u = blobUrl(b); im.src = u; im.tabIndex = 0; im.addEventListener("click", function () { openLightbox(u, im.alt || "image"); }); }
+      if (b) im.src = blobUrl(b);
       else { im.replaceWith(h("span", { class: "muted small", text: "[image not saved offline]" })); }
     });
+    wireGallery(pv, "img"); // videos need the network, so the offline gallery holds the saved images only
     var raw = h("pre", { class: "raw", text: it.body || "" });
     var tabs = tabList("Saved copy views");
     var sel = tab === "raw" ? "raw" : "preview";

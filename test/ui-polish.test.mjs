@@ -16,7 +16,7 @@ const PUPPETEER = `${process.env.HOME}/.npm-packages/lib/node_modules/puppeteer`
 const haveChrome = existsSync(CHROME) && existsSync(PUPPETEER);
 const PORT = SERVER_PORTS.uipolish, ORIGIN = `http://127.0.0.1:${PORT}`;
 const PID = "ui-polish", OTHER = "ui-other";
-let s, h, browser, page, docId, imgId, otherImg;
+let s, h, browser, page, docId, imgId, otherImg, img2Id, galleryDocId;
 
 async function uploadPng(token, pid, title, bytes) {
   const a = agentHttp(ORIGIN, token);
@@ -38,6 +38,8 @@ before(async () => {
   otherImg = await uploadPng((await grant(h, OTHER, "other-up", true)).token, OTHER, "Other image", makePng(16, 16));
   const body = `# Doc\n\nInline: ![A diagram](${imgId})\n\nOther project: ![nope](${otherImg})\n\nExternal: ![ext](https://example.com/x.png)\n\nUnknown: ![u](art_doesnotexist)`;
   docId = (await h.req("POST", `/api/projects/${PID}/artifacts`, { title: "Polish doc", body })).body.artifact_id;
+  img2Id = await uploadPng(tok, PID, "Second", makePng(40, 30));
+  galleryDocId = (await h.req("POST", `/api/projects/${PID}/artifacts`, { title: "Gallery doc", body: `# G\n\n![First](${imgId})\n\nText between.\n\n![Second](${img2Id})\n` })).body.artifact_id;
   if (haveChrome) {
     browser = await require(PUPPETEER).launch({ executablePath: CHROME, headless: true, args: ["--no-first-run"] });
     page = await browser.newPage();
@@ -149,6 +151,78 @@ test("browser: inline image in preview opens a full-size overlay with download; 
   await page.waitForSelector(".lightbox img");
   await page.click('.lightbox .bar button[aria-label="Close"]');
   assert.equal(await page.$(".lightbox"), null);
+});
+
+test("browser: document media open as a gallery with Previous/Next, arrow keys and a position counter", { skip: !haveChrome && "Chrome not installed" }, async () => {
+  await page.goto(`${ORIGIN}/#/p/${PID}/a/${galleryDocId}`);
+  await page.waitForFunction(() => document.querySelectorAll(".preview img[data-artifact]").length === 2);
+  const state = () => page.evaluate(() => ({ cap: document.querySelector(".lightbox .cap").textContent, count: document.querySelector(".lightbox .count").textContent, src: document.querySelector(".lightbox .stage img").getAttribute("src") }));
+  // Opening the second image starts the gallery there.
+  await page.evaluate(() => document.querySelectorAll(".preview img[data-artifact]")[1].click());
+  await page.waitForSelector(".lightbox .stage img");
+  let st = await state();
+  assert.equal(st.count, "2 / 2"); assert.match(st.cap, /^Second/); assert.match(st.src, new RegExp(img2Id));
+  await page.click('.lightbox button[aria-label="Next"]'); // wraps to the first
+  st = await state(); assert.equal(st.count, "1 / 2"); assert.match(st.cap, /^First/);
+  assert.match(await page.evaluate(() => document.querySelector('.lightbox a[aria-label="Download"]').getAttribute("href")), new RegExp(`${imgId}/content\\?download=1$`));
+  await page.keyboard.press("ArrowRight");
+  st = await state(); assert.equal(st.count, "2 / 2");
+  // The page behind the dialog is inert (Tab stays in the gallery); the position is announced with the item name.
+  assert.equal(await page.evaluate(() => !!document.querySelector("#app, main")?.closest("[inert]")), true);
+  assert.match(await page.evaluate(() => document.querySelector(".lightbox .sr[aria-live]").textContent), /^Second, 2 of 2$/);
+  await page.click('.lightbox button[aria-label="Previous"]');
+  st = await state(); assert.equal(st.count, "1 / 2");
+  await page.screenshot({ path: "tmp/test-evidence/ui-gallery.png" });
+  await page.keyboard.press("Escape");
+  assert.equal(await page.$(".lightbox"), null);
+  // A single image has no gallery controls.
+  await page.goto(`${ORIGIN}/#/p/${PID}/a/${docId}`);
+  await page.waitForSelector(".preview img[data-artifact]");
+  await page.click(".preview img[data-artifact]");
+  await page.waitForSelector(".lightbox img");
+  assert.equal(await page.$(".lightbox .gnav"), null);
+  await page.keyboard.press("Escape");
+});
+
+test("browser: Preview has a full-screen mode that covers the app chrome; Escape and Exit leave it", { skip: !haveChrome && "Chrome not installed" }, async () => {
+  for (const vp of [{ width: 900, height: 900 }, { width: 390, height: 800, isMobile: true, hasTouch: true }]) {
+    await page.setViewport(vp);
+    await page.goto(`${ORIGIN}/#/p/${PID}/a/${galleryDocId}`);
+    await page.waitForSelector(".preview img[data-artifact]");
+    await page.click('button[aria-label="Full screen"]');
+    await page.waitForSelector("section.fs-on .fs-bar");
+    const cover = await page.evaluate(() => {
+      const r = document.querySelector("section.fs-on").getBoundingClientRect();
+      // The element at the very top and bottom of the viewport belongs to the full-screen panel, not the app header/tab bar.
+      const topEl = document.elementFromPoint(innerWidth / 2, 4), botEl = document.elementFromPoint(innerWidth / 2, innerHeight - 4);
+      const sec = document.querySelector("section.fs-on");
+      // Hidden app chrome (header, nav, tabs) is inert, so Tab cannot reach controls behind the panel.
+      const chromeInert = [".top", ".side", "[role=tablist]"].every((s) => { const el = document.querySelector(s); return !el || el.closest("[inert]"); });
+      return { x: r.x, y: r.y, w: Math.round(r.width) === innerWidth, h: Math.round(r.height) === innerHeight, top: sec.contains(topEl), bottom: sec.contains(botEl), title: sec.querySelector(".fs-title").textContent, focusInPanel: document.activeElement === sec, chromeInert };
+    });
+    assert.deepEqual(cover, { x: 0, y: 0, w: true, h: true, top: true, bottom: true, title: "Gallery doc", focusInPanel: true, chromeInert: true }, JSON.stringify(vp));
+    // Tab and Shift+Tab never reach the covered app chrome.
+    for (let k = 0; k < 6; k++) await page.keyboard.press("Tab");
+    assert.ok(await page.evaluate(() => document.querySelector("section.fs-on").contains(document.activeElement)), "Tab stays in full screen");
+    await page.keyboard.down("Shift"); for (let k = 0; k < 8; k++) await page.keyboard.press("Tab"); await page.keyboard.up("Shift");
+    assert.ok(await page.evaluate(() => document.querySelector("section.fs-on").contains(document.activeElement) || document.activeElement === document.body), "Shift+Tab stays in full screen");
+    // The gallery still opens on top of full screen; Escape closes only the gallery first.
+    await page.click("section.fs-on .preview img[data-artifact]");
+    await page.waitForSelector(".lightbox");
+    await page.keyboard.press("Escape");
+    assert.equal(await page.$(".lightbox"), null);
+    assert.ok(await page.$("section.fs-on"));
+    await page.screenshot({ path: `tmp/test-evidence/ui-fullscreen-${vp.width}.png` });
+    if (vp.isMobile) await page.click(".fs-bar button");
+    else await page.keyboard.press("Escape");
+    assert.equal(await page.$("section.fs-on"), null);
+    assert.equal(await page.evaluate(() => document.body.classList.contains("reading")), false);
+    assert.equal(await page.evaluate(() => document.querySelectorAll("[inert]").length), 0, "inert is fully undone");
+    // Not offered on the Edit tab.
+    await page.evaluate(() => [...document.querySelectorAll("[role=tab]")].find((b) => b.textContent === "Edit").click());
+    assert.equal(await page.evaluate(() => document.querySelector('button[aria-label="Full screen"]').hidden), true);
+  }
+  await page.setViewport({ width: 900, height: 900 });
 });
 
 test("browser: account menu -> Connected apps and Agent tokens (advanced); revoke a token", { skip: !haveChrome && "Chrome not installed" }, async () => {

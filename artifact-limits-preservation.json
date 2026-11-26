@@ -1,7 +1,7 @@
 {
-  "base_sha256": "d3bd384ecf6abb28ee9c63af1190d10d331fc4f72fb6c7fa6eeba470fd0b0223",
-  "integrated_sha256": "3506ba58f346df10ce40defd1545fcdad9b432e86a01f7c09257042b99ed7dca",
-  "preserved_bytes_sha256": "fc378db4ffbf9e866261d2f9ea097036a2bbbc5b98150592703fac4d2f1e0db9",
+  "base_sha256": "083f6e4cf1a5faad7116e7982377178b2693926defd494b27dbd3c5fa0a890d6",
+  "integrated_sha256": "3e45f76c706e9fa75f00401fbf35184297a8d16c807a90fd86ef409bcbc4f992",
+  "preserved_bytes_sha256": "94eca43888e4fbf5f40e72af734ec175f996bf7ea4cc1d7e081bad5b8cf1f883",
   "patches": [
     {
       "module": "// src/auth.ts",
