@@ -167,10 +167,12 @@ test("Chrome: the HTML preview frame shows the page from the content host, with 
     await fr.waitForFunction(() => document.body && /synthetic heron/.test(document.body.innerText));
     await fr.waitForFunction(() => { const i = document.querySelector("img[alt=chart]"); return i && i.complete && i.naturalWidth === 40; });
     assert.equal(await fr.evaluate(() => document.cookie), "", "no cookies on the content site");
-    // Readable in the device theme: the page paints its own background (the frame is white behind it).
+    // Readable: the page uses the light scheme of the white frame it is shown on, so default text is dark.
+    // (The root stays transparent, so a page's own body background still fills the frame.)
     const [fg, bg] = await fr.evaluate(() => [getComputedStyle(document.querySelector("h1")).color, getComputedStyle(document.documentElement).backgroundColor]);
-    assert.notEqual(fg, bg, `heading ${fg} on ${bg}`);
-    assert.notEqual(bg, "rgba(0, 0, 0, 0)", "opaque page background");
+    const frameBg = await frameEl.evaluate((f) => getComputedStyle(f).backgroundColor);
+    assert.equal(bg === "rgba(0, 0, 0, 0)" ? frameBg : bg, "rgb(255, 255, 255)", `page background ${bg} over frame ${frameBg}`);
+    assert.equal(fg, "rgb(0, 0, 0)", `heading ${fg}`);
     await page.screenshot({ path: "tmp/test-evidence/content-host-html.png" });
     // PDF: Open goes to a new tab, which lands on the content host.
     await page.goto(`${APP}/#/p/${PID}/a/${pdf}`);
