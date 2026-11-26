@@ -1,6 +1,6 @@
 {
-  "base_icon_fixes_sha256": "97956f96b4ed07c549e68f5a2a26465f50b33d62de6472dd996ec801f9dc2317",
-  "integrated_sha256": "c59a058ecab278c4c4c678f972dff98ce891dc0cf4dd7c82219580a34d50b038",
+  "base_icon_fixes_sha256": "b04ff0ffee5eb3663cabc3a294442cc649967b3c17d63035ae9bb78994dccd89",
+  "integrated_sha256": "cf072a395334ddb4d2fdd647f3e2bda39f0a5f399bb21aaba8680bbcbbba09a7",
   "sources_sha256": {
     "service.js": "8b1c74c4d7a99af0b5aaad18fb02584d28249e743ebd28b5d5e961734892c49f",
     "oauth-tools.js": "abc5f4eb6d87826363a6c865388eeee5073435d65f531db0f0e429b594daf473",

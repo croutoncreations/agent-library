@@ -258,6 +258,7 @@ section.fs-on{position:fixed;inset:0;z-index:40;background:var(--bg);overflow:au
 .fs-bar{position:sticky;top:0;z-index:2;display:flex;align-items:center;gap:10px;margin:0 -16px 12px;padding:8px 16px;padding-top:calc(8px + env(safe-area-inset-top,0px));background:color-mix(in srgb,var(--bg) 92%,transparent);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);border-bottom:1px solid var(--line)}
 .fs-bar .fs-title{flex:1;min-width:0;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 section.fs-on > .preview{width:100%;max-width:calc(var(--read) + 64px);margin:0 auto;border:0;background:transparent}
+section.fs-on > :not(iframe){flex-shrink:0} /* the panel scrolls, not a squeezed child */
 section.fs-on iframe.htmlview{flex:1;min-height:0;border-radius:var(--r2)}
 section.fs-on > div:not(.fs-bar):not(.preview),section.fs-on > p{width:100%;max-width:1200px;margin-left:auto;margin-right:auto}
 section.fs-on .media img,section.fs-on .media video{max-height:calc(100dvh - 160px);margin:0 auto;width:auto}

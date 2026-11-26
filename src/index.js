@@ -13671,6 +13671,7 @@ section.fs-on{position:fixed;inset:0;z-index:40;background:var(--bg);overflow:au
 .fs-bar{position:sticky;top:0;z-index:2;display:flex;align-items:center;gap:10px;margin:0 -16px 12px;padding:8px 16px;padding-top:calc(8px + env(safe-area-inset-top,0px));background:color-mix(in srgb,var(--bg) 92%,transparent);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);border-bottom:1px solid var(--line)}
 .fs-bar .fs-title{flex:1;min-width:0;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 section.fs-on > .preview{width:100%;max-width:calc(var(--read) + 64px);margin:0 auto;border:0;background:transparent}
+section.fs-on > :not(iframe){flex-shrink:0} /* the panel scrolls, not a squeezed child */
 section.fs-on iframe.htmlview{flex:1;min-height:0;border-radius:var(--r2)}
 section.fs-on > div:not(.fs-bar):not(.preview),section.fs-on > p{width:100%;max-width:1200px;margin-left:auto;margin-right:auto}
 section.fs-on .media img,section.fs-on .media video{max-height:calc(100dvh - 160px);margin:0 auto;width:auto}
@@ -16273,25 +16274,42 @@ async function viewArtifact(pid, aid, initialTab) {
     var p = panels.preview; if (!p || fsBar) return;
     var exit = h("button", { type: "button", class: "secondary", onclick: function () { exitFs(); } }, icon("x"), "Exit full screen");
     fsBar = h("div", { class: "fs-bar" }, h("span", { class: "fs-title", text: A.meta.title }), exit);
-    // Keep the reader's place: the panel becomes its own scroller, so carry the current offset into it.
-    var y = Math.max(0, -p.getBoundingClientRect().top);
+    // Keep the reader's place: the layout changes (width, padding), so anchor on the first block visible below
+    // the app header and bring that same block to the top of the full-screen view.
+    var head = document.querySelector(".top"), at = blockAt(p, head ? Math.max(0, head.getBoundingClientRect().bottom) : 0);
     p.prepend(fsBar); p.classList.add("fs-on"); document.body.classList.add("reading");
     p.setAttribute("aria-label", "Full screen: " + A.meta.title);
-    p.scrollTop = y;
+    if (at) p.scrollTop += at.el.getBoundingClientRect().top - fsBar.getBoundingClientRect().bottom - at.off;
     // The covered app chrome must not take focus or be read out while hidden behind the panel.
     fsInert = inertOutside(p);
     document.addEventListener("keydown", fsKey);
     // Focus the panel itself (not Exit), so Space/arrows scroll the content instead of leaving full screen.
     p.tabIndex = -1; p.focus({ preventScroll: true });
   }
+  // The first content block still visible below the line y (viewport px), and how far its top sits from that line.
+  function blockAt(p, y) {
+    var root = p.querySelector(":scope > .preview") || p;
+    for (var k = 0; k < root.children.length; k++) {
+      var el = root.children[k]; if (el === fsBar || el === fsBtn) continue;
+      var r = el.getBoundingClientRect(); if (r.bottom > y) return { el: el, off: Math.min(0, r.top - y) };
+    }
+    return null;
+  }
   function exitFs(leaving) {
     if (!fsBar) return;
+    var p = panels.preview, at = leaving ? null : blockAt(p, fsBar.getBoundingClientRect().bottom);
     fsBar.remove(); fsBar = null;
     fsInert(); fsInert = null;
-    panels.preview.classList.remove("fs-on"); panels.preview.removeAttribute("tabindex"); panels.preview.removeAttribute("aria-label");
+    p.classList.remove("fs-on"); p.removeAttribute("tabindex"); p.removeAttribute("aria-label");
     document.body.classList.remove("reading");
     document.removeEventListener("keydown", fsKey);
-    if (!leaving && !fsBtn.hidden) fsBtn.focus();
+    if (leaving) return;
+    // Keep the reader's place: put the same block just below the (sticky) app header on the normal page.
+    if (at && at.el.isConnected) {
+      var head = document.querySelector(".top"), below = head ? Math.max(0, head.getBoundingClientRect().bottom) : 0;
+      window.scrollBy(0, at.el.getBoundingClientRect().top - below - at.off);
+    }
+    if (!fsBtn.hidden) fsBtn.focus({ preventScroll: true });
   }
   S.cleanups.push(function () { exitFs(true); });
   function addTab(name, label, onShow) {
@@ -16881,13 +16899,15 @@ function openGallery(items, start) {
     else if (multi && (e.key === "ArrowLeft" || e.key === "ArrowRight") && !(document.activeElement && document.activeElement.tagName === "VIDEO")) { e.preventDefault(); go(e.key === "ArrowLeft" ? -1 : 1); }
   }
   var restore = null;
+  // Leaving the view (Back, a link, sign-out) closes the gallery too, before that view releases its blob: URLs.
+  var onLeave = function () { done(true); };
+  S.cleanups.push(onLeave);
   function done(leaving) {
     if (!box.isConnected) return;
     document.removeEventListener("keydown", onKey); if (restore) restore(); box.remove();
+    var k = S.cleanups.indexOf(onLeave); if (k >= 0) S.cleanups.splice(k, 1); // don't pile up one per opening
     if (leaving !== true && opener && opener.focus) opener.focus();
   }
-  // Leaving the view (Back, a link, sign-out) closes the gallery too, before that view releases its blob: URLs.
-  S.cleanups.push(function () { done(true); });
   box.addEventListener("click", function (e) { if (e.target === box || e.target === stage) done(); });
   if (multi) {
     // Swipe left/right on touch screens (not on a video, where horizontal drags scrub the timeline).

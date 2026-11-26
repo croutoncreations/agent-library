@@ -1,7 +1,7 @@
 {
-  "base_diagnostics_sha256": "1c0d0e68297cd005da46c6da88e331116e42ffc5833f5a376611f132623246c8",
-  "integrated_sha256": "9feff00fcec6246388579828c0513bb05248d685d3421d9b5b998e908ff03ccd",
-  "preserved_outside_patches_sha256": "7bcc4ca80b0f8a98cfa0bc6de271c80b454d6871ccea763439aa3d81115a9be3",
+  "base_diagnostics_sha256": "725f6477137979991326b11c90fdda41823449e6ac62fa3ce1ad401b1ae90bac",
+  "integrated_sha256": "2927f6db5322e5ffa8a3a6aa7c5f09ab627ad6cf0fdc66a7a1147b3400c15dfe",
+  "preserved_outside_patches_sha256": "d80a6f93609edbdc740b24c64cb1796c507e59f34a168b98c43cd4daf73f69c3",
   "sources_sha256": {
     "home-types.js": "b2625b8f7a991973ca6c84e044918c8b8c3005c7af8721e50f48dd00ee261654",
     "browser.js": "65afbb3f60b6258da2cf6b4d7a6e8577e787ba00aeb105011e52432ebd5f1270",

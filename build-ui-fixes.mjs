@@ -6,9 +6,9 @@
 import {readFileSync,writeFileSync} from 'node:fs';
 import {createHash} from 'node:crypto';
 const sha=b=>createHash('sha256').update(b).digest('hex');
-const SERVICE='ecb38097e00c6ed5a3c5204325727bf29e4c9638b4ed2b3cad52d4a142af4792';
+const SERVICE='ad110fcf22e2f19c00881477067aee178c255d522f4d53d05aa15324e09220e9';
 const input=readFileSync('src/index.js','utf8');
-if(sha(input)!==SERVICE)throw Error('Input is not the service-fixes bundle ecb38097; run build-service-fixes.mjs first');
+if(sha(input)!==SERVICE)throw Error('Input is not the service-fixes bundle ad110fcf; run build-service-fixes.mjs first');
 const once=(s,needle,what,from=0)=>{const i=s.indexOf(needle,from);if(i<0||s.indexOf(needle,i+1)>=0)throw Error('Expected exactly one '+what);return i;};
 const start=once(input,'// src/home.ts\n','home module start');
 const end=once(input,'\n// src/pwa-icons.ts\n','ui module end')+1;

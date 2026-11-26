@@ -16,7 +16,7 @@ const PUPPETEER = `${process.env.HOME}/.npm-packages/lib/node_modules/puppeteer`
 const haveChrome = existsSync(CHROME) && existsSync(PUPPETEER);
 const PORT = SERVER_PORTS.uipolish, ORIGIN = `http://127.0.0.1:${PORT}`;
 const PID = "ui-polish", OTHER = "ui-other";
-let s, h, browser, page, docId, imgId, otherImg, img2Id, galleryDocId;
+let s, h, browser, page, docId, imgId, otherImg, img2Id, galleryDocId, longDocId;
 
 async function uploadPng(token, pid, title, bytes) {
   const a = agentHttp(ORIGIN, token);
@@ -40,6 +40,7 @@ before(async () => {
   docId = (await h.req("POST", `/api/projects/${PID}/artifacts`, { title: "Polish doc", body })).body.artifact_id;
   img2Id = await uploadPng(tok, PID, "Second", makePng(40, 30));
   galleryDocId = (await h.req("POST", `/api/projects/${PID}/artifacts`, { title: "Gallery doc", body: `# G\n\n![First](${imgId})\n\nText between.\n\n![Second](${img2Id})\n` })).body.artifact_id;
+  longDocId = (await h.req("POST", `/api/projects/${PID}/artifacts`, { title: "Long doc", body: "# Long\n\n" + Array.from({ length: 60 }, (_, i) => `## Section ${i + 1}\n\nParagraph ${i + 1} of synthetic filler text for scrolling.`).join("\n\n") })).body.artifact_id;
   if (haveChrome) {
     browser = await require(PUPPETEER).launch({ executablePath: CHROME, headless: true, args: ["--no-first-run"] });
     page = await browser.newPage();
@@ -223,6 +224,30 @@ test("browser: Preview has a full-screen mode that covers the app chrome; Escape
     assert.equal(await page.evaluate(() => document.querySelector('button[aria-label="Full screen"]').hidden), true);
   }
   await page.setViewport({ width: 900, height: 900 });
+});
+
+test("browser: entering and leaving full screen keeps the reading position", { skip: !haveChrome && "Chrome not installed" }, async () => {
+  await page.setViewport({ width: 900, height: 900 });
+  await page.goto(`${ORIGIN}/#/p/${PID}/a/${longDocId}`);
+  await page.waitForFunction(() => document.querySelectorAll(".preview h2").length === 60);
+  // The first heading visible below the sticky header (the fixed full-screen bar when it is shown).
+  const topHeading = () => page.evaluate(() => {
+    const bar = document.querySelector(".fs-bar") || document.querySelector(".top"), line = bar.getBoundingClientRect().bottom;
+    return [...document.querySelectorAll(".preview h2")].find((e) => e.getBoundingClientRect().bottom > line)?.textContent;
+  });
+  await page.evaluate(() => [...document.querySelectorAll(".preview h2")][29].scrollIntoView({ block: "start" }));
+  await page.evaluate(() => window.scrollBy(0, -80)); // clear of the sticky header
+  const before = await topHeading();
+  assert.match(before, /^Section (29|30)$/);
+  await page.evaluate(() => document.querySelector('button[aria-label="Full screen"]').click());
+  await page.waitForSelector("section.fs-on");
+  assert.equal(await topHeading(), before, "same place in full screen");
+  await page.evaluate(() => { document.querySelector("section.fs-on").scrollTop += 600; });
+  const moved = await topHeading();
+  assert.notEqual(moved, before);
+  await page.keyboard.press("Escape");
+  assert.equal(await page.$("section.fs-on"), null);
+  assert.equal(await topHeading(), moved, "same place after leaving full screen");
 });
 
 test("browser: account menu -> Connected apps and Agent tokens (advanced); revoke a token", { skip: !haveChrome && "Chrome not installed" }, async () => {
