@@ -13639,8 +13639,43 @@ details summary:hover{color:var(--fg)}
 .search svg{position:absolute;left:12px;top:50%;width:16px;height:16px;margin-top:-8px;stroke:var(--faint);fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;pointer-events:none}
 .search input{width:100%;padding-left:36px}
 .lightbox{position:fixed;inset:0;z-index:50;background:rgba(0,0,0,.94);display:flex;flex-direction:column;align-items:center;justify-content:center;padding:56px 16px 16px}
+.lightbox .stage{flex:1;min-height:0;width:100%;display:flex;align-items:center;justify-content:center}
 .lightbox img{width:100%;height:100%;object-fit:contain;image-rendering:auto}
+.lightbox video{max-width:100%;max-height:100%;background:#000}
 .lightbox img.small{image-rendering:pixelated}
+.lightbox .bar .count{color:#aaa;font-size:13.5px;font-variant-numeric:tabular-nums;padding:0 8px;white-space:nowrap}
+.lightbox .gnav{position:absolute;top:50%;margin-top:-24px;width:48px;height:48px;min-height:48px;border-radius:50%;background:rgba(0,0,0,.55);color:#eee;border:1px solid rgba(255,255,255,.18)}
+.lightbox .gnav:hover{background:rgba(40,40,40,.85);color:#fff}
+.lightbox .gnav svg{width:24px;height:24px}
+.lightbox .gnav.prev{left:calc(10px + env(safe-area-inset-left,0px))}.lightbox .gnav.prev svg{transform:scaleX(-1)}
+.lightbox .gnav.next{right:calc(10px + env(safe-area-inset-right,0px))}
+.lightbox.multi{padding-left:72px;padding-right:72px}
+@media (max-width:760px){.lightbox .gnav{top:auto;bottom:calc(14px + env(safe-area-inset-bottom,0px));margin-top:0}
+ .lightbox.multi{padding-left:16px;padding-right:16px;padding-bottom:calc(76px + env(safe-area-inset-bottom,0px))}}
+/* full-screen reading: the Preview panel covers the app chrome (header, sidebar, mobile tab bar) */
+.fs-host{position:relative}
+.fs-host > .fs-toggle{position:absolute;top:8px;right:8px;z-index:3;background:color-mix(in srgb,var(--card) 88%,transparent);color:var(--muted);border:1px solid var(--line2);box-shadow:0 1px 3px rgba(0,0,0,.12);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.fs-host > .fs-toggle:hover{background:var(--card);color:var(--fg)}
+section.fs-on > .fs-toggle{display:none!important}
+/* keep the first line of content clear of the corner button */
+.fs-host > .preview > :first-child,.fs-host > p.muted:first-of-type{margin-right:52px}
+@media (pointer:coarse){.fs-host > .preview > :first-child,.fs-host > p.muted:first-of-type{margin-right:56px}}
+/* pages, media and data: the button sits in its own row above the content instead of floating over it */
+.fs-host.fs-inline > .fs-toggle{position:static;display:flex;margin:0 0 8px auto}
+.fs-host.fs-inline > .fs-toggle[hidden]{display:none}
+.fs-host.fs-inline > p.muted:first-of-type{margin-right:0}
+section.fs-on > .preview > :first-child{margin-right:0}
+body.reading{overflow:hidden}
+section.fs-on{position:fixed;inset:0;z-index:40;background:var(--bg);overflow:auto;overscroll-behavior:contain;display:flex;flex-direction:column;
+ padding:0 max(16px,env(safe-area-inset-right,0px)) calc(16px + env(safe-area-inset-bottom,0px)) max(16px,env(safe-area-inset-left,0px))}
+.fs-bar{position:sticky;top:0;z-index:2;display:flex;align-items:center;gap:10px;margin:0 -16px 12px;padding:8px 16px;padding-top:calc(8px + env(safe-area-inset-top,0px));background:color-mix(in srgb,var(--bg) 92%,transparent);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);border-bottom:1px solid var(--line)}
+.fs-bar .fs-title{flex:1;min-width:0;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+section.fs-on > .preview{width:100%;max-width:calc(var(--read) + 64px);margin:0 auto;border:0;background:transparent}
+section.fs-on > :not(iframe){flex-shrink:0} /* the panel scrolls, not a squeezed child */
+section.fs-on iframe.htmlview{flex:1;min-height:0;border-radius:var(--r2)}
+section.fs-on > div:not(.fs-bar):not(.preview),section.fs-on > p{width:100%;max-width:1200px;margin-left:auto;margin-right:auto}
+section.fs-on .media img,section.fs-on .media video{max-height:calc(100dvh - 160px);margin:0 auto;width:auto}
+@media (max-width:760px){section.fs-on > .preview{padding:4px 2px 24px}}
 .lightbox .bar{position:absolute;top:0;right:0;left:0;padding:8px 10px;padding-top:calc(8px + env(safe-area-inset-top,0px));background:#000;display:flex;gap:4px;justify-content:flex-end;align-items:center}
 .lightbox .bar .cap{flex:1;color:#ddd;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-left:6px}
 .lightbox .bar .icon{color:#ddd}.lightbox .bar .icon:hover{background:rgba(255,255,255,.12);color:#fff}
@@ -16229,6 +16264,54 @@ async function viewArtifact(pid, aid, initialTab) {
   // shared panels
   var panels = {}, tabBtns = {};
   var tabNav = tabList("Document views");
+  // Full screen: the Preview/Page panel fills the viewport (over the app header and the mobile tab bar) with a
+  // slim title bar. CSS only, so it works on phones too (iPhone Safari has no element Fullscreen API).
+  // The button floats in the top-right corner of the Preview panel, so the tab row keeps its full width on phones.
+  var fsBtn = iconButton("expand", "Full screen", function () { enterFs(); }, { class: "icon fs-toggle", hidden: true });
+  var fsBar = null, fsInert = null;
+  function fsKey(e) { if (e.key === "Escape" && !e.defaultPrevented && !document.querySelector(".lightbox")) exitFs(); }
+  function enterFs() {
+    var p = panels.preview; if (!p || fsBar) return;
+    var exit = h("button", { type: "button", class: "secondary", onclick: function () { exitFs(); } }, icon("x"), "Exit full screen");
+    fsBar = h("div", { class: "fs-bar" }, h("span", { class: "fs-title", text: A.meta.title }), exit);
+    // Keep the reader's place: the layout changes (width, padding), so anchor on the first block visible below
+    // the app header and bring that same block to the top of the full-screen view.
+    var head = document.querySelector(".top"), at = blockAt(p, head ? Math.max(0, head.getBoundingClientRect().bottom) : 0);
+    p.prepend(fsBar); p.classList.add("fs-on"); document.body.classList.add("reading");
+    p.setAttribute("aria-label", "Full screen: " + A.meta.title);
+    if (at) p.scrollTop += at.el.getBoundingClientRect().top - fsBar.getBoundingClientRect().bottom - at.off;
+    // The covered app chrome must not take focus or be read out while hidden behind the panel.
+    fsInert = inertOutside(p);
+    document.addEventListener("keydown", fsKey);
+    // Focus the panel itself (not Exit), so Space/arrows scroll the content instead of leaving full screen.
+    p.tabIndex = -1; p.focus({ preventScroll: true });
+  }
+  // The first content block still visible below the line y (viewport px), and how far its top sits from that line.
+  function blockAt(p, y) {
+    var root = p.querySelector(":scope > .preview") || p;
+    for (var k = 0; k < root.children.length; k++) {
+      var el = root.children[k]; if (el === fsBar || el === fsBtn) continue;
+      var r = el.getBoundingClientRect(); if (r.bottom > y) return { el: el, off: Math.min(0, r.top - y) };
+    }
+    return null;
+  }
+  function exitFs(leaving) {
+    if (!fsBar) return;
+    var p = panels.preview, at = leaving ? null : blockAt(p, fsBar.getBoundingClientRect().bottom);
+    fsBar.remove(); fsBar = null;
+    fsInert(); fsInert = null;
+    p.classList.remove("fs-on"); p.removeAttribute("tabindex"); p.removeAttribute("aria-label");
+    document.body.classList.remove("reading");
+    document.removeEventListener("keydown", fsKey);
+    if (leaving) return;
+    // Keep the reader's place: put the same block just below the (sticky) app header on the normal page.
+    if (at && at.el.isConnected) {
+      var head = document.querySelector(".top"), below = head ? Math.max(0, head.getBoundingClientRect().bottom) : 0;
+      window.scrollBy(0, at.el.getBoundingClientRect().top - below - at.off);
+    }
+    if (!fsBtn.hidden) fsBtn.focus({ preventScroll: true });
+  }
+  S.cleanups.push(function () { exitFs(true); });
   function addTab(name, label, onShow) {
     panels[name] = h("section", { hidden: true });
     tabBtns[name] = tabButton(label, panels[name], function () { showTab(name); });
@@ -16238,6 +16321,9 @@ async function viewArtifact(pid, aid, initialTab) {
   function showTab(name) {
     for (var k in panels) panels[k].hidden = k !== name;
     selectTab(tabNav, tabBtns[name]);
+    if (name !== "preview") exitFs(true);
+    // Files with no inline view (a PDF card) gain nothing from full screen.
+    fsBtn.hidden = name !== "preview" || !!(panels.preview && panels.preview.querySelector(".filecard") && !panels.preview.querySelector("img, video"));
     A.tab = name;
     if (isTextDoc(A.meta.kind) && (name === "preview" || name === "edit")) {
       var want = "#/p/" + enc(pid) + "/a/" + enc(aid) + (name === "edit" ? "/edit" : "");
@@ -16647,6 +16733,12 @@ async function viewArtifact(pid, aid, initialTab) {
   if (isTextDoc(A.meta.kind)) renderMarkdownEditor(A, data, { titleEl: titleEl, details: details, tabNav: tabNav, panels: panels, addTab: addTab, showTab: showTab, fillMeta: fillMeta, below: below });
   else if (isDataKind(A.meta.kind)) renderDataFile(A, data, { titleEl: titleEl, details: details, tabNav: tabNav, panels: panels, addTab: addTab, showTab: showTab, below: below });
   else renderBinary(A, data, { titleEl: titleEl, details: details, tabNav: tabNav, panels: panels, addTab: addTab, showTab: showTab, below: below });
+  if (panels.preview) {
+    panels.preview.classList.add("fs-host"); panels.preview.prepend(fsBtn);
+    // Only rendered documents float the button over their own padded corner; pages (iframe), media and data
+    // previews get it in a row above the content so it never covers anything.
+    if (!panels.preview.querySelector(":scope > .preview")) panels.preview.classList.add("fs-inline");
+  }
 
   addTab("history", "History", VH.load);
   panels.history.append(VH.root);
@@ -16755,25 +16847,101 @@ function enhanceTables(root) {
     root.tableCleanups.push(stop); S.cleanups.push(stop);
   });
 }
-function openLightbox(src, title) {
-  var opener = document.activeElement;
-  var img = h("img", { src: src, alt: title || "image" });
-  // Fill the viewport (contain); crisp scaling for tiny images. Natural size is shown in the caption.
-  img.addEventListener("load", function () { if (img.naturalWidth < 300) img.classList.add("small"); cap.textContent = (title || "") + " - " + img.naturalWidth + "x" + img.naturalHeight; });
-  var cap = h("span", { class: "cap", text: title || "" });
-  var close;
-  var box = h("div", { class: "lightbox", role: "dialog", "aria-modal": "true", "aria-label": title || "Image" },
-    h("div", { class: "bar" }, cap,
-      iconLink("external", "Open original", src, { target: "_blank", rel: "noopener" }),
-      iconLink("download", "Download", downloadUrl(src), { download: title || "image.png" }),
-      close = iconButton("x", "Close", function () { done(); })),
-    img);
-  function onKey(e) { if (e.key === "Escape") done(); }
-  function done() { document.removeEventListener("keydown", onKey); box.remove(); if (opener && opener.focus) opener.focus(); }
-  box.addEventListener("click", function (e) { if (e.target === box) done(); });
+function openLightbox(src, title) { openGallery([{ src: src, title: title, type: "image" }], 0); }
+// Make everything outside "keep" inert (no focus, hidden from assistive tech): each sibling along keep's ancestor
+// path up to <body>. Returns a function that undoes exactly what it changed, so overlays can nest.
+function inertOutside(keep) {
+  var changed = [];
+  for (var el = keep; el && el !== document.body && el.parentNode; el = el.parentNode) {
+    Array.prototype.forEach.call(el.parentNode.children, function (sib) {
+      if (sib === el || sib.inert || sib.classList.contains("toast") || /^(SCRIPT|STYLE)$/.test(sib.tagName)) return;
+      sib.inert = true; changed.push(sib);
+    });
+  }
+  return function () { changed.forEach(function (s) { s.inert = false; }); };
+}
+// Full-size media overlay. With more than one item it is a gallery: Previous/Next buttons, Left/Right arrow keys
+// and a horizontal swipe move through the items (wrapping at the ends). Escape / click outside / Close dismisses;
+// focus returns to the opener.
+function openGallery(items, start) {
+  var opener = document.activeElement, i = Math.max(0, Math.min(items.length - 1, start || 0)), multi = items.length > 1;
+  var cap = h("span", { class: "cap" }), count = h("span", { class: "count", "aria-hidden": "true" });
+  var said = h("span", { class: "sr", "aria-live": "polite" });
+  var openLink = iconLink("external", "Open original", "#", { target: "_blank", rel: "noopener" });
+  var dlLink = iconLink("download", "Download", "#");
+  var stage = h("div", { class: "stage" });
+  var close = iconButton("x", "Close", function () { done(); });
+  var box = h("div", { class: "lightbox" + (multi ? " multi" : ""), role: "dialog", "aria-modal": "true" },
+    h("div", { class: "bar" }, cap, multi ? count : null, multi ? said : null, openLink, dlLink, close), stage,
+    multi ? iconButton("chevron", "Previous", function () { go(-1); }, { class: "icon gnav prev" }) : null,
+    multi ? iconButton("chevron", "Next", function () { go(1); }, { class: "icon gnav next" }) : null);
+  function show() {
+    var it = items[i], title = it.title || (it.type === "video" ? "video" : "image"), el;
+    cap.textContent = title; box.setAttribute("aria-label", title);
+    count.textContent = (i + 1) + " / " + items.length;
+    said.textContent = title + ", " + (i + 1) + " of " + items.length;
+    openLink.href = it.src;
+    // blob: URLs (offline copies) are downloaded as they are; server URLs ask for an attachment.
+    dlLink.href = /^blob:/.test(it.src) ? it.src : downloadUrl(it.src); dlLink.setAttribute("download", it.title || (it.type === "video" ? "video.mp4" : "image.png"));
+    if (it.type === "video") el = h("video", { src: it.src, controls: true, playsInline: true, preload: "metadata" });
+    else {
+      // Fill the viewport (contain); crisp scaling for tiny images. Natural size is shown in the caption.
+      el = h("img", { src: it.src, alt: title });
+      el.addEventListener("load", function () { if (!stage.contains(el)) return; if (el.naturalWidth < 300) el.classList.add("small"); cap.textContent = title + " - " + el.naturalWidth + "x" + el.naturalHeight; });
+    }
+    stage.replaceChildren(el);
+    // Warm the neighbours so moving through the gallery feels instant.
+    if (multi) [items[(i + 1) % items.length], items[(i - 1 + items.length) % items.length]].forEach(function (n) { if (n.type !== "video") new Image().src = n.src; });
+  }
+  function go(d) { i = (i + d + items.length) % items.length; show(); }
+  function onKey(e) {
+    if (e.key === "Escape") { e.preventDefault(); done(); } // handled: an enclosing full screen stays open
+    else if (multi && (e.key === "ArrowLeft" || e.key === "ArrowRight") && !(document.activeElement && document.activeElement.tagName === "VIDEO")) { e.preventDefault(); go(e.key === "ArrowLeft" ? -1 : 1); }
+  }
+  var restore = null;
+  // Leaving the view (Back, a link, sign-out) closes the gallery too, before that view releases its blob: URLs.
+  var onLeave = function () { done(true); };
+  S.cleanups.push(onLeave);
+  function done(leaving) {
+    if (!box.isConnected) return;
+    document.removeEventListener("keydown", onKey); if (restore) restore(); box.remove();
+    var k = S.cleanups.indexOf(onLeave); if (k >= 0) S.cleanups.splice(k, 1); // don't pile up one per opening
+    if (leaving !== true && opener && opener.focus) opener.focus();
+  }
+  box.addEventListener("click", function (e) { if (e.target === box || e.target === stage) done(); });
+  if (multi) {
+    // Swipe left/right on touch screens (not on a video, where horizontal drags scrub the timeline).
+    var sx = null, sy = 0;
+    stage.addEventListener("touchstart", function (e) { sx = e.touches.length === 1 && e.target.tagName !== "VIDEO" ? e.touches[0].clientX : null; sy = e.touches[0].clientY; }, { passive: true });
+    stage.addEventListener("touchend", function (e) {
+      if (sx === null) return;
+      if (window.visualViewport && visualViewport.scale > 1.01) { sx = null; return; } // panning a pinch-zoomed view
+      var dx = e.changedTouches[0].clientX - sx, dy = e.changedTouches[0].clientY - sy; sx = null;
+      if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy) * 1.5) go(dx < 0 ? 1 : -1);
+    });
+  }
+  show();
   document.addEventListener("keydown", onKey);
   document.body.append(box);
+  restore = inertOutside(box); // keep Tab inside the dialog
   close.focus();
+}
+// Make every image in rendered content open the gallery of all media there (images and videos, in document order).
+function wireGallery(root, selector) {
+  function items() {
+    return Array.prototype.map.call(root.querySelectorAll(selector), function (el) {
+      return el.tagName === "VIDEO" ? { src: el.getAttribute("src"), title: el.getAttribute("title") || "video", type: "video" }
+        : { src: el.getAttribute("src"), title: el.getAttribute("alt") || "image", type: "image", el: el };
+    });
+  }
+  root.querySelectorAll("img").forEach(function (im) {
+    if (!im.matches(selector)) return;
+    im.tabIndex = 0; im.title = "View full size"; im.setAttribute("role", "button");
+    im.setAttribute("aria-label", "View full size: " + (im.getAttribute("alt") || "image"));
+    var open = function () { var list = items(), k = list.findIndex(function (x) { return x.el === im; }); openGallery(list, k < 0 ? 0 : k); };
+    im.addEventListener("click", open);
+    im.addEventListener("keydown", function (e) { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); } });
+  });
 }
 
 // version: label of an older version shown in History ("v3"), for data-file messages.
@@ -17362,12 +17530,7 @@ function renderMarkdownEditor(A, data, ui) {
     try {
       var r = await api("GET", A.base + "/preview?rev=" + A.rev); previewBox.innerHTML = r.html; enhanceTables(previewBox); enhanceCodeBlocks(previewBox);
       previewBox.querySelectorAll("video[data-artifact]").forEach(function (v) { v.preload = "metadata"; });
-      previewBox.querySelectorAll("img[data-artifact]").forEach(function (im) {
-        im.tabIndex = 0; im.title = "View full size";
-        var open = function () { openLightbox(im.getAttribute("src"), im.getAttribute("alt") || "image"); };
-        im.addEventListener("click", open);
-        im.addEventListener("keydown", function (e) { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); } });
-      });
+      wireGallery(previewBox, "img[data-artifact], video[data-artifact]");
     }
     catch (err) { previewBox.replaceChildren(h("p", { class: "msg", role: "alert", text: "Preview failed: " + err.message })); }
   }
@@ -17631,9 +17794,10 @@ async function viewOfflineItem(pid, aid, tab) {
     var pv = h("div", { class: "preview" }); pv.innerHTML = it.html || ""; enhanceTables(pv); enhanceCodeBlocks(pv); // server-sanitized HTML saved while online
     pv.querySelectorAll("img").forEach(function (im) {
       var src = im.getAttribute("src"), b = it.images && it.images[src];
-      if (b) { var u = blobUrl(b); im.src = u; im.tabIndex = 0; im.addEventListener("click", function () { openLightbox(u, im.alt || "image"); }); }
+      if (b) im.src = blobUrl(b);
       else { im.replaceWith(h("span", { class: "muted small", text: "[image not saved offline]" })); }
     });
+    wireGallery(pv, "img"); // videos need the network, so the offline gallery holds the saved images only
     var raw = h("pre", { class: "raw", text: it.body || "" });
     var tabs = tabList("Saved copy views");
     var sel = tab === "raw" ? "raw" : "preview";
