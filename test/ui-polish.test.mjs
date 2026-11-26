@@ -16,7 +16,7 @@ const PUPPETEER = `${process.env.HOME}/.npm-packages/lib/node_modules/puppeteer`
 const haveChrome = existsSync(CHROME) && existsSync(PUPPETEER);
 const PORT = SERVER_PORTS.uipolish, ORIGIN = `http://127.0.0.1:${PORT}`;
 const PID = "ui-polish", OTHER = "ui-other";
-let s, h, browser, page, docId, imgId, otherImg, img2Id, galleryDocId, longDocId;
+let s, h, browser, page, docId, imgId, otherImg, img2Id, galleryDocId, longDocId, pageId;
 
 async function uploadPng(token, pid, title, bytes) {
   const a = agentHttp(ORIGIN, token);
@@ -40,6 +40,7 @@ before(async () => {
   docId = (await h.req("POST", `/api/projects/${PID}/artifacts`, { title: "Polish doc", body })).body.artifact_id;
   img2Id = await uploadPng(tok, PID, "Second", makePng(40, 30));
   galleryDocId = (await h.req("POST", `/api/projects/${PID}/artifacts`, { title: "Gallery doc", body: `# G\n\n![First](${imgId})\n\nText between.\n\n![Second](${img2Id})\n` })).body.artifact_id;
+  pageId = (await h.req("POST", `/api/projects/${PID}/artifacts`, { title: "Synthetic page", kind: "html", body: "<h1>Synthetic page</h1><p>Plain text.</p>" })).body.artifact_id;
   longDocId = (await h.req("POST", `/api/projects/${PID}/artifacts`, { title: "Long doc", body: "# Long\n\n" + Array.from({ length: 60 }, (_, i) => `## Section ${i + 1}\n\nParagraph ${i + 1} of synthetic filler text for scrolling.`).join("\n\n") })).body.artifact_id;
   if (haveChrome) {
     browser = await require(PUPPETEER).launch({ executablePath: CHROME, headless: true, args: ["--no-first-run"] });
@@ -225,6 +226,23 @@ test("browser: Preview has a full-screen mode that covers the app chrome; Escape
     assert.equal(await page.evaluate(() => document.querySelector('button[aria-label="Full screen"]').hidden), true);
   }
   await page.setViewport({ width: 900, height: 900 });
+});
+
+test("browser: Escape typed inside a rendered HTML page leaves full screen", { skip: !haveChrome && "Chrome not installed" }, async () => {
+  await page.setViewport({ width: 900, height: 900 });
+  await page.goto(`${ORIGIN}/#/p/${PID}/a/${pageId}`);
+  await page.waitForSelector("iframe.htmlview");
+  const frame = await (await page.$("iframe.htmlview")).contentFrame();
+  await frame.waitForFunction(() => document.body?.innerText.includes("Plain text"));
+  await page.click('button[aria-label="Full screen"]');
+  await page.waitForSelector("section.fs-on iframe.htmlview");
+  // Focus moves into the frame's document (as a click in the page would); its keys don't reach the app document.
+  await page.click("section.fs-on iframe.htmlview");
+  assert.equal(await page.evaluate(() => document.activeElement?.tagName), "IFRAME");
+  await page.keyboard.press("Escape");
+  await page.waitForFunction(() => !document.querySelector("section.fs-on"), { timeout: 3000 });
+  // The frame stays scriptless and sandboxed exactly as before.
+  assert.equal(await page.$eval("iframe.htmlview", (f) => f.getAttribute("sandbox")), "allow-same-origin allow-popups allow-popups-to-escape-sandbox");
 });
 
 test("browser: entering and leaving full screen keeps the reading position", { skip: !haveChrome && "Chrome not installed" }, async () => {

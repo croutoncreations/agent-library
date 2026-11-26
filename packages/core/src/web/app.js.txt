@@ -3267,6 +3267,7 @@ async function viewArtifact(pid, aid, initialTab) {
     // The covered app chrome must not take focus or be read out while hidden behind the panel.
     fsInert = inertOutside(p);
     document.addEventListener("keydown", fsKey);
+    fsFrameKeys(true);
     // Focus the panel itself (not Exit), so Space/arrows scroll the content instead of leaving full screen.
     p.tabIndex = -1; p.focus({ preventScroll: true });
   }
@@ -3287,6 +3288,7 @@ async function viewArtifact(pid, aid, initialTab) {
     p.classList.remove("fs-on"); p.removeAttribute("tabindex"); p.removeAttribute("aria-label");
     document.body.classList.remove("reading");
     document.removeEventListener("keydown", fsKey);
+    fsFrameKeys(false);
     if (leaving) return;
     // Keep the reader's place: put the same block just below the (sticky) app header on the normal page.
     if (at && at.el.isConnected) {
@@ -3296,6 +3298,24 @@ async function viewArtifact(pid, aid, initialTab) {
     if (!fsBtn.hidden) fsBtn.focus({ preventScroll: true });
   }
   S.cleanups.push(function () { exitFs(true); });
+  // Keys typed inside the rendered page (a same-origin iframe without scripts) never reach this document, so Escape
+  // is also heard on the frame's own document. The listener runs here, in the app; the frame's sandbox is unchanged.
+  // Re-attached on each frame load, since navigation replaces that document.
+  var fsFrameDoc = null;
+  function fsFrameAttach() {
+    var fr = panels.preview && panels.preview.querySelector("iframe.htmlview"), d = null;
+    try { d = fr && fr.contentDocument; } catch (e) { d = null; }
+    if (fsFrameDoc === d) return;
+    if (fsFrameDoc) fsFrameDoc.removeEventListener("keydown", fsKey);
+    fsFrameDoc = d; if (d) d.addEventListener("keydown", fsKey);
+  }
+  function fsFrameKeys(on) {
+    var fr = panels.preview && panels.preview.querySelector("iframe.htmlview");
+    if (on) { fsFrameAttach(); if (fr) fr.addEventListener("load", fsFrameAttach); return; }
+    if (fr) fr.removeEventListener("load", fsFrameAttach);
+    if (fsFrameDoc) fsFrameDoc.removeEventListener("keydown", fsKey);
+    fsFrameDoc = null;
+  }
   // Offered only on Preview, and only when there is a view to enlarge: not for a PDF card (no inline view) or
   // a page too large to render (only its notice is shown). Called again when the preview changes.
   function syncFsBtn() {
@@ -3927,7 +3947,7 @@ function openGallery(items, start) {
     else if (multi && (e.key === "ArrowLeft" || e.key === "ArrowRight") && !(document.activeElement && document.activeElement.tagName === "VIDEO")) { e.preventDefault(); go(e.key === "ArrowLeft" ? -1 : 1); }
   }
   var restore = null;
-  // Leaving the view (Back, a link, sign-out) closes the gallery too, before that view releases its blob: URLs.
+  // Leaving the view (Back, a link, sign-out) closes the gallery too, so it never outlives the view or its blob: URLs.
   var onLeave = function () { done(true); };
   S.cleanups.push(onLeave);
   function done(leaving) {
@@ -4013,6 +4033,7 @@ function renderBinary(A, data, ui) {
     info.textContent = (Object.prototype.hasOwnProperty.call(kinds, d.revision.mime) ? kinds[d.revision.mime] : d.revision.mime) + " · " + fmtBytes(d.revision.size) + " · rev " + d.revision.rev + " · updated " + fmtDate(d.revision.created_at);
     info.title = "sha256 " + d.revision.sha256;
     holder.replaceChildren(mediaFor(d.revision.mime, d.content_url, d.artifact.title));
+    if (A.syncFsBtn) A.syncFsBtn(); // a new version may change between a PDF card and an image or video
   }
   A.reload = async function () { draw(await api("GET", A.base)); };
   draw(data);
