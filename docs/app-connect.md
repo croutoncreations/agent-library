@@ -8,17 +8,19 @@ Turn it on with `APP_CONNECT_ENABLED = "1"` (the example config and the self-hos
 
 | | App | You (owner) | Agents with access to the project |
 |---|---|---|---|
-| Create, replace, delete its files | yes | no (protected source) | no |
-| Read its own files | yes | yes | yes, read-only |
+| Create, replace, delete its files | yes | no (protected source), unless you allow [shared editing](#shared-editing) | no, unless you allow shared editing |
+| Read its own files | yes | yes | yes (read-only without shared editing) |
 | Read anything else in the library | **no** | yes | per their grant |
 
-To edit an app's file, make a copy. Revoking the app (Settings → Publishing apps) stops it at once; its files stay in your library. Disabling an app stops every connection it has, reads included (`401`).
+To edit an app's file, make a copy, or allow shared editing. Revoking the app (Settings → Publishing apps) stops it at once; its files stay in your library. Disabling an app stops every connection it has, reads included (`401`).
 
 ## Connect
 
 1. **Register the app** (owner, once): Settings → Publishing apps. Enter a display name, 1–3 exact callback URLs and 0–3 web origins. This creates a public OAuth client (PKCE, no secret). Registration grants nothing.
 2. **The app sends you to** `https://MCP_HOST/authorize` with `response_type=code`, its `client_id`, an exact `redirect_uri`, `scope=agentlib:publish offline_access`, `resource=https://MCP_HOST/v1`, `state` and a PKCE S256 `code_challenge`. You sign in and pick the project and destination (a new folder, an existing folder or the project root), or resume the app's earlier connection. The page lists who can already read that project.
 3. **Token exchange:** `POST https://MCP_HOST/oauth/token` returns an access token (15 minutes) and a refresh token. Dynamic client registration can never obtain `agentlib:publish`.
+
+**Shared editing.** The consent page has a box, **Let people and agents edit these files too**, which is off by default. See [Shared editing](#shared-editing).
 
 **Suggested destination.** The app may add `agentlib_project` (an id or title) and `agentlib_folder` (a top-level folder name, 1–80 characters, no `/`) to the authorize URL; you can also set defaults when registering (`suggested_project`, `suggested_folder` on `PUT /api/app-clients/{id}`). These only pre-fill the consent page. You always choose, and invalid values are ignored.
 
@@ -28,7 +30,7 @@ One path-addressed API for every kind of file: text (Markdown, HTML, JSON, CSV) 
 
 | Request | Answer |
 |---|---|
-| `GET /v1/app` | `{ app_id, publisher_id, display_name, project: {id, title}, folder: {id, name, path} or null, limits: { max_file_bytes, max_text_bytes, max_binary_bytes, max_path_chars, max_path_segments } }` (`max_file_bytes` is the text limit, kept for older apps) |
+| `GET /v1/app` | `{ app_id, publisher_id, display_name, project: {id, title}, folder: {id, name, path} or null, shared_edit (see [Shared editing](#shared-editing)), limits: { max_file_bytes, max_text_bytes, max_binary_bytes, max_path_chars, max_path_segments } }` (`max_file_bytes` is the text limit, kept for older apps) |
 | `GET /v1/app/files?prefix=&cursor=&limit=` | `{ files, next_cursor }` in path order, `limit` 1–100. Each file: `path`, `file_id`, `kind`, `mime`, `content_type`, `title`, `folder: {id, path}` (or null at the project root), `revision`, `etag`, `sha256`, `size`, `created_at`, `updated_at`, `web_url` (and `preview_url` for text) |
 | `GET` / `HEAD /v1/app/files/{path}` | The bytes, with `ETag: "<sha256>"`. Supports `If-None-Match` (`304`) and `Range` (`206`, `416`) |
 | `PUT /v1/app/files/{path}` | Needs `Content-Type` (the path's type), `Content-Length`, `Idempotency-Key`, and `If-None-Match: *` (create) or `If-Match: "<sha256>"` (replace). Binary files also need `X-Content-SHA256: <64 hex>`. Optional: `X-Agentlib-Title`, `X-Agentlib-Author`, `X-Agentlib-Change-Note` ([below](#title-author-and-change-note)). `201`/`200 { file }` (`file.title` included); `200 { file, unchanged: true }` when the bytes are the current ones (nothing is written); `412` with `current_etag` and `current_revision` when the precondition fails |
@@ -93,6 +95,18 @@ There is no multi-file transaction. To publish a consistent set of files:
 A `412` on the index means another writer won: re-read the index, rebuild and retry. A crash between steps leaves the previous index in place, and repeating the run with the same keys is safe: unchanged files answer `unchanged: true`.
 
 **Readers** (agents, bots, other apps) read `index.json` first. Find it with `list_artifacts` and `app_path: "index.json"` (also `GET /v1/projects/{id}/files?app_path=index.json` with an API key). Then read each listed file **at its pinned revision** (`read_artifact` takes a `revision`) and check its `sha256`. A reader that arrives during a run sees the old index and the old revisions, never a mix. Every file's metadata carries `app_path` (null for files that are not an app's), so a title match is never needed.
+
+## Shared editing
+
+By default only the app changes its files, so the app stays the source of truth. Some apps are shared workspaces instead, for example a bot library where you and your agents keep notes next to the bot's reports. For those, tick **Let people and agents edit these files too** on the consent page, or turn it on later in **Settings → Connections → Publishing apps** (one switch per connection). With it on:
+
+- People with edit access to the project, and agents connected with edit access to it (MCP, API keys, agent tokens), can save new versions of the app's files, upload a new version of a binary file (same type), rename them, change tags, comment, restore older versions and trash them. History shows who made each version.
+- The app still owns the paths. Files stay in its folders and can't be moved out, and its folders keep their rules (see **Folders** above). The app keeps reading and writing them at the same paths.
+- **The app must expect outside changes.** `GET /v1/app` reports `shared_edit: true`. Always replace with `If-Match`: a `412 precondition_failed` answer carries `current_etag` and `current_revision`. Re-read, merge, and `PUT` again with the new ETag. Never overwrite blindly. A file someone trashed answers `409 destination_file_trashed` until you restore it.
+- Review doesn't apply: app files never wait for review, so an agent's edit is saved directly, even in a project that requires review. The consent page and the Settings confirmation say so.
+- An outside edit of a text file must fit the app's own 1 MiB text limit (`413 too_large`), so the app can always replace the file again.
+
+Changing the setting takes effect on the next write. It is `PUT /api/publishers/{publisher_id}/sharing` with `{ "shared_edit": true | false }`. The person who connected the app (while they can still edit the project) or a project admin may change it. Each change is audited as `publisher.sharing`. Turning it on needs an active connection in an active workspace. Turning it off is always allowed, even for a revoked connection or in a suspended workspace. Re-sending the current value changes nothing and isn't audited. Turning it off protects the files again; edits already made stay in their history. **Revoking the app turns shared editing off**, so a revoked app's files are protected, as before. A resumed connection keeps its setting. A Worker rolled back before this release ignores the setting, and every app file is protected again.
 
 ## Backup
 

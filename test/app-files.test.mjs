@@ -23,11 +23,11 @@ const sql = (q) => JSON.parse(execFileSync("wrangler", ["d1", "--config", LOCAL_
 const ok = (r, status = 200) => { assert.equal(r.status, status, JSON.stringify(r.body ?? r.json)); return r.body ?? r.json; };
 const TYPE = { md: "text/markdown", html: "text/html", json: "application/json", csv: "text/csv" };
 
-/** A fresh app + publisher into project `pid` (the owner consents). */
-async function connect(pid, { destination = "root", origins = [] } = {}) {
+/** A fresh app + publisher into project `pid` (the owner consents; sharedEdit ticks "Let people and agents edit"). */
+async function connect(pid, { destination = "root", origins = [], sharedEdit = false } = {}) {
   const label = uniq("app").replace("-key", "");
   const app = await h.registerApp({ display_name: `Files ${label}`, redirect_uris: [`https://${label}.example.test/cb`], origins });
-  const P = await h.connectPublisher(app, { project_id: pid, destination, ...destination === "new" ? { new_folder_name: label } : {} });
+  const P = await h.connectPublisher(app, { project_id: pid, destination, ...destination === "new" ? { new_folder_name: label } : {}, ...sharedEdit ? { shared_edit: "1" } : {} });
   return { app, P, tok: P.access_token };
 }
 /** PUT a file: { create } sends If-None-Match: *, { match } sends If-Match; headers override (null removes). */
@@ -72,7 +72,8 @@ after(async () => { await h?.stop(); });
 test("GET /v1/app says who the app is, with its destination and limit", async () => {
   const c = await connect("files-own", { destination: "new" });
   const me = ok(await h.pub(c.tok, "GET", "/app"));
-  assert.deepEqual(Object.keys(me).sort(), ["app_id", "display_name", "folder", "limits", "project", "publisher_id"]);
+  assert.deepEqual(Object.keys(me).sort(), ["app_id", "display_name", "folder", "limits", "project", "publisher_id", "shared_edit"]);
+  assert.equal(me.shared_edit, false, "only the app edits its files unless the owner allowed shared editing");
   assert.equal(me.app_id, c.app.app_client_id); assert.equal(me.publisher_id, c.P.publisher_id);
   assert.deepEqual(me.project, { id: "files-own", title: "Files own" });
   assert.match(me.folder.id, /^fld_/); assert.equal(me.folder.path, me.folder.name);
@@ -338,6 +339,61 @@ test("agents can read app files but never write them; the owner cannot edit them
   const edit = await owner.req("PUT", `/api/projects/files-own/artifacts/${f.file_id}`, { expected_revision: 1, content: "{}" });
   assert.equal(edit.status, 403); assert.equal(edit.body.error.code, "protected_source");
   assert.equal((await get(c.tok, "index.json")).text, '{"files":[]}', "untouched");
+});
+
+test("shared editing: chosen at consent, agents and the owner edit the app's files, the app sees it, and turning it off protects them again", async () => {
+  // The consent page offers the choice, unticked by default.
+  const app0 = await h.registerApp({ display_name: "Files consent page", redirect_uris: ["https://consent-page.example.test/cb"] });
+  const page = await h.authorize(app0, {}, { stopAtConsent: true });
+  assert.match(page.consentHtml, /<input type="checkbox" name="shared_edit" value="1">/, "offered, not ticked");
+
+  const c = await connect("files-own", { destination: "new", sharedEdit: true });
+  assert.equal(ok(await h.pub(c.tok, "GET", "/app")).shared_edit, true, "the app is told");
+  assert.equal(ok(await h.pub((await connect("files-own")).tok, "GET", "/app")).shared_edit, false, "off unless ticked");
+  const doc = (await put(c.tok, "notes/plan.md", "# plan\n", { create: true })).json.file;
+  const data = (await put(c.tok, "index.json", '{"n":1}', { create: true })).json.file;
+  const agent = await h.connectMcpAgent({ "files-own": "write" }, { clientName: "Shared files agent" });
+  const meta = await agent.call("read_artifact", { project_id: "files-own", artifact_id: doc.file_id });
+  assert.equal(meta.data.artifact.publisher.protected, false, "agents see the file is editable");
+
+  // An MCP agent with write access edits the app's Markdown; the owner edits its JSON in the app.
+  const save = await agent.call("save_markdown", { project_id: "files-own", artifact_id: doc.file_id, expected_revision: 1, body: "# plan\n\nagent line\n", idempotency_key: uniq("shared-save") });
+  assert.equal(save.isError, false, JSON.stringify(save.data)); assert.equal(save.data.revision, 2);
+  ok(await owner.req("PUT", `/api/projects/files-own/artifacts/${data.file_id}`, { expected_revision: 1, content: '{"n":2}' }));
+
+  // The app reads the new bytes at the same path; its stale If-Match gets 412 with the current ETag, and it can merge.
+  assert.equal((await get(c.tok, "notes/plan.md")).text, "# plan\n\nagent line\n");
+  const stale = await put(c.tok, "notes/plan.md", "# plan v2\n", { match: doc.etag });
+  err(stale, 412, "precondition_failed"); assert.equal(stale.json.error.current_etag, etagOf("# plan\n\nagent line\n"));
+  assert.equal((await put(c.tok, "notes/plan.md", "# plan\n\nagent line\napp line\n", { match: stale.json.error.current_etag })).status, 200);
+  assert.deepEqual(ok(await list(c.tok)).files.map((x) => x.path), ["index.json", "notes/plan.md"], "still the app's files, at their paths");
+  // Outside edits stay within the app's own 1 MiB text limit, so the app can always replace the file again.
+  const cur = ok(await list(c.tok)).files.find((x) => x.path === "notes/plan.md");
+  const big = await agent.call("save_markdown", { project_id: "files-own", artifact_id: doc.file_id, expected_revision: cur.revision, body: "#".repeat(1048577), idempotency_key: uniq("shared-big") });
+  assert.equal(big.isError, true); assert.match(JSON.stringify(big.data), /too_large/);
+  assert.equal(ok(await list(c.tok)).files.find((x) => x.path === "notes/plan.md").revision, cur.revision, "nothing written");
+
+  // Only the person who connected it (or a project admin) turns it off; then agents and the owner are refused again.
+  const off = ok(await owner.req("PUT", `/api/publishers/${c.P.publisher_id}/sharing`, { shared_edit: false }));
+  assert.deepEqual(off, { publisher_id: c.P.publisher_id, shared_edit: false });
+  assert.equal(ok(await h.pub(c.tok, "GET", "/app")).shared_edit, false);
+  const again = await agent.call("save_markdown", { project_id: "files-own", artifact_id: doc.file_id, expected_revision: 3, body: "x", idempotency_key: uniq("shared-save") });
+  assert.equal(again.isError, true); assert.match(JSON.stringify(again.data), /protected_source/);
+  const edit = await owner.req("PUT", `/api/projects/files-own/artifacts/${data.file_id}`, { expected_revision: 2, content: "{}" });
+  assert.equal(edit.status, 403); assert.equal(edit.body.error.code, "protected_source");
+  const listed = ok(await owner.req("GET", "/api/app-clients")).app_clients.flatMap((x) => x.publishers).find((p) => p.publisher_id === c.P.publisher_id);
+  assert.equal(listed.shared_edit, false);
+  assert.equal((await owner.req("PUT", `/api/publishers/${c.P.publisher_id}/sharing`, { shared_edit: "yes" })).status, 400);
+  assert.equal((await owner.req("PUT", "/api/publishers/pub_doesnotexist00/sharing", { shared_edit: true })).status, 404);
+  assert.equal(ok(await owner.req("PUT", `/api/publishers/${c.P.publisher_id}/sharing`, { shared_edit: false })).shared_edit, false, "same value: answered, not re-audited");
+  assert.deepEqual(sql(`SELECT result FROM audits WHERE action = 'publisher.sharing' AND object_id = '${c.P.publisher_id}'`).map((r) => r.result), ["ok:app-only"]);
+
+  // Revoking a shared connection protects its files again.
+  const r = await connect("files-own", { sharedEdit: true });
+  const rf = (await put(r.tok, "revoked.md", "# r\n", { create: true })).json.file;
+  ok(await owner.req("POST", `/api/publishers/${r.P.publisher_id}/revoke`, {}));
+  const afterRevoke = await agent.call("save_markdown", { project_id: "files-own", artifact_id: rf.file_id, expected_revision: 1, body: "x", idempotency_key: uniq("shared-save") });
+  assert.equal(afterRevoke.isError, true); assert.match(JSON.stringify(afterRevoke.data), /protected_source/);
 });
 
 test("other credentials are refused: cookies 400, an API key, an MCP token and no token 401", async () => {

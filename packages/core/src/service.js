@@ -1,4 +1,4 @@
-import { TEXT_MAX_BYTES } from "./text-limits.js";
+import { APP_TEXT_MAX_BYTES, TEXT_MAX_BYTES } from "./text-limits.js";
 import { commitTextWrites, getText, isTextWriteFenceError, mapContent, stageTextWrite, textWriteComplete } from "./content-store.js";
 import { authorizeProject, authzSql, contentWriteSql, credentialGate, protectSql, requireHuman } from "./auth.js";
 import { chQuery, cleanupChanges, listChanges } from "./changes/service.js";
@@ -22,7 +22,8 @@ function requireAppConnect(ctx) {
 }
 function assertWritable(ctx, a, what) {
   tplAssertMaintenance(ctx, a);
-  if (!a?.publisher_id || ctx.publisher) return;
+  // pub_shared: the owner opened this app's files to shared editing (re-checked inside the write's own statement).
+  if (!a?.publisher_id || ctx.publisher || a.pub_shared) return;
   if (what === "content" || ctx.principal.kind === "agent")
     throw new HttpError(403, "protected_source", "This file is a source export owned by a connected app and cannot be modified here");
 }
@@ -397,6 +398,14 @@ async function publishRevision(ctx, projectId, artifactId, expected, i, rev, ext
   const next = expected + 1;
   const azBase = authzSql(ctx, projectId);
   const cw = contentWriteSql(ctx, artifactId);
+  // Shared editing: someone else's text version of an app's file must still fit the app's own 1 MiB limit, or the app
+  // could never replace it again. Checked here for a clear error and again inside the insert (appText below).
+  const textRev = rev.body != null;
+  if (textRev && !ctx.publisher && rev.size > APP_TEXT_MAX_BYTES && await db(ctx).prepare("SELECT 1 FROM artifacts WHERE id = ? AND publisher_id IS NOT NULL").bind(artifactId).first())
+    throw new HttpError(413, "too_large", `A connected app's text file can be at most 1 MiB (${APP_TEXT_MAX_BYTES.toLocaleString("en-US")} bytes), so the app can still replace it`, { max_bytes: APP_TEXT_MAX_BYTES });
+  const appText = textRev && !ctx.publisher
+    ? { sql: "(? <= ? OR NOT EXISTS (SELECT 1 FROM artifacts WHERE id = ? AND publisher_id IS NOT NULL))", params: [rev.size, APP_TEXT_MAX_BYTES, artifactId] }
+    : { sql: "1", params: [] };
   // Text revisions count against storage here; new file revisions were reserved (and counted) when the upload began.
   // A restored file version adds a revision row of its size (counted in usage), so it is checked here too.
   const reserved = rev.reservedUpload;
@@ -411,7 +420,7 @@ async function publishRevision(ctx, projectId, artifactId, expected, i, rev, ext
         AND (a.folder_id IS NULL OR EXISTS (SELECT 1 FROM folders f WHERE f.id = a.folder_id AND f.project_id = u.project_id)))`,
     params: [reserved.id, projectId, artifactId, reserved.token, rev.size, rev.sha256, rev.mime]
   } : { sql: "1", params: [] };
-  const az = { sql: `${azBase.sql} AND ${cw.sql} AND ${lg.sql} AND ${reservation.sql}${rev.fence ? " AND " + rev.fence.sql : ""}`, params: [...azBase.params, ...cw.params, ...lg.params, ...reservation.params, ...rev.fence?.params ?? []] };
+  const az = { sql: `${azBase.sql} AND ${cw.sql} AND ${appText.sql} AND ${lg.sql} AND ${reservation.sql}${rev.fence ? " AND " + rev.fence.sql : ""}`, params: [...azBase.params, ...cw.params, ...appText.params, ...lg.params, ...reservation.params, ...rev.fence?.params ?? []] };
   const now = nowIso();
   const gate = "EXISTS (SELECT 1 FROM revisions WHERE id = ?)";
   const body2 = { artifact_id: artifactId, revision: next, revision_id: revId, sha256: rev.sha256, ...reserved ? { size: rev.size } : {} };
@@ -459,8 +468,8 @@ async function publishRevision(ctx, projectId, artifactId, expected, i, rev, ext
     if (cur && cur.head_rev !== expected)
       throw new HttpError(409, "revision_conflict", "Expected revision is stale", { current_revision: cur.head_rev, expected_revision: expected });
     if ((addBytes || reserved) && lg.workspaceId) await explainLimit(ctx.env, lg.workspaceId, { storage_bytes: addBytes }, lg.limits);
-    const pub = await db(ctx).prepare("SELECT publisher_id FROM artifacts WHERE id = ?").bind(artifactId).first("publisher_id");
-    if (pub && !ctx.publisher) throw new HttpError(403, "protected_source", "This file is a source export owned by a connected app and cannot be modified here");
+    const pub = await db(ctx).prepare(`SELECT a.publisher_id, (SELECT shared_edit FROM publishers WHERE id = a.publisher_id AND revoked_at IS NULL) AS shared FROM artifacts a WHERE a.id = ?`).bind(artifactId).first();
+    if (pub?.publisher_id && !pub.shared && !ctx.publisher) throw new HttpError(403, "protected_source", "This file is a source export owned by a connected app and cannot be modified here");
     throw new HttpError(403, "forbidden", "Grant no longer valid");
   }
   return { status: 200, body: body2 };
@@ -794,11 +803,12 @@ artifactView = (a, appConnect = true) => ({
   ...appConnect ? {
     folder_id: a.folder_id ?? null,
     schema: a.schema_id ?? null,
-    publisher: a.publisher_id ? { id: a.publisher_id, display_name: a.pub_name ?? null, protected: true } : null,
+    // protected: only the app can change it. false: the owner chose shared editing for this app's files.
+    publisher: a.publisher_id ? { id: a.publisher_id, display_name: a.pub_name ?? null, protected: !a.pub_shared } : null,
     app_path: a.publisher_id ? a.export_name ?? null : null
   } : a.folder_id ? { folder_id: a.folder_id } : {},
   ...rvArtifactReview(a)
 });
-ART_COLS = "a.*, (SELECT display_name FROM publishers WHERE id = a.publisher_id) AS pub_name" + RV_ART_COLS;
+ART_COLS = "a.*, (SELECT display_name FROM publishers WHERE id = a.publisher_id) AS pub_name, (SELECT shared_edit FROM publishers WHERE id = a.publisher_id AND revoked_at IS NULL) AS pub_shared" + RV_ART_COLS;
 
 export { BINARY_TYPES, FOLDERS_PER_PROJECT, FOLDER_ROOM_SQL, IMAGE_TYPES, LIMITS, RS_SCHEMA, RT_ID_TOO_LONG, RT_KINDS_ALL, RT_KINDS_DOCS, VIDEO_TYPES, addComment, appConnectEnabled, assertWritable, audit, auditDenied, chQuery, cleanupChanges, connectionInfo, createFile, createFolder, createFromTemplate, createGrant, createMarkdown, createProject, updateProject, db, diffRevisions, folderCheck, folderName, getArtifact, history, idemInsert, idemLookup, legacyConnectionInfo, listArtifacts, listAudit, listChanges, listComments, listFolders, listGrants, listProjects, listTemplates, loadArtifact, textCreateMetadata, mdBody, metaHistory, previewTemplate, provenance, publishRevision, readRecords, readRecordsPage, readTextChunk, requireAppConnect, restoreMetadata, restoreRevision, rsQuery, rsReady, rsToolReady, rtChunkLimit, rtFit, rtIdBytes, rtQuery, rtReadAuthzSql, runBatch, saveAsTemplate, saveFile, saveMarkdown, searchArtifacts, servedContentType, tplDate, tplTools, tooManyFolders, updateGrant, updateMetadata };

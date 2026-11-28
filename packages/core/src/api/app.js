@@ -19,6 +19,8 @@ async function me(env, db, p) {
     display_name: p.display_name,
     project: { id: proj.id, title: proj.title },
     folder: f ? { id: f.id, name: f.name, path: f.path } : null,
+    // true: the owner lets people and agents edit this app's files too; expect 412 on If-Match and re-read.
+    shared_edit: p.shared_edit === 1,
     // max_file_bytes: text files (kept for older apps); max_binary_bytes: binary files, the workspace plan's file limit.
     limits: { max_file_bytes: APP_FILE_MAX_BYTES, max_text_bytes: APP_FILE_MAX_BYTES, max_binary_bytes: (await projectLimitGuard(env, p.project_id, {})).limits.file_bytes, max_path_chars: APP_PATH_MAX_CHARS, max_path_segments: APP_PATH_MAX_SEGMENTS }
   };

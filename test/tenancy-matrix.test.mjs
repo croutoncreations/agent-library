@@ -9,6 +9,8 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { createRequire } from "node:module";
+import { existsSync } from "node:fs";
 import { startAppConnectServer } from "./fixtures/app-connect-harness.mjs";
 import { agentHttp, mcpClient, key, sha256, ROOT, LOCAL_CONFIG } from "./helpers.mjs";
 import { makePng } from "./make-fixtures.mjs";
@@ -84,6 +86,28 @@ function readOps(kind, X, agent = cred.oauth) {
 const toolStatus = (r) => !r.isError ? 200 : (r.data?.error?.status ?? r.data?.status ?? (r.status >= 400 ? r.status : 500));
 const mcpCall = async (m, name, args) => { try { const r = await m.call(name, args); return { status: toolStatus(r), text: JSON.stringify(r.data ?? {}) }; } catch (e) { return { status: e.code ?? 500, text: String(e.message) }; } };
 const oc = async (agent, name, args) => { const r = await agent.call(name, args); return { status: toolStatus(r), text: JSON.stringify(r.data ?? {}) }; };
+
+// Real Chrome: open Settings -> Publishing apps as `who`, find the card for another person's app, tick its sharing switch
+// (accepting the confirmation) and wait for the server's answer.
+const CHROME = process.env.CHROME_PATH ?? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+const PUPPETEER = `${process.env.HOME}/.npm-packages/lib/node_modules/puppeteer`;
+const haveChrome = existsSync(CHROME) && existsSync(PUPPETEER);
+async function settingsSwitch(who, publisherId, appName) {
+  const browser = await createRequire(import.meta.url)(PUPPETEER).launch({ executablePath: CHROME, headless: true, args: ["--no-first-run"] });
+  try {
+    const p = await browser.newPage();
+    const [cn, cv] = who.cookie.split("=");
+    await p.setCookie({ name: cn, value: cv, url: h.appUi });
+    p.on("dialog", (d) => d.accept());
+    await p.goto(`${h.appUi}/#/settings/publishing`);
+    const sel = `input[aria-label="Let people and agents edit ${appName}'s files"]`;
+    await p.waitForSelector(sel, { timeout: 15000 });
+    assert.match(await p.evaluate(() => document.body.innerText), /Other apps publishing into your projects/i);
+    const done = p.waitForResponse((r) => r.url().endsWith(`/api/publishers/${publisherId}/sharing`) && r.request().method() === "PUT");
+    await p.click(sel);
+    assert.equal((await done).status(), 200);
+  } finally { await browser.close(); }
+}
 
 before(async () => {
   h = await startAppConnectServer({ port: SERVER_PORTS["tenancy-matrix"] });
@@ -334,15 +358,47 @@ test("management: members get 403, outsiders 404; a chosen project id is refused
   const pubA = await h.connectPublisher(cred.app, { project_id: A.project, destination: "root" });
   const listed = ok(await bob.req("GET", "/api/app-clients")).other_publishers.find((p) => p.publisher_id === pubA.publisher_id);
   assert.ok(listed && listed.project_id === A.project, "the admin sees the member's publisher in other_publishers");
+  assert.equal(listed.display_name, cred.app.display_name, "named, so Settings can show its card and sharing switch");
+  assert.equal(listed.shared_edit, false);
   // An outsider sees nothing of it and can't revoke it; the admin can.
   assert.equal((await dave.req("GET", "/api/app-clients")).body.other_publishers.some((p) => p.publisher_id === pubA.publisher_id), false);
   assert.equal((await dave.req("POST", `/api/publishers/${pubA.publisher_id}/revoke`)).status, 404);
+  // Shared editing: a member who didn't connect it and an outsider can't change it; the connecting member and an admin can.
+  const sharing = (who, on) => who.req("PUT", `/api/publishers/${pubA.publisher_id}/sharing`, { shared_edit: on });
+  assert.equal((await sharing(carol, true)).status, 404, "a member who didn't connect it");
+  assert.equal((await sharing(dave, true)).status, 404, "an outsider");
+  assert.equal(ok(await sharing(owner, true)).shared_edit, true, "the member who connected it");
+  assert.equal(ok(await sharing(owner, true)).shared_edit, true, "the same value again answers it");
+  assert.equal(ok(await sharing(bob, false)).shared_edit, false, "an admin");
+  ok(await sharing(bob, true));
   ok(await bob.req("POST", `/api/publishers/${pubA.publisher_id}/revoke`));
+  // Revoking ends sharing (the app's files are protected again); turning it on for a revoked connection is refused,
+  // turning it off is always fine.
+  assert.equal((await sharing(bob, true)).status, 404, "a revoked connection can't be opened");
+  assert.equal(ok(await sharing(bob, false)).shared_edit, false, "off is always allowed");
+  assert.deepEqual(sql(`SELECT result FROM audits WHERE action = 'publisher.sharing' AND object_id = '${pubA.publisher_id}' ORDER BY rowid`).map((r) => r.result), ["ok:shared-edit", "ok:app-only", "ok:shared-edit"], "one audit row per real change");
   assert.equal((await h.pub(pubA.access_token, "GET", "/app")).status, 401);
   // The owner's own app listing shows only publishers whose project they can see (the B one, and A while member).
   ok(await bob.req("DELETE", `/api/workspaces/${WSA}/members/${ownerId}`));
   const mineAfter = ok(await owner.req("GET", "/api/app-clients")).app_clients.flatMap((c) => c.publishers);
   assert.ok(mineAfter.some((p) => p.project_id === B.project));
+});
+
+// Runs before the last-owner race below, which can demote bob from owner.
+test("Settings: an admin turns on shared editing for an app someone else registered (real Chrome)", { skip: !haveChrome && "Chrome not installed" }, async () => {
+  // A member connects their own app into the workspace's project; the admin (bob) didn't register it.
+  const frank = await h.person("frank");
+  const inv = ok(await bob.req("POST", `/api/workspaces/${WSA}/invites`, { email: "frank@example.test", role: "member" }), 201);
+  ok(await frank.req("POST", "/api/invites/accept", { token: inv.accept_url.split("/").pop() }));
+  const app = ok(await frank.req("POST", "/api/app-clients", { display_name: "Frank Exporter", redirect_uris: ["https://frank-exporter.example.test/cb"] }), 201);
+  // Connected straight in the database: the publisher consent harness signs in as the owner only. Same columns the
+  // consent page writes; the admin's view and the sharing route are what this test checks.
+  const frankId = ok(await frank.req("GET", "/api/me")).principal.id, pid = "pub_frankexporter01", agt = "agt_frankexporter01", at = new Date().toISOString();
+  sql(`INSERT INTO principals (id, kind, issuer, subject, label, created_at) VALUES ('${agt}', 'agent', 'agent-library-publisher', '${pid}', 'publisher:Frank Exporter', '${at}')`);
+  sql(`INSERT INTO publishers (id, owner_principal_id, principal_id, app_client_id, display_name, project_id, folder_id, created_at, workspace_id, created_by) VALUES ('${pid}', '${frankId}', '${agt}', '${app.app_client_id}', 'Frank Exporter', '${A.project}', NULL, '${at}', '${WSA}', '${frankId}')`);
+  await settingsSwitch(bob, pid, "Frank Exporter");
+  const listed = ok(await bob.req("GET", "/api/app-clients")).other_publishers.find((p) => p.publisher_id === pid);
+  assert.equal(listed.display_name, "Frank Exporter"); assert.equal(listed.shared_edit, true, "turned on from Settings");
 });
 
 test("last owner: two concurrent demotions of the only two owners leave exactly one owner", async () => {
@@ -360,3 +416,4 @@ test("last owner: two concurrent demotions of the only two owners leave exactly 
   // Each success removed one owner: the statuses agree with the final state.
   assert.equal([r1, r2].filter((r) => r.status === 200).length, 2 - owners, `statuses ${r1.status}, ${r2.status}; owners ${owners}`);
 });
+
