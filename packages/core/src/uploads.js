@@ -133,6 +133,11 @@ async function uploadBegin(ctx, projectId, input, key, { allowText = false, allo
     const a = target ?? await loadArtifact(ctx, projectId, artifactId, { pendingOk: rvGatedActor(ctx) });
     assertWritable(ctx, a, "content");
     if (!kind && a.kind !== "binary") throw new HttpError(400, "invalid_input", "Not a binary artifact");
+    // A shared app file's type is fixed by its app path's extension (shot.png): a new version by anyone else keeps it.
+    if (!kind && a.publisher_id && !ctx.publisher) {
+      const headMime = await ctx.env.DB.prepare("SELECT mime FROM revisions WHERE id = ?").bind(a.head_revision_id).first("mime");
+      if (headMime && headMime !== mime) throw new HttpError(400, "invalid_input", `A connected app's file keeps its type: upload ${headMime}`, { expected: headMime });
+    }
     // 0: an agent's own new file while it waits for review.
     baseRev = int(input.expected_revision, "expected_revision", a.pending_review === 1 ? 0 : 1);
   } else {

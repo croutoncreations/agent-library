@@ -2,7 +2,7 @@ import { TEXT_WRITE_BODY_BYTES } from "./text-limits.js";
 import { adapters, notify, resolveAdapters, withAdapters } from "./adapters.js";
 import { browserSignInEnabled, checkEmailPage, signinCallback, signinChoices, signinStart } from "./identity/browser.js";
 import { TURNSTILE_ORIGIN, turnstileSiteKey } from "./identity/turnstile.js";
-import { disableAppClient, listAppClients, registerAppClient, revokePublisher, updateAppClient } from "./api/app-clients.js";
+import { disableAppClient, listAppClients, registerAppClient, revokePublisher, setPublisherSharing, updateAppClient } from "./api/app-clients.js";
 import { createApiKey, listApiKeys, replaceApiKey, revokeApiKey, setApiKeyScope } from "./api/credentials.js";
 import { handleV1, isV1Path } from "./api/v1.js";
 import { authenticate, enforceRate, requireCsrf, requireHuman, sessionCookie } from "./auth.js";
@@ -251,6 +251,7 @@ function legalLinks(env) {
   if (seg[0] === "review-grants" && seg.length === 1 && m === "GET") return json(await listReviewGrants(ctx));
   if (seg[0] === "review-grants" && seg.length === 1 && m === "PUT") return json(await setReviewGrant(ctx, await body(req)));
   if (seg[0] === "publishers" && seg.length === 3 && seg[2] === "revoke" && m === "POST") return json(await revokePublisher(ctx, str(seg[1], "publisher", 64)));
+  if (seg[0] === "publishers" && seg.length === 3 && seg[2] === "sharing" && m === "PUT") return json(await setPublisherSharing(ctx, str(seg[1], "publisher", 64), await body(req)));
   if (seg[0] !== "projects") return extraRoute(req, env, url, requestId, ctx);
   if (seg.length === 1) {
     if (m === "GET") return json(await listProjects(ctx));

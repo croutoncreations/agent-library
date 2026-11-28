@@ -2820,6 +2820,17 @@ function viewPublishingApps() {
   function pending(){return JSON.parse(localStorage.getItem(key)||"null");}
   function setBusy(v){busy=v;[submit,prefill,name,origins,callbacks,sugProject,sugFolder].forEach(function(e){e.disabled=v||!allowed;});}
   function same(c,v){function sorted(a){return JSON.stringify((a||[]).slice().sort());}return c.display_name===v.display_name&&sorted(c.origins)===sorted(v.origins)&&sorted(c.redirect_uris)===sorted(v.redirect_uris);}
+  // Shared editing per connection (docs/app-connect.md#shared-editing): saved at once; the box goes back if refused.
+  function sharingToggle(c,p){
+    var box=h("input",{type:"checkbox",checked:!!p.shared_edit,"aria-label":"Let people and agents edit "+c.display_name+"'s files"});
+    box.onchange=async function(){var want=box.checked;
+      if(want&&!confirm("Let people and agents with edit access to "+(projectTitles[p.project_id]||"this project")+" change, rename and trash "+c.display_name+"'s files? "+c.display_name+" will see their changes and may overwrite them."))return void(box.checked=false);
+      box.disabled=true;
+      try{var r=await api("PUT","/api/publishers/"+enc(p.publisher_id)+"/sharing",{shared_edit:want});p.shared_edit=r.shared_edit;box.checked=r.shared_edit;toast(r.shared_edit?"People and agents can now edit "+c.display_name+"'s files":"Only "+c.display_name+" can change its files now");}
+      catch(err){box.checked=!want;showMsg(msg,"Couldn't change editing for "+c.display_name+": "+err.message);}
+      finally{box.disabled=false;}};
+    return h("label",{class:"small row"},box,h("span",{text:"People and agents can edit its files in "+(projectTitles[p.project_id]||p.project_id)}));
+  }
   function draw(cs){list.replaceChildren(h("h2",{text:"Registered publishing apps"}));if(!cs.length)list.append(stateBox("","upload","No publishing apps registered","Register an app below. Registering does not connect a project or export anything."));cs.forEach(function(c){
     var id=h("input",{readOnly:true,value:c.client_id,"aria-label":c.display_name+" public client ID",class:"token"});
     // Publishing access is shown from saved publisher records only; registration alone grants nothing.
@@ -2827,8 +2838,8 @@ function viewPublishingApps() {
     list.append(connCard({name:c.display_name,icon:"upload",sub:"Publishing app · "+((c.origins||[]).join(", ")||"no web origins"),
       status:statusBadge(c.disabled?"disabled":active.length?"active":"registered"),inactive:!!c.disabled,
       accessLabel:active.length?"Publishes into:":"Not connected to any project yet. Connect from the app and choose a destination; you approve it on a consent page.",
-      access:active.length?active.map(function(p){return {title:projectTitles[p.project_id]||p.project_id,access:(p.folder_id?"own folder":"project root")};}):undefined,
-      diagnostic: h("div", null, pubs.map(function(p) { return connectionSummary("publisher", p.publisher_id, c.display_name, [{ project_id: p.project_id, folder_id: p.folder_id, access: "own files only" }], null, null, c.disabled ? "disabled" : p.status, c.checked_at); })),
+      access:active.length?active.map(function(p){return {title:projectTitles[p.project_id]||p.project_id,access:(p.folder_id?"own folder":"project root")+(p.shared_edit?" · shared editing":"")};}):undefined,
+      diagnostic: h("div", null, active.map(function(p) { return sharingToggle(c, p); }), pubs.map(function(p) { return connectionSummary("publisher", p.publisher_id, c.display_name, [{ project_id: p.project_id, folder_id: p.folder_id, access: p.shared_edit ? "own files, also editable by people and agents" : "own files only" }], null, null, c.disabled ? "disabled" : p.status, c.checked_at); })),
       foot:["Callbacks: "+(c.redirect_uris||[]).join(", ")].concat(c.suggested_project||c.suggested_folder?["Suggests: "+(c.suggested_project||"first project")+" / "+(c.suggested_folder||"app name")]:[]).concat(["Registered "+fmtDate(c.created_at)])}),
       h("details",null,h("summary",{text:"Public client ID (not a secret)"}),h("div",{class:"row"},id,h("button",{type:"button",class:"secondary",onclick:function(){id.select();copyText(c.client_id,msg);}},icon("copy"),"Copy"))));
   });}

@@ -22,7 +22,8 @@ function requireAppConnect(ctx) {
 }
 function assertWritable(ctx, a, what) {
   tplAssertMaintenance(ctx, a);
-  if (!a?.publisher_id || ctx.publisher) return;
+  // pub_shared: the owner opened this app's files to shared editing (re-checked inside the write's own statement).
+  if (!a?.publisher_id || ctx.publisher || a.pub_shared) return;
   if (what === "content" || ctx.principal.kind === "agent")
     throw new HttpError(403, "protected_source", "This file is a source export owned by a connected app and cannot be modified here");
 }
@@ -459,8 +460,8 @@ async function publishRevision(ctx, projectId, artifactId, expected, i, rev, ext
     if (cur && cur.head_rev !== expected)
       throw new HttpError(409, "revision_conflict", "Expected revision is stale", { current_revision: cur.head_rev, expected_revision: expected });
     if ((addBytes || reserved) && lg.workspaceId) await explainLimit(ctx.env, lg.workspaceId, { storage_bytes: addBytes }, lg.limits);
-    const pub = await db(ctx).prepare("SELECT publisher_id FROM artifacts WHERE id = ?").bind(artifactId).first("publisher_id");
-    if (pub && !ctx.publisher) throw new HttpError(403, "protected_source", "This file is a source export owned by a connected app and cannot be modified here");
+    const pub = await db(ctx).prepare(`SELECT a.publisher_id, (SELECT shared_edit FROM publishers WHERE id = a.publisher_id) AS shared FROM artifacts a WHERE a.id = ?`).bind(artifactId).first();
+    if (pub?.publisher_id && !pub.shared && !ctx.publisher) throw new HttpError(403, "protected_source", "This file is a source export owned by a connected app and cannot be modified here");
     throw new HttpError(403, "forbidden", "Grant no longer valid");
   }
   return { status: 200, body: body2 };
@@ -794,11 +795,12 @@ artifactView = (a, appConnect = true) => ({
   ...appConnect ? {
     folder_id: a.folder_id ?? null,
     schema: a.schema_id ?? null,
-    publisher: a.publisher_id ? { id: a.publisher_id, display_name: a.pub_name ?? null, protected: true } : null,
+    // protected: only the app can change it. false: the owner chose shared editing for this app's files.
+    publisher: a.publisher_id ? { id: a.publisher_id, display_name: a.pub_name ?? null, protected: !a.pub_shared } : null,
     app_path: a.publisher_id ? a.export_name ?? null : null
   } : a.folder_id ? { folder_id: a.folder_id } : {},
   ...rvArtifactReview(a)
 });
-ART_COLS = "a.*, (SELECT display_name FROM publishers WHERE id = a.publisher_id) AS pub_name" + RV_ART_COLS;
+ART_COLS = "a.*, (SELECT display_name FROM publishers WHERE id = a.publisher_id) AS pub_name, (SELECT shared_edit FROM publishers WHERE id = a.publisher_id) AS pub_shared" + RV_ART_COLS;
 
 export { BINARY_TYPES, FOLDERS_PER_PROJECT, FOLDER_ROOM_SQL, IMAGE_TYPES, LIMITS, RS_SCHEMA, RT_ID_TOO_LONG, RT_KINDS_ALL, RT_KINDS_DOCS, VIDEO_TYPES, addComment, appConnectEnabled, assertWritable, audit, auditDenied, chQuery, cleanupChanges, connectionInfo, createFile, createFolder, createFromTemplate, createGrant, createMarkdown, createProject, updateProject, db, diffRevisions, folderCheck, folderName, getArtifact, history, idemInsert, idemLookup, legacyConnectionInfo, listArtifacts, listAudit, listChanges, listComments, listFolders, listGrants, listProjects, listTemplates, loadArtifact, textCreateMetadata, mdBody, metaHistory, previewTemplate, provenance, publishRevision, readRecords, readRecordsPage, readTextChunk, requireAppConnect, restoreMetadata, restoreRevision, rsQuery, rsReady, rsToolReady, rtChunkLimit, rtFit, rtIdBytes, rtQuery, rtReadAuthzSql, runBatch, saveAsTemplate, saveFile, saveMarkdown, searchArtifacts, servedContentType, tplDate, tplTools, tooManyFolders, updateGrant, updateMetadata };

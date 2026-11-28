@@ -975,7 +975,8 @@ ${active.length ? `<section class="sec"><h2>Destination</h2>${cards}<label class
 <label class="field"><span>Project</span><select name="project_id" aria-label="Project">${projOpts}</select></label>${consentProjectsNote(projects)}
 <label class="field"><span>Folder</span>${folderSelect}</label>
 <label class="field newname"><span>Folder name</span><input type="text" name="new_folder_name" maxlength="80" value="${esc(pick("new_folder_name", defaultFolder))}" aria-label="New folder name"></label>
-<details class="more"><summary>${cxIcon("chev")}Who else can read this project</summary><div class="inner"><p class="fine">They will be able to read this app's files, <strong>including future exports</strong>, and <strong>cannot edit them</strong>. Nothing new is granted to them.</p>${audienceHtml}</div></details>
+<label class="check"><input type="checkbox" name="shared_edit" value="1"${pick("shared_edit", "") === "1" ? " checked" : ""}><span><strong>Let people and agents edit these files too</strong><small>Anyone with edit access to this project, including connected agents (MCP), can change, rename and trash the app's files. Otherwise only ${esc(name)} can. You can change this later in Settings.</small></span></label>
+<details class="more"><summary>${cxIcon("chev")}Who else can read this project</summary><div class="inner"><p class="fine">They will be able to read this app's files, <strong>including future exports</strong>, and <strong>cannot edit them</strong> unless you tick the box above. Nothing new is granted to them.</p>${audienceHtml}</div></details>
 </section>
 ${cxBar("")}</form>`), consent.headers, status);
 }
@@ -1009,6 +1010,8 @@ async function publishConsentPost(req, env, oauth, form, handle, origin) {
     const proj = await env.DB.prepare(`SELECT p.id, COALESCE(p.workspace_id, 'wsp_' || p.owner_id) AS workspace_id FROM projects p WHERE p.id = ? AND ${memberRoleSql("p.id", "member")}`).bind(projectId, sess.principal_id).first();
     if (!proj) return retry("Choose one of your projects.");
     const dest = String(form.get("destination") ?? "");
+    // Shared editing: only an explicit tick (an unchecked box submits nothing). A resumed connection keeps its setting.
+    const sharedEdit = form.get("shared_edit") === "1" ? 1 : 0;
     let folderId = null;
     publisherId = randomId("pub", 15);
     epoch = 1;
@@ -1043,9 +1046,9 @@ async function publishConsentPost(req, env, oauth, form, handle, origin) {
     stmts.push(
       env.DB.prepare(`INSERT INTO principals (id, kind, issuer, subject, label, created_at) SELECT ?, 'agent', 'agent-library-publisher', ?, ?, ? WHERE ${pg.sql}${newFolder ? " AND EXISTS (SELECT 1 FROM folders WHERE id = ?)" : ""}`)
         .bind(principalId, publisherId, `publisher:${app.display_name}`.slice(0, 200), at, ...pg.params, ...newFolder ? [newFolder] : []),
-      env.DB.prepare(`INSERT INTO publishers (id, owner_principal_id, principal_id, app_client_id, display_name, project_id, folder_id, created_at, workspace_id, created_by)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(publisherId, sess.principal_id, principalId, app.id, app.display_name, projectId, folderId, at, proj.workspace_id, sess.principal_id),
-      audit2(projectId, "publisher.connect", publisherId, folderId ? "ok:folder" : "ok:root")
+      env.DB.prepare(`INSERT INTO publishers (id, owner_principal_id, principal_id, app_client_id, display_name, project_id, folder_id, created_at, workspace_id, created_by, shared_edit)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(publisherId, sess.principal_id, principalId, app.id, app.display_name, projectId, folderId, at, proj.workspace_id, sess.principal_id, sharedEdit),
+      audit2(projectId, "publisher.connect", publisherId, (folderId ? "ok:folder" : "ok:root") + (sharedEdit ? ":shared-edit" : ""))
     );
   }
   const approved = await oauth.approveConsent(req, handle, { scope: [SCOPES.publish, SCOPES.offline] });

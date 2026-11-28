@@ -89,7 +89,7 @@ async function listAppClients(ctx) {
   r.results = r.results.slice(0, 100);
   // Publishers of these apps, plus any publisher connected into a project where I'm an admin or connected it myself.
   const pubs = await ctx.env.DB.prepare(
-    `SELECT pb.id, pb.app_client_id, pb.project_id, pb.folder_id, pb.created_at, pb.revoked_at
+    `SELECT pb.id, pb.app_client_id, pb.project_id, pb.folder_id, pb.created_at, pb.revoked_at, pb.shared_edit
      FROM publishers pb WHERE (pb.app_client_id IN (SELECT c.id FROM app_clients c WHERE ${APP_MANAGER})
          AND (COALESCE(pb.created_by, pb.owner_principal_id) = ? OR ${memberRoleSql("pb.project_id", "viewer")}))
        OR COALESCE(pb.created_by, pb.owner_principal_id) = ? OR ${memberRoleSql("pb.project_id", "admin", "?", true)} ORDER BY pb.created_at DESC LIMIT 501`
@@ -101,6 +101,7 @@ async function listAppClients(ctx) {
     project_id: p.project_id,
     folder_id: p.folder_id,
     created_at: p.created_at,
+    shared_edit: p.shared_edit === 1,
     status: p.revoked_at === null ? "active" : "revoked"
   });
   const mine = new Set(r.results.map((c) => c.id));
@@ -131,4 +132,21 @@ async function revokePublisher(ctx, id) {
   return { ok: true };
 }
 
-export { disableAppClient, listAppClients, registerAppClient, revokePublisher, updateAppClient };
+// Shared editing (docs/app-connect.md#shared-editing): whether people and agents with edit access to the project may
+// change this app's files too. Turning it on opens the files to them, so it needs the person who connected the app (still
+// able to edit the project) or a project admin, in an active workspace. Each write re-reads it in its own statement.
+async function setPublisherSharing(ctx, id, input) {
+  requireHuman(ctx);
+  requireAppConnect(ctx);
+  if (typeof input?.shared_edit !== "boolean") throw new HttpError(400, "invalid_input", "shared_edit must be true or false");
+  const on = input.shared_edit ? 1 : 0;
+  const r = await ctx.env.DB.prepare(`UPDATE publishers AS pb SET shared_edit = ? WHERE pb.id = ? AND pb.revoked_at IS NULL
+      AND ((COALESCE(pb.created_by, pb.owner_principal_id) = ? AND ${memberRoleSql("pb.project_id", "member")}) OR ${memberRoleSql("pb.project_id", "admin")})`)
+    .bind(on, id, ctx.principal.id, ctx.principal.id, ctx.principal.id).run();
+  if (!r.meta.changes) throw new HttpError(404, "not_found", "Publisher not found, revoked, or not yours to change");
+  const p = await ctx.env.DB.prepare("SELECT project_id FROM publishers WHERE id = ?").bind(id).first("project_id");
+  await ctx.env.DB.prepare("INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id) VALUES (?, ?, ?, 'publisher.sharing', ?, ?, ?)").bind(nowIso(), ctx.principal.id, p, id, on ? "ok:shared-edit" : "ok:app-only", ctx.requestId).run();
+  return { publisher_id: id, shared_edit: !!on };
+}
+
+export { disableAppClient, listAppClients, registerAppClient, revokePublisher, setPublisherSharing, updateAppClient };

@@ -50,14 +50,14 @@ test('0034 is the only rebuild of oauth_connections, carries the owner approval 
   // Pipeline order: a database at 0033 refuses until 0034 has been run by hand, then applies 0035 on its own.
   const at33 = names.indexOf('0033_proposal_text_keys.sql');
   assert.throws(() => planMigrations(names.slice(0, at33 + 1), repo), /manual owner-run window.*0034_oauth_connections_nullable_project\.sql/);
-  assert.deepEqual(planMigrations(names.slice(0, at33 + 2), repo).map((m) => m.name), ['0035_oauth_connection_label.sql', '0036_nested_folders.sql', '0037_app_files_author.sql']);
+  assert.deepEqual(planMigrations(names.slice(0, at33 + 2), repo).map((m) => m.name), ['0035_oauth_connection_label.sql', '0036_nested_folders.sql', '0037_app_files_author.sql', '0038_publisher_shared_edit.sql']);
 });
 
 test('0036_nested_folders.sql is additive (same columns and index as public main 0018_nested_folders.sql) and auto-applies after 0035', () => {
   const m = repo.find((x) => x.name === '0036_nested_folders.sql');
   assert.ok(m && !m.destructive, '0036 must stay additive');
   for (const s of ['ALTER TABLE folders ADD COLUMN parent_id TEXT;', 'ALTER TABLE folders ADD COLUMN path TEXT;', 'CREATE INDEX IF NOT EXISTS folders_parent ON folders(project_id, parent_id);']) assert.ok(m.sql.includes(s), s);
-  assert.deepEqual(planMigrations(names.slice(0, names.indexOf('0035_oauth_connection_label.sql') + 1), repo).map((x) => x.name), ['0036_nested_folders.sql', '0037_app_files_author.sql']);
+  assert.deepEqual(planMigrations(names.slice(0, names.indexOf('0035_oauth_connection_label.sql') + 1), repo).map((x) => x.name), ['0036_nested_folders.sql', '0037_app_files_author.sql', '0038_publisher_shared_edit.sql']);
 });
 
 test('0037_app_files_author.sql adds one nullable column to revisions and meta_versions and auto-applies after 0036', () => {
@@ -65,7 +65,15 @@ test('0037_app_files_author.sql adds one nullable column to revisions and meta_v
   assert.ok(m && !m.destructive, '0037 must stay additive');
   const stmts = m.sql.split('\n').filter((l) => l.trim() && !l.startsWith('--'));
   assert.deepEqual(stmts, ['ALTER TABLE revisions ADD COLUMN on_behalf_of TEXT;', 'ALTER TABLE meta_versions ADD COLUMN on_behalf_of TEXT;']);
-  assert.deepEqual(planMigrations(names.slice(0, names.indexOf('0036_nested_folders.sql') + 1), repo).map((x) => x.name), ['0037_app_files_author.sql']);
+  assert.deepEqual(planMigrations(names.slice(0, names.indexOf('0036_nested_folders.sql') + 1), repo).map((x) => x.name), ['0037_app_files_author.sql', '0038_publisher_shared_edit.sql']);
+});
+
+test('0038_publisher_shared_edit.sql adds one defaulted column to publishers and auto-applies after 0037', () => {
+  const m = repo.find((x) => x.name === '0038_publisher_shared_edit.sql');
+  assert.ok(m && !m.destructive, '0038 must stay additive');
+  const stmts = m.sql.split('\n').filter((l) => l.trim() && !l.startsWith('--'));
+  assert.deepEqual(stmts, ['ALTER TABLE publishers ADD COLUMN shared_edit INTEGER NOT NULL DEFAULT 0;']);
+  assert.deepEqual(planMigrations(names.slice(0, names.indexOf('0037_app_files_author.sql') + 1), repo).map((x) => x.name), ['0038_publisher_shared_edit.sql']);
 });
 
 test('0034 rebuilds oauth_connections: rows, columns and all four indexes survive, project_id accepts NULL, and the foreign key from oauth_connection_projects still holds', () => {
