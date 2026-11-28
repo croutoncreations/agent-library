@@ -384,6 +384,23 @@ test("management: members get 403, outsiders 404; a chosen project id is refused
   assert.ok(mineAfter.some((p) => p.project_id === B.project));
 });
 
+// Runs before the last-owner race below, which can demote bob from owner.
+test("Settings: an admin turns on shared editing for an app someone else registered (real Chrome)", { skip: !haveChrome && "Chrome not installed" }, async () => {
+  // A member connects their own app into the workspace's project; the admin (bob) didn't register it.
+  const frank = await h.person("frank");
+  const inv = ok(await bob.req("POST", `/api/workspaces/${WSA}/invites`, { email: "frank@example.test", role: "member" }), 201);
+  ok(await frank.req("POST", "/api/invites/accept", { token: inv.accept_url.split("/").pop() }));
+  const app = ok(await frank.req("POST", "/api/app-clients", { display_name: "Frank Exporter", redirect_uris: ["https://frank-exporter.example.test/cb"] }), 201);
+  // Connected straight in the database: the publisher consent harness signs in as the owner only. Same columns the
+  // consent page writes; the admin's view and the sharing route are what this test checks.
+  const frankId = ok(await frank.req("GET", "/api/me")).principal.id, pid = "pub_frankexporter01", agt = "agt_frankexporter01", at = new Date().toISOString();
+  sql(`INSERT INTO principals (id, kind, issuer, subject, label, created_at) VALUES ('${agt}', 'agent', 'agent-library-publisher', '${pid}', 'publisher:Frank Exporter', '${at}')`);
+  sql(`INSERT INTO publishers (id, owner_principal_id, principal_id, app_client_id, display_name, project_id, folder_id, created_at, workspace_id, created_by) VALUES ('${pid}', '${frankId}', '${agt}', '${app.app_client_id}', 'Frank Exporter', '${A.project}', NULL, '${at}', '${WSA}', '${frankId}')`);
+  await settingsSwitch(bob, pid, "Frank Exporter");
+  const listed = ok(await bob.req("GET", "/api/app-clients")).other_publishers.find((p) => p.publisher_id === pid);
+  assert.equal(listed.display_name, "Frank Exporter"); assert.equal(listed.shared_edit, true, "turned on from Settings");
+});
+
 test("last owner: two concurrent demotions of the only two owners leave exactly one owner", async () => {
   const eve = await h.person("eve");
   const inv = ok(await bob.req("POST", `/api/workspaces/${WSA}/invites`, { email: "eve@example.test", role: "admin" }), 201);
@@ -400,18 +417,3 @@ test("last owner: two concurrent demotions of the only two owners leave exactly 
   assert.equal([r1, r2].filter((r) => r.status === 200).length, 2 - owners, `statuses ${r1.status}, ${r2.status}; owners ${owners}`);
 });
 
-test("Settings: an admin turns on shared editing for an app someone else registered (real Chrome)", { skip: !haveChrome && "Chrome not installed" }, async () => {
-  // A member connects their own app into the workspace's project; the admin (bob) didn't register it.
-  const frank = await h.person("frank");
-  const inv = ok(await bob.req("POST", `/api/workspaces/${WSA}/invites`, { email: "frank@example.test", role: "member" }), 201);
-  ok(await frank.req("POST", "/api/invites/accept", { token: inv.accept_url.split("/").pop() }));
-  const app = ok(await frank.req("POST", "/api/app-clients", { display_name: "Frank Exporter", redirect_uris: ["https://frank-exporter.example.test/cb"] }), 201);
-  // Connected straight in the database: the publisher consent harness signs in as the owner only. Same columns the
-  // consent page writes; the admin's view and the sharing route are what this test checks.
-  const frankId = ok(await frank.req("GET", "/api/me")).principal.id, pid = "pub_frankexporter01", agt = "agt_frankexporter01", at = new Date().toISOString();
-  sql(`INSERT INTO principals (id, kind, issuer, subject, label, created_at) VALUES ('${agt}', 'agent', 'agent-library-publisher', '${pid}', 'publisher:Frank Exporter', '${at}')`);
-  sql(`INSERT INTO publishers (id, owner_principal_id, principal_id, app_client_id, display_name, project_id, folder_id, created_at, workspace_id, created_by) VALUES ('${pid}', '${frankId}', '${agt}', '${app.app_client_id}', 'Frank Exporter', '${A.project}', NULL, '${at}', '${WSA}', '${frankId}')`);
-  await settingsSwitch(bob, pid, "Frank Exporter");
-  const listed = ok(await bob.req("GET", "/api/app-clients")).other_publishers.find((p) => p.publisher_id === pid);
-  assert.equal(listed.display_name, "Frank Exporter"); assert.equal(listed.shared_edit, true, "turned on from Settings");
-});
