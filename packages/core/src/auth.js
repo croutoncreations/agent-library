@@ -137,15 +137,16 @@ async function authorizeProject(ctx, projectId, write) {
 // consent page or later in Settings): people and agents with write access edit it like any other file. Read inside
 // every write's own statement, so turning sharing off takes effect on the next write. A Worker older than
 // 0038_publisher_shared_edit.sql never reads the column, so rolling back makes every app file protected again.
-const PROTECTED_APP_FILE = "publisher_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM publishers pb WHERE pb.id = artifacts.publisher_id AND pb.shared_edit = 1)";
+// Always used against the alias `pa` (FROM artifacts pa), so an enclosing UPDATE artifacts can't change what it means.
+const PROTECTED_APP_FILE = "pa.publisher_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM publishers pb WHERE pb.id = pa.publisher_id AND pb.shared_edit = 1 AND pb.revoked_at IS NULL)";
 function protectSql(ctx, artifactId) {
   if (ctx.principal.kind !== "agent" || ctx.publisher || artifactId === void 0) return { sql: "1", params: [] };
-  return { sql: `NOT EXISTS (SELECT 1 FROM artifacts WHERE id = ? AND (is_template = 1 OR (${PROTECTED_APP_FILE})))`, params: [artifactId] };
+  return { sql: `NOT EXISTS (SELECT 1 FROM artifacts pa WHERE pa.id = ? AND (pa.is_template = 1 OR (${PROTECTED_APP_FILE})))`, params: [artifactId] };
 }
 function contentWriteSql(ctx, artifactId) {
-  if (ctx.principal.kind === "agent" && artifactId !== void 0) return { sql: `NOT EXISTS (SELECT 1 FROM artifacts WHERE id = ? AND (is_template = 1 OR (? = 0 AND ${PROTECTED_APP_FILE})))`, params: [artifactId, ctx.publisher ? 1 : 0] };
+  if (ctx.principal.kind === "agent" && artifactId !== void 0) return { sql: `NOT EXISTS (SELECT 1 FROM artifacts pa WHERE pa.id = ? AND (pa.is_template = 1 OR (? = 0 AND ${PROTECTED_APP_FILE})))`, params: [artifactId, ctx.publisher ? 1 : 0] };
   if (ctx.publisher || artifactId === void 0) return { sql: "1", params: [] };
-  return { sql: `NOT EXISTS (SELECT 1 FROM artifacts WHERE id = ? AND ${PROTECTED_APP_FILE})`, params: [artifactId] };
+  return { sql: `NOT EXISTS (SELECT 1 FROM artifacts pa WHERE pa.id = ? AND ${PROTECTED_APP_FILE})`, params: [artifactId] };
 }
 /**
  * SQL gate for one credential on one project, evaluated inside each statement. need: "read" | "write".

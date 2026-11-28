@@ -197,7 +197,7 @@ async function rvPropose(ctx, projectId, a, i, s) {
     if (cur?.trashed_at) throw new HttpError(409, "trashed", "Artifact is in trash");
     if (cur && checkRev && cur.head_rev !== a.head_rev) throw new HttpError(409, "revision_conflict", "Expected revision is stale", { current_revision: cur.head_rev, expected_revision: s.expectedRev });
     if (cur && checkMeta && cur.meta_version !== a.meta_version) throw new HttpError(409, "metadata_conflict", "Expected metadata version is stale", { current_meta_version: cur.meta_version });
-    const pub = await db(ctx).prepare("SELECT a.publisher_id, a.is_template, (SELECT shared_edit FROM publishers WHERE id = a.publisher_id) AS shared FROM artifacts a WHERE a.id = ?").bind(a.id).first();
+    const pub = await db(ctx).prepare("SELECT a.publisher_id, a.is_template, (SELECT shared_edit FROM publishers WHERE id = a.publisher_id AND revoked_at IS NULL) AS shared FROM artifacts a WHERE a.id = ?").bind(a.id).first();
     if ((pub?.publisher_id && !pub.shared) || pub?.is_template) throw new HttpError(403, "protected_source", "This document cannot be modified here");
     if (lg.workspaceId) await explainLimit(ctx.env, lg.workspaceId, { storage_bytes: content.size }, lg.limits, projectId);
     throw new HttpError(403, "forbidden", "Grant no longer valid");

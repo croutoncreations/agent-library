@@ -7,6 +7,7 @@
 import { authzSql } from "../auth.js";
 import { blobPrefix, blobWriteFence, dropBlobWrite, isBlobWriteError, stageBlobWrite, textWriteComplete, writeUploadBlob } from "../content-store.js";
 import { MIME, checkFile } from "../formats.js";
+import { APP_TEXT_MAX_BYTES } from "../text-limits.js";
 import { fdEnsure, fdPathOf } from "../folders.js";
 import { BINARY_TYPES, audit, createMarkdown, idemInsert, idemLookup, mdBody, publishRevision, runBatch, servedContentType } from "../service.js";
 import { metaBaselineInsert, metaVersionInsert, provenance } from "../history/service.js";
@@ -32,7 +33,7 @@ export const APP_PATH_MAX_CHARS = 200;
 export const APP_PATH_MAX_SEGMENTS = 8;
 export const APP_FILES_PAGE_MAX = 100;
 /** A text file sent to App Files: at most 1 MiB, declared by Content-Length and refused before any byte is read. */
-export const APP_FILE_MAX_BYTES = 1048576;
+export const APP_FILE_MAX_BYTES = APP_TEXT_MAX_BYTES;
 /** A binary file: at most the workspace plan's file_bytes (limits.js, default 25 MiB, never above 90 MiB). */
 
 const ROOT = "/v1/app/files";

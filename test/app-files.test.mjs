@@ -367,6 +367,11 @@ test("shared editing: chosen at consent, agents and the owner edit the app's fil
   err(stale, 412, "precondition_failed"); assert.equal(stale.json.error.current_etag, etagOf("# plan\n\nagent line\n"));
   assert.equal((await put(c.tok, "notes/plan.md", "# plan\n\nagent line\napp line\n", { match: stale.json.error.current_etag })).status, 200);
   assert.deepEqual(ok(await list(c.tok)).files.map((x) => x.path), ["index.json", "notes/plan.md"], "still the app's files, at their paths");
+  // Outside edits stay within the app's own 1 MiB text limit, so the app can always replace the file again.
+  const cur = ok(await list(c.tok)).files.find((x) => x.path === "notes/plan.md");
+  const big = await agent.call("save_markdown", { project_id: "files-own", artifact_id: doc.file_id, expected_revision: cur.revision, body: "#".repeat(1048577), idempotency_key: uniq("shared-big") });
+  assert.equal(big.isError, true); assert.match(JSON.stringify(big.data), /too_large/);
+  assert.equal(ok(await list(c.tok)).files.find((x) => x.path === "notes/plan.md").revision, cur.revision, "nothing written");
 
   // Only the person who connected it (or a project admin) turns it off; then agents and the owner are refused again.
   const off = ok(await owner.req("PUT", `/api/publishers/${c.P.publisher_id}/sharing`, { shared_edit: false }));
@@ -380,7 +385,15 @@ test("shared editing: chosen at consent, agents and the owner edit the app's fil
   assert.equal(listed.shared_edit, false);
   assert.equal((await owner.req("PUT", `/api/publishers/${c.P.publisher_id}/sharing`, { shared_edit: "yes" })).status, 400);
   assert.equal((await owner.req("PUT", "/api/publishers/pub_doesnotexist00/sharing", { shared_edit: true })).status, 404);
+  assert.equal(ok(await owner.req("PUT", `/api/publishers/${c.P.publisher_id}/sharing`, { shared_edit: false })).shared_edit, false, "same value: answered, not re-audited");
   assert.deepEqual(sql(`SELECT result FROM audits WHERE action = 'publisher.sharing' AND object_id = '${c.P.publisher_id}'`).map((r) => r.result), ["ok:app-only"]);
+
+  // Revoking a shared connection protects its files again.
+  const r = await connect("files-own", { sharedEdit: true });
+  const rf = (await put(r.tok, "revoked.md", "# r\n", { create: true })).json.file;
+  ok(await owner.req("POST", `/api/publishers/${r.P.publisher_id}/revoke`, {}));
+  const afterRevoke = await agent.call("save_markdown", { project_id: "files-own", artifact_id: rf.file_id, expected_revision: 1, body: "x", idempotency_key: uniq("shared-save") });
+  assert.equal(afterRevoke.isError, true); assert.match(JSON.stringify(afterRevoke.data), /protected_source/);
 });
 
 test("other credentials are refused: cookies 400, an API key, an MCP token and no token 401", async () => {

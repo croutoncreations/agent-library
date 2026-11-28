@@ -6,7 +6,7 @@ import { __name } from "./runtime.js";
 import { FILE_BYTES_CEILING, explainLimit, fileTooLarge, guardSql, projectLimitGuard } from "./limits.js";
 import { BINARY_TYPES, IMAGE_TYPES, VIDEO_TYPES, appConnectEnabled, assertWritable, audit, idemLookup, loadArtifact, mdBody, provenance, publishRevision, requireAppConnect, servedContentType, textCreateMetadata } from "./service.js";
 import { RV_PLACEHOLDER, rvGateUpload, rvGatedActor, rvNewCap, rvNewGated, rvResolveRev } from "./review/service.js";
-import { TEXT_MAX_BYTES } from "./text-limits.js";
+import { APP_TEXT_MAX_BYTES, TEXT_MAX_BYTES } from "./text-limits.js";
 import { FD_FOLDER_PROP, fdResolve } from "./folders.js";
 import { HttpError, int, nowIso, nowMs, randomId, sha256Hex, str } from "./util.js";
 
@@ -117,6 +117,9 @@ async function uploadBegin(ctx, projectId, input, key, { allowText = false, allo
     target = await loadArtifact(ctx, projectId, targetId, { pendingOk: rvGatedActor(ctx) });
     assertWritable(ctx, target, "content");
     if (target.kind !== kind) throw new HttpError(400, "invalid_input", "mime must match the existing document kind");
+    // Shared editing: an app's text file stays within the app's own limit (publishRevision re-checks at finish).
+    if (target.publisher_id && !ctx.publisher && size > APP_TEXT_MAX_BYTES)
+      throw new HttpError(413, "too_large", `A connected app's text file can be at most 1 MiB (${APP_TEXT_MAX_BYTES.toLocaleString("en-US")} bytes), so the app can still replace it`, { max_bytes: APP_TEXT_MAX_BYTES });
     if (input.schema !== void 0 && (input.schema == null ? null : String(input.schema)) !== target.schema_id) throw new HttpError(400, "invalid_input", "schema must match the existing document schema");
   }
   await reconcileUploads(ctx.env, { projectId, limit: 20 });
@@ -126,7 +129,9 @@ async function uploadBegin(ctx, projectId, input, key, { allowText = false, allo
   let reviewMeta = null;
   const stmts = [];
   const azBase = authzSql(ctx, projectId);
-  const cw = kind && target ? contentWriteSql(ctx, target.id) : { sql: "1", params: [] };
+  // A new version of an existing file (text or binary) is gated in the reservation's own statement: whether it is an
+  // app's file someone may edit can change at any time (shared editing).
+  const cw = input.artifact_id ? contentWriteSql(ctx, str(input.artifact_id, "artifact_id", 64)) : { sql: "1", params: [] };
   const az = { sql: `${azBase.sql} AND ${cw.sql}`, params: [...azBase.params, ...cw.params] };
   if (input.artifact_id) {
     artifactId = str(input.artifact_id, "artifact_id", 64);
@@ -230,7 +235,9 @@ async function uploadPut(req, env, requestId, uploadId, linkCtx, { projectId, ra
     assertWritable(ctx, await loadArtifact(ctx, u.project_id, u.artifact_id, { allowUnpublished: u.base_rev === 0, pendingOk: rvGatedActor(ctx) }), "content");
   }
   const azBase = authzSql(ctx, u.project_id);
-  const cw = textKind ? contentWriteSql(ctx, u.artifact_id) : { sql: "1", params: [] };
+  // A new version's bytes (text or binary) are accepted only while the target is still writable (shared editing can be
+  // turned off between begin and transfer). A new file's placeholder (base_rev 0) is the uploader's own.
+  const cw = textKind || u.base_rev > 0 ? contentWriteSql(ctx, u.artifact_id) : { sql: "1", params: [] };
   const az = { sql: `${azBase.sql} AND ${cw.sql}`, params: [...azBase.params, ...cw.params] };
   // Claim the upload and register the write in one statement: cleanup purges final_key only once final_writes is 0.
   // An upload begun by the previous Worker has no final_key yet; it is fixed here (nothing else writes it while pending).

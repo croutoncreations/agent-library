@@ -337,7 +337,20 @@ test("management: members get 403, outsiders 404; a chosen project id is refused
   // An outsider sees nothing of it and can't revoke it; the admin can.
   assert.equal((await dave.req("GET", "/api/app-clients")).body.other_publishers.some((p) => p.publisher_id === pubA.publisher_id), false);
   assert.equal((await dave.req("POST", `/api/publishers/${pubA.publisher_id}/revoke`)).status, 404);
+  // Shared editing: a member who didn't connect it and an outsider can't change it; the connecting member and an admin can.
+  const sharing = (who, on) => who.req("PUT", `/api/publishers/${pubA.publisher_id}/sharing`, { shared_edit: on });
+  assert.equal((await sharing(carol, true)).status, 404, "a member who didn't connect it");
+  assert.equal((await sharing(dave, true)).status, 404, "an outsider");
+  assert.equal(ok(await sharing(owner, true)).shared_edit, true, "the member who connected it");
+  assert.equal(ok(await sharing(owner, true)).shared_edit, true, "the same value again answers it");
+  assert.equal(ok(await sharing(bob, false)).shared_edit, false, "an admin");
+  ok(await sharing(bob, true));
   ok(await bob.req("POST", `/api/publishers/${pubA.publisher_id}/revoke`));
+  // Revoking ends sharing (the app's files are protected again); turning it on for a revoked connection is refused,
+  // turning it off is always fine.
+  assert.equal((await sharing(bob, true)).status, 404, "a revoked connection can't be opened");
+  assert.equal(ok(await sharing(bob, false)).shared_edit, false, "off is always allowed");
+  assert.deepEqual(sql(`SELECT result FROM audits WHERE action = 'publisher.sharing' AND object_id = '${pubA.publisher_id}' ORDER BY rowid`).map((r) => r.result), ["ok:shared-edit", "ok:app-only", "ok:shared-edit"], "one audit row per real change");
   assert.equal((await h.pub(pubA.access_token, "GET", "/app")).status, 401);
   // The owner's own app listing shows only publishers whose project they can see (the B one, and A while member).
   ok(await bob.req("DELETE", `/api/workspaces/${WSA}/members/${ownerId}`));

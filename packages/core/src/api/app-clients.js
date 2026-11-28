@@ -124,7 +124,8 @@ async function revokePublisher(ctx, id) {
   requireHuman(ctx);
   requireAppConnect(ctx);
   // The person who connected the publisher, or an admin of the project's workspace.
-  const r = await ctx.env.DB.prepare(`UPDATE publishers AS pb SET revoked_at = ? WHERE pb.id = ? AND pb.revoked_at IS NULL
+  // Revoking also ends shared editing: a revoked app's files are protected again, as before shared editing existed.
+  const r = await ctx.env.DB.prepare(`UPDATE publishers AS pb SET revoked_at = ?, shared_edit = 0 WHERE pb.id = ? AND pb.revoked_at IS NULL
       AND (COALESCE(pb.created_by, pb.owner_principal_id) = ? OR ${memberRoleSql("pb.project_id", "admin", "?", true)})`).bind(nowMs(), id, ctx.principal.id, ctx.principal.id).run();
   if (!r.meta.changes) throw new HttpError(404, "not_found", "Publisher not found or already revoked");
   const p = await ctx.env.DB.prepare("SELECT project_id FROM publishers WHERE id = ?").bind(id).first("project_id");
@@ -133,20 +134,31 @@ async function revokePublisher(ctx, id) {
 }
 
 // Shared editing (docs/app-connect.md#shared-editing): whether people and agents with edit access to the project may
-// change this app's files too. Turning it on opens the files to them, so it needs the person who connected the app (still
-// able to edit the project) or a project admin, in an active workspace. Each write re-reads it in its own statement.
+// change this app's files too. Who: the person who connected the app (still a member of the project) or a project admin.
+// Turning it ON opens the files, so it needs an active connection in an active workspace. Turning it OFF only reduces
+// access, so it is always allowed (revoked connection, suspended workspace). The change and its audit row are one batch;
+// re-sending the current value changes and audits nothing. Each write re-reads the flag in its own statement.
 async function setPublisherSharing(ctx, id, input) {
   requireHuman(ctx);
   requireAppConnect(ctx);
   if (typeof input?.shared_edit !== "boolean") throw new HttpError(400, "invalid_input", "shared_edit must be true or false");
-  const on = input.shared_edit ? 1 : 0;
-  const r = await ctx.env.DB.prepare(`UPDATE publishers AS pb SET shared_edit = ? WHERE pb.id = ? AND pb.revoked_at IS NULL
-      AND ((COALESCE(pb.created_by, pb.owner_principal_id) = ? AND ${memberRoleSql("pb.project_id", "member")}) OR ${memberRoleSql("pb.project_id", "admin")})`)
-    .bind(on, id, ctx.principal.id, ctx.principal.id, ctx.principal.id).run();
-  if (!r.meta.changes) throw new HttpError(404, "not_found", "Publisher not found, revoked, or not yours to change");
-  const p = await ctx.env.DB.prepare("SELECT project_id FROM publishers WHERE id = ?").bind(id).first("project_id");
-  await ctx.env.DB.prepare("INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id) VALUES (?, ?, ?, 'publisher.sharing', ?, ?, ?)").bind(nowIso(), ctx.principal.id, p, id, on ? "ok:shared-edit" : "ok:app-only", ctx.requestId).run();
-  return { publisher_id: id, shared_edit: !!on };
+  const on = input.shared_edit ? 1 : 0, off = !on;
+  const who = `((COALESCE(pb.created_by, pb.owner_principal_id) = ? AND ${memberRoleSql("pb.project_id", "member", "?", off)}) OR ${memberRoleSql("pb.project_id", "admin", "?", off)})`;
+  const live = on ? " AND pb.revoked_at IS NULL" : "";
+  const DB = ctx.env.DB, at = nowIso();
+  const [upd] = await DB.batch([
+    DB.prepare(`UPDATE publishers AS pb SET shared_edit = ? WHERE pb.id = ? AND pb.shared_edit <> ?${live} AND ${who}`)
+      .bind(on, id, on, ctx.principal.id, ctx.principal.id, ctx.principal.id),
+    DB.prepare(`INSERT INTO audits (at, actor_id, project_id, action, object_id, result, request_id)
+      SELECT ?, ?, project_id, 'publisher.sharing', id, ?, ? FROM publishers WHERE id = ? AND changes() > 0`)
+      .bind(at, ctx.principal.id, on ? "ok:shared-edit" : "ok:app-only", ctx.requestId, id)
+  ]);
+  if (upd.meta.changes) return { publisher_id: id, shared_edit: !!on };
+  // Nothing changed: already at that value (answer it), or not found / revoked / not yours (404, no detail).
+  const same = await DB.prepare(`SELECT 1 FROM publishers AS pb WHERE pb.id = ? AND pb.shared_edit = ?${live} AND ${who}`)
+    .bind(id, on, ctx.principal.id, ctx.principal.id, ctx.principal.id).first();
+  if (same) return { publisher_id: id, shared_edit: !!on };
+  throw new HttpError(404, "not_found", "Publisher not found, revoked, or not yours to change");
 }
 
 export { disableAppClient, listAppClients, registerAppClient, revokePublisher, setPublisherSharing, updateAppClient };

@@ -2824,7 +2824,7 @@ function viewPublishingApps() {
   function sharingToggle(c,p){
     var box=h("input",{type:"checkbox",checked:!!p.shared_edit,"aria-label":"Let people and agents edit "+c.display_name+"'s files"});
     box.onchange=async function(){var want=box.checked;
-      if(want&&!confirm("Let people and agents with edit access to "+(projectTitles[p.project_id]||"this project")+" change, rename and trash "+c.display_name+"'s files? "+c.display_name+" will see their changes and may overwrite them."))return void(box.checked=false);
+      if(want&&!confirm("Let people and agents with edit access to "+(projectTitles[p.project_id]||"this project")+" change, rename and trash "+c.display_name+"'s files? Their edits are saved directly, even where the project requires review. "+c.display_name+" will see their changes and may overwrite them."))return void(box.checked=false);
       box.disabled=true;
       try{var r=await api("PUT","/api/publishers/"+enc(p.publisher_id)+"/sharing",{shared_edit:want});p.shared_edit=r.shared_edit;box.checked=r.shared_edit;toast(r.shared_edit?"People and agents can now edit "+c.display_name+"'s files":"Only "+c.display_name+" can change its files now");}
       catch(err){box.checked=!want;showMsg(msg,"Couldn't change editing for "+c.display_name+": "+err.message);}
