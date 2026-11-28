@@ -10,6 +10,7 @@ import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createRequire } from "node:module";
+import { existsSync } from "node:fs";
 import { startAppConnectServer } from "./fixtures/app-connect-harness.mjs";
 import { agentHttp, mcpClient, key, sha256, ROOT, LOCAL_CONFIG } from "./helpers.mjs";
 import { makePng } from "./make-fixtures.mjs";
@@ -90,6 +91,7 @@ const oc = async (agent, name, args) => { const r = await agent.call(name, args)
 // (accepting the confirmation) and wait for the server's answer.
 const CHROME = process.env.CHROME_PATH ?? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 const PUPPETEER = `${process.env.HOME}/.npm-packages/lib/node_modules/puppeteer`;
+const haveChrome = existsSync(CHROME) && existsSync(PUPPETEER);
 async function settingsSwitch(who, publisherId, appName) {
   const browser = await createRequire(import.meta.url)(PUPPETEER).launch({ executablePath: CHROME, headless: true, args: ["--no-first-run"] });
   try {
@@ -368,9 +370,7 @@ test("management: members get 403, outsiders 404; a chosen project id is refused
   assert.equal(ok(await sharing(owner, true)).shared_edit, true, "the member who connected it");
   assert.equal(ok(await sharing(owner, true)).shared_edit, true, "the same value again answers it");
   assert.equal(ok(await sharing(bob, false)).shared_edit, false, "an admin");
-  // In Settings, the admin sees the member's app (registered by someone else) with its own sharing switch, and uses it.
-  await settingsSwitch(bob, pubA.publisher_id, cred.app.display_name);
-  assert.equal(ok(await bob.req("GET", "/api/app-clients")).other_publishers.find((p) => p.publisher_id === pubA.publisher_id).shared_edit, true, "turned on from Settings");
+  ok(await sharing(bob, true));
   ok(await bob.req("POST", `/api/publishers/${pubA.publisher_id}/revoke`));
   // Revoking ends sharing (the app's files are protected again); turning it on for a revoked connection is refused,
   // turning it off is always fine.
@@ -398,4 +398,20 @@ test("last owner: two concurrent demotions of the only two owners leave exactly 
   assert.ok(owners >= 1, `at least one owner must remain (statuses ${r1.status}, ${r2.status})`);
   // Each success removed one owner: the statuses agree with the final state.
   assert.equal([r1, r2].filter((r) => r.status === 200).length, 2 - owners, `statuses ${r1.status}, ${r2.status}; owners ${owners}`);
+});
+
+test("Settings: an admin turns on shared editing for an app someone else registered (real Chrome)", { skip: !haveChrome && "Chrome not installed" }, async () => {
+  // A member connects their own app into the workspace's project; the admin (bob) didn't register it.
+  const frank = await h.person("frank");
+  const inv = ok(await bob.req("POST", `/api/workspaces/${WSA}/invites`, { email: "frank@example.test", role: "member" }), 201);
+  ok(await frank.req("POST", "/api/invites/accept", { token: inv.accept_url.split("/").pop() }));
+  const app = ok(await frank.req("POST", "/api/app-clients", { display_name: "Frank Exporter", redirect_uris: ["https://frank-exporter.example.test/cb"] }), 201);
+  // Connected straight in the database: the publisher consent harness signs in as the owner only. Same columns the
+  // consent page writes; the admin's view and the sharing route are what this test checks.
+  const frankId = ok(await frank.req("GET", "/api/me")).principal.id, pid = "pub_frankexporter01", agt = "agt_frankexporter01", at = new Date().toISOString();
+  sql(`INSERT INTO principals (id, kind, issuer, subject, label, created_at) VALUES ('${agt}', 'agent', 'agent-library-publisher', '${pid}', 'publisher:Frank Exporter', '${at}')`);
+  sql(`INSERT INTO publishers (id, owner_principal_id, principal_id, app_client_id, display_name, project_id, folder_id, created_at, workspace_id, created_by) VALUES ('${pid}', '${frankId}', '${agt}', '${app.app_client_id}', 'Frank Exporter', '${A.project}', NULL, '${at}', '${WSA}', '${frankId}')`);
+  await settingsSwitch(bob, pid, "Frank Exporter");
+  const listed = ok(await bob.req("GET", "/api/app-clients")).other_publishers.find((p) => p.publisher_id === pid);
+  assert.equal(listed.display_name, "Frank Exporter"); assert.equal(listed.shared_edit, true, "turned on from Settings");
 });
