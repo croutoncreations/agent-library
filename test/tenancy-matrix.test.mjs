@@ -9,6 +9,7 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { createRequire } from "node:module";
 import { startAppConnectServer } from "./fixtures/app-connect-harness.mjs";
 import { agentHttp, mcpClient, key, sha256, ROOT, LOCAL_CONFIG } from "./helpers.mjs";
 import { makePng } from "./make-fixtures.mjs";
@@ -84,6 +85,27 @@ function readOps(kind, X, agent = cred.oauth) {
 const toolStatus = (r) => !r.isError ? 200 : (r.data?.error?.status ?? r.data?.status ?? (r.status >= 400 ? r.status : 500));
 const mcpCall = async (m, name, args) => { try { const r = await m.call(name, args); return { status: toolStatus(r), text: JSON.stringify(r.data ?? {}) }; } catch (e) { return { status: e.code ?? 500, text: String(e.message) }; } };
 const oc = async (agent, name, args) => { const r = await agent.call(name, args); return { status: toolStatus(r), text: JSON.stringify(r.data ?? {}) }; };
+
+// Real Chrome: open Settings -> Publishing apps as `who`, find the card for another person's app, tick its sharing switch
+// (accepting the confirmation) and wait for the server's answer.
+const CHROME = process.env.CHROME_PATH ?? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+const PUPPETEER = `${process.env.HOME}/.npm-packages/lib/node_modules/puppeteer`;
+async function settingsSwitch(who, publisherId, appName) {
+  const browser = await createRequire(import.meta.url)(PUPPETEER).launch({ executablePath: CHROME, headless: true, args: ["--no-first-run"] });
+  try {
+    const p = await browser.newPage();
+    const [cn, cv] = who.cookie.split("=");
+    await p.setCookie({ name: cn, value: cv, url: h.appUi });
+    p.on("dialog", (d) => d.accept());
+    await p.goto(`${h.appUi}/#/settings/publishing`);
+    const sel = `input[aria-label="Let people and agents edit ${appName}'s files"]`;
+    await p.waitForSelector(sel, { timeout: 15000 });
+    assert.match(await p.evaluate(() => document.body.innerText), /Other apps publishing into your projects/i);
+    const done = p.waitForResponse((r) => r.url().endsWith(`/api/publishers/${publisherId}/sharing`) && r.request().method() === "PUT");
+    await p.click(sel);
+    assert.equal((await done).status(), 200);
+  } finally { await browser.close(); }
+}
 
 before(async () => {
   h = await startAppConnectServer({ port: SERVER_PORTS["tenancy-matrix"] });
@@ -334,6 +356,8 @@ test("management: members get 403, outsiders 404; a chosen project id is refused
   const pubA = await h.connectPublisher(cred.app, { project_id: A.project, destination: "root" });
   const listed = ok(await bob.req("GET", "/api/app-clients")).other_publishers.find((p) => p.publisher_id === pubA.publisher_id);
   assert.ok(listed && listed.project_id === A.project, "the admin sees the member's publisher in other_publishers");
+  assert.equal(listed.display_name, cred.app.display_name, "named, so Settings can show its card and sharing switch");
+  assert.equal(listed.shared_edit, false);
   // An outsider sees nothing of it and can't revoke it; the admin can.
   assert.equal((await dave.req("GET", "/api/app-clients")).body.other_publishers.some((p) => p.publisher_id === pubA.publisher_id), false);
   assert.equal((await dave.req("POST", `/api/publishers/${pubA.publisher_id}/revoke`)).status, 404);
@@ -344,7 +368,9 @@ test("management: members get 403, outsiders 404; a chosen project id is refused
   assert.equal(ok(await sharing(owner, true)).shared_edit, true, "the member who connected it");
   assert.equal(ok(await sharing(owner, true)).shared_edit, true, "the same value again answers it");
   assert.equal(ok(await sharing(bob, false)).shared_edit, false, "an admin");
-  ok(await sharing(bob, true));
+  // In Settings, the admin sees the member's app (registered by someone else) with its own sharing switch, and uses it.
+  await settingsSwitch(bob, pubA.publisher_id, cred.app.display_name);
+  assert.equal(ok(await bob.req("GET", "/api/app-clients")).other_publishers.find((p) => p.publisher_id === pubA.publisher_id).shared_edit, true, "turned on from Settings");
   ok(await bob.req("POST", `/api/publishers/${pubA.publisher_id}/revoke`));
   // Revoking ends sharing (the app's files are protected again); turning it on for a revoked connection is refused,
   // turning it off is always fine.
